@@ -82,8 +82,13 @@ jobs:
             REVIEW_TAG="${REVIEW_TAG% }"
           fi
 
-          # 標題可能很長或含換行,依碼點截斷(用 cut -c 會切壞中文)
-          TITLE="$(jq -rn --arg t "${PR_TITLE:-}" '$t | gsub("[\r\n]"; " ") | .[0:200]')"
+          # 標題是外部可控字串,做三件事:
+          #   1. 去掉換行與反引號 2. 依碼點截斷 200(用 cut -c 會切壞中文)
+          #   3. 包成行內程式碼 —— Discord 就不會解讀裡面的 markdown,
+          #      像 [看這裡](https://釣魚網址) 這種偽裝連結會原樣顯示
+          TITLE="$(jq -rn --arg t "${PR_TITLE:-}" '
+            ($t | gsub("[\r\n`]"; " ") | .[0:200]) as $c
+            | if ($c | test("\\S")) then "`" + $c + "`" else "(無標題)" end')"
 
           # --- 組訊息 ---------------------------------------------------
           MSG=""
@@ -151,20 +156,39 @@ jobs:
           fi
 
           # --- 送出 -----------------------------------------------------
+          # Discord 介面給的 webhook URL 不含版本號,會被路由到已棄用的 API v6,
+          # 而 v6 對 flags 這類參數的支援沒有文件保證 —— 釘在 v10。
+          # 注意:改過的 URL 已經不等於 secret 原值,GitHub 不會再幫忙遮罩,絕對不要 echo。
+          # 用前後綴切割來插入版本號。${var/a/b} 在替換字串裡不會吃掉反斜線,
+          # 寫成 ${HOOK/\/api\/…} 會產生字面上的 \/,送出去就壞了。
+          case "$HOOK" in
+            */api/v[0-9]*/webhooks/*) : ;;
+            */api/webhooks/*)
+              HOOK="${HOOK%%/api/webhooks/*}/api/v10/webhooks/${HOOK#*/api/webhooks/}" ;;
+          esac
+          # wait=true 讓 Discord 回傳實際結果;預設的 204 在訊息被丟棄時也一樣是 204,
+          # 等於失敗看起來像成功。
+          case "$HOOK" in *\?*) URL="${HOOK}&wait=true" ;; *) URL="${HOOK}?wait=true" ;; esac
+
           # allowed_mentions 用白名單:只有上面明確收集的 id 會真的響鈴。
           # 這同時擋掉標題注入 —— 有人把 PR 取名成 @everyone 也不會全頻道被 tag。
+          # flags: 4 = SUPPRESS_EMBEDS,關掉連結預覽卡。用 flags 而不是把網址包成 <...>,
+          # 是因為前者對整則訊息生效,標題裡被塞的網址也蓋得到。
+          # 絕對不要加 4096(SUPPRESS_NOTIFICATIONS),那會讓提及不跳通知只剩紅點。
           # 注意 jq 要用 -n:對空字串下 `jq -R` 不會產生任何輸出,--argjson 會直接爆掉。
           to_arr() { jq -cn --arg s "$1" '$s | split(" ") | map(select(length > 0)) | unique'; }
           PAYLOAD="$(jq -n \
             --arg content "$MSG" \
             --argjson users "$(to_arr "$PING_USERS")" \
             --argjson roles "$(to_arr "$PING_ROLES")" \
-            '{content: $content, allowed_mentions: {parse: [], users: $users, roles: $roles}}')"
+            '{content: $content,
+              flags: 4,
+              allowed_mentions: {parse: [], users: $users, roles: $roles}}')"
 
           CODE="$(curl -sS -o /tmp/discord_resp.txt -w '%{http_code}' \
                     --max-time 20 --retry 2 \
                     -H 'Content-Type: application/json' \
-                    --data-binary "$PAYLOAD" "$HOOK" || true)"
+                    --data-binary "$PAYLOAD" "$URL" || true)"
           CODE="${CODE:-000}"
           if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
             echo "已送出(${KIND} http=${CODE})"
