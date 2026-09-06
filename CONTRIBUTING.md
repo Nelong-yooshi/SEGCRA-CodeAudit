@@ -41,6 +41,20 @@ fix: 修正邊界條件判斷
 doc: 補充規格撰寫說明
 ```
 
+## Discord 通知
+
+PR 的狀態變化會自動送到 Discord 頻道,由 [`.github/workflows/discord-notify.yml`](.github/workflows/discord-notify.yml) 處理,依情境 tag 不同的人:
+
+| 情境 | 會 tag 誰 |
+|---|---|
+| PR 開啟 / 重新開啟 / 草稿轉正式 | code review 群組 |
+| 審查已核准 / 需要修改 / 有審查意見 | PR 作者 |
+| PR 已合併 / 已關閉未合併 | PR 作者 |
+
+草稿 PR、作者自審、沒有總評的行內留言、非成員的審查都不會發通知。
+
+webhook URL 與 Discord 身分對照表放在 repo Settings 的 Secrets 與 Variables,不寫進原始碼。對照表沒設定時通知照送,只是顯示 GitHub 帳號、不會 @ 到人。設定項目見該檔開頭的註解。
+
 ## 提交前檢查
 
 * 不要提交任何憑證、token、密碼或內部主機資訊(`.gitignore` 已排除 `*.env`,但仍請自行確認)。

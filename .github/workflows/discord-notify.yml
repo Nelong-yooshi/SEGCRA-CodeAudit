@@ -1,0 +1,203 @@
+name: PR Discord Notification
+
+# 全部送到同一個 Discord 頻道,依情境 tag 不同身分:
+#   PR 開出來、等人審            → tag code review 群組
+#   審查有回應、PR 被合併或關閉  → tag PR 作者
+#
+# 需要設定的東西全部放在 repo Settings,原始碼裡不寫任何人名或 ID:
+#   Secrets   DISCORD_WEBHOOK          頻道的 webhook URL
+#   Variables DISCORD_USER_MAP         {"github_login":"discord_數字id", ...}
+#             DISCORD_REVIEW_ROLE_ID   code review 身分組的 Discord role id
+#             DISCORD_REVIEW_IDS       沒有身分組時的替代:用空白隔開的 discord 數字 id
+#
+# 對照表沒設也不會壞,只是訊息裡顯示 GitHub 帳號純文字而不是 @ 提及。
+
+on:
+  pull_request:
+    types: [opened, ready_for_review, reopened, closed]
+  pull_request_review:
+    types: [submitted]
+
+# 這個 workflow 不讀寫 repo,不需要任何 GITHUB_TOKEN 權限
+permissions: {}
+
+# 刻意不設 concurrency:同一個 PR 的 concurrency group 在有新 run 排隊時
+# 會把還在等的舊 run 取消掉,等於直接漏掉一則通知。這些 job 很短,讓它們各跑各的。
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compose and send Discord notification
+        env:
+          # 通知目的地
+          HOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          # 身分對照
+          USER_MAP: ${{ vars.DISCORD_USER_MAP }}
+          REVIEW_ROLE_ID: ${{ vars.DISCORD_REVIEW_ROLE_ID }}
+          REVIEW_IDS: ${{ vars.DISCORD_REVIEW_IDS }}
+          # 事件資料一律經由 env 傳入。不可以把 ${{ }} 直接寫進 shell:
+          # PR 標題是外部可控字串,直接內插等於讓任何人在 runner 上執行指令。
+          EVENT: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+          PR_NUM: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_MERGED: ${{ github.event.pull_request.merged }}
+          MERGED_BY: ${{ github.event.pull_request.merged_by.login }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+          REVIEWER: ${{ github.event.review.user.login }}
+          REVIEW_BODY: ${{ github.event.review.body }}
+          REVIEW_ASSOC: ${{ github.event.review.author_association }}
+        run: |
+          set -euo pipefail
+
+          # --- 身分解析 -------------------------------------------------
+          # 查 GitHub 帳號對應的 Discord 數字 id;查不到回傳空字串
+          lookup_id() {
+            [ -n "${USER_MAP:-}" ] || return 0
+            printf '%s' "$USER_MAP" | jq -r --arg l "$1" '.[$l] // empty' 2>/dev/null || true
+          }
+
+          # 作者:對得到就用 @ 提及,對不到就顯示 GitHub 帳號
+          AUTHOR_ID="$(lookup_id "${PR_AUTHOR:-}")"
+          AUTHOR_PLAIN="**${PR_AUTHOR:-unknown}**"
+          if [ -n "$AUTHOR_ID" ]; then AUTHOR_TAG="<@${AUTHOR_ID}>"; else AUTHOR_TAG="$AUTHOR_PLAIN"; fi
+
+          # code review 群組:優先用 Discord 身分組,其次用 id 清單,都沒有就純文字
+          REVIEW_TAG="code review"
+          REVIEW_ROLE_PING=""
+          REVIEW_USER_PING=""
+          if [ -n "${REVIEW_ROLE_ID:-}" ]; then
+            REVIEW_TAG="<@&${REVIEW_ROLE_ID}>"
+            REVIEW_ROLE_PING="$REVIEW_ROLE_ID"
+          elif [ -n "${REVIEW_IDS:-}" ]; then
+            REVIEW_TAG=""
+            for id in $REVIEW_IDS; do
+              REVIEW_TAG="${REVIEW_TAG}<@${id}> "
+              REVIEW_USER_PING="$REVIEW_USER_PING $id"
+            done
+            REVIEW_TAG="${REVIEW_TAG% }"
+          fi
+
+          # 標題是外部可控字串(公開 repo,任何人都能決定它的內容)。順序有意義:
+          #   1. 先清掉控制字元、雙向覆寫字元、零寬字元與反引號
+          #      —— 反引號一定要先清,否則標題自己就能關掉下面的程式碼區塊逃出去;
+          #         U+202E 之類的雙向覆寫可以讓 gnp.exe 在畫面上顯示成 exe.png
+          #   2. 再依碼點截斷 200(用 cut -c 會切壞中文;先包再截會切斷程式碼區塊)
+          #   3. 最後才包成行內程式碼,讓 Discord 不解讀裡面的 markdown,
+          #      像 [看這裡](https://釣魚網址) 這種偽裝連結就只會原樣顯示
+          TITLE="$(jq -rn --arg t "${PR_TITLE:-}" '
+            ($t | gsub("[\u0001-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2066-\u2069`]"; " ") | .[0:200]) as $c
+            | if ($c | test("\\S")) then "`" + $c + "`" else "(無標題)" end')"
+
+          # --- 組訊息 ---------------------------------------------------
+          MSG=""
+          KIND=""         # 只用於 log,方便從 Actions 記錄看出送的是哪一類
+          PING_USERS=""   # 這則訊息允許響鈴的 user id
+          PING_ROLES=""   # 這則訊息允許響鈴的 role id
+
+          if [ "$EVENT" = "pull_request" ]; then
+            case "$ACTION" in
+              opened|reopened|ready_for_review)
+                # 草稿 PR 先不吵審查者,等 ready_for_review 再送
+                if [ "${PR_DRAFT:-false}" = "true" ] && [ "$ACTION" != "ready_for_review" ]; then
+                  echo "draft PR,略過"; exit 0
+                fi
+                KIND="待審查"
+                # 只 tag 審查者。作者剛做完這個動作,不需要再被通知一次
+                PING_USERS="$REVIEW_USER_PING"; PING_ROLES="$REVIEW_ROLE_PING"
+                MSG="${REVIEW_TAG} PR #${PR_NUM:-} 待審查"$'\n'"標題:${TITLE}"$'\n'"作者:${AUTHOR_PLAIN}"$'\n'"${PR_URL:-}"
+                ;;
+              closed)
+                KIND="合併/關閉"
+                PING_USERS="$AUTHOR_ID"
+                if [ "${PR_MERGED:-false}" = "true" ]; then
+                  MSG="${AUTHOR_TAG} PR #${PR_NUM:-} 已合併"$'\n'"標題:${TITLE}"$'\n'"合併者:${MERGED_BY:-unknown}"$'\n'"${PR_URL:-}"
+                else
+                  MSG="${AUTHOR_TAG} PR #${PR_NUM:-} 已關閉,未合併"$'\n'"標題:${TITLE}"$'\n'"${PR_URL:-}"
+                fi
+                ;;
+            esac
+
+          elif [ "$EVENT" = "pull_request_review" ]; then
+            # 自己審自己的 PR 不用通知
+            if [ "${REVIEWER:-}" = "${PR_AUTHOR:-}" ]; then
+              echo "作者自審,略過"; exit 0
+            fi
+            # repo 是公開的,任何 GitHub 使用者都能對 PR 送審查意見。
+            # 只認 repo 內部成員,否則路人就能對頻道洗版。
+            case "${REVIEW_ASSOC:-}" in
+              OWNER|MEMBER|COLLABORATOR) : ;;
+              *) echo "外部人員的審查(author_association=${REVIEW_ASSOC:-空}),不進頻道"; exit 0 ;;
+            esac
+            STATE="$(printf '%s' "${REVIEW_STATE:-}" | tr '[:upper:]' '[:lower:]')"
+            case "$STATE" in
+              approved)          RESULT="已核准" ;;
+              changes_requested) RESULT="需要修改" ;;
+              commented)
+                # 只有行內留言、沒有總評的 submitted 事件會很吵,略過
+                if [ -z "${REVIEW_BODY:-}" ]; then echo "空白留言審查,略過"; exit 0; fi
+                RESULT="有審查意見" ;;
+              *) echo "未處理的審查狀態:${STATE}"; exit 0 ;;
+            esac
+            KIND="審查結果"
+            PING_USERS="$AUTHOR_ID"
+            MSG="${AUTHOR_TAG} PR #${PR_NUM:-} ${RESULT}"$'\n'"標題:${TITLE}"$'\n'"審查者:${REVIEWER:-unknown}"$'\n'"${PR_URL:-}"
+          fi
+
+          if [ -z "$MSG" ]; then
+            echo "此事件不需通知(event=${EVENT} action=${ACTION})"; exit 0
+          fi
+
+          if [ -z "${HOOK:-}" ]; then
+            # fork 送來的 PR 拿不到 secrets,這裡會是空的,屬正常情況
+            echo "::warning::沒有拿到 DISCORD_WEBHOOK;若此 PR 來自 fork 則屬預期行為"
+            exit 0
+          fi
+
+          # --- 送出 -----------------------------------------------------
+          # Discord 介面給的 webhook URL 不含版本號,會被路由到「預設版本」,
+          # 而文件裡預設版本標的是 v6 (Deprecated)。v6 目前還活著,不是壞的,
+          # 但預設值哪天改動我們不會知道 —— 釘死 v10,行為才是確定的。
+          # 注意:改過的 URL 已經不等於 secret 原值,GitHub 不會再幫忙遮罩,絕對不要 echo。
+          # 用前後綴切割來插入版本號。${var/a/b} 在替換字串裡不會吃掉反斜線,
+          # 寫成 ${HOOK/\/api\/…} 會產生字面上的 \/,送出去就壞了。
+          case "$HOOK" in
+            */api/v[0-9]*/webhooks/*) : ;;
+            */api/webhooks/*)
+              HOOK="${HOOK%%/api/webhooks/*}/api/v10/webhooks/${HOOK#*/api/webhooks/}" ;;
+          esac
+          # wait=true 讓 Discord 回傳實際結果;預設的 204 在訊息被丟棄時也一樣是 204,
+          # 等於失敗看起來像成功。
+          case "$HOOK" in *\?*) URL="${HOOK}&wait=true" ;; *) URL="${HOOK}?wait=true" ;; esac
+
+          # allowed_mentions 用白名單:只有上面明確收集的 id 會真的響鈴。
+          # 這同時擋掉標題注入 —— 有人把 PR 取名成 @everyone 也不會全頻道被 tag。
+          # flags: 4 = SUPPRESS_EMBEDS,關掉連結預覽卡。用 flags 而不是把網址包成 <...>,
+          # 是因為前者對整則訊息生效,標題裡被塞的網址也蓋得到。
+          # 絕對不要加 4096(SUPPRESS_NOTIFICATIONS),那會讓提及不跳通知只剩紅點。
+          # 注意 jq 要用 -n:對空字串下 `jq -R` 不會產生任何輸出,--argjson 會直接爆掉。
+          to_arr() { jq -cn --arg s "$1" '$s | split(" ") | map(select(length > 0)) | unique'; }
+          PAYLOAD="$(jq -n \
+            --arg content "$MSG" \
+            --argjson users "$(to_arr "$PING_USERS")" \
+            --argjson roles "$(to_arr "$PING_ROLES")" \
+            '{content: $content,
+              flags: 4,
+              allowed_mentions: {parse: [], users: $users, roles: $roles}}')"
+
+          CODE="$(curl -sS -o /tmp/discord_resp.txt -w '%{http_code}' \
+                    --max-time 20 --retry 2 \
+                    -H 'Content-Type: application/json' \
+                    --data-binary "$PAYLOAD" "$URL" || true)"
+          CODE="${CODE:-000}"
+          if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
+            echo "已送出(${KIND} http=${CODE})"
+          else
+            echo "::error::Discord 回應 ${CODE}"
+            cat /tmp/discord_resp.txt
+            exit 1
+          fi
