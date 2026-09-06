@@ -1,13 +1,11 @@
 name: PR Discord Notification
 
-# 兩組通知,分開送到兩個 Discord 頻道:
-#   code review 群組 — PR 開出來、等人審 → DISCORD_WEBHOOK_REVIEW
-#   dev 群組         — 審查有回應、PR 被合併或關閉 → DISCORD_WEBHOOK_DEV
+# 全部送到同一個 Discord 頻道,依情境 tag 不同身分:
+#   PR 開出來、等人審            → tag code review 群組
+#   審查有回應、PR 被合併或關閉  → tag PR 作者
 #
 # 需要設定的東西全部放在 repo Settings,原始碼裡不寫任何人名或 ID:
-#   Secrets   DISCORD_WEBHOOK_REVIEW   code review 頻道的 webhook URL
-#             DISCORD_WEBHOOK_DEV      dev 頻道的 webhook URL
-#             DISCORD_WEBHOOK          兩者皆未設定時的退路(單一頻道)
+#   Secrets   DISCORD_WEBHOOK          頻道的 webhook URL
 #   Variables DISCORD_USER_MAP         {"github_login":"discord_數字id", ...}
 #             DISCORD_REVIEW_ROLE_ID   code review 身分組的 Discord role id
 #             DISCORD_REVIEW_IDS       沒有身分組時的替代:用空白隔開的 discord 數字 id
@@ -33,9 +31,7 @@ jobs:
       - name: Compose and send Discord notification
         env:
           # 通知目的地
-          HOOK_REVIEW: ${{ secrets.DISCORD_WEBHOOK_REVIEW }}
-          HOOK_DEV: ${{ secrets.DISCORD_WEBHOOK_DEV }}
-          HOOK_FALLBACK: ${{ secrets.DISCORD_WEBHOOK }}
+          HOOK: ${{ secrets.DISCORD_WEBHOOK }}
           # 身分對照
           USER_MAP: ${{ vars.DISCORD_USER_MAP }}
           REVIEW_ROLE_ID: ${{ vars.DISCORD_REVIEW_ROLE_ID }}
@@ -91,7 +87,7 @@ jobs:
 
           # --- 組訊息 ---------------------------------------------------
           MSG=""
-          TARGET=""
+          KIND=""         # 只用於 log,方便從 Actions 記錄看出送的是哪一類
           PING_USERS=""   # 這則訊息允許響鈴的 user id
           PING_ROLES=""   # 這則訊息允許響鈴的 role id
 
@@ -102,13 +98,13 @@ jobs:
                 if [ "${PR_DRAFT:-false}" = "true" ] && [ "$ACTION" != "ready_for_review" ]; then
                   echo "draft PR,略過"; exit 0
                 fi
-                TARGET="review"
+                KIND="待審查"
                 # 只 tag 審查者。作者剛做完這個動作,不需要再被通知一次
                 PING_USERS="$REVIEW_USER_PING"; PING_ROLES="$REVIEW_ROLE_PING"
                 MSG="${REVIEW_TAG} PR #${PR_NUM:-} 待審查"$'\n'"標題:${TITLE}"$'\n'"作者:${AUTHOR_PLAIN}"$'\n'"${PR_URL:-}"
                 ;;
               closed)
-                TARGET="dev"
+                KIND="合併/關閉"
                 PING_USERS="$AUTHOR_ID"
                 if [ "${PR_MERGED:-false}" = "true" ]; then
                   MSG="${AUTHOR_TAG} PR #${PR_NUM:-} 已合併"$'\n'"標題:${TITLE}"$'\n'"合併者:${MERGED_BY:-unknown}"$'\n'"${PR_URL:-}"
@@ -124,7 +120,7 @@ jobs:
               echo "作者自審,略過"; exit 0
             fi
             # repo 是公開的,任何 GitHub 使用者都能對 PR 送審查意見。
-            # 只認 repo 內部成員,否則路人就能對 dev 頻道洗版。
+            # 只認 repo 內部成員,否則路人就能對頻道洗版。
             case "${REVIEW_ASSOC:-}" in
               OWNER|MEMBER|COLLABORATOR) : ;;
               *) echo "外部人員的審查(author_association=${REVIEW_ASSOC:-空}),不進頻道"; exit 0 ;;
@@ -139,7 +135,7 @@ jobs:
                 RESULT="有審查意見" ;;
               *) echo "未處理的審查狀態:${STATE}"; exit 0 ;;
             esac
-            TARGET="dev"
+            KIND="審查結果"
             PING_USERS="$AUTHOR_ID"
             MSG="${AUTHOR_TAG} PR #${PR_NUM:-} ${RESULT}"$'\n'"標題:${TITLE}"$'\n'"審查者:${REVIEWER:-unknown}"$'\n'"${PR_URL:-}"
           fi
@@ -148,17 +144,9 @@ jobs:
             echo "此事件不需通知(event=${EVENT} action=${ACTION})"; exit 0
           fi
 
-          # --- 選 webhook -----------------------------------------------
-          if [ "$TARGET" = "review" ]; then
-            HOOK="${HOOK_REVIEW:-}"
-          else
-            HOOK="${HOOK_DEV:-}"
-          fi
-          HOOK="${HOOK:-${HOOK_FALLBACK:-}}"
-
-          if [ -z "$HOOK" ]; then
+          if [ -z "${HOOK:-}" ]; then
             # fork 送來的 PR 拿不到 secrets,這裡會是空的,屬正常情況
-            echo "::warning::找不到可用的 Discord webhook(target=${TARGET});若此 PR 來自 fork 則屬預期行為"
+            echo "::warning::沒有拿到 DISCORD_WEBHOOK;若此 PR 來自 fork 則屬預期行為"
             exit 0
           fi
 
@@ -179,7 +167,7 @@ jobs:
                     --data-binary "$PAYLOAD" "$HOOK" || true)"
           CODE="${CODE:-000}"
           if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
-            echo "已送出(target=${TARGET} http=${CODE})"
+            echo "已送出(${KIND} http=${CODE})"
           else
             echo "::error::Discord 回應 ${CODE}"
             cat /tmp/discord_resp.txt
