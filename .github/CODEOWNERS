@@ -1,0 +1,10 @@
+# CODEOWNERS
+#
+# 這份檔案定義各路徑的預設審查者。任何 Pull Request 只要動到對應路徑，
+# GitHub 會自動把這裡列出的 owner 加為 Reviewer;搭配分支保護規則
+# (Require review from Code Owners),PR 必須經 owner Approve 才能合併。
+#
+# 語法:<path pattern>  <@user 或 @org/team>;後面的規則覆蓋前面的規則。
+
+# 全域:整個 repo 的所有變更都由以下兩位審查
+* @Rlonglong @nemo00407

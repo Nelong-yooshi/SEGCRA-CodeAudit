@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 執行產物
+review_output/
+
+# 憑證 / 環境變數(絕不提交)
+config/gitlab.env
+*.env
+!*.env.example

@@ -1,0 +1,17 @@
+{
+  "title": "新增異常交易規則 R-201:單日 ATM 提領累計達 10 萬(含)通報",
+  "description": "依核定規格 specs/R-201.md 實作。每日批次於 T+1 02:00 執行,時間窗以 :start_date/:end_date 參數傳入。",
+  "sha": "a1a1a1a1",
+  "files": [
+    {
+      "path": "sql/rules/r201_atm_withdraw_daily.sql",
+      "diff": "@@ -0,0 +1,12 @@\n+-- R-201: 單日 ATM 現金提領累計達 100000(含)通報\n+SELECT\n+    t.account_id,\n+    SUM(t.amount) AS total_amount\n+FROM transactions t\n+WHERE t.tx_type = 'WITHDRAW'\n+  AND t.channel = 'ATM'\n+  AND t.currency = 'TWD'\n+  AND t.tx_time >= :start_date AND t.tx_time < :end_date\n+  AND NOT EXISTS (SELECT 1 FROM exempt_accounts e WHERE e.account_id = t.account_id)\n+GROUP BY t.account_id\n+HAVING SUM(t.amount) >= 100000;",
+      "full_content": "-- R-201: 單日 ATM 現金提領累計達 100000(含)通報\nSELECT\n    t.account_id,\n    SUM(t.amount) AS total_amount\nFROM transactions t\nWHERE t.tx_type = 'WITHDRAW'\n  AND t.channel = 'ATM'\n  AND t.currency = 'TWD'\n  AND t.tx_time >= :start_date AND t.tx_time < :end_date\n  AND NOT EXISTS (SELECT 1 FROM exempt_accounts e WHERE e.account_id = t.account_id)\nGROUP BY t.account_id\nHAVING SUM(t.amount) >= 100000;"
+    }
+  ],
+  "_expected": [
+    "SQL 與 specs/R-201.md 完全相符 → 執行驗證應通過(所有條件 true/false 兩向 + 邊界案例相符)",
+    "H001 沖正檢核點被 binding bind-reversal-netted 確定性抑制(不會出現在報告)",
+    "新規則檔(sql/rules/ 新建)→ 依政策至少 needs_human,不自動放行"
+  ]
+}
