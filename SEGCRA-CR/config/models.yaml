@@ -6,7 +6,7 @@ default_profile: review
 
 profiles:
   review:                # 審查主力(tag 以 ollama registry 實際名稱為準)
-    model: gemma4:31b
+    model: qwen2.5-coder:7b   # 開發機(RTX 3080 Ti/12GB)現有的模型;客戶環境請改回 gemma4:31b
     num_ctx: 32768
     temperature: 0.1
     max_output_tokens: 8192
