@@ -5,7 +5,7 @@
   python eval/run_eval.py                     # 跑全部 case
   python eval/run_eval.py --profile fast      # 換模型
   python eval/run_eval.py --layer injection   # 只跑某一層
-  python eval/run_eval.py --case 101          # 只跑單一 case
+  python eval/run_eval.py --case 405,406      # 只跑指定 case(逗號分隔)
   python eval/run_eval.py --dry-run           # 不呼叫 LLM(只驗確定性層)
   python eval/run_eval.py --json out.json     # 另存機器可讀結果
 
@@ -182,11 +182,13 @@ def check_golden(g: dict, report: dict, skip_post_llm: bool = False) -> list[tup
 # ─────────────────────────── 主流程 ───────────────────────────
 
 def load_cases(layer: str | None, only: str | None) -> list[tuple[str, dict]]:
+    # --case 接受逗號分隔的多個 id(如 405,406,408,410),方便一次跑一組對照
+    wanted = {c.strip() for c in only.split(",") if c.strip()} if only else None
     cases = []
     for p in sorted(GOLDEN_DIR.glob("mr_*.json")):
         case = json.loads(p.read_text(encoding="utf-8"))
         mr_id = p.stem.removeprefix("mr_")
-        if only and mr_id != only:
+        if wanted and mr_id not in wanted:
             continue
         if layer and (case.get("_golden") or {}).get("layer") != layer:
             continue
@@ -337,7 +339,8 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--profile", default=None, help="模型 profile(見 config/models.yaml)")
     ap.add_argument("--layer", default=None, help="只跑某一層(injection/rule-base/binding/…)")
-    ap.add_argument("--case", default=None, help="只跑單一 case id(如 101)")
+    ap.add_argument("--case", default=None,
+                help="只跑指定 case id,逗號分隔(如 405,406,408,410)")
     ap.add_argument("--dry-run", action="store_true", help="不呼叫 LLM,只驗確定性層")
     ap.add_argument("--json", default=None, help="另存機器可讀結果的路徑")
     sys.exit(asyncio.run(run(ap.parse_args())))
