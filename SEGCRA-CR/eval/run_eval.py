@@ -261,10 +261,24 @@ async def run(args) -> int:
         st = layer_stat.setdefault(layer, {"pass": 0, "fail": 0, "gap": 0, "error": 0})
         st["gap" if (bad and is_gap) else ("fail" if bad else "pass")] += 1
 
+        # 執行驗證的細節是分析品質最需要的數字(通過與否、驗了幾案、缺了幾角),
+        # 全部收進結果檔,報告可直接由 JSON 生成,不必人工翻 review 輸出。
+        se = report.get("_spec_exec") or {}
+        se_stat = {
+            "passed": se.get("passed"),
+            "spec_code": se.get("spec_code"),
+            "conditions": len(se.get("conditions") or []),
+            "cases": len(se.get("case_results") or []),
+            "coverage_gaps": len(se.get("coverage_gaps") or []),
+            "dropped_cases": len(se.get("dropped_cases") or []),
+            "gap_detail": se.get("coverage_gaps") or [],
+        }
         rows.append({
             "case": mr_id, "layer": layer, "intent": golden.get("intent", ""),
             "known_gap": is_gap, "expected": len(expected), "hit": hits,
             "noise": len(noise), "decision": decision,
+            "severities": sorted({f.get("severity") for f in findings if f.get("severity")}),
+            "spec_exec": se_stat,
             "checks": len(checks), "failed": len(bad),
             "failures": [{"name": n, "why": w} for n, _, w in bad],
         })
@@ -274,9 +288,15 @@ async def run(args) -> int:
             failures.append((mr_id, layer, bad))
 
         mark = "⚠" if (bad and is_gap) else ("✓" if not bad else "✗")
+        se_note = ""
+        if se_stat["spec_code"]:
+            se_note = (f" | spec_exec {se_stat['spec_code']}"
+                       f" passed={se_stat['passed']}"
+                       f" 案例{se_stat['cases']}"
+                       f" 缺口{se_stat['coverage_gaps']}")
         print(f"{mark} mr_{mr_id} [{layer}] recall {hits}/{len(expected)} "
               f"誤報 {len(noise)} 決策 {decision} 斷言 {len(checks) - len(bad)}/{len(checks)}"
-              + ("  (已知缺口)" if bad and is_gap else ""))
+              + se_note + ("  (已知缺口)" if bad and is_gap else ""))
 
     # ── 彙總 ──
     print("\n" + "=" * 62)
