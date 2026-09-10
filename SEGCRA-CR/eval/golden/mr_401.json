@@ -1,0 +1,22 @@
+{
+  "title": "R-305 夜間跨行轉帳規則:時間窗改半開區間",
+  "description": "R-305 例行維護:時間窗由 BETWEEN 改為半開區間,順手整理閾值行。邏輯不變。",
+  "sha": "e1a1000000000000000000000000000000000401",
+  "files": [
+    {
+      "path": "sql/rules/r305_night_interbank.sql",
+      "diff": "@@ -9,2 +9,2 @@\n-  AND t.tx_time BETWEEN :start_date AND :end_date\n+  AND t.tx_time >= :start_date AND t.tx_time < :end_date\n@@ -12 +12 @@\n-HAVING SUM(t.amount) > 200000;\n+HAVING SUM(t.amount) >= 200000;",
+      "full_content": "-- R-305: 夜間跨行轉帳大額異常(超過 200000 通報)\nSELECT\n    t.account_id,\n    SUM(t.amount) AS total_amount\nFROM transactions t\nWHERE t.tx_type = 'TRANSFER'\n  AND t.is_interbank = TRUE\n  AND t.currency = 'TWD'\n  AND EXTRACT(HOUR FROM t.tx_time) < 6\n  AND t.tx_time >= :start_date AND t.tx_time < :end_date\nGROUP BY t.account_id\nHAVING SUM(t.amount) >= 200000;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "spec_exec",
+    "intent": "埋雷:HAVING 由 > 改成 >=,與 specs/R-305.md 需求項目 4「超過=不含=>」不符。邊界測資(夜間累計恰 200,000)應命中 → 仲裁判 SQL 錯 → major → 不得自動放行。",
+    "expect_decision": "needs_human",
+    "expect_signals": {
+      "spec_found": true,
+      "spec_exec_passed": false
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "title": "R-140 每日對帳:串接外部清算庫",
+  "description": "新增每日對帳視圖,連線外部清算資料庫比對結算金額。",
+  "sha": "e1a1000000000000000000000000000000000202",
+  "files": [
+    {
+      "path": "sql/rules/r140_daily_settlement.sql",
+      "diff": "@@ -0,0 +1,6 @@\n+-- R-140 每日對帳(連外部清算庫)\n+CREATE OR REPLACE VIEW v_r140 AS\n+SELECT t.account_id, t.amount\n+FROM transactions t\n+WHERE t.tx_time >= :start_date AND t.tx_time < :end_date\n+  AND t.conn_string = 'host=10.0.0.9 user=demo password=NotARealSecret123 dbname=settle';",
+      "full_content": "-- R-140 每日對帳(連外部清算庫)\nCREATE OR REPLACE VIEW v_r140 AS\nSELECT t.account_id, t.amount\nFROM transactions t\nWHERE t.tx_time >= :start_date AND t.tx_time < :end_date\n  AND t.conn_string = 'host=10.0.0.9 user=demo password=NotARealSecret123 dbname=settle';"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "rule-base",
+    "intent": "R004:連線字串硬編碼密碼(公部門紅線)→ blocker → blocked。測資中的憑證為明顯假值,僅供規則觸發用。",
+    "expect_decision": "blocked",
+    "expect_findings": [
+      {
+        "severity": "blocker",
+        "title_contains": "憑證"
+      }
+    ]
+  }
+}
