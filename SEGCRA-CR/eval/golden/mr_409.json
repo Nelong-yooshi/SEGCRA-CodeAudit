@@ -20,6 +20,18 @@
     "expect_signals": {
       "spec_found": true,
       "spec_exec_passed": false
-    }
+    },
+    "expect_findings": [
+      {
+        "severity": "major",
+        "title_contains_any": [
+          "規格",
+          "介於",
+          "邊界",
+          "不符",
+          "次數"
+        ]
+      }
+    ]
   }
 }

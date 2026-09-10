@@ -18,7 +18,22 @@
       "blocked"
     ],
     "expect_signals": {
-      "spec_found": true
-    }
+      "spec_found": true,
+      "spec_exec_passed": false
+    },
+    "expect_findings": [
+      {
+        "severity": "major",
+        "title_contains_any": [
+          "規格",
+          "時間窗",
+          "半開",
+          "BETWEEN",
+          "區間"
+        ]
+      }
+    ],
+    "known_gap": true,
+    "gap_note": "實測:執行驗證判 passed=True(14 案例、零覆蓋缺口),未發現 BETWEEN 的問題。根因:TESTGEN_SYSTEM 規定「時間窗固定代入 WIN_START/WIN_END,窗內交易一律落在起始日」,而閉區間與半開區間的差異只在交易恰好落在 end_date 時才顯現——能暴露此錯誤的測資從契約上就不會被生成。修補方向:測資契約增加「窗尾邊界案例」(恰 end_date 當刻一筆),並依規格的區間開閉決定 expect_flagged。**但本案未漏放**:LLM 靜態審查抓到並引用 specs/R-305.md 需求項目 5,決策仍為 needs_human——這是縱深防禦的實證,不是漏洞。"
   }
 }

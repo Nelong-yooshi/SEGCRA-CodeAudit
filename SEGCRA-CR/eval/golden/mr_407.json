@@ -12,7 +12,7 @@
   "expected": [],
   "_golden": {
     "layer": "spec_exec",
-    "intent": "埋雷:漏掉「排除行銷活動撥入(PROMO)」這條排除條件,會把行銷撥入一併計入累計金額 → 多報(誤報)。描述宣稱「不影響結果」是錯的。這類『少一條排除』是真實規格最常見的落差。",
+    "intent": "埋雷:漏掉「排除行銷活動撥入(PROMO)」這條排除條件,會把行銷撥入一併計入累計金額 → 多報(誤報)。描述宣稱「不影響結果」是錯的。這類『少一條排除』是真實規格最常見的落差。\n實測補註:spec_exec 的 passed=False 並非來自「執行時抓到不符」,而是覆蓋缺口(C5 缺 false 向——能暴露漏排除 PROMO 的案例未生成)。真正指出問題的是 LLM 靜態審查。因此本 case 的關鍵斷言是 expect_findings,不是 spec_exec_passed。",
     "expect_decision": [
       "needs_human",
       "blocked"
@@ -20,6 +20,17 @@
     "expect_signals": {
       "spec_found": true,
       "spec_exec_passed": false
-    }
+    },
+    "expect_findings": [
+      {
+        "severity": "major",
+        "title_contains_any": [
+          "規格",
+          "PROMO",
+          "排除",
+          "行銷"
+        ]
+      }
+    ]
   }
 }
