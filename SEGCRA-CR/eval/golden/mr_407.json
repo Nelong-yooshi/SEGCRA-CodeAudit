@@ -1,0 +1,36 @@
+{
+  "title": "R-140 現金大額入帳監控:簡化過濾條件",
+  "description": "移除行銷通路的額外判斷以簡化查詢,經確認不影響結果。",
+  "sha": "e1a1000000000000000000000000000000000000",
+  "files": [
+    {
+      "path": "sql/rules/r140_cash_inbound.sql",
+      "diff": "@@ -8 +7 @@\n-  AND COALESCE(t.channel_name, '') <> 'PROMO'\n",
+      "full_content": "-- R-140: 當日現金入帳累計達 500000(含)通報\nSELECT\n    t.account_id,\n    SUM(t.amount) AS total_amount\nFROM txn_log t\nWHERE t.op_code IN ('OP01','OP02','OP03')\n  AND t.cash_flag = 'Y'\n  AND COALESCE(t.rev_flag, 'N') <> 'Y'\n  AND t.amount > 1000\n  AND t.tx_time >= :start_date AND t.tx_time < :end_date\nGROUP BY t.account_id\nHAVING SUM(t.amount) >= 500000;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "spec_exec",
+    "intent": "埋雷:漏掉「排除行銷活動撥入(PROMO)」這條排除條件,會把行銷撥入一併計入累計金額 → 多報(誤報)。描述宣稱「不影響結果」是錯的。這類『少一條排除』是真實規格最常見的落差。\n實測補註:spec_exec 的 passed=False 並非來自「執行時抓到不符」,而是覆蓋缺口(C5 缺 false 向——能暴露漏排除 PROMO 的案例未生成)。真正指出問題的是 LLM 靜態審查。因此本 case 的關鍵斷言是 expect_findings,不是 spec_exec_passed。",
+    "expect_decision": [
+      "needs_human",
+      "blocked"
+    ],
+    "expect_signals": {
+      "spec_found": true,
+      "spec_exec_passed": false
+    },
+    "expect_findings": [
+      {
+        "severity": "major",
+        "title_contains_any": [
+          "規格",
+          "PROMO",
+          "排除",
+          "行銷"
+        ]
+      }
+    ]
+  }
+}

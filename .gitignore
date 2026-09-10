@@ -8,6 +8,7 @@ __pycache__/
 
 # 執行產物
 review_output/
+**/eval/_output/
 
 # 憑證 / 環境變數(絕不提交)
 config/gitlab.env

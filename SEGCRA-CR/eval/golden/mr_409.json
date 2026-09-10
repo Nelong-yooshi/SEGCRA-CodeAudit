@@ -1,0 +1,37 @@
+{
+  "title": "R-410 條件 1 出帳次數範圍調整",
+  "description": "條件 1-1 的自助設備出帳次數範圍微調,語意不變。",
+  "sha": "e1a1000000000000000000000000000000000000",
+  "files": [
+    {
+      "path": "sql/rules/r410_retail_multi.sql",
+      "diff": "@@ -19 +19 @@\n-WHERE (s.atm_cnt >= 2 AND s.atm_cnt <= 3\n+WHERE (s.atm_cnt > 2 AND s.atm_cnt <= 3",
+      "full_content": "-- R-410: 零售帳戶多條件異常清單(條件 1 或條件 2 任一成立)\nSELECT s.account_id, s.atm_cnt, s.atm_amt, s.in_amt, s.in_cnt\nFROM (\n    SELECT\n        t.account_id,\n        COUNT(*) FILTER (WHERE t.op_code IN ('OP11','OP12')) AS atm_cnt,\n        COALESCE(SUM(t.amount) FILTER (WHERE t.op_code IN ('OP11','OP12')), 0) AS atm_amt,\n        COALESCE(SUM(t.amount) FILTER (\n            WHERE t.op_code IN ('OP01','OP02','OP03') AND t.amount > 1000), 0) AS in_amt,\n        COUNT(*) FILTER (\n            WHERE t.op_code IN ('OP01','OP02','OP03') AND t.amount > 1000) AS in_cnt\n    FROM txn_log t\n    WHERE COALESCE(t.rev_flag, 'N') <> 'Y'\n      AND COALESCE(t.channel_name, '') <> 'PROMO'\n      AND t.tx_time >= :start_date AND t.tx_time < :end_date\n    GROUP BY t.account_id\n) s\nWHERE (s.atm_cnt > 2 AND s.atm_cnt <= 3\n       AND s.atm_amt >= 50000 AND s.atm_amt <= 100000\n       AND s.in_amt >= 80000 AND s.in_amt <= 100000)\n   OR (s.atm_cnt >= 4 AND s.atm_cnt <= 10\n       AND s.atm_amt >= 90000 AND s.atm_amt <= 150000\n       AND s.in_cnt >= 2 AND s.in_cnt <= 3);"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "spec_exec",
+    "intent": "埋雷:條件 1-1「介於 2–3 次」的下界被寫成不含(`> 2`),恰 2 次的帳戶會漏報。規格補充明訂「介於」含兩端。與 mr_401 的 `>` vs `>=` 是同型錯誤,但埋在多條件結構的深處,測的是複雜條件下還抓不抓得到。",
+    "expect_decision": [
+      "needs_human",
+      "blocked"
+    ],
+    "expect_signals": {
+      "spec_found": true,
+      "spec_exec_passed": false
+    },
+    "expect_findings": [
+      {
+        "severity": "major",
+        "title_contains_any": [
+          "規格",
+          "介於",
+          "邊界",
+          "不符",
+          "次數"
+        ]
+      }
+    ]
+  }
+}

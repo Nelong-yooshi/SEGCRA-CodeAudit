@@ -1,0 +1,25 @@
+{
+  "title": "R-201 可讀性整理:補上輸出欄位註解",
+  "description": "僅調整註解排版,不更動任何過濾條件、閾值或時間窗。",
+  "sha": "e1a1000000000000000000000000000000000601",
+  "files": [
+    {
+      "path": "sql/rules/r201_atm_withdraw_daily.sql",
+      "diff": "@@ -4 +4 @@\n-    SUM(t.amount) AS total_amount\n+    SUM(t.amount) AS total_amount   -- 單日累計提領金額",
+      "full_content": "-- R-201: 單日 ATM 現金提領累計達 100000(含)通報\nSELECT\n    t.account_id,\n    SUM(t.amount) AS total_amount\nFROM transactions t\nWHERE t.tx_type = 'WITHDRAW'\n  AND t.channel = 'ATM'\n  AND t.currency = 'TWD'\n  AND t.tx_time >= :start_date AND t.tx_time < :end_date\n  AND NOT EXISTS (SELECT 1 FROM exempt_accounts e WHERE e.account_id = t.account_id)\nGROUP BY t.account_id\nHAVING SUM(t.amount) >= 100000;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "decision",
+    "intent": "乾淨的小幅可讀性調整,實作與 specs/R-201.md 相符:不得產生 blocker/major。本 case 量的是「會不會亂吼」——調門檻時觀察它的決策落點。",
+    "expect_decision": [
+      "auto_approved",
+      "needs_human"
+    ],
+    "forbid_severities": [
+      "blocker",
+      "major"
+    ]
+  }
+}

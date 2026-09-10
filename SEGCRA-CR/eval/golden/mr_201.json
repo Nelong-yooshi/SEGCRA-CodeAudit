@@ -1,0 +1,29 @@
+{
+  "title": "清理 R-201 通報暫存表",
+  "description": "批次執行前清空前一日的通報暫存資料。",
+  "sha": "e1a1000000000000000000000000000000000201",
+  "files": [
+    {
+      "path": "sql/maintenance/purge_r201_staging.sql",
+      "diff": "@@ -0,0 +1,2 @@\n+-- R-201 通報暫存表清理\n+DELETE FROM r201_report_staging;",
+      "full_content": "-- R-201 通報暫存表清理\nDELETE FROM r201_report_staging;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "rule-base",
+    "intent": "R001:DELETE 無 WHERE 會清空全表 → blocker → blocked。模型漏報時 enforce_rules 亦須確定性補上。",
+    "expect_decision": "blocked",
+    "expect_findings": [
+      {
+        "severity": "blocker",
+        "title_contains_any": [
+          "WHERE",
+          "全表",
+          "整表",
+          "整張表"
+        ]
+      }
+    ]
+  }
+}

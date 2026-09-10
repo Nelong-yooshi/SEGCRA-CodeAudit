@@ -1,0 +1,32 @@
+{
+  "title": "R-201 時間窗改用系統日期",
+  "description": "簡化批次參數傳遞,直接以系統日期計算前一日區間。",
+  "sha": "e1a1000000000000000000000000000000000302",
+  "files": [
+    {
+      "path": "sql/rules/r201_atm_withdraw_daily.sql",
+      "diff": "@@ -8 +8 @@\n-  AND t.tx_time >= :start_date AND t.tx_time < :end_date\n+  AND t.tx_time >= CURRENT_DATE - 1 AND t.tx_time < CURRENT_DATE",
+      "full_content": "-- R-201: 單日 ATM 現金提領累計達 100000(含)通報\nSELECT\n    t.account_id,\n    SUM(t.amount) AS total_amount\nFROM transactions t\nWHERE t.tx_type = 'WITHDRAW'\n  AND t.channel = 'ATM'\n  AND t.currency = 'TWD'\n  AND t.tx_time >= CURRENT_DATE - 1 AND t.tx_time < CURRENT_DATE\n  AND NOT EXISTS (SELECT 1 FROM exempt_accounts e WHERE e.account_id = t.account_id)\nGROUP BY t.account_id\nHAVING SUM(t.amount) >= 100000;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "binding",
+    "intent": "binding bind-no-sysdate(規範型,人工撰寫)明訂「SQL 內不得使用 CURRENT_DATE/SYSDATE,日期一律由批次參數傳入」。此 MR 正好違反,應被指出 → 驗「講過的要遵守」(與 mr_301 的『講過的不再提』成對)。(規範型 binding:無 suppress,只注入 context,須由 LLM 讀了照做,故 dry-run 驗不到)",
+    "expect_findings": [
+      {
+        "title_contains_any": [
+          "CURRENT_DATE",
+          "SYSDATE",
+          "系統日期",
+          "批次參數"
+        ]
+      }
+    ],
+    "expect_decision": [
+      "needs_human",
+      "blocked"
+    ],
+    "needs_llm": true
+  }
+}
