@@ -1,0 +1,33 @@
+{
+  "title": "R-201 擴充:聯名戶逐持有人通報",
+  "description": "聯名帳戶需對每位持有人各通報一次,故加入持有人關聯。",
+  "sha": "e1a1000000000000000000000000000000000303",
+  "files": [
+    {
+      "path": "sql/rules/r201_atm_withdraw_daily.sql",
+      "diff": "@@ -5,0 +6 @@\n+JOIN joint_holders j ON j.account_id = t.account_id",
+      "full_content": "-- R-201: 單日 ATM 現金提領累計達 100000(含)通報(含聯名戶擴充)\nSELECT\n    t.account_id,\n    j.holder_id,\n    SUM(t.amount) AS total_amount\nFROM transactions t\nJOIN joint_holders j ON j.account_id = t.account_id\nWHERE t.tx_type = 'WITHDRAW'\n  AND t.channel = 'ATM'\n  AND t.currency = 'TWD'\n  AND t.tx_time >= :start_date AND t.tx_time < :end_date\nGROUP BY t.account_id, j.holder_id\nHAVING SUM(t.amount) >= 100000;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "binding",
+    "intent": "驗抑制是「定向」而非全域:bind-reversal-netted 只宣告 suppress H001,H002(通報粒度/聯名戶 fan-out)必須照常出現。若 H002 也消失,代表 suppress 濾除範圍過寬。",
+    "expect_findings": [
+      {
+        "title_contains_any": [
+          "粒度",
+          "聯名",
+          "fan-out",
+          "重複通報",
+          "重複計"
+        ]
+      }
+    ],
+    "forbid_findings": [
+      {
+        "title_contains": "沖正"
+      }
+    ]
+  }
+}

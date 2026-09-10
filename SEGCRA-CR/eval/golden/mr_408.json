@@ -1,0 +1,20 @@
+{
+  "title": "R-410 零售帳戶多條件異常清單:依核定規格實作",
+  "description": "依核定規格 specs/R-410.md 實作,條件 1/2 為 OR,組內各子項為 AND,「介於」含兩端。",
+  "sha": "e1a1000000000000000000000000000000000000",
+  "files": [
+    {
+      "path": "sql/rules/r410_retail_multi.sql",
+      "diff": "@@ -0,0 +1,23 @@\n+-- R-410: 零售帳戶多條件異常清單(條件 1 或條件 2 任一成立)\n+SELECT s.account_id, s.atm_cnt, s.atm_amt, s.in_amt, s.in_cnt\n+FROM (\n+    SELECT\n+        t.account_id,\n+        COUNT(*) FILTER (WHERE t.op_code IN ('OP11','OP12')) AS atm_cnt,\n+        COALESCE(SUM(t.amount) FILTER (WHERE t.op_code IN ('OP11','OP12')), 0) AS atm_amt,\n+        COALESCE(SUM(t.amount) FILTER (\n+            WHERE t.op_code IN ('OP01','OP02','OP03') AND t.amount > 1000), 0) AS in_amt,\n+        COUNT(*) FILTER (\n+            WHERE t.op_code IN ('OP01','OP02','OP03') AND t.amount > 1000) AS in_cnt\n+    FROM txn_log t\n+    WHERE t.rev_flag <> 'Y'\n+      AND t.channel_name <> 'PROMO'\n+      AND t.tx_time >= :start_date AND t.tx_time < :end_date\n+    GROUP BY t.account_id\n+) s\n+WHERE (s.atm_cnt >= 2 AND s.atm_cnt <= 3\n+       AND s.atm_amt >= 50000 AND s.atm_amt <= 100000\n+       AND s.in_amt >= 80000 AND s.in_amt <= 100000)\n+   OR (s.atm_cnt >= 4 AND s.atm_cnt <= 10\n+       AND s.atm_amt >= 90000 AND s.atm_amt <= 150000\n+       AND s.in_cnt >= 2 AND s.in_cnt <= 3);",
+      "full_content": "-- R-410: 零售帳戶多條件異常清單(條件 1 或條件 2 任一成立)\nSELECT s.account_id, s.atm_cnt, s.atm_amt, s.in_amt, s.in_cnt\nFROM (\n    SELECT\n        t.account_id,\n        COUNT(*) FILTER (WHERE t.op_code IN ('OP11','OP12')) AS atm_cnt,\n        COALESCE(SUM(t.amount) FILTER (WHERE t.op_code IN ('OP11','OP12')), 0) AS atm_amt,\n        COALESCE(SUM(t.amount) FILTER (\n            WHERE t.op_code IN ('OP01','OP02','OP03') AND t.amount > 1000), 0) AS in_amt,\n        COUNT(*) FILTER (\n            WHERE t.op_code IN ('OP01','OP02','OP03') AND t.amount > 1000) AS in_cnt\n    FROM txn_log t\n    WHERE t.rev_flag <> 'Y'\n      AND t.channel_name <> 'PROMO'\n      AND t.tx_time >= :start_date AND t.tx_time < :end_date\n    GROUP BY t.account_id\n) s\nWHERE (s.atm_cnt >= 2 AND s.atm_cnt <= 3\n       AND s.atm_amt >= 50000 AND s.atm_amt <= 100000\n       AND s.in_amt >= 80000 AND s.in_amt <= 100000)\n   OR (s.atm_cnt >= 4 AND s.atm_cnt <= 10\n       AND s.atm_amt >= 90000 AND s.atm_amt <= 150000\n       AND s.in_cnt >= 2 AND s.in_cnt <= 3);"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "spec_exec",
+    "intent": "正向對照(R-410):多條件 OR-of-ANDs 全部照規格,含兩端邊界正確。這份規格條件數多,同時也在測『測資生成 agent 能不能拆得完整』——若 coverage_gaps 很多,代表複雜規格的執行驗證能力有上限。",
+    "expect_signals": {
+      "spec_found": true
+    }
+  }
+}

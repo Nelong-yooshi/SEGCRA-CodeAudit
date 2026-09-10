@@ -1,0 +1,24 @@
+{
+  "title": "R-305 時間窗寫法還原為 BETWEEN",
+  "description": "為與其他規則寫法一致,時間窗改回 BETWEEN。閾值未動。",
+  "sha": "e1a1000000000000000000000000000000000403",
+  "files": [
+    {
+      "path": "sql/rules/r305_night_interbank.sql",
+      "diff": "@@ -10 +10 @@\n-  AND t.tx_time >= :start_date AND t.tx_time < :end_date\n+  AND t.tx_time BETWEEN :start_date AND :end_date",
+      "full_content": "-- R-305: 夜間跨行轉帳大額異常(超過 200000 通報)\nSELECT\n    t.account_id,\n    SUM(t.amount) AS total_amount\nFROM transactions t\nWHERE t.tx_type = 'TRANSFER'\n  AND t.is_interbank = TRUE\n  AND t.currency = 'TWD'\n  AND EXTRACT(HOUR FROM t.tx_time) < 6\n  AND t.tx_time BETWEEN :start_date AND :end_date\nGROUP BY t.account_id\nHAVING SUM(t.amount) > 200000;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "spec_exec",
+    "intent": "時間窗閉區間錯誤:specs/R-305.md 需求項目 5 明訂半開區間,BETWEEN 會把 end_date 當日 00:00:00 的交易重複計入相鄰批次 → 應被指出,不得自動放行。閾值本身正確,只有區間錯。",
+    "expect_decision": [
+      "needs_human",
+      "blocked"
+    ],
+    "expect_signals": {
+      "spec_found": true
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "title": "R-093 高頻轉帳規則效能調整",
+  "description": "R-093 例行調整,降低閾值以提高偵測敏感度。",
+  "sha": "e1a1000000000000000000000000000000000402",
+  "files": [
+    {
+      "path": "sql/rules/r093_transfer_frequency.sql",
+      "diff": "@@ -8 +8 @@\n-HAVING COUNT(*) >= 20;\n+HAVING COUNT(*) >= 2;",
+      "full_content": "-- R-093: 單日轉帳筆數達 20 筆(含)通報\nSELECT\n    t.account_id,\n    COUNT(*) AS tx_count\nFROM transactions t\nWHERE t.tx_type = 'TRANSFER'\n  AND t.tx_time >= :start_date AND t.tx_time < :end_date\nGROUP BY t.account_id\nHAVING COUNT(*) >= 2;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "spec_exec",
+    "intent": "數量級 typo:核定 20 筆被改成 2 筆,specs/R-093.md 補充明訂「不得任意調低(調低會造成海量誤報)」。邊界測資(19 筆不通報)應抓到 → 不得自動放行。",
+    "expect_decision": [
+      "needs_human",
+      "blocked"
+    ],
+    "expect_signals": {
+      "spec_found": true,
+      "spec_exec_passed": false
+    }
+  }
+}

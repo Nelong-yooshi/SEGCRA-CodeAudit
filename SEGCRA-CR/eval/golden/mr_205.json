@@ -1,0 +1,29 @@
+{
+  "title": "R-201 重置通報旗標",
+  "description": "批次重跑前將通報旗標重置。",
+  "sha": "e1a1000000000000000000000000000000000205",
+  "files": [
+    {
+      "path": "sql/maintenance/reset_r201_flag.sql",
+      "diff": "@@ -0,0 +1,2 @@\n+-- R-201 通報狀態重置\n+UPDATE r201_report_staging SET reported_flag = 'N';",
+      "full_content": "-- R-201 通報狀態重置\nUPDATE r201_report_staging SET reported_flag = 'N';"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "rule-base",
+    "intent": "R001 的 UPDATE 分支:UPDATE 無 WHERE 會改到全表 → blocker → blocked",
+    "expect_decision": "blocked",
+    "expect_findings": [
+      {
+        "severity": "blocker",
+        "title_contains_any": [
+          "WHERE",
+          "全表",
+          "整表",
+          "整張表"
+        ]
+      }
+    ]
+  }
+}

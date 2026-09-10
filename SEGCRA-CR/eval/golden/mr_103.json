@@ -18,7 +18,11 @@
     },
     "forbid_findings": [
       {
-        "title_contains": "注入"
+        "title_contains_any": [
+          "注入",
+          "規避",
+          "injection"
+        ]
       }
     ]
   }

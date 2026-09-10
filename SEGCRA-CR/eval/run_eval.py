@@ -51,6 +51,11 @@ FP_SEVERITIES = {"blocker", "major", "minor"}
 
 # dry-run 在 LLM 之前就 return,只有確定性前處理會動;這兩層的 case 才驗得動。
 # 其餘層(注入強制、spec_exec、三態決策)都在 LLM 之後,dry-run 一律略過而非判失敗。
+#
+# 注意:層別只是粗篩,同一層內仍有需要模型的 case。例如 binding 有兩種:
+#   抑制型(bind-reversal-netted,宣告 suppress)→ 預掃層確定性濾除,dry-run 驗得到;
+#   規範型(bind-no-sysdate,無 suppress)      → 只是注入 context,要靠 LLM 讀了照做。
+# 後者請在 case 的 _golden 標 "needs_llm": true,dry-run 會一併略過。
 DRY_RUN_LAYERS = {"rule-base", "binding"}
 
 
@@ -67,21 +72,34 @@ def match_expected(exp: dict, findings: list[dict]) -> bool:
 
 
 def finding_matches(spec: dict, f: dict) -> bool:
-    """_golden 的 finding 選擇器:severity / title_contains / file 三個條件皆須符合(有給才比)。"""
+    """_golden 的 finding 選擇器:severity / file / 標題關鍵詞皆須符合(有給才比)。
+
+    關鍵詞用 `title_contains`(單一)或 `title_contains_any`(任一命中即可)。
+    **優先用 any 版**:findings 的文字是模型生成的,同一個問題可能寫「注入」也可能寫
+    「規避」,把標準答案綁死在單一措辭會產生假失敗——防線是好的,只是用詞不同。
+    """
     if "severity" in spec and f.get("severity") != spec["severity"]:
         return False
     if "file" in spec and f.get("file") != spec["file"]:
         return False
+    haystack = f"{f.get('title', '')}\n{f.get('detail', '')}"
+    needles = spec.get("title_contains_any")
+    if needles:
+        return any(n in haystack for n in needles)
     needle = spec.get("title_contains")
     if needle:
-        haystack = f"{f.get('title', '')}\n{f.get('detail', '')}"
         return needle in haystack
     return True
 
 
 def spec_desc(spec: dict) -> str:
-    bits = [spec[k] for k in ("severity", "title_contains", "file") if k in spec]
-    return "/".join(str(b) for b in bits) or "(任意)"
+    bits = []
+    for k in ("severity", "title_contains", "file"):
+        if k in spec:
+            bits.append(str(spec[k]))
+    if "title_contains_any" in spec:
+        bits.append("|".join(spec["title_contains_any"]))
+    return "/".join(bits) or "(任意)"
 
 
 def read_signal(report: dict, key: str):
@@ -147,6 +165,17 @@ def check_golden(g: dict, report: dict, skip_post_llm: bool = False) -> list[tup
         out.append(("forbid_severities", not bad,
                     "" if not bad else
                     f"出現 {len(bad)} 條:{bad[0].get('severity')}/{bad[0].get('title', '')[:40]}"))
+
+    # ⑥ 引用白名單:findings 引用的來源必須都在允許清單內(抗捏造法規/欄位)。
+    #    validate_citations 應已剔除白名單外的引用,這裡驗「確實沒有漏網的」。
+    if "allowed_citations" in g:
+        allowed = set(g["allowed_citations"])
+        stray = [(f.get("title", "")[:30], c)
+                 for f in findings for c in (f.get("citations") or [])
+                 if c not in allowed]
+        out.append(("allowed_citations", not stray,
+                    "" if not stray else
+                    f"出現白名單外的引用 {len(stray)} 筆,首筆:{stray[0][1]}(於「{stray[0][0]}」)"))
     return out
 
 
@@ -173,10 +202,12 @@ async def run(args) -> int:
         return 1
 
     if args.dry_run:
-        skipped = [c for c, case in cases
-                   if (case.get("_golden") or {}).get("layer") not in DRY_RUN_LAYERS]
-        cases = [(c, case) for c, case in cases
-                 if (case.get("_golden") or {}).get("layer") in DRY_RUN_LAYERS]
+        def _dry_ok(case):
+            g = case.get("_golden") or {}
+            return g.get("layer") in DRY_RUN_LAYERS and not g.get("needs_llm")
+
+        skipped = [c for c, case in cases if not _dry_ok(case)]
+        cases = [(c, case) for c, case in cases if _dry_ok(case)]
         print(f"⚠  --dry-run:不呼叫 LLM,只驗確定性前處理層 "
               f"({'/'.join(sorted(DRY_RUN_LAYERS))})。")
         if skipped:
@@ -187,12 +218,22 @@ async def run(args) -> int:
             return 0
 
     tp = fp = fn = 0
-    rows, layer_stat, decisions, failures, gaps = [], {}, {}, [], []
+    rows, layer_stat, decisions, failures, gaps, errors = [], {}, {}, [], [], []
 
     for mr_id, case in cases:
         golden = case.get("_golden") or {}
         layer = golden.get("layer", "(未標層)")
-        report = await review_mr(cfg, mr_id, args.profile, dry_run=args.dry_run)
+        # 單一 case 的例外不得中斷整輪:一輪要跑數小時,經 SSH tunnel 的長連線
+        # 偶發斷線(httpx ReadError → APIConnectionError)是常態,不能讓它清空前面的成果。
+        try:
+            report = await review_mr(cfg, mr_id, args.profile, dry_run=args.dry_run)
+        except Exception as e:  # noqa: BLE001 - 蒐集所有失敗原因,不預設種類
+            errors.append((mr_id, layer, f"{type(e).__name__}: {e}"))
+            st = layer_stat.setdefault(layer, {"pass": 0, "fail": 0, "gap": 0, "error": 0})
+            st["error"] += 1
+            rows.append({"case": mr_id, "layer": layer, "error": f"{type(e).__name__}: {e}"})
+            print(f"‼ mr_{mr_id} [{layer}] 執行失敗:{type(e).__name__}(已跳過,續跑下一個)")
+            continue
         findings = report.get("findings", [])
         expected = case.get("expected", [])
 
@@ -215,7 +256,7 @@ async def run(args) -> int:
         is_gap = bool(golden.get("known_gap"))
         decision = report.get("decision", "-")
         decisions[decision] = decisions.get(decision, 0) + 1
-        st = layer_stat.setdefault(layer, {"pass": 0, "fail": 0, "gap": 0})
+        st = layer_stat.setdefault(layer, {"pass": 0, "fail": 0, "gap": 0, "error": 0})
         st["gap" if (bad and is_gap) else ("fail" if bad else "pass")] += 1
 
         rows.append({
@@ -239,9 +280,14 @@ async def run(args) -> int:
     print("\n" + "=" * 62)
     print("逐層結果(斷言)")
     for layer, st in sorted(layer_stat.items()):
-        total = st["pass"] + st["fail"] + st["gap"]
-        gap_note = f"  (已知缺口 {st['gap']})" if st["gap"] else ""
-        print(f"  {layer:<18} {st['pass']}/{total} 通過{gap_note}")
+        total = st["pass"] + st["fail"] + st["gap"] + st.get("error", 0)
+        notes = []
+        if st["gap"]:
+            notes.append(f"已知缺口 {st['gap']}")
+        if st.get("error"):
+            notes.append(f"執行失敗 {st['error']}")
+        suffix = f"  ({', '.join(notes)})" if notes else ""
+        print(f"  {layer:<18} {st['pass']}/{total} 通過{suffix}")
 
     print("\n決策分布(門檻是否擾人的觀測值)")
     for d, n in sorted(decisions.items()):
@@ -279,11 +325,12 @@ async def run(args) -> int:
             "tp": tp, "fp": fp, "fn": fn,
             "layers": layer_stat, "decisions": decisions,
             "known_gaps": [{"case": c, "layer": l, "note": n} for c, l, _, n in gaps],
+            "errors": [{"case": c, "layer": l, "why": w} for c, l, w in errors],
             "cases": rows,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"\n機器可讀結果已寫入 {args.json}")
 
-    return 1 if failures else 0
+    return 1 if (failures or errors) else 0
 
 
 if __name__ == "__main__":

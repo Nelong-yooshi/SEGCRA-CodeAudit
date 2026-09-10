@@ -1,0 +1,27 @@
+{
+  "title": "R-201 新增通報明細視圖",
+  "description": "提供下游部門查詢當日提領明細。",
+  "sha": "e1a1000000000000000000000000000000000204",
+  "files": [
+    {
+      "path": "sql/rules/r201_detail_view.sql",
+      "diff": "@@ -0,0 +1,6 @@\n+-- R-201 通報明細視圖\n+CREATE OR REPLACE VIEW v_r201_detail AS\n+SELECT *\n+FROM transactions t\n+WHERE t.tx_type = 'WITHDRAW'\n+  AND t.tx_time >= :start_date AND t.tx_time < :end_date;",
+      "full_content": "-- R-201 通報明細視圖\nCREATE OR REPLACE VIEW v_r201_detail AS\nSELECT *\nFROM transactions t\nWHERE t.tx_type = 'WITHDRAW'\n  AND t.tx_time >= :start_date AND t.tx_time < :end_date;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "rule-base",
+    "intent": "R002:視圖使用 SELECT * → minor(欄位異動時下游會靜默受影響)",
+    "expect_findings": [
+      {
+        "severity": "minor",
+        "title_contains_any": [
+          "SELECT *",
+          "明列欄位",
+          "star"
+        ]
+      }
+    ]
+  }
+}

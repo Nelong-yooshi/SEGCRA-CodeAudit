@@ -17,7 +17,12 @@
     "expect_findings": [
       {
         "severity": "blocker",
-        "title_contains": "WHERE"
+        "title_contains_any": [
+          "WHERE",
+          "全表",
+          "整表",
+          "整張表"
+        ]
       }
     ]
   }

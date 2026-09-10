@@ -1,0 +1,22 @@
+{
+  "title": "R-201 通報暫存表清理:限定日期範圍",
+  "description": "僅清除前一交易日之前的暫存資料,保留當日。",
+  "sha": "e1a1000000000000000000000000000000000206",
+  "files": [
+    {
+      "path": "sql/maintenance/purge_r201_staging.sql",
+      "diff": "@@ -2 +2,3 @@\n-DELETE FROM r201_report_staging;\n+DELETE FROM r201_report_staging\n+WHERE report_date < :start_date;",
+      "full_content": "-- R-201 通報暫存表清理(僅清前一日)\nDELETE FROM r201_report_staging\nWHERE report_date < :start_date;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "rule-base",
+    "intent": "乾淨對照:DELETE 有 WHERE 且用批次參數,R001 不得誤觸發(與 mr_201 成對,量規則層的誤報側)",
+    "forbid_findings": [
+      {
+        "severity": "blocker"
+      }
+    ]
+  }
+}
