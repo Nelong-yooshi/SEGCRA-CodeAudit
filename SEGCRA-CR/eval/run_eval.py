@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -57,6 +58,51 @@ FP_SEVERITIES = {"blocker", "major", "minor"}
 #   規範型(bind-no-sysdate,無 suppress)      → 只是注入 context,要靠 LLM 讀了照做。
 # 後者請在 case 的 _golden 標 "needs_llm": true,dry-run 會一併略過。
 DRY_RUN_LAYERS = {"rule-base", "binding"}
+
+
+# ─────────────────── 門檻調校用的量測 ───────────────────
+# 純風格 finding 的識別(僅供統計,不影響任何判定)。sqlfluff 的規則碼很獨特,
+# 誤判率低;關鍵詞是輔助訊號。system prompt 已要求風格問題「至多彙總一條 info」,
+# 這裡量的就是實際遵守情況。
+_STYLE_CODE = re.compile(r"\b(LT|CP|AL|LN|ST|RF|CV|JJ)\d{2}\b")
+_STYLE_WORD = re.compile(r"風格|排版|縮排|格式化|formatter")
+
+
+def is_style_finding(f: dict) -> bool:
+    hay = f"{f.get('title', '')}\n{f.get('detail', '')}"
+    return bool(_STYLE_CODE.search(hay) or _STYLE_WORD.search(hay))
+
+
+def auto_approve_blockers(report: dict, policy: dict) -> list[str]:
+    """列出這個 MR 失去自動放行資格的原因(可能多項)。
+
+    調門檻的核心數據:知道是被哪一項擋掉,才知道該調哪一項。
+    decision=blocked 時管線提早 return、不寫 _policy_signals,故單獨處理。
+    """
+    if report.get("decision") == "blocked":
+        return ["有 blocker(直接擋下)"]
+    if not report.get("decision"):
+        return []                      # dry-run:根本沒跑到決策層,不列統計
+    ps = report.get("_policy_signals") or {}
+    if not ps:
+        return ["無 _policy_signals"]
+    aa = policy.get("auto_approve", {})
+    out = []
+    if ps.get("change_lines", 0) > aa.get("max_diff_lines", 0):
+        out.append(f"diff 行數 {ps.get('change_lines')} > {aa.get('max_diff_lines')}")
+    if ps.get("new_rule"):
+        out.append("新規則檔")
+    if not ps.get("spec_exec_passed"):
+        out.append("執行驗證未通過")
+    if report.get("score", 0) < aa.get("min_score", 101):
+        out.append(f"分數 {report.get('score')} < {aa.get('min_score')}")
+    allowed = set(aa.get("allowed_severities") or [])
+    got = set(ps.get("severities") or [])
+    if not got <= allowed:
+        out.append(f"severity 白名單(出現 {sorted(got - allowed)})")
+    if aa.get("forbid_pending_hints", True) and ps.get("pending_hints"):
+        out.append("待確認檢核點")
+    return out
 
 
 # ─────────────────────────── 比對工具 ───────────────────────────
@@ -279,6 +325,10 @@ async def run(args) -> int:
             "noise": len(noise), "decision": decision,
             "severities": sorted({f.get("severity") for f in findings if f.get("severity")}),
             "spec_exec": se_stat,
+            "policy_signals": report.get("_policy_signals") or {},
+            "auto_approve_blockers": auto_approve_blockers(report, cfg.policy),
+            "style_findings": [{"severity": f.get("severity"), "title": f.get("title", "")[:60]}
+                               for f in findings if is_style_finding(f)],
             "checks": len(checks), "failed": len(bad),
             "failures": [{"name": n, "why": w} for n, _, w in bad],
         })
@@ -311,9 +361,32 @@ async def run(args) -> int:
         suffix = f"  ({', '.join(notes)})" if notes else ""
         print(f"  {layer:<18} {st['pass']}/{total} 通過{suffix}")
 
+    # 門檻調校用的彙總:純風格 finding 的 severity 分布,以及每個 case
+    # 失去自動放行資格的原因統計——知道被哪一項擋掉,才知道該調哪一項。
+    style_sev, blocker_tally = {}, {}
+    for r in rows:
+        for sf in r.get("style_findings") or []:
+            k = sf.get("severity") or "(未標)"
+            style_sev[k] = style_sev.get(k, 0) + 1
+        for b in r.get("auto_approve_blockers") or []:
+            key = b.split("(")[0].split(" ")[0]
+            blocker_tally[key] = blocker_tally.get(key, 0) + 1
+
     print("\n決策分布(門檻是否擾人的觀測值)")
     for d, n in sorted(decisions.items()):
         print(f"  {d:<18} {n}")
+
+    if style_sev:
+        print("\n純風格 finding 的 severity 分布"
+              "(system prompt 要求「至多彙總一條 info」)")
+        for k, v in sorted(style_sev.items()):
+            flag = "" if k == "info" else "  ← 未依指示,會擋掉自動放行"
+            print(f"  {k:<10} {v}{flag}")
+
+    if blocker_tally:
+        print("\n失去自動放行資格的原因(可複選;調門檻的主要依據)")
+        for k, v in sorted(blocker_tally.items(), key=lambda x: -x[1]):
+            print(f"  {k:<20} {v}")
 
     precision = tp / (tp + fp) if tp + fp else None
     recall = tp / (tp + fn) if tp + fn else None
@@ -346,6 +419,7 @@ async def run(args) -> int:
             "precision": precision, "recall": recall,
             "tp": tp, "fp": fp, "fn": fn,
             "layers": layer_stat, "decisions": decisions,
+            "style_severity": style_sev, "auto_approve_blockers": blocker_tally,
             "known_gaps": [{"case": c, "layer": l, "note": n} for c, l, _, n in gaps],
             "errors": [{"case": c, "layer": l, "why": w} for c, l, w in errors],
             "cases": rows,
