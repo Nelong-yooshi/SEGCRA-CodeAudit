@@ -216,9 +216,14 @@ def check_golden(g: dict, report: dict, skip_post_llm: bool = False) -> list[tup
     #    validate_citations 應已剔除白名單外的引用,這裡驗「確實沒有漏網的」。
     if "allowed_citations" in g:
         allowed = set(g["allowed_citations"])
-        stray = [(f.get("title", "")[:30], c)
-                 for f in findings for c in (f.get("citations") or [])
-                 if c not in allowed]
+        # 管線的 citation 是 dict {"source": ..., "article": ...}(見 pipeline.validate_citations);
+        # 舊格式可能是純字串。白名單比對的是「來源」,取 source 再比。
+        stray = []
+        for f in findings:
+            for c in (f.get("citations") or []):
+                src = c.get("source", "") if isinstance(c, dict) else str(c)
+                if src and src not in allowed:
+                    stray.append((f.get("title", "")[:30], src))
         out.append(("allowed_citations", not stray,
                     "" if not stray else
                     f"出現白名單外的引用 {len(stray)} 筆,首筆:{stray[0][1]}(於「{stray[0][0]}」)"))
