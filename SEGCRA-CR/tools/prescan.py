@@ -37,9 +37,10 @@ def main():
 
     print(f"== 預掃:{path} ==")
     hits = json.loads(run_rules(sql))
-    if isinstance(hits, dict) and hits.get("error"):
-        print(f"\n[rule-base] SQL 解析失敗:{hits['error']}")
-        sys.exit(1)
+    parse_error = None
+    if isinstance(hits, dict):
+        parse_error, hits = hits.get("error"), hits.get("hits", [])
+        print(f"\n[rule-base] SQL 解析失敗,AST 規則未執行(僅文字層規則有效):{parse_error}")
 
     print(f"\n[rule-base] 命中 {len(hits)} 項")
     gate = 0
@@ -50,6 +51,9 @@ def main():
         print(f"  {_SEV_MARK.get(sev, sev):<24} [{h.get('rule')}] {h.get('message')}")
         if h.get("statement"):
             print(f"      ↳ {h['statement'][:120]}")
+
+    if parse_error:
+        gate = 1
 
     if not args.no_lint:
         issues = json.loads(lint(sql))

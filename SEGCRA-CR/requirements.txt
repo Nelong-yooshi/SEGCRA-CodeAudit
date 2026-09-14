@@ -2,6 +2,6 @@ openai>=1.60
 httpx>=0.27
 sqlglot>=25.0
 sqlfluff>=3.0
-duckdb>=1.1
+pymssql>=2.3        # 執行驗證沙盒(SQL Server)
 pyyaml>=6.0
 json-repair>=0.30

@@ -6,7 +6,7 @@
     {
       "path": "sql/rules/r093_transfer_frequency.sql",
       "diff": "@@ -8 +8 @@\n-HAVING COUNT(*) >= 2;\n+HAVING COUNT(*) >= 20;",
-      "full_content": "-- R-093: 單日轉帳筆數達 20 筆(含)通報\nSELECT\n    t.account_id,\n    COUNT(*) AS tx_count\nFROM transactions t\nWHERE t.tx_type = 'TRANSFER'\n  AND t.tx_time >= :start_date AND t.tx_time < :end_date\nGROUP BY t.account_id\nHAVING COUNT(*) >= 20;"
+      "full_content": "-- R-093: 單日轉帳筆數達 20 筆(含)通報\nSELECT\n    t.account_id,\n    COUNT(*) AS tx_count\nFROM transactions t\nWHERE t.tx_type = 'TRANSFER'\n  AND t.tx_time >= @start_date AND t.tx_time < @end_date\nGROUP BY t.account_id\nHAVING COUNT(*) >= 20;"
     }
   ],
   "expected": [],

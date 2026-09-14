@@ -5,8 +5,8 @@
   "files": [
     {
       "path": "sql/maintenance/purge_r201_staging.sql",
-      "diff": "@@ -2 +2,3 @@\n-DELETE FROM r201_report_staging;\n+DELETE FROM r201_report_staging\n+WHERE report_date < :start_date;",
-      "full_content": "-- R-201 通報暫存表清理(僅清前一日)\nDELETE FROM r201_report_staging\nWHERE report_date < :start_date;"
+      "diff": "@@ -2 +2,3 @@\n-DELETE FROM r201_report_staging;\n+DELETE FROM r201_report_staging\n+WHERE report_date < @start_date;",
+      "full_content": "-- R-201 通報暫存表清理(僅清前一日)\nDELETE FROM r201_report_staging\nWHERE report_date < @start_date;"
     }
   ],
   "expected": [],
