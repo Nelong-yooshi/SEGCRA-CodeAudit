@@ -5,8 +5,8 @@
   "files": [
     {
       "path": "sql/rules/r305_night_interbank.sql",
-      "diff": "@@ -10 +10 @@\n-  AND t.tx_time >= :start_date AND t.tx_time < :end_date\n+  AND t.tx_time BETWEEN :start_date AND :end_date",
-      "full_content": "-- R-305: 夜間跨行轉帳大額異常(超過 200000 通報)\nSELECT\n    t.account_id,\n    SUM(t.amount) AS total_amount\nFROM transactions t\nWHERE t.tx_type = 'TRANSFER'\n  AND t.is_interbank = TRUE\n  AND t.currency = 'TWD'\n  AND EXTRACT(HOUR FROM t.tx_time) < 6\n  AND t.tx_time BETWEEN :start_date AND :end_date\nGROUP BY t.account_id\nHAVING SUM(t.amount) > 200000;"
+      "diff": "@@ -10 +10 @@\n-  AND t.tx_time >= @start_date AND t.tx_time < @end_date\n+  AND t.tx_time BETWEEN @start_date AND @end_date",
+      "full_content": "-- R-305: 夜間跨行轉帳大額異常(超過 200000 通報)\nSELECT\n    t.account_id,\n    SUM(t.amount) AS total_amount\nFROM transactions t\nWHERE t.tx_type = 'TRANSFER'\n  AND t.is_interbank = 1\n  AND t.currency = 'TWD'\n  AND DATEPART(HOUR, t.tx_time) < 6\n  AND t.tx_time BETWEEN @start_date AND @end_date\nGROUP BY t.account_id\nHAVING SUM(t.amount) > 200000;"
     }
   ],
   "expected": [],

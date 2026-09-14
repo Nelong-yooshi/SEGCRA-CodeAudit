@@ -158,6 +158,8 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
 _SYSDATE = re.compile(r"\b(GETDATE|SYSDATETIME|GETUTCDATE|SYSUTCDATETIME)\s*\(\s*\)|\bCURRENT_TIMESTAMP\b",
                       re.I)
 _SANDBOX_DB_PREFIX = "segcra_sbx_"
+_LEADING_COMMENTS = re.compile(r"^(?:\s*(?:--[^\n]*(?:\n|$)|/\*.*?\*/))*", re.S)
+_WRAPPED = re.compile(r"\s*(?:WITH\b[\s\S]*?\bINSERT\b|INSERT\b|CREATE\s+(?:OR\s+ALTER\s+)?VIEW\b)", re.I)
 
 
 def _sandbox_params() -> dict:
@@ -177,16 +179,26 @@ def _sandbox_params() -> dict:
 
 def prepare_sql(sql: str) -> str:
     """把規則 SQL 準備成可在沙盒執行的形式。**SQL 本體原樣執行,不轉譯**:
-    - INSERT INTO … SELECT → 只取 SELECT(驗的是篩選邏輯,不寫入報表表)
+    - INSERT INTO … SELECT、CREATE [OR ALTER] VIEW … AS SELECT → 只取 SELECT
+      (驗的是篩選邏輯;報表表不在沙盒 schema 裡,VIEW 在 SQL Server 也必須是批次第一句)
     - @start_date / @end_date → 以 DECLARE 代入固定執行窗
     - 系統日期函式 → 換成窗尾,確保每次執行結果可重現"""
     body = sql.strip().rstrip(";")
-    if re.match(r"^\s*(WITH\b[\s\S]*?\bINSERT\b|INSERT\b)", body, re.I):
+    # 檔案開頭通常是註解,判斷語句類型前先跳過,否則 INSERT / VIEW 會被當成一般 SELECT
+    head = _LEADING_COMMENTS.sub("", body)
+    if _WRAPPED.match(head):
         try:
             import sqlglot
             st = sqlglot.parse_one(body, dialect="tsql")
-            if st.key == "insert" and st.expression is not None:
-                body = st.expression.sql(dialect="tsql")
+            is_view = st.key == "create" and str(st.args.get("kind", "")).upper() == "VIEW"
+            if (st.key == "insert" or is_view) and st.expression is not None:
+                sel = st.expression
+                # WITH … INSERT … 的 CTE 掛在 INSERT 上,要一起帶走(sqlglot 新版的欄位名是 with_)
+                for key in ("with_", "with"):
+                    if st.args.get(key) is not None and sel.args.get(key) is None:
+                        sel.set(key, st.args[key])
+                        break
+                body = sel.sql(dialect="tsql")
         except Exception:
             pass
     body = _SYSDATE.sub(f"CAST('{WIN_END}' AS DATETIME2)", body)
