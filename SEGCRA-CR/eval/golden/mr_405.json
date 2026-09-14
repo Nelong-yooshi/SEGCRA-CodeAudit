@@ -1,0 +1,26 @@
+{
+  "title": "R-093 依核定規格實作高頻轉帳通報",
+  "description": "依核定規格 specs/R-093.md 實作,閾值 20 筆(含),時間窗採半開區間。",
+  "sha": "e1a1000000000000000000000000000000000405",
+  "files": [
+    {
+      "path": "sql/rules/r093_transfer_frequency.sql",
+      "diff": "@@ -8 +8 @@\n-HAVING COUNT(*) >= 2;\n+HAVING COUNT(*) >= 20;",
+      "full_content": "-- R-093: 單日轉帳筆數達 20 筆(含)通報\nSELECT\n    t.account_id,\n    COUNT(*) AS tx_count\nFROM transactions t\nWHERE t.tx_type = 'TRANSFER'\n  AND t.tx_time >= :start_date AND t.tx_time < :end_date\nGROUP BY t.account_id\nHAVING COUNT(*) >= 20;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "spec_exec",
+    "intent": "正向對照:實作與 specs/R-093.md 完全相符,執行驗證應通過。若此 case 也判 fail,代表 spec_exec 有系統性偏誤(把什麼都判錯),整層的陽性結果就不可信——這是整組 4xx 的對照基準。",
+    "expect_signals": {
+      "spec_found": true,
+      "spec_exec_passed": true
+    },
+    "forbid_findings": [
+      {
+        "severity": "blocker"
+      }
+    ]
+  }
+}

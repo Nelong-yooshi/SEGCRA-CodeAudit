@@ -1,0 +1,26 @@
+{
+  "title": "新增異常交易規則 R-201:單日 ATM 提領累計達 10 萬(含)通報",
+  "description": "依核定規格 specs/R-201.md 實作,首次建立本規則檔。",
+  "sha": "e1a1000000000000000000000000000000000602",
+  "files": [
+    {
+      "path": "sql/rules/r201_atm_withdraw_daily.sql",
+      "diff": "@@ -0,0 +1,12 @@\n+-- R-201: 單日 ATM 現金提領累計達 100000(含)通報\n+SELECT\n+    t.account_id,\n+    SUM(t.amount) AS total_amount\n+FROM transactions t\n+WHERE t.tx_type = 'WITHDRAW'\n+  AND t.channel = 'ATM'\n+  AND t.currency = 'TWD'\n+  AND t.tx_time >= :start_date AND t.tx_time < :end_date\n+  AND NOT EXISTS (SELECT 1 FROM exempt_accounts e WHERE e.account_id = t.account_id)\n+GROUP BY t.account_id\n+HAVING SUM(t.amount) >= 100000;",
+      "full_content": "-- R-201: 單日 ATM 現金提領累計達 100000(含)通報\nSELECT\n    t.account_id,\n    SUM(t.amount) AS total_amount\nFROM transactions t\nWHERE t.tx_type = 'WITHDRAW'\n  AND t.channel = 'ATM'\n  AND t.currency = 'TWD'\n  AND t.tx_time >= :start_date AND t.tx_time < :end_date\n  AND NOT EXISTS (SELECT 1 FROM exempt_accounts e WHERE e.account_id = t.account_id)\nGROUP BY t.account_id\nHAVING SUM(t.amount) >= 100000;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "decision",
+    "intent": "新規則檔閘門:即使實作完全符合規格,policy 的 new_rule 條件也禁止自動放行(新規則上線影響面大,一律要人看過)。驗閘門不是只看有沒有問題,還看變更的性質。",
+    "expect_decision": [
+      "needs_human",
+      "blocked"
+    ],
+    "forbid_findings": [
+      {
+        "severity": "blocker"
+      }
+    ]
+  }
+}
