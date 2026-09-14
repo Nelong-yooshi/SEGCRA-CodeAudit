@@ -1,0 +1,31 @@
+{
+  "title": "R-201 豁免名單改用 NOT IN 子查詢",
+  "description": "將豁免帳戶判斷由 NOT EXISTS 改寫為 NOT IN,語意等價。",
+  "sha": "e1a1000000000000000000000000000000000203",
+  "files": [
+    {
+      "path": "sql/rules/r201_atm_withdraw_daily.sql",
+      "diff": "@@ -9 +9 @@\n-  AND NOT EXISTS (SELECT 1 FROM exempt_accounts e WHERE e.account_id = t.account_id)\n+  AND t.account_id NOT IN (SELECT e.account_id FROM exempt_accounts e)",
+      "full_content": "-- R-201: 單日 ATM 現金提領累計達 100000(含)通報\nSELECT\n    t.account_id,\n    SUM(t.amount) AS total_amount\nFROM transactions t\nWHERE t.tx_type = 'WITHDRAW'\n  AND t.channel = 'ATM'\n  AND t.currency = 'TWD'\n  AND t.tx_time >= :start_date AND t.tx_time < :end_date\n  AND t.account_id NOT IN (SELECT e.account_id FROM exempt_accounts e)\nGROUP BY t.account_id\nHAVING SUM(t.amount) >= 100000;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "rule-base",
+    "intent": "R003:NOT IN + 子查詢,豁免名單含 NULL 時整個條件不成立,規則會靜默失效 → major。描述宣稱「語意等價」是錯的。",
+    "expect_findings": [
+      {
+        "severity": "major",
+        "title_contains_any": [
+          "NOT IN",
+          "NULL",
+          "NOT EXISTS"
+        ]
+      }
+    ],
+    "expect_decision": [
+      "needs_human",
+      "blocked"
+    ]
+  }
+}

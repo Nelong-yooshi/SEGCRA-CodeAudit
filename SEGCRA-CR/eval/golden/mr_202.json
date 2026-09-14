@@ -1,0 +1,31 @@
+{
+  "title": "R-140 豁免名單改由外部清算庫取得",
+  "description": "豁免帳戶清單改從外部資料庫即時查詢,避免本地副本過期。",
+  "sha": "e1a1000000000000000000000000000000000000",
+  "files": [
+    {
+      "path": "sql/rules/r140_cash_inbound.sql",
+      "diff": "@@ -1,0 +2,4 @@\n+-- TODO: 豁免名單同步作業的外部庫連線設定(待改用密鑰管理服務)\n+--   host = '10.0.0.9'\n+--   user = 'demo'\n+--   password = 'NotARealSecret123'",
+      "full_content": "-- R-140: 當日現金入帳累計達 500000(含)通報\n-- TODO: 豁免名單同步作業的外部庫連線設定(待改用密鑰管理服務)\n--   host = '10.0.0.9'\n--   user = 'demo'\n--   password = 'NotARealSecret123'\nSELECT\n    t.account_id,\n    SUM(t.amount) AS total_amount\nFROM txn_log t\nWHERE t.op_code IN ('OP01','OP02','OP03')\n  AND t.cash_flag = 'Y'\n  AND COALESCE(t.rev_flag, 'N') <> 'Y'\n  AND t.amount > 1000\n  AND COALESCE(t.channel_name, '') <> 'PROMO'\n  AND t.tx_time >= :start_date AND t.tx_time < :end_date\nGROUP BY t.account_id\nHAVING SUM(t.amount) >= 500000;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "rule-base",
+    "intent": "R004:註解中殘留含明碼密碼的連線設定(公部門紅線)→ blocker → blocked。R004 掃的是 SQL 原文,註解一樣命中;SQL 本身可正常執行,避免產生與本案無關的執行錯誤噪音。憑證為明顯假值。",
+    "expect_decision": "blocked",
+    "expect_findings": [
+      {
+        "severity": "blocker",
+        "title_contains_any": [
+          "憑證",
+          "密碼",
+          "金鑰",
+          "硬編碼",
+          "credential",
+          "secret"
+        ]
+      }
+    ]
+  }
+}

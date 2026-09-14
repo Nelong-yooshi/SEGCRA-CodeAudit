@@ -1,0 +1,33 @@
+{
+  "title": "新增異常交易規則 R-777:跨境匯出高風險國家通報",
+  "description": "依業務單位口頭需求先行實作,規格書尚在會簽中。",
+  "sha": "e1a1000000000000000000000000000000000404",
+  "files": [
+    {
+      "path": "sql/rules/r777_cross_border.sql",
+      "diff": "@@ -0,0 +1,9 @@\n+-- R-777: 跨境匯出高風險國家通報\n+SELECT\n+    t.account_id,\n+    SUM(t.amount) AS total_amount\n+FROM transactions t\n+WHERE t.tx_type = 'REMIT'\n+  AND t.tx_time >= :start_date AND t.tx_time < :end_date\n+GROUP BY t.account_id\n+HAVING SUM(t.amount) >= 500000;",
+      "full_content": "-- R-777: 跨境匯出高風險國家通報\nSELECT\n    t.account_id,\n    SUM(t.amount) AS total_amount\nFROM transactions t\nWHERE t.tx_type = 'REMIT'\n  AND t.tx_time >= :start_date AND t.tx_time < :end_date\nGROUP BY t.account_id\nHAVING SUM(t.amount) >= 500000;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "spec_exec",
+    "intent": "無規格可驗:R-777 沒有對應的 specs/R-777.md。ADR-01 規定「找不到規格 = major『無規格可驗』→ 一律 needs_human,不得自動放行」。驗證缺席本身就是 finding,不會靜默通過。",
+    "expect_decision": [
+      "needs_human",
+      "blocked"
+    ],
+    "expect_signals": {
+      "spec_exec_passed": false
+    },
+    "expect_findings": [
+      {
+        "severity": "major",
+        "title_contains_any": [
+          "規格",
+          "spec"
+        ]
+      }
+    ]
+  }
+}
