@@ -8,9 +8,11 @@ MR 的 SQL 不只要「看起來對」,還要「跑起來對」。流程:
   1. 角色一 測資生成 agent(LLM):讀 spec → 產出 schema DDL + 原子條件清單 +
      逐條件 true/false 兩向 + 邊界值的測資案例(嚴格 JSON)。
      生成後做**確定性形狀/覆蓋檢查**(缺的列入 coverage_gaps)。
-  2. 角色二 執行(確定性程式,非 LLM——執行本身不可有幻覺):每個案例在
-     in-memory DuckDB 建表灌資料,對 MR 的 SQL 做參數代入 + postgres→duckdb
-     transpile 後執行,比對「有無命中」與 expect_flagged。
+  2. 角色二 執行(確定性程式,非 LLM——執行本身不可有幻覺):在 **MS SQL 沙盒**
+     (scripts/sandbox.sh 起的 SQL Server 容器)裡,每個案例於獨立交易中建表灌資料、
+     原樣執行 MR 的 T-SQL,比對「有無命中」與 expect_flagged,結束即 rollback。
+     引擎必須與正式環境相同:不同引擎在型別轉換、日期運算、除法上的語意不同,
+     換引擎驗出的「通過」不能代表正式環境的行為。
   3. 角色三 仲裁 agent(LLM):只對 mismatch 逐案出動,判定是**測資錯**
      (測資生成也可能幻覺 → 剔除該案並記錄)還是 **SQL 錯**(→ major finding)。
 
@@ -18,14 +20,16 @@ MR 的 SQL 不只要「看起來對」,還要「跑起來對」。流程:
 全程記錄進 report["_spec_exec"] 供稽核。
 """
 import json
+import os
 import re
+import uuid
 
 from .agent import extract_json, run_agent
 from .config import Config, PKG_ROOT
 
 SPECS_DIR = PKG_ROOT / "specs"
 
-# 執行窗固定(可重現)::start_date / :end_date 代入這兩天(半開區間)
+# 執行窗固定(可重現):@start_date / @end_date 以 DECLARE 代入這兩天(半開區間)
 WIN_START, WIN_END = "2026-06-01", "2026-06-02"
 
 _RULE_CODE = re.compile(r"\bR-\d{2,4}\b")
@@ -67,7 +71,7 @@ TESTGEN_SYSTEM = """你是測試資料工程師。給你一份異常交易規則
 你要產出可機器執行的測資計畫。**spec 是唯一真值**,不得自行增減條件。
 
 # 產出(嚴格 JSON,不要 markdown 圍欄、不要多餘文字)
-{"schema_ddl": ["CREATE TABLE ...(照 spec 的資料表定義,一字不差的欄位名/型別)"],
+{"schema_ddl": ["CREATE TABLE ...(照 spec 的資料表定義,T-SQL 語法,一字不差的欄位名/型別)"],
  "conditions": [{"id": "C1", "desc": "<spec 的一個原子條件,如:tx_type='WITHDRAW'>"}],
  "cases": [{"case_id": "C1-T", "condition_id": "C1", "direction": "true",
             "rows": [["<表名>", <值1>, <值2>, ...], ...],
@@ -80,13 +84,15 @@ TESTGEN_SYSTEM = """你是測試資料工程師。給你一份異常交易規則
    (只有此條件不成立 → 不應命中)**兩向案例**;涉及數值門檻的條件另加**邊界案例**
    (剛好等於門檻、差最小單位),依 spec 的含/不含決定 expect_flagged。
 3. rows:每列 = [資料表名, 各欄位值...],值的順序與 schema_ddl 欄位順序一致;
-   時間值用 "YYYY-MM-DD HH:MM:SS" 字串、日期用 "YYYY-MM-DD"、布林用 true/false。
-4. 時間窗:SQL 的 :start_date 會代入 DATE '{win_start}'、:end_date 代入
-   DATE '{win_end}'(半開區間)。「窗內」交易的時間一律落在 {win_start} 當天;
-   測「窗外」時才用其他日期。
+   時間值用 "YYYY-MM-DD HH:MM:SS" 字串、日期用 "YYYY-MM-DD"、BIT 欄位用 1 或 0。
+4. 時間窗:SQL 的 @start_date 會代入 '{win_start}'、@end_date 代入 '{win_end}'
+   (半開區間)。「窗內」交易的時間一律落在 {win_start} 當天;測「窗外」時才用其他日期。
 5. 每個案例只放**該案例需要的資料列**(案例之間互相獨立,各自在乾淨資料庫執行;
    expect_flagged=true 表示該案例的資料應使規則輸出至少一列)。
-6. 只用 spec 資料表定義裡存在的表與欄位,不得發明欄位。"""
+6. 只用 spec 資料表定義裡存在的表與欄位,不得發明欄位。
+7. 資料庫是 MS SQL(SQL Server),schema_ddl 一律用 T-SQL 型別
+   (NVARCHAR(n) / DECIMAL(p,s) / DATETIME2 / DATE / BIT / INT / BIGINT)。字串型別一定要寫長度:
+   T-SQL 的 NVARCHAR 不寫長度等於長度 1。"""
 
 
 def _shape_check(plan: dict) -> tuple[dict, list[str], list[dict]]:
@@ -149,65 +155,150 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
 
 
 # ------------------------------------------------------------------ 2. 確定性執行
+_SYSDATE = re.compile(r"\b(GETDATE|SYSDATETIME|GETUTCDATE|SYSUTCDATETIME)\s*\(\s*\)|\bCURRENT_TIMESTAMP\b",
+                      re.I)
+_SANDBOX_DB_PREFIX = "segcra_sbx_"
+
+
+def _sandbox_params() -> dict:
+    """沙盒連線設定:環境變數優先,沒設就讀 config/sandbox.env(不進版控)。"""
+    env_file = PKG_ROOT / "config" / "sandbox.env"
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+    return {"server": os.environ.get("SANDBOX_MSSQL_HOST", "127.0.0.1"),
+            "port": int(os.environ.get("SANDBOX_MSSQL_PORT", "1433")),
+            "user": os.environ.get("SANDBOX_MSSQL_USER", "sa"),
+            "password": os.environ.get("SANDBOX_MSSQL_PASSWORD", ""),
+            "login_timeout": 10, "timeout": 120}
+
+
 def prepare_sql(sql: str) -> str:
-    """參數代入 + INSERT→取其 SELECT + postgres→duckdb transpile。
-    (參數代入需在 sqlglot 之前,否則 :name 會被改寫。)"""
-    import sqlglot
-    sql = sql.replace(":start_date", f"DATE '{WIN_START}'")
-    sql = sql.replace(":end_date", f"DATE '{WIN_END}'")
-    sql = re.sub(r"\bCURRENT_DATE\b", f"DATE '{WIN_END}'", sql, flags=re.I)
+    """把規則 SQL 準備成可在沙盒執行的形式。**SQL 本體原樣執行,不轉譯**:
+    - INSERT INTO … SELECT → 只取 SELECT(驗的是篩選邏輯,不寫入報表表)
+    - @start_date / @end_date → 以 DECLARE 代入固定執行窗
+    - 系統日期函式 → 換成窗尾,確保每次執行結果可重現"""
+    body = sql.strip().rstrip(";")
+    if re.match(r"^\s*(WITH\b[\s\S]*?\bINSERT\b|INSERT\b)", body, re.I):
+        try:
+            import sqlglot
+            st = sqlglot.parse_one(body, dialect="tsql")
+            if st.key == "insert" and st.expression is not None:
+                body = st.expression.sql(dialect="tsql")
+        except Exception:
+            pass
+    body = _SYSDATE.sub(f"CAST('{WIN_END}' AS DATETIME2)", body)
+    decl = []
+    if re.search(r"@start_date\b", body, re.I):
+        decl.append(f"@start_date DATE = '{WIN_START}'")
+    if re.search(r"@end_date\b", body, re.I):
+        decl.append(f"@end_date DATE = '{WIN_END}'")
+    head = "SET NOCOUNT ON; SET DATEFORMAT ymd;\n"
+    if decl:
+        head += "DECLARE " + ", ".join(decl) + ";\n"
+    return head + body
+
+
+def _drop_stale_sandbox_dbs(admin) -> None:
+    """清掉之前異常中斷留下的沙盒資料庫(每個只活幾秒,超過一小時必定是殘留)。"""
     try:
-        st = sqlglot.parse_one(sql, dialect="postgres")
-        if st.key == "insert" and st.expression is not None:
-            st = st.expression
-        sql = st.sql(dialect="postgres")
+        cur = admin.cursor()
+        cur.execute(f"SELECT name FROM sys.databases WHERE name LIKE '{_SANDBOX_DB_PREFIX}%' "
+                    "AND create_date < DATEADD(HOUR, -1, SYSDATETIME())")
+        for (name,) in cur.fetchall():
+            if re.fullmatch(_SANDBOX_DB_PREFIX + r"[0-9a-f]{12}", name):
+                cur.execute(f"ALTER DATABASE [{name}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; "
+                            f"DROP DATABASE [{name}]")
     except Exception:
         pass
-    try:
-        return sqlglot.transpile(sql, read="postgres", write="duckdb")[0]
-    except Exception:
-        return sql
 
 
 def execute_cases(sql: str, plan: dict) -> dict:
-    """角色二:確定性執行(非 LLM)。每案例在乾淨的 in-memory DuckDB 建 schema、
-    灌該案例的 rows、跑 MR 的 SQL,比對「是否有輸出列」與 expect_flagged。
-    回傳 {case_results, mismatches, sql_error, testdata_error}。"""
-    import duckdb
+    """角色二:確定性執行(非 LLM)。
+
+    每次呼叫在沙盒建一個專用資料庫(與其他同時進行的審查互不干擾),每個案例在
+    獨立交易裡建表、灌資料、執行 MR 的 SQL,比對「是否有輸出列」與 expect_flagged,
+    結束一律 rollback(下一個案例從乾淨狀態開始)。最後刪掉整個資料庫。
+    回傳 {case_results, mismatches, sql_error, testdata_error, sandbox_error, engine}。"""
+    import pymssql
+    params = _sandbox_params()
     prepared = prepare_sql(sql)
     results, mismatches = [], []
-    for case in plan["cases"]:
-        con = duckdb.connect(":memory:")
+    out = {"case_results": results, "mismatches": mismatches, "sql_error": None,
+           "testdata_error": None, "sandbox_error": None, "engine": None}
+
+    if not params["password"]:
+        out["sandbox_error"] = "未設定 SANDBOX_MSSQL_PASSWORD(見 config/sandbox.env.example)"
+        return out
+    try:
+        admin = pymssql.connect(**params, autocommit=True)
+    except Exception as e:
+        out["sandbox_error"] = f"無法連線執行驗證沙盒 {params['server']}:{params['port']}:{str(e)[:160]}"
+        return out
+
+    dbname = _SANDBOX_DB_PREFIX + uuid.uuid4().hex[:12]
+    con = None
+    try:
+        cur = admin.cursor()
+        cur.execute("SELECT CAST(SERVERPROPERTY('ProductVersion') AS NVARCHAR(64)), "
+                    "CAST(SERVERPROPERTY('Edition') AS NVARCHAR(128))")
+        ver, edition = cur.fetchone()
+        out["engine"] = f"SQL Server {ver} ({edition})"
+        _drop_stale_sandbox_dbs(admin)
+        cur.execute(f"CREATE DATABASE [{dbname}]")
+        con = pymssql.connect(**params, database=dbname, autocommit=False)
+
+        for case in plan["cases"]:
+            c = con.cursor()
+            try:
+                try:
+                    for ddl in plan["schema_ddl"]:
+                        c.execute(ddl)
+                    for row in case["rows"]:
+                        table, vals = row[0], row[1:]
+                        ph = ",".join(["%s"] * len(vals))
+                        c.execute(f"INSERT INTO {table} VALUES ({ph})", tuple(vals))
+                except Exception as e:   # DDL / 灌資料失敗 = 測資側的錯,不是 SQL 的錯
+                    out["testdata_error"] = f"建表/灌資料失敗於 {case['case_id']}:{str(e)[:200]}"
+                    return out
+                try:
+                    c.execute(prepared)
+                    rows = c.fetchall() if c.description else []
+                except Exception as e:   # SQL 本身跑不起來(語法/欄位/方言)→ SQL 側的錯
+                    out["sql_error"] = str(e)[:300]
+                    return out
+            finally:
+                try:
+                    con.rollback()
+                except Exception:
+                    pass
+            actual = len(rows) > 0
+            r = {"case_id": case["case_id"], "condition_id": case["condition_id"],
+                 "direction": case["direction"], "note": case.get("note", ""),
+                 "expect_flagged": case["expect_flagged"], "actual_flagged": actual,
+                 "actual_rows": [[str(v) for v in row] for row in rows[:5]],
+                 "ok": actual == case["expect_flagged"]}
+            results.append(r)
+            if not r["ok"]:
+                mismatches.append({**r, "rows": case["rows"]})
+        return out
+    except Exception as e:
+        out["sandbox_error"] = f"沙盒執行異常:{str(e)[:200]}"
+        return out
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
         try:
-            try:
-                for ddl in plan["schema_ddl"]:
-                    con.execute(ddl)
-                for row in case["rows"]:
-                    table, vals = row[0], row[1:]
-                    ph = ",".join("?" * len(vals))
-                    con.execute(f"INSERT INTO {table} VALUES ({ph})", vals)
-            except Exception as e:   # DDL / 灌資料失敗 = 測資側的錯,不是 SQL 的錯
-                return {"case_results": results, "mismatches": mismatches,
-                        "sql_error": None,
-                        "testdata_error": f"建表/灌資料失敗於 {case['case_id']}:{str(e)[:200]}"}
-            try:
-                rows = con.execute(prepared).fetchall()
-            except Exception as e:   # SQL 本身跑不起來(語法/欄位)→ SQL 側的錯
-                return {"case_results": results, "mismatches": mismatches,
-                        "sql_error": str(e)[:300], "testdata_error": None}
-        finally:
-            con.close()
-        actual = len(rows) > 0
-        r = {"case_id": case["case_id"], "condition_id": case["condition_id"],
-             "direction": case["direction"], "note": case.get("note", ""),
-             "expect_flagged": case["expect_flagged"], "actual_flagged": actual,
-             "actual_rows": [[str(v) for v in row] for row in rows[:5]],
-             "ok": actual == case["expect_flagged"]}
-        results.append(r)
-        if not r["ok"]:
-            mismatches.append({**r, "rows": case["rows"]})
-    return {"case_results": results, "mismatches": mismatches,
-            "sql_error": None, "testdata_error": None}
+            admin.cursor().execute(f"ALTER DATABASE [{dbname}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; "
+                                   f"DROP DATABASE [{dbname}]")
+        except Exception:
+            pass
+        admin.close()
 
 
 # ------------------------------------------------------------------ 3. 仲裁
@@ -217,6 +308,7 @@ ARBITER_SYSTEM = """你是獨立仲裁者。一條規則 SQL 在一個測資案�
 
 # 原則(客觀稽核)
 - **spec 是唯一真值**:只以 spec 條文判斷,不猜、不腦補規格沒寫的東西。
+- SQL 在 MS SQL(SQL Server)上執行,判斷「SQL 為什麼給出這個結果」時一律依 T-SQL 語意。
 - 逐步核對:這個案例的資料在 spec 之下「應該」命中嗎?→ 再看 SQL 為什麼給出相反結果。
 - 測資與 SQL 都可能錯;不預設任何一方。無法確定時,傾向判測資錯並說明疑點
   (誤殺一個測資案例的代價低;誤指控 SQL 會產生假 finding)。
@@ -304,19 +396,28 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
 
     # 角色二:確定性執行
     ex = execute_cases(sql, plan)
+    if ex["sandbox_error"]:
+        # 沙盒不可用 ≠ 驗證通過:照樣不得自動放行,並講清楚是環境問題而非程式問題
+        findings.append(_finding(path, "major", "執行驗證無法完成(沙盒不可用)",
+                                 f"{ex['sandbox_error']}。這是驗證環境的問題,不代表程式有錯;"
+                                 "但未經執行驗證,本 MR 不得自動放行。",
+                                 "啟動沙盒(scripts/sandbox.sh start)後重新觸發審查。"))
+        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],
+                "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
+                "case_results": [], "dropped_cases": dropped_cases, "findings": findings}
     if ex["testdata_error"]:
         findings.append(_finding(path, "major", "執行驗證無法完成(測資無法建置)",
                                  f"測資生成 agent 產出的 schema/資料無法建置:"
                                  f"{ex['testdata_error']}。需人工執行驗證。"))
-        return {"passed": False, "spec_code": spec_code,
+        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],
                 "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
                 "case_results": ex["case_results"], "dropped_cases": dropped_cases,
                 "findings": findings}
     if ex["sql_error"]:
         findings.append(_finding(path, "major", "執行驗證:SQL 無法在測資上執行",
                                  f"執行錯誤(語法/欄位):{ex['sql_error']}",
-                                 "修正 SQL 使其可依規格的資料表定義執行。"))
-        return {"passed": False, "spec_code": spec_code,
+                                 "修正 SQL 使其可依規格的資料表定義在 MS SQL 上執行。"))
+        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],
                 "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
                 "case_results": ex["case_results"], "dropped_cases": dropped_cases,
                 "findings": findings}
@@ -359,7 +460,7 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                                  f"執行驗證通過({len(effective)} 案例全數相符)",
                                  f"規則 {spec_code} 的每個原子條件 true/false 兩向與邊界案例"
                                  f"皆與規格預期一致。"))
-    return {"passed": passed, "spec_code": spec_code,
+    return {"passed": passed, "spec_code": spec_code, "engine": ex["engine"],
             "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
             "case_results": ex["case_results"], "dropped_cases": dropped_cases,
             "findings": findings}

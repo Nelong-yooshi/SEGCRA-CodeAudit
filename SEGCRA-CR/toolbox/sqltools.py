@@ -13,7 +13,9 @@ from sqlglot import exp
 
 logging.disable(logging.INFO)  # sqlfluff 的 INFO 輸出會灌爆 stderr
 
-DIALECT = os.environ.get("SQL_DIALECT", "postgres")
+# 規則程式跑在 MS SQL 上。用別的方言解析,T-SQL 的方括號識別字、TOP、WITH (NOLOCK)
+# 會解析失敗,AST 規則(R001 DML 無 WHERE、R002 SELECT * …)就整組跳過。
+DIALECT = os.environ.get("SQL_DIALECT", "tsql")
 
 
 def _parse(sql: str):
@@ -172,10 +174,14 @@ def _text_rules(sql: str):
 def run_rules(sql: str) -> str:
     """執行 rule-base 檢查(組織既有規則的掛載點),回傳命中清單。"""
     hits = []
+    parse_error = None
     try:
         statements = _parse(sql)
     except Exception as e:
-        return json.dumps({"error": f"parse failed: {e}"}, ensure_ascii=False)
+        # 解析失敗時 AST 規則無法執行,但文字層規則(R004 明碼憑證等)不需要 AST,
+        # 照樣要跑 —— 否則一段解析不了的 SQL 會連明碼密碼都一起放過。
+        msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e))      # 去掉 sqlglot 錯誤訊息裡的終端機色碼
+        statements, parse_error = [], f"parse failed: {' '.join(msg.split())[:200]}"
     for st in statements:
         if st is None:
             continue
@@ -198,4 +204,6 @@ def run_rules(sql: str) -> str:
                                 f"比較運算子(達/以上=含=>=;超過=不含=>)、時間窗、"
                                 f"通報粒度、豁免條件、**輸出欄位的遮罩/明碼**(規格說明碼者"
                                 f"不得遮罩、說遮罩者必須遮罩);不符即為 major「實作與核定規格不符」"})
+    if parse_error:
+        return json.dumps({"error": parse_error, "hits": hits}, ensure_ascii=False)
     return json.dumps(hits, ensure_ascii=False)

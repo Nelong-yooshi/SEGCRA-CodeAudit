@@ -156,9 +156,13 @@ async def prescan(hub: ToolHub, files: list[dict]) -> list[dict]:
         sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or f.get("diff", "")
         entry = {"path": f["path"]}
         rules = await hub.call_json("sqltools__run_rules", {"sql": sql})
-        entry["rules"] = rules if isinstance(rules, list) else []
-        if isinstance(rules, dict) and rules.get("error"):
-            entry["parse_error"] = rules["error"]
+        if isinstance(rules, dict):
+            hits = rules.get("hits")
+            entry["rules"] = hits if isinstance(hits, list) else []
+            if rules.get("error"):
+                entry["parse_error"] = rules["error"]
+        else:
+            entry["rules"] = rules if isinstance(rules, list) else []
         lint = await hub.call_json("sqltools__lint", {"sql": sql})
         entry["lint"] = lint[:15] if isinstance(lint, list) else []
         results.append(entry)
@@ -309,6 +313,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = validate_citations(report, spec_code)
         report = sanitize_findings(report)
         report = enforce_rules(report, pre)    # rule-base 命中不因模型省略而消失
+        report = enforce_parse(report, pre)    # 預掃解析失敗 = 確定性規則沒跑,必須看得見
         report = enforce_hints(report, pre)
         report = enforce_style(report, pre)    # 已學會的風格(如前置逗號)確定性補報
         report = enforce_injection(report, injection_hits)  # 確定性 blocker,不論模型是否被攻陷
@@ -416,6 +421,29 @@ _RULE_KEYWORDS = {
     "R003": ["NOT IN", "NULL 陷阱", "NOT EXISTS"],
     "R004": ["憑證", "密碼", "金鑰", "硬編碼", "hardcode", "credential", "secret"],
 }
+
+
+_PARSE_FAIL_TITLE = "預掃無法解析此檔的 SQL,rule-base 規則未執行"
+
+
+def _parse_fail_finding(entry: dict) -> dict:
+    return {"file": entry["path"], "line": 0, "severity": "major",
+            "title": _PARSE_FAIL_TITLE,
+            "detail": (f"{entry['parse_error']}。rule-base 的語法樹規則(如 DML 無 WHERE、"
+                       "SELECT *)沒有執行,這個檔案的確定性檢查不完整,不得自動放行。"
+                       "常見原因:SQL 不是 T-SQL 語法,或含 dbt / Jinja 樣板尚未展開。"),
+            "suggestion": "確認檔案為可在 MS SQL 執行的 T-SQL;dbt 模型需先展開樣板。",
+            "citations": []}
+
+
+def enforce_parse(report: dict, pre: list[dict]) -> dict:
+    """預掃解析失敗的強制揭露。解析失敗時 AST 規則整組沒跑,若不補一條 finding,
+    這個缺口不會出現在報告任何地方,MR 還可能因「沒有命中」而被自動放行。"""
+    have = {(f.get("file"), f.get("title")) for f in report.get("findings", [])}
+    for entry in pre:
+        if entry.get("parse_error") and (entry["path"], _PARSE_FAIL_TITLE) not in have:
+            report.setdefault("findings", []).append(_parse_fail_finding(entry))
+    return report
 
 
 def enforce_rules(report: dict, pre: list[dict]) -> dict:
@@ -567,6 +595,8 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                              "title": f"[{hit['rule']}] {hit['message']}",
                              "detail": hit.get("statement", ""), "suggestion": "",
                              "citations": []})
+        if entry.get("parse_error"):
+            findings.append(_parse_fail_finding(entry))
     report = {"score": max(0, 100 - 40 * sum(f["severity"] == "blocker" for f in findings)
                            - 15 * sum(f["severity"] == "major" for f in findings)
                            - 5 * sum(f["severity"] == "minor" for f in findings)),

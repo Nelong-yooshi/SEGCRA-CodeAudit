@@ -36,4 +36,4 @@
 
 ## 本目錄附帶的示例
 - `bind-reversal-netted.md`:使用者明確指示「資料已淨額」→ 抑制 H001 檢核點。
-- `bind-no-sysdate.md`:人工撰寫的恆常規範(禁用 CURRENT_DATE/SYSDATE)。
+- `bind-no-sysdate.md`:人工撰寫的恆常規範(禁用 GETDATE()/SYSDATETIME() 等系統日期函式)。

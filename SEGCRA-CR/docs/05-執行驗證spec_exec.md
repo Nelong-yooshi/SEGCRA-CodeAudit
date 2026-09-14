@@ -2,7 +2,7 @@
 
 ## 在幹嘛(一段白話)
 
-靜態審查只能看 SQL「像不像對的」;執行驗證讓它「真的跑一遍」。`orchestrator/spec_exec.py` 對每個 MR 做四步:(0)確定性找出這條 SQL 對應哪份核定規格(spec);(1)請一個 LLM(角色一,測資生成)讀 spec,把需求拆成原子條件,替每個條件造出「應命中」與「不應命中」兩向、外加數值門檻的邊界值測資;(2)由確定性程式(角色二,非 LLM)把每個測資案例灌進一個乾淨的 in-memory DuckDB,跑 MR 的 SQL,比對有沒有命中;(3)實際結果與測資預期不符時,再請另一個 LLM(角色三,仲裁)以 spec 為唯一真值判定是**測資造錯了**還是 **SQL 寫錯了**——前者剔除該案並記錄覆蓋缺口,後者才成為 major finding。整包結果(通過與否、條件清單、覆蓋缺口、逐案結果、被剔案例)寫進報告的 `_spec_exec`,供稽核;`passed` 是後續自動放行的**硬條件**。
+靜態審查只能看 SQL「像不像對的」;執行驗證讓它「真的跑一遍」。`orchestrator/spec_exec.py` 對每個 MR 做四步:(0)確定性找出這條 SQL 對應哪份核定規格(spec);(1)請一個 LLM(角色一,測資生成)讀 spec,把需求拆成原子條件,替每個條件造出「應命中」與「不應命中」兩向、外加數值門檻的邊界值測資;(2)由確定性程式(角色二,非 LLM)在 **MS SQL 沙盒**裡把每個測資案例灌進獨立的交易,原樣執行 MR 的 T-SQL,比對有沒有命中;(3)實際結果與測資預期不符時,再請另一個 LLM(角色三,仲裁)以 spec 為唯一真值判定是**測資造錯了**還是 **SQL 寫錯了**——前者剔除該案並記錄覆蓋缺口,後者才成為 major finding。整包結果(通過與否、條件清單、覆蓋缺口、逐案結果、被剔案例)寫進報告的 `_spec_exec`,供稽核;`passed` 是後續自動放行的**硬條件**。
 
 ## 防的是什麼
 
@@ -52,14 +52,21 @@
 
 ### 第 2 步:角色二 沙盒執行(確定性程式,非 LLM;`prepare_sql` / `execute_cases`)
 
-**SQL 前處理**(`prepare_sql`):先做參數代入(`:start_date`/`:end_date` → `DATE '2026-06-01'`/`DATE '2026-06-02'` 字面值;`CURRENT_DATE` → 窗結束日)——**必須在 sqlglot 之前**,否則 `:name` 會被改寫;再用 sqlglot 以 postgres 方言 parse,若整句是 `INSERT INTO ... SELECT` 取其 SELECT 部分(通報寫入表不在沙盒 schema 裡);最後 `transpile(postgres → duckdb)`。parse/transpile 失敗都 fallback 用原句(讓 DuckDB 自己報錯,錯誤會被歸到 SQL 側)。
+**為什麼沙盒必須是 MS SQL**:規則程式跑在 MS SQL 上。不同引擎在整數除法(`7/2` 在 SQL Server 是 3,在 DuckDB 是 3.5)、`DATETIME` 精度、型別轉換、日期函式上的語意不同,同一段 SQL 在別的引擎上「通過」,不代表在正式環境通過。所以沙盒是 `scripts/sandbox.sh` 起的 SQL Server 容器(Developer 版,只綁 127.0.0.1),**SQL 本體原樣執行、不做方言轉譯**。
 
-**逐案執行**(`execute_cases`):每個案例開一個全新的 `duckdb.connect(":memory:")`(案例之間零污染):
+**SQL 前處理**(`prepare_sql`),只做三件事:
+1. 整句是 `INSERT INTO … SELECT`(含前置 `WITH`)時,用 sqlglot(tsql 方言)取出 SELECT 部分——驗的是篩選邏輯,通報寫入表不在沙盒 schema 裡;其餘 SQL 不經 sqlglot,原字原句;
+2. 系統日期函式(`GETDATE()`、`SYSDATETIME()`、`CURRENT_TIMESTAMP` 等)換成窗尾,確保可重現;
+3. 用到 `@start_date` / `@end_date` 時,前面補 `DECLARE @start_date DATE = '2026-06-01', @end_date DATE = '2026-06-02';`,並固定 `SET NOCOUNT ON; SET DATEFORMAT ymd;`。
+
+**逐案執行**(`execute_cases`):每次執行在沙盒建一個專用資料庫(`segcra_sbx_<隨機碼>`,同時進行的審查互不干擾),結束後刪除;超過一小時的殘留資料庫會在下次執行時清掉。每個案例在**獨立交易**裡執行,結束一律 rollback,下一個案例從乾淨狀態開始:
 
 1. 跑 plan 的所有 `schema_ddl` 建表;
-2. 逐列 `INSERT INTO <表名> VALUES (?,?,…)` 參數化灌入該案例的 rows;
+2. 逐列 `INSERT INTO <表名> VALUES (%s,%s,…)` 參數化灌入該案例的 rows;
 3. **這兩步任何例外 = 測資側的錯**(schema/資料造不起來)→ 整包回 `testdata_error`,`run_spec_exec` 轉 major「執行驗證無法完成(測資無法建置)」→ 需人工;
-4. 執行 prepared SQL;**這步例外 = SQL 側的錯**(語法/欄位)→ 回 `sql_error`,轉 major「SQL 無法在測資上執行」;
+4. 執行 prepared SQL;**這步例外 = SQL 側的錯**(語法/欄位/非 T-SQL 寫法)→ 回 `sql_error`,轉 major「SQL 無法在測資上執行」;
+
+連不上沙盒(沒啟動、密碼錯)→ 回 `sandbox_error`,轉 major「執行驗證無法完成(沙盒不可用)」,並註明是環境問題而非程式問題——照樣 `passed: False`,**沙盒不可用絕不等於驗證通過**。報告的 `_spec_exec.engine` 記錄實際執行的引擎版本,供稽核。
 5. 比對邏輯:`actual_flagged = 輸出列數 > 0`,與 `expect_flagged` 相等即 `ok`;不等進 `mismatches`(帶原始 rows 供仲裁)。每案記錄 `case_id/condition_id/direction/note/expect_flagged/actual_flagged/actual_rows(前5列)/ok`。
 
 ### 第 3 步:角色三 仲裁(LLM;`arbitrate`)
@@ -156,12 +163,13 @@ mr = {"title": "調整報表", "files": [{"path": "sql/x.sql", "full_content": "
 - **怎麼寫 spec 才驗得動**(整理自 README §4 與三份內附 spec):
   1. **「資料表定義」段必須釘死 schema**(可直接執行的 `CREATE TABLE`)——角色一照抄建表,沒有固定 schema 整個執行驗證做不起來;
   2. **需求項目逐條原子化、含運算子**:每條具體到可直接對照實作(交易範圍、聚合、閾值、時間窗、幣別、豁免、通報粒度、輸出欄位各自成條),用語與含等一致——「達/以上」=含=`>=`、「超過」=不含=`>`,並在補充段記下核定依據;含等寫錯一定被邊界案例抓到,寫「模糊」則測資會亂猜;
-  3. 時間窗一律寫半開區間(`>= :start_date AND < :end_date`),參數名固定 `:start_date`/`:end_date`;
-  4. 表格式規格 → md 的整理範例在 `examples/sample/RETAIL_M1_spec.md`(原則:只寫核定規格有的、實作細節列「待補」不腦補、跨源不一致以核定規格為準);dbt + Jinja + SQL Server 的規則程式要先 `dbt compile` 展開成純 SQL 再進管線——本包執行層吃 postgres 方言(sqlglot 轉 duckdb)。
+  3. 時間窗一律寫半開區間(`>= @start_date AND < @end_date`),參數名固定 `@start_date`/`@end_date`;程式與規格的 SQL 一律寫 T-SQL(`BIT` 用 `= 1`、`DATEPART(HOUR, x)`、字串型別寫長度、日期時間用 `DATETIME2` 而非 `TIMESTAMP`);
+  4. 表格式規格 → md 的整理範例在 `examples/sample/RETAIL_M1_spec.md`(原則:只寫核定規格有的、實作細節列「待補」不腦補、跨源不一致以核定規格為準);dbt + Jinja 的規則程式要先展開樣板才能執行——目前尚未內建,含樣板的檔案會被擋下需人工(不會誤判通過)。
 - **換模型**:`config/models.yaml` 的 `roles.testgen` / `roles.arbiter` 各自指到任一 profile;小模型常產不出合法測資 JSON(症狀:「測資生成失敗」finding),把 testgen 指回大 profile 即可(README §10)。
 - **改 prompt**:`orchestrator/spec_exec.py` 的 `TESTGEN_SYSTEM`(測資契約)與 `ARBITER_SYSTEM`(仲裁原則);執行窗常數 `WIN_START/WIN_END` 也在檔頭。改 TESTGEN 的輸出形狀時,`_shape_check` 必須同步改——形狀檢查是契約的執行者。
 - **已知限制**:
   - 一個 MR 只驗**一份 spec、一段 SQL**:`find_spec` 回第一個找得到規格檔的規則碼;SQL 取自最後一個有內容的變更檔。一個 MR 改多條規則時,現版只驗到其一——拆 MR 是目前的正解。
   - 命中判定是「有無輸出列」(`len(rows) > 0`),**通報粒度**(每帳戶每日至多 1 筆)與輸出欄位語意不在執行驗證範圍,靠靜態審查的 H002/規格核對把關。
   - 覆蓋是「LLM 拆出的條件」的覆蓋:若角色一漏拆某條件,形狀檢查看不出「本來該有第 N 條」——上限由 spec 條列品質決定,這也是需求項目要逐條原子化的原因。
-  - 方言:postgres → duckdb 轉譯,DuckDB 不支援的方言特性會落在 `sql_error`(major、needs_human),不會誤判通過。
+  - 沙盒需要先啟動(`scripts/sandbox.sh start`,約 2GB 記憶體);沙盒未啟動時執行驗證一律判不通過(major、needs_human)。
+  - dbt 樣板(`{{ ref() }}`、`{{ var() }}`、macro)尚未展開:含樣板的程式會落在 `sql_error`,不會誤判通過。

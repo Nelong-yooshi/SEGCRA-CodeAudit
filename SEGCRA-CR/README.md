@@ -22,7 +22,7 @@ MR(webhook 或手動觸發)
  │    ├ enforce 鏈(rule/hint/style/injection:預掃命中不因模型省略而消失)
  │    ├ **執行驗證 spec_exec(必跑)**:
  │    │    角色一 測資生成 agent(LLM,讀 spec 產測資)
- │    │    → 角色二 沙盒執行(確定性程式,DuckDB in-memory)
+ │    │    → 角色二 沙盒執行(確定性程式,MS SQL 沙盒)
  │    │    → 角色三 仲裁 agent(LLM,只對不符案例判定測資錯還是 SQL 錯)
  │    ├ rubric 評分(分數由 severity 確定性計算,不信模型自評)
  │    └ 決策三態:auto_approved / needs_human / blocked
@@ -61,7 +61,7 @@ SEGCRA-CR/
 | `docs/02-分層記憶與binding.md` | 三層知識庫、來源分級、「講過的不再提」全機制、風格自學 |
 | `docs/03-LLM審查層.md` | agent loop、JSON 容錯、工具註冊表、skill、prompt 組裝 |
 | `docs/04-後處理防線.md` | enforce 鏈逐道:防什麼、演算法、對 findings 的動作 |
-| `docs/05-執行驗證spec_exec.md` | 三角色最細一篇:測資契約、覆蓋檢查、DuckDB 執行、仲裁 |
+| `docs/05-執行驗證spec_exec.md` | 三角色最細一篇:測資契約、覆蓋檢查、MS SQL 沙盒執行、仲裁 |
 | `docs/06-決策與merge閘門.md` | 評分公式、三態全部條件、CE 閘門三件套 |
 | `docs/07-webhook自動化.md` | token 驗證、事件路由、debounce、已知限制 |
 | `docs/08-學習迴路autopin.md` | 判例入庫 → 分群起草 → binding MR 人閘全鏈 |
@@ -82,7 +82,8 @@ SEGCRA-CR/
 
 - Python 3.12+
 - Ollama(本機或遠端 endpoint，見 §5 模型端點)
-- 模型:`gemma4:31b`(審查主力，對應 `review` profile)+ 一個小模型供開發迭代(預設 `gpt-oss:20b`,對應 `fast` profile;可換更小的，改 `config/models.yaml` 即可)
+- 模型:`gemma4:31b`(審查主力，對應 `review` profile)+ 一個小模型供開發迭代(預設 `gpt-oss:20b`,對應 `fast` profile;可換更小的,改 `config/models.yaml` 即可)
+- Docker:執行驗證的沙盒是一個 SQL Server 容器(`scripts/sandbox.sh`),約需 2GB 記憶體。**規則程式跑在 MS SQL 上,沙盒就必須是 MS SQL** —— 不同引擎在型別轉換、日期運算、除法上的語意不同,換引擎驗出的「通過」不能代表正式環境
 
 ## 3. 快速開始(mock 模式，不用 GitLab)
 
@@ -94,7 +95,11 @@ python3 -m venv .venv
 # 1) 管線煙霧測試(不呼叫模型):預掃 + 記憶 + spec 尋找是否正常
 .venv/bin/python demo.py --mr 001 --dry-run
 
-# 2) 完整審查(需要模型;預設 profile=review)
+# 啟動執行驗證沙盒(SQL Server,只綁 127.0.0.1;用完 scripts/sandbox.sh stop)
+cp config/sandbox.env.example config/sandbox.env    # 填入 SANDBOX_MSSQL_PASSWORD
+scripts/sandbox.sh start
+
+# 2) 完整審查(需要模型與沙盒;預設 profile=review)
 .venv/bin/python demo.py --mr 001
 .venv/bin/python demo.py --mr 001 --profile fast   # 開發時換小模型
 
@@ -124,12 +129,12 @@ python3 -m venv .venv
 一段白話:這條規則偵測什麼、何時通報。
 
 ## 資料表定義(釘死 schema;執行驗證以此建表)
-CREATE TABLE transactions(account_id INT, tx_time TIMESTAMP, ...);
+CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20), ...);
 
 ## 需求項目
 1. **交易範圍**:tx_type='WITHDRAW' AND channel='ATM'
 2. **閾值**:100,000 元;「達(含)」= `>= 100000`
-3. **時間窗**:半開區間(`>= :start_date AND < :end_date`)
+3. **時間窗**:半開區間(`>= @start_date AND < @end_date`)
 ...(每一條具體到可直接對照實作:含運算子、欄位、條件)
 
 ## 補充
@@ -138,9 +143,10 @@ CREATE TABLE transactions(account_id INT, tx_time TIMESTAMP, ...);
 
 要點:
 
-- **schema 必須釘死**(資料表定義段)。測資生成 agent 依此建表;沒有固定 schema 就無法執行驗證。
+- **schema 必須釘死**(資料表定義段),而且是 **T-SQL**。測資生成 agent 依此在 MS SQL 沙盒建表;沒有固定 schema 就無法執行驗證。注意兩個 T-SQL 的坑:`TIMESTAMP` 不是日期時間(是 rowversion,日期請用 `DATETIME2`);`NVARCHAR` / `VARCHAR` 不寫長度等於長度 1。
+- **程式與規格裡的 SQL 一律寫 T-SQL**:布林是 `BIT`(`= 1`,不是 `= TRUE`)、取小時用 `DATEPART(HOUR, x)`(不是 `EXTRACT`)、參數是 `@start_date` / `@end_date`。
 - **用語與含等一致**:「達/以上」= 含 = `>=`;「超過」= 不含 = `>`。測資會對每個數值門檻生成邊界案例(恰好等於門檻、差最小單位)，含等寫錯一定被抓。
-- 測資生成怎麼用它:agent 把需求項目拆成**原子條件**(過濾、閾值、時段、幣別、豁免、時間窗各自成條)，每條生成 true/false 兩向案例;之後由確定性程式逐案在 DuckDB 執行比對。
+- 測資生成怎麼用它:agent 把需求項目拆成**原子條件**(過濾、閾值、時段、幣別、豁免、時間窗各自成條)，每條生成 true/false 兩向案例;之後由確定性程式逐案在 MS SQL 沙盒執行比對。
 - **找不到 spec 會怎樣**:管線從 MR 的 SQL/標題/描述抓規則碼(`R-\d+`)，對應 `specs/<code>.md`(real 模式從 GitLab repo 的 `specs/` 目錄抓;mock 模式讀本地 `specs/`)。找不到 → major finding「無規格可驗，無法執行驗證」→ 決策至多 needs_human，**不會自動放行**。
 
 ### 範例:表格式規格 → md(導入時的第一件整理工作)
@@ -154,7 +160,7 @@ CREATE TABLE transactions(account_id INT, tx_time TIMESTAMP, ...);
 
 整理原則:**規格未載明的實作細節一律列入「待補」,不從程式碼腦補**。程式怎麼寫是實作,不等於規則的核定內容;把實作反寫成規格,等於讓錯誤的實作自我認證。跨來源不一致時,以核定規格為準。
 
-> 注意:這類程式是 dbt + Jinja + SQL Server 方言，本包的執行驗證吃**純 SQL**(postgres→duckdb 轉譯)。接實際環境時，規則 SQL 先 `dbt compile` 展開 macro/ref、把日期變數帶入，再送進管線——這是整合工作的一部分,範例的 macro(`is_inward_large` 等)展開後就是規格 md 裡的代碼清單 + 排除規則。
+> 注意:這類程式是 dbt + Jinja + T-SQL。執行驗證在 MS SQL 沙盒上原樣執行 T-SQL,但**目前還不會展開 dbt 樣板**(`{{ ref() }}`、`{{ var() }}`、macro):含樣板的檔案,預掃會報 major「預掃無法解析此檔的 SQL」、執行驗證會報 SQL 無法執行,兩者都會擋下自動放行,不會誤判通過。展開樣板是下一步的工作;範例的 macro(`is_inward_large` 等)展開後就是規格 md 裡的代碼清單 + 排除規則。
 
 ## 5. 接上 GitLab(CE)
 
@@ -329,7 +335,9 @@ ssh -L 8929:localhost:8929 <your-user>@<your-server>
 | webhook 完全收不到(GitLab 端顯示錯誤) | ① Admin Area → Settings → Network → Outbound requests 沒勾 **Allow requests to the local network from webhooks**;② URL 要用 `http://172.17.0.1:8000/...`(容器內打 `localhost` 是打容器自己);③ webhook server 沒起來(`curl http://127.0.0.1:8000/health`) |
 | MR 觸發了但沒審 | webhook server 的 stdout:同 MR debounce 中、或 action 不在 open/reopen/update |
 | 執行驗證報「無規格可驗」 | MR 的 SQL/標題/描述抓不到 `R-xxx` 規則碼，或 `specs/<code>.md` 不存在(real 模式看 GitLab repo 的 `specs/`;mock 模式看本地 `specs/`) |
-| DuckDB transpile 失敗 / SQL 無法在測資上執行 | 報告會帶 major「SQL 無法在測資上執行」與錯誤訊息。常見:方言特有語法(sqlglot 轉不動)、用了 spec 資料表定義沒有的欄位。SQL 應以 postgres 方言撰寫，時間參數用 `:start_date`/`:end_date` |
+| SQL 無法在測資上執行 | 報告會帶 major「SQL 無法在測資上執行」與 SQL Server 的錯誤訊息。常見:不是 T-SQL 寫法(`= TRUE`、`EXTRACT(...)`、`:start_date` 這類其他資料庫的語法)、用了 spec 資料表定義沒有的欄位、含 dbt 樣板。時間參數用 `@start_date` / `@end_date` |
+| 執行驗證報「沙盒不可用」 | 沙盒沒啟動或連不上:`scripts/sandbox.sh status`;沒啟動就 `scripts/sandbox.sh start`。沙盒不可用時一律不自動放行 |
+| 預掃報「無法解析此檔的 SQL」 | rule-base 的語法樹規則沒有執行(文字層規則如明碼憑證仍有效)。常見:非 T-SQL 語法、dbt 樣板未展開。這條是 major,會擋下自動放行 |
 | 測資生成一直失敗(測資生成失敗 finding) | 小模型產不出合法 JSON;把 `config/models.yaml` 的 `roles.testgen` 指到較大的 profile(預設 review) |
 | GitLab 網頁打不開 | 先在該主機上 `docker ps -a --filter name=segcra-gitlab` 看容器起了沒;剛啟動要等 1~4 分鐘(ready 判準見 §8);GitLab 在遠端時,自己電腦要掛著 `ssh -L 8929:localhost:8929 <your-user>@<your-server>` |
 | commit status 沒鎖住 Merge 按鈕 | 專案 Settings → Merge requests 沒勾 **Pipelines must succeed**;或審的是舊 commit(push 新 commit 後要重審) |
