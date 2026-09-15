@@ -96,7 +96,9 @@ python3 -m venv .venv
 .venv/bin/python demo.py --mr 001 --dry-run
 
 # 啟動執行驗證沙盒(SQL Server,只綁 127.0.0.1;用完 scripts/sandbox.sh stop)
-cp config/sandbox.env.example config/sandbox.env    # 填入 SANDBOX_MSSQL_PASSWORD
+cp config/sandbox.env.example config/sandbox.env
+#   自己起沙盒:自訂一組密碼填入 SANDBOX_MSSQL_PASSWORD,start 會用它建立容器
+#   連共用的沙盒:填管理者給的密碼(必須跟建立時相同),不需要執行 start
 scripts/sandbox.sh start
 
 # 2) 完整審查(需要模型與沙盒;預設 profile=review)
@@ -336,6 +338,7 @@ ssh -L 8929:localhost:8929 <your-user>@<your-server>
 | MR 觸發了但沒審 | webhook server 的 stdout:同 MR debounce 中、或 action 不在 open/reopen/update |
 | 執行驗證報「無規格可驗」 | MR 的 SQL/標題/描述抓不到 `R-xxx` 規則碼，或 `specs/<code>.md` 不存在(real 模式看 GitLab repo 的 `specs/`;mock 模式看本地 `specs/`) |
 | SQL 無法在測資上執行 | 報告會帶 major「SQL 無法在測資上執行」與 SQL Server 的錯誤訊息。常見:不是 T-SQL 寫法(`= TRUE`、`EXTRACT(...)`、`:start_date` 這類其他資料庫的語法)、用了 spec 資料表定義沒有的欄位、含 dbt 樣板。時間參數用 `@start_date` / `@end_date` |
+| 沙盒登入失敗(`Login failed for user 'sa'`) | `config/sandbox.env` 的密碼跟沙盒建立時的不同。共用沙盒的密碼向管理者取得,不是自己設的 |
 | 執行驗證報「沙盒不可用」 | 沙盒沒啟動或連不上:`scripts/sandbox.sh status`;沒啟動就 `scripts/sandbox.sh start`。沙盒不可用時一律不自動放行 |
 | 預掃報「無法解析此檔的 SQL」 | rule-base 的語法樹規則沒有執行(文字層規則如明碼憑證仍有效)。常見:非 T-SQL 語法、dbt 樣板未展開。這條是 major,會擋下自動放行 |
 | 測資生成一直失敗(測資生成失敗 finding) | 小模型產不出合法 JSON;把 `config/models.yaml` 的 `roles.testgen` 指到較大的 profile(預設 review) |
