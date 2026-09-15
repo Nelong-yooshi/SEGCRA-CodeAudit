@@ -469,7 +469,7 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
     passed = bool(effective) and not sql_faults and not coverage_gaps
     if passed:
         findings.append(_finding(path, "info",
-                                 f"執行驗證通過({len(effective)} 案例全數相符)",
+                                 f"執行驗證未發現不符({len(effective)} 案例)",
                                  f"規則 {spec_code} 的每個原子條件 true/false 兩向與邊界案例"
                                  f"皆與規格預期一致。"))
     return {"passed": passed, "spec_code": spec_code, "engine": ex["engine"],
