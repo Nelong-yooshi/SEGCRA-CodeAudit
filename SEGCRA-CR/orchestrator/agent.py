@@ -30,11 +30,14 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
 
     tool_kwargs = ({"tools": hub.openai_tools, "tool_choice": "auto"}
                    if use_tools and hub else {})
+    # seed 沒設定(None)時不傳這個參數,讓模型維持原本的隨機性(能力報告用)
+    seed_kwargs = {"seed": profile.seed} if profile.seed is not None else {}
     for i in range(MAX_ITERATIONS):
         resp = await client.chat.completions.create(
             model=profile.model, messages=messages, **tool_kwargs,
             temperature=profile.temperature,
             max_tokens=profile.max_output_tokens,
+            **seed_kwargs,
         )
         msg = resp.choices[0].message
         messages.append(msg.model_dump(exclude_none=True))

@@ -4,16 +4,25 @@ endpoint: http://localhost:11434/v1
 api_key: ollama          # Ollama 不驗證,佔位即可
 default_profile: review
 
+# temperature/seed 的方針(對應 eval/README.md「發現三:測資生成覆蓋度不穩定」):
+# - 回歸比較(eval/run_eval.py 平常跑法):固定 temperature 0 + 固定 seed,求可重現
+#   ——不然同一份輸入兩次跑出不同結果,分不清是「真的改壞了」還是「本來就會變」。
+# - 出能力報告(要看模型真實表現的分布,例如量測資生成覆蓋度多不穩):保留隨機性、
+#   同一個 case 跑多次、報告分布——不要改這裡,跑的時候用環境變數暫時覆蓋:
+#     LLM_TEMPERATURE=0.1 LLM_SEED= .venv/bin/python eval/run_eval.py ...
+#   (LLM_SEED 設空字串 = 取消固定 seed,恢復隨機)
 profiles:
   review:                # 審查主力(tag 以 ollama registry 實際名稱為準)
     model: gemma4:31b
     num_ctx: 32768
-    temperature: 0.1
+    temperature: 0
+    seed: 42
     max_output_tokens: 8192
   fast:                  # 開發迭代用;可換更小的模型(如 qwen3:8b),先 ollama pull
     model: gpt-oss:20b
     num_ctx: 16384
-    temperature: 0.1
+    temperature: 0
+    seed: 42
     max_output_tokens: 8192
 
 # 執行驗證的兩個 agent 角色各自可指定 profile;預設同 review

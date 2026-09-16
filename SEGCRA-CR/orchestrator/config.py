@@ -13,6 +13,7 @@ class ModelProfile:
     num_ctx: int
     temperature: float
     max_output_tokens: int
+    seed: int | None = None
 
 
 @dataclass
@@ -27,7 +28,16 @@ class Config:
 
     def profile(self, name: str | None = None) -> ModelProfile:
         p = self.profiles[name or self.default_profile]
-        return ModelProfile(**p)
+        prof = ModelProfile(**p)
+        # 出能力報告(多次取樣看分布)要暫時關掉固定的 temperature/seed,
+        # 不為了這件事另開 profile 或動 yaml —— 環境變數覆蓋就好。
+        # LLM_SEED 設成空字串代表「取消固定 seed,恢復隨機」。
+        if "LLM_TEMPERATURE" in os.environ:
+            prof.temperature = float(os.environ["LLM_TEMPERATURE"])
+        if "LLM_SEED" in os.environ:
+            v = os.environ["LLM_SEED"].strip()
+            prof.seed = int(v) if v else None
+        return prof
 
     def role_profile(self, role: str) -> ModelProfile:
         """依角色(testgen / arbiter)取模型 profile;未設定則用預設 profile。"""
