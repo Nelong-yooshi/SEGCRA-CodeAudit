@@ -2,5 +2,5 @@
 # 確定性測試只需要展開(jinja2)與解析(sqlglot),不碰 LLM 也不連資料庫。
 # 全裝的話 pymssql 會在 CI 上要求編譯 freetds,平白讓 workflow 失敗。
 pytest>=8.0
-jinja2>=3.1
+jinja2>=3.1.6
 sqlglot>=25.0

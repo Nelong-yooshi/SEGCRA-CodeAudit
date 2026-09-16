@@ -6,15 +6,23 @@ on:
     branches: [main]
   pull_request:
 
+# PR 送進來的程式碼會在 CI 裡執行 → token 只給讀取權限,不使用任何 secret。
+permissions:
+  contents: read
+
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: SEGCRA-CR
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      # 第三方 action 釘選到 commit SHA:tag 可以被改指向別的程式碼,SHA 不行(供應鏈攻擊)
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false   # 不把 token 留在 .git/config 給後續步驟讀到
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
       - name: Install deps
@@ -22,4 +30,4 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
       - name: Run tests
-        run: pytest -q
+        run: pytest -q -p no:cacheprovider -rs

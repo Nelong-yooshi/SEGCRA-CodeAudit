@@ -1,0 +1,26 @@
+# 對照專案的連線設定。本檔不得出現任何實際帳號、密碼或主機位址。
+#
+# sqlserver:結構比照正式環境(type: sqlserver、單一資料庫、dbo),資料庫為假名。
+#   dbt-sqlserver 即使 --no-introspect 仍會實際連線,需要 ODBC Driver 18 與
+#   一台可連的 SQL Server;帳密一律走環境變數。
+# duckdb:內嵌式資料庫,不需伺服器與驅動。樣板展開由 dbt-core 負責、與轉接器無關;
+#   以檔名 SAMPLE_DW 讓資料庫名與 sqlserver 目標一致,產出格式同為
+#   "SAMPLE_DW"."dbo"."<表>"。
+segcra_reference:
+  target: sqlserver
+  outputs:
+    duckdb:
+      type: duckdb
+      path: SAMPLE_DW.duckdb
+      schema: dbo
+    sqlserver:
+      type: sqlserver
+      driver: "ODBC Driver 18 for SQL Server"
+      server: localhost
+      port: 1433
+      database: SAMPLE_DW
+      schema: dbo
+      user: "{{ env_var('SEGCRA_REF_DB_USER') }}"
+      password: "{{ env_var('SEGCRA_REF_DB_PASSWORD') }}"
+      encrypt: true
+      trust_cert: true
