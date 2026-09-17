@@ -108,7 +108,8 @@ def build_project(tmp: pathlib.Path) -> None:
         _write_exact(tmp / p.relative_to(SAMPLE), read_canonical(p))
 
 
-def run_compile(dbt: str, tmp: pathlib.Path, target: str) -> None:
+def dbt_env(tmp: pathlib.Path) -> dict[str, str]:
+    """傳給 dbt 子行程的環境變數:白名單 + 關閉使用統計 + 佔位帳密。"""
     env = {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
     env.update({
         "DO_NOT_TRACK": "1",
@@ -117,17 +118,25 @@ def run_compile(dbt: str, tmp: pathlib.Path, target: str) -> None:
         "PYTHONUTF8": "1",
         "DBT_LOG_PATH": str(tmp / "logs"),
     })
-    # 未提供帳密時填佔位值,讓 profile 解析得過(duckdb 目標根本用不到)。
+    # 未提供帳密時填佔位值,讓 profile 解析得過(compile --no-introspect / parse 不需要)。
     env.setdefault("SEGCRA_REF_DB_USER", "unused")
     env.setdefault("SEGCRA_REF_DB_PASSWORD", "unused")
-    cmd = [dbt, "compile", "--no-introspect", "--target", target,
-           "--project-dir", str(tmp), "--profiles-dir", str(tmp),
-           "--vars", VARS, "--select", *reference_sources()]
-    proc = subprocess.run(cmd, cwd=tmp, env=env, capture_output=True,
+    return env
+
+
+def run_dbt(dbt: str, tmp: pathlib.Path, args: list[str]) -> None:
+    """以參數清單呼叫 dbt(不經 shell);失敗時印出輸出尾段並結束。"""
+    cmd = [dbt, *args, "--project-dir", str(tmp), "--profiles-dir", str(tmp)]
+    proc = subprocess.run(cmd, cwd=tmp, env=dbt_env(tmp), capture_output=True,
                           text=True, encoding="utf-8", errors="replace")
     if proc.returncode != 0:
         sys.stderr.write((proc.stdout or "")[-4000:] + (proc.stderr or "")[-4000:])
-        raise SystemExit(f"dbt compile 失敗(exit {proc.returncode})")
+        raise SystemExit(f"dbt {args[0]} 失敗(exit {proc.returncode})")
+
+
+def run_compile(dbt: str, tmp: pathlib.Path, target: str) -> None:
+    run_dbt(dbt, tmp, ["compile", "--no-introspect", "--target", target,
+                       "--vars", VARS, "--select", *reference_sources()])
 
 
 def collect(tmp: pathlib.Path, target: str) -> list[pathlib.Path]:

@@ -18,6 +18,7 @@
 import ast
 import importlib.util
 import json
+import os
 import pathlib
 import random
 import time
@@ -31,6 +32,7 @@ from orchestrator.dbt_render import (
     _map_from_difflib, _mask_tags, build_env, is_dbt_template, render_model,
     render_model_isolated,
 )
+from orchestrator.isolation import run_isolated
 
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
 CODE_ROOT = PKG_ROOT / "examples" / "sample" / "RETAIL_M1_code"
@@ -694,23 +696,37 @@ def test_difflib_is_skipped_for_huge_inputs(monkeypatch):
 
 
 # --- 本模組的能力範圍 ---
-def test_renderer_imports_are_allowlisted():
-    """展開器不得悄悄獲得網路、指令執行、檔案寫入等能力。新增 import 必須刻意更新這裡。"""
-    tree = ast.parse(DBT_RENDER_PY.read_text(encoding="utf-8"))
+def _imports_of(path: pathlib.Path) -> set[str]:
+    """模組 import 的頂層名稱;相對 import 以 "." 加模組名表示。"""
     imported = set()
-    for node in ast.walk(tree):
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
         if isinstance(node, ast.Import):
             imported |= {a.name.split(".")[0] for a in node.names}
-        elif isinstance(node, ast.ImportFrom) and node.level == 0:
-            imported.add(node.module.split(".")[0])
-    assert imported == {"copy", "dataclasses", "difflib", "jinja2", "multiprocessing",
-                        "pathlib", "re", "resource", "secrets", "types"}
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(("." * node.level) + (node.module or "").split(".")[0])
+    return imported
 
 
-def test_renderer_never_writes_files():
-    code = DBT_RENDER_PY.read_text(encoding="utf-8")
-    for forbidden in ("write_text", "write_bytes", "open(", "unlink", "rmtree", "mkdir"):
-        assert forbidden not in code, forbidden
+@pytest.mark.parametrize("module, allowed", [
+    ("dbt_render.py", {"copy", "dataclasses", "difflib", "jinja2", "pathlib", "re",
+                       "secrets", "types", ".isolation"}),
+    ("isolation.py", {"multiprocessing", "resource"}),
+])
+def test_module_imports_are_allowlisted(module, allowed):
+    """處理不可信內容的模組不得悄悄獲得網路、指令執行、檔案寫入等能力。
+    新增 import 必須刻意更新這裡。"""
+    assert _imports_of(PKG_ROOT / "orchestrator" / module) == allowed
+
+
+@pytest.mark.parametrize("module", ["dbt_render.py", "isolation.py"])
+def test_modules_never_write_files_or_exec(module):
+    """以語法樹檢查(不用子字串比對,避免誤判或換個寫法就漏判):不寫檔、不執行程式碼。"""
+    tree = ast.parse((PKG_ROOT / "orchestrator" / module).read_text(encoding="utf-8"))
+    names = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+    attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+    assert not names & {"open", "eval", "exec", "compile", "__import__", "input", "breakpoint"}
+    assert not attrs & {"write_text", "write_bytes", "open", "unlink", "mkdir", "rmdir", "rmtree",
+                        "system", "popen", "chmod", "rename", "replace_file", "symlink_to"}
 
 
 # ---------------------------------------------------------------- 隔離展開
@@ -735,6 +751,19 @@ def test_isolated_render_failures_are_sanitized(tmp_path):
     r = render_model_isolated(tmp_path / "secret_dir_name" / "m.sql", database=SAMPLE_DB)
     assert not r.ok
     assert "secret_dir_name" not in r.error
+
+
+def _isolated(fn, *args):
+    return run_isolated(fn, args, timeout_s=60, max_memory_mb=1024, on_failure=lambda m: ("失敗", m))
+
+
+def test_isolation_returns_result_and_fails_closed_on_crash_or_exception():
+    """共用的子行程執行器:成功回傳結果;子行程直接結束或拋例外都收斂成失敗,且不帶出輸入內容。"""
+    assert _isolated(len, "abc") == 3
+    crashed = _isolated(os._exit, 3)             # 子行程沒送出結果就結束(類似被系統終止)
+    assert crashed[0] == "失敗" and "異常結束" in crashed[1] and "3" in crashed[1]
+    raised = _isolated(int, "secret-input-value")
+    assert raised == ("失敗", "ValueError: 子行程執行失敗")
 
 
 @pytest.mark.skipif(importlib.util.find_spec("resource") is None,

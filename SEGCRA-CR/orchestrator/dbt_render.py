@@ -80,7 +80,6 @@
 """
 import copy
 import difflib
-import multiprocessing
 import pathlib
 import re
 import secrets
@@ -91,6 +90,8 @@ import jinja2
 from jinja2 import StrictUndefined, Undefined
 from jinja2.defaults import DEFAULT_NAMESPACE
 from jinja2.sandbox import SandboxedEnvironment
+
+from .isolation import run_isolated
 
 # 沙箱逃逸已修補的最低版本:3.1.5 修 CVE-2024-56326,3.1.6 修 CVE-2025-27516
 MIN_JINJA_VERSION = (3, 1, 6)
@@ -649,25 +650,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
 
 
 # ------------------------------------------------------------------ 隔離展開
-def _isolated_worker(conn, max_memory_mb: int, args: tuple, kwargs: dict) -> None:
-    """子行程進入點:先設記憶體上限(支援的平台),再展開,結果經 pipe 傳回。"""
-    try:
-        import resource   # 僅 Unix 有
-
-        limit = max_memory_mb * 1024 * 1024
-        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-    except (ImportError, ValueError, OSError):
-        pass              # Windows 等平台:只剩逾時與模組內的資源上限
-    try:
-        result = render_model(*args, **kwargs)
-    except BaseException as e:   # 含 MemoryError
-        result = RenderResult(ok=False, error=_safe_error(e))
-    try:
-        conn.send(result)
-    except BaseException:
-        pass
-    finally:
-        conn.close()
+def _render_failure(message: str) -> RenderResult:
+    return RenderResult(ok=False, error=message)
 
 
 def render_model_isolated(model_path, *, timeout_s: float = DEFAULT_ISOLATED_TIMEOUT_S,
@@ -676,39 +660,13 @@ def render_model_isolated(model_path, *, timeout_s: float = DEFAULT_ISOLATED_TIM
     """在獨立子行程中展開(參數同 render_model)。**待審的 MR 內容一律走這個。**
 
     Jinja 沙箱防得了任意程式執行,防不了「一個跑不完的迴圈」或「一個吃光記憶體的
-    字串」。這裡用行程邊界兜底:超過 timeout_s 秒強制終止;Linux 上另以 RLIMIT_AS
-    限制記憶體。任何異常一律收斂成 ok=False。
+    字串」。這裡用行程邊界兜底(見 isolation.run_isolated):超過 timeout_s 秒強制
+    終止;Linux 上另以 RLIMIT_AS 限制記憶體。任何異常一律收斂成 ok=False。
 
     呼叫端程式的進入點需有 `if __name__ == "__main__":` 保護(multiprocessing spawn 的要求)。
     """
-    ctx = multiprocessing.get_context("spawn")
-    recv_conn, send_conn = ctx.Pipe(duplex=False)
-    proc = ctx.Process(target=_isolated_worker, daemon=True,
-                       args=(send_conn, max_memory_mb, (model_path,), kwargs))
-    proc.start()
-    send_conn.close()
-    crashed = False
-    try:
-        if recv_conn.poll(timeout_s):
-            try:
-                result = recv_conn.recv()
-            except (EOFError, OSError):
-                crashed = True     # 子行程沒送出結果就結束(例如被系統因記憶體不足終止)
-        else:
-            result = RenderResult(ok=False,
-                                  error=f"DbtRenderError: 展開逾時(超過 {timeout_s} 秒),已強制終止")
-    finally:
-        recv_conn.close()
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(5)
-            if proc.is_alive():
-                proc.kill()
-        proc.join(5)
-    if crashed:
-        return RenderResult(ok=False, error=(
-            f"DbtRenderError: 展開子行程異常結束(結束代碼 {proc.exitcode}),"
-            f"可能是資源耗盡或執行環境無法啟動子行程"))
+    result = run_isolated(render_model, (model_path,), kwargs, timeout_s=timeout_s,
+                          max_memory_mb=max_memory_mb, on_failure=_render_failure)
     if not isinstance(result, RenderResult):
-        return RenderResult(ok=False, error="DbtRenderError: 展開子行程回傳了非預期的資料")
+        return _render_failure("DbtRenderError: 展開子行程回傳了非預期的資料")
     return result
