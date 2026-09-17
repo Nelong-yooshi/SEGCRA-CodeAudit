@@ -23,4 +23,7 @@ segcra_reference:
       user: "{{ env_var('SEGCRA_REF_DB_USER') }}"
       password: "{{ env_var('SEGCRA_REF_DB_PASSWORD') }}"
       encrypt: true
-      trust_cert: true
+      # 驗證伺服器憑證,不信任自簽憑證。產生標準答案用不到連線(duckdb 目標與 dbt parse
+      # 都不連線);若在本機測試機實際連線遇到憑證錯誤,請把測試機的 CA 加入信任,
+      # 不要改成 true —— 關閉驗證會讓連線可被中間人攔截,也不應被照抄到正式環境。
+      trust_cert: false

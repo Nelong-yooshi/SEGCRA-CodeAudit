@@ -15,6 +15,9 @@ review_output/
 **/dbt_reference/target/
 **/dbt_reference/logs/
 **/dbt_reference/dbt_packages/
+**/dbt_impact_reference/target/
+**/dbt_impact_reference/logs/
+**/dbt_impact_reference/dbt_packages/
 *.duckdb
 *.duckdb.wal
 
