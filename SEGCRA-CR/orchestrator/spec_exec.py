@@ -470,8 +470,9 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
     if passed:
         findings.append(_finding(path, "info",
                                  f"執行驗證未發現不符({len(effective)} 案例)",
-                                 f"規則 {spec_code} 的每個原子條件 true/false 兩向與邊界案例"
-                                 f"皆與規格預期一致。"))
+                                 f"依規格 {spec_code} 生成的 {len(effective)} 個案例"
+                                 f"(涵蓋每個拆出條件的真/假兩向與邊界值),實際結果皆與預期"
+                                 f"相同;案例沒有涵蓋到的情境不在此驗證範圍內。"))
     return {"passed": passed, "spec_code": spec_code, "engine": ex["engine"],
             "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
             "case_results": ex["case_results"], "dropped_cases": dropped_cases,
