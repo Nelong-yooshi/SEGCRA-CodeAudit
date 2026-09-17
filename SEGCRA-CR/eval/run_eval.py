@@ -33,6 +33,11 @@ GOLDEN_DIR = EVAL_DIR / "golden"
 os.environ["FIXTURES_DIR"] = str(GOLDEN_DIR)
 os.environ["REVIEW_OUTPUT"] = str(EVAL_DIR / "_output")
 
+# 回歸比較預設固定 temperature 0 + seed 42,求可重現;正式審查不受影響(models.yaml 維持原值)。
+# 用 setdefault:呼叫端明確設的環境變數優先(含 LLM_SEED= 空字串代表取消固定 seed)。
+os.environ.setdefault("LLM_TEMPERATURE", "0")
+os.environ.setdefault("LLM_SEED", "42")
+
 sys.path.insert(0, str(PKG_ROOT))
 
 from orchestrator.config import load_config  # noqa: E402
