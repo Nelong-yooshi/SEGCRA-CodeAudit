@@ -1,0 +1,696 @@
+{
+ "project": "rnd_project",
+ "projects": [
+  {
+   "deps": {
+    "macros": {
+     "m0": {
+      "macros": [],
+      "path": "macros/c/d/f2.sql"
+     },
+     "m1": {
+      "macros": [],
+      "path": "macros/c/d/f2.sql"
+     },
+     "m2": {
+      "macros": [
+       "rnd_project.m3",
+       "rnd_project.m4"
+      ],
+      "path": "macros/b/f1.sql"
+     },
+     "m3": {
+      "macros": [],
+      "path": "macros/c/d/f2.sql"
+     },
+     "m4": {
+      "macros": [],
+      "path": "macros/a/f3.sql"
+     }
+    },
+    "models": {
+     "models/M0.sql": {
+      "macros": [
+       "rnd_project.m4"
+      ]
+     },
+     "models/M1.sql": {
+      "macros": [
+       "rnd_project.m1",
+       "rnd_project.m2",
+       "rnd_project.m3",
+       "rnd_project.m4"
+      ]
+     },
+     "models/M3.sql": {
+      "macros": [
+       "rnd_project.m1"
+      ]
+     },
+     "models/sub/M2.sql": {
+      "macros": [
+       "rnd_project.m0",
+       "rnd_project.m4"
+      ]
+     }
+    },
+    "operations": {}
+   },
+   "files": {
+    "dbt_project.yml": "name: rnd_project\nversion: \"1.0.0\"\nconfig-version: 2\nprofile: segcra_reference\nmodel-paths: [\"models\"]\nmacro-paths: [\"macros\"]\nflags:\n  send_anonymous_usage_stats: false\n",
+    "macros/a/f3.sql": "{% macro m4() %}1{% endmacro %}\n",
+    "macros/b/f1.sql": "{% macro m2() %}{{ m3() }} {{ m4() }}{% endmacro %}\n",
+    "macros/c/d/f2.sql": "{% macro m0() %}1{% endmacro %}\n{% macro m1() %}1{% endmacro %}\n{% macro m3() %}1{% endmacro %}\n",
+    "models/M0.sql": "SELECT 0 AS c {{ m4() }}\n",
+    "models/M1.sql": "{{ config(post_hook='{{ m2() }}') }}\nSELECT 1 AS c {{ rnd_project.m1() }} {{ rnd_project.m3() }} {% set f_m4 = m4 %}{{ f_m4() }}\n",
+    "models/M3.sql": "SELECT 3 AS c {% set f_m1 = m1 %}{{ f_m1() }}\n",
+    "models/sub/M2.sql": "SELECT 2 AS c {{ m0() }} {{ m4() }}\n"
+   }
+  },
+  {
+   "deps": {
+    "macros": {
+     "default__m5": {
+      "macros": [],
+      "path": "macros/c/d/f2.sql"
+     },
+     "m0": {
+      "macros": [
+       "rnd_project.m1",
+       "rnd_project.m2"
+      ],
+      "path": "macros/b/f3.sql"
+     },
+     "m1": {
+      "macros": [
+       "rnd_project.m2"
+      ],
+      "path": "macros/a/f3.sql"
+     },
+     "m2": {
+      "macros": [],
+      "path": "macros/c/d/f1.sql"
+     },
+     "m3": {
+      "macros": [],
+      "path": "macros/b/f1.sql"
+     },
+     "m4": {
+      "macros": [
+       "rnd_project.default__m5"
+      ],
+      "path": "macros/c/d/f1.sql"
+     }
+    },
+    "models": {
+     "models/M0.sql": {
+      "macros": [
+       "rnd_project.m1"
+      ]
+     },
+     "models/M1.sql": {
+      "macros": [
+       "rnd_project.m3",
+       "rnd_project.m4"
+      ]
+     },
+     "models/M2.sql": {
+      "macros": [
+       "rnd_project.m1"
+      ]
+     },
+     "models/sub/M3.sql": {
+      "macros": [
+       "rnd_project.m1"
+      ]
+     }
+    },
+    "operations": {}
+   },
+   "files": {
+    "dbt_project.yml": "name: rnd_project\nversion: \"1.0.0\"\nconfig-version: 2\nprofile: segcra_reference\nmodel-paths: [\"models\"]\nmacro-paths: [\"macros\"]\nflags:\n  send_anonymous_usage_stats: false\n",
+    "macros/a/f3.sql": "{% macro m1() %}{{ m2() }}{% endmacro %}\n",
+    "macros/b/f1.sql": "{% macro m3() %}1{% endmacro %}\n",
+    "macros/b/f3.sql": "{% macro m0() %}{{ rnd_project.m1() }} {{ m2() }}{% endmacro %}\n",
+    "macros/c/d/f1.sql": "{% macro m2() %}1{% endmacro %}\n{% macro m4() %}{{ adapter.dispatch('m5')() }}{% endmacro %}\n",
+    "macros/c/d/f2.sql": "{% macro default__m5() %}1{% endmacro %}\n",
+    "models/M0.sql": "SELECT 0 AS c {{ rnd_project.m1() }}\n",
+    "models/M1.sql": "{{ config(post_hook='{{ m3() }}') }}\nSELECT 1 AS c {{ m4() }}\n",
+    "models/M2.sql": "SELECT 2 AS c {{ m1() }}\n",
+    "models/sub/M3.sql": "SELECT 3 AS c {{ m1() }}\n"
+   }
+  },
+  {
+   "deps": {
+    "macros": {
+     "m0": {
+      "macros": [
+       "rnd_project.m2",
+       "rnd_project.m3"
+      ],
+      "path": "macros/c/d/f2.sql"
+     },
+     "m1": {
+      "macros": [
+       "rnd_project.m2"
+      ],
+      "path": "macros/b/f1.sql"
+     },
+     "m2": {
+      "macros": [],
+      "path": "macros/b/f1.sql"
+     },
+     "m3": {
+      "macros": [],
+      "path": "macros/a/f0.sql"
+     },
+     "m4": {
+      "macros": [],
+      "path": "macros/c/d/f1.sql"
+     }
+    },
+    "models": {
+     "models/M0.sql": {
+      "macros": [
+       "rnd_project.m0",
+       "rnd_project.m2",
+       "rnd_project.m4"
+      ]
+     },
+     "models/M1.sql": {
+      "macros": [
+       "rnd_project.m2",
+       "rnd_project.m3",
+       "rnd_project.m4"
+      ]
+     },
+     "models/M3.sql": {
+      "macros": [
+       "rnd_project.m0",
+       "rnd_project.m2"
+      ]
+     },
+     "models/sub/M2.sql": {
+      "macros": [
+       "rnd_project.m2"
+      ]
+     }
+    },
+    "operations": {}
+   },
+   "files": {
+    "dbt_project.yml": "name: rnd_project\nversion: \"1.0.0\"\nconfig-version: 2\nprofile: segcra_reference\nmodel-paths: [\"models\"]\nmacro-paths: [\"macros\"]\nflags:\n  send_anonymous_usage_stats: false\n",
+    "macros/a/f0.sql": "{% macro m3() %}1{% endmacro %}\n",
+    "macros/b/f1.sql": "{% macro m1() %}{{ m2() }} {% set f_m3 = m3 %}{{ f_m3() }} {% set f_m4 = m4 %}{{ f_m4() }}{% endmacro %}\n{% macro m2() %}1{% endmacro %}\n",
+    "macros/c/d/f1.sql": "{% macro m4() %}1{% endmacro %}\n",
+    "macros/c/d/f2.sql": "{% macro m0() %}{{ m2() }} {{ m3() }}{% endmacro %}\n",
+    "models/M0.sql": "{{ config(post_hook='{{ m2() }}') }}\nSELECT 0 AS c {% set f_m0 = m0 %}{{ f_m0() }} {% set f_m4 = m4 %}{{ f_m4() }}\n",
+    "models/M1.sql": "{{ config(post_hook='{{ m2() }}') }}\nSELECT 1 AS c {{ rnd_project.m3() }} {{ rnd_project.m4() }}\n",
+    "models/M3.sql": "{{ config(post_hook='{{ m0() }}') }}\nSELECT 3 AS c {{ rnd_project.m2() }}\n",
+    "models/sub/M2.sql": "{{ config(post_hook='{{ m2() }}') }}\nSELECT 2 AS c {% set f_m2 = m2 %}{{ f_m2() }}\n"
+   }
+  },
+  {
+   "deps": {
+    "macros": {
+     "default__m1": {
+      "macros": [],
+      "path": "macros/c/d/f3.sql"
+     },
+     "default__m3": {
+      "macros": [],
+      "path": "macros/c/d/f1.sql"
+     },
+     "m0": {
+      "macros": [],
+      "path": "macros/b/f2.sql"
+     },
+     "m2": {
+      "macros": [],
+      "path": "macros/b/f3.sql"
+     }
+    },
+    "models": {
+     "models/M0.sql": {
+      "macros": [
+       "rnd_project.m2"
+      ]
+     },
+     "models/M1.sql": {
+      "macros": [
+       "rnd_project.default__m3",
+       "rnd_project.m0"
+      ]
+     }
+    },
+    "operations": {
+     "rnd_project-on-run-end-0": {
+      "macros": [
+       "rnd_project.m2"
+      ]
+     }
+    }
+   },
+   "files": {
+    "dbt_project.yml": "name: rnd_project\nversion: \"1.0.0\"\nconfig-version: 2\nprofile: segcra_reference\nmodel-paths: [\"models\"]\nmacro-paths: [\"macros\"]\non-run-end:\n  - \"{{ m2() }}\"\nflags:\n  send_anonymous_usage_stats: false\n",
+    "macros/b/f2.sql": "{% macro m0() %}1{% endmacro %}\n",
+    "macros/b/f3.sql": "{% macro m2() %}1{% endmacro %}\n",
+    "macros/c/d/f1.sql": "{% macro default__m3() %}1{% endmacro %}\n",
+    "macros/c/d/f3.sql": "{% macro default__m1() %}1{% endmacro %}\n",
+    "models/M0.sql": "SELECT 0 AS c {{ rnd_project.m2() }}\n",
+    "models/M1.sql": "{{ config(post_hook='{{ adapter.dispatch(\\'m3\\')() }}') }}\nSELECT 1 AS c {{ rnd_project.m0() }}\n"
+   }
+  },
+  {
+   "deps": {
+    "macros": {
+     "default__m2": {
+      "macros": [],
+      "path": "macros/c/d/f2.sql"
+     },
+     "default__m3": {
+      "macros": [],
+      "path": "macros/a/f3.sql"
+     },
+     "m0": {
+      "macros": [],
+      "path": "macros/c/d/f1.sql"
+     },
+     "m1": {
+      "macros": [],
+      "path": "macros/a/f1.sql"
+     }
+    },
+    "models": {
+     "models/M0.sql": {
+      "macros": []
+     },
+     "models/sub/M1.sql": {
+      "macros": [
+       "rnd_project.m0",
+       "rnd_project.m1"
+      ]
+     },
+     "models/sub/M2.sql": {
+      "macros": [
+       "rnd_project.default__m2",
+       "rnd_project.default__m3"
+      ]
+     },
+     "models/sub/M3.sql": {
+      "macros": [
+       "rnd_project.default__m3",
+       "rnd_project.m0"
+      ]
+     }
+    },
+    "operations": {
+     "rnd_project-on-run-end-0": {
+      "macros": [
+       "rnd_project.default__m3"
+      ]
+     }
+    }
+   },
+   "files": {
+    "dbt_project.yml": "name: rnd_project\nversion: \"1.0.0\"\nconfig-version: 2\nprofile: segcra_reference\nmodel-paths: [\"models\"]\nmacro-paths: [\"macros\"]\non-run-end:\n  - \"{{ adapter.dispatch('m3')() }}\"\nflags:\n  send_anonymous_usage_stats: false\n",
+    "macros/a/f1.sql": "{% macro m1() %}1{% endmacro %}\n",
+    "macros/a/f3.sql": "{% macro default__m3() %}1{% endmacro %}\n",
+    "macros/c/d/f1.sql": "{% macro m0() %}1{% endmacro %}\n",
+    "macros/c/d/f2.sql": "{% macro default__m2() %}1{% endmacro %}\n",
+    "models/M0.sql": "SELECT 0 AS c \n",
+    "models/sub/M1.sql": "SELECT 1 AS c {{ rnd_project.m0() }} {% set f_m1 = m1 %}{{ f_m1() }}\n",
+    "models/sub/M2.sql": "SELECT 2 AS c {{ adapter.dispatch('m2')() }} {{ adapter.dispatch('m3')() }}\n",
+    "models/sub/M3.sql": "{{ config(post_hook='{{ m0() }}') }}\nSELECT 3 AS c {{ m0() }} {{ adapter.dispatch('m3')() }}\n"
+   }
+  },
+  {
+   "deps": {
+    "macros": {
+     "m0": {
+      "macros": [],
+      "path": "macros/b/f0.sql"
+     },
+     "m1": {
+      "macros": [],
+      "path": "macros/a/f2.sql"
+     },
+     "m2": {
+      "macros": [],
+      "path": "macros/b/f0.sql"
+     }
+    },
+    "models": {
+     "models/M1.sql": {
+      "macros": [
+       "rnd_project.m0",
+       "rnd_project.m1"
+      ]
+     },
+     "models/sub/M0.sql": {
+      "macros": [
+       "rnd_project.m0",
+       "rnd_project.m2"
+      ]
+     }
+    },
+    "operations": {}
+   },
+   "files": {
+    "dbt_project.yml": "name: rnd_project\nversion: \"1.0.0\"\nconfig-version: 2\nprofile: segcra_reference\nmodel-paths: [\"models\"]\nmacro-paths: [\"macros\"]\nflags:\n  send_anonymous_usage_stats: false\n",
+    "macros/a/f2.sql": "{% macro m1() %}1{% endmacro %}\n",
+    "macros/b/f0.sql": "{% macro m0() %}1{% endmacro %}\n{% macro m2() %}1{% endmacro %}\n",
+    "models/M1.sql": "SELECT 1 AS c {{ rnd_project.m0() }} {{ m1() }}\n",
+    "models/sub/M0.sql": "SELECT 0 AS c {% set f_m0 = m0 %}{{ f_m0() }} {{ m2() }}\n"
+   }
+  },
+  {
+   "deps": {
+    "macros": {
+     "default__m5": {
+      "macros": [
+       "rnd_project.m7"
+      ],
+      "path": "macros/c/d/f1.sql"
+     },
+     "m0": {
+      "macros": [
+       "rnd_project.default__m5",
+       "rnd_project.m3",
+       "rnd_project.m4"
+      ],
+      "path": "macros/c/d/f2.sql"
+     },
+     "m1": {
+      "macros": [],
+      "path": "macros/c/d/f0.sql"
+     },
+     "m2": {
+      "macros": [],
+      "path": "macros/b/f1.sql"
+     },
+     "m3": {
+      "macros": [],
+      "path": "macros/b/f3.sql"
+     },
+     "m4": {
+      "macros": [],
+      "path": "macros/b/f0.sql"
+     },
+     "m6": {
+      "macros": [],
+      "path": "macros/c/d/f2.sql"
+     },
+     "m7": {
+      "macros": [],
+      "path": "macros/b/f1.sql"
+     },
+     "m8": {
+      "macros": [],
+      "path": "macros/a/f3.sql"
+     }
+    },
+    "models": {
+     "models/M0.sql": {
+      "macros": []
+     },
+     "models/M3.sql": {
+      "macros": [
+       "rnd_project.m0",
+       "rnd_project.m2",
+       "rnd_project.m3",
+       "rnd_project.m6",
+       "rnd_project.m7"
+      ]
+     },
+     "models/M4.sql": {
+      "macros": [
+       "rnd_project.default__m5",
+       "rnd_project.m0",
+       "rnd_project.m7"
+      ]
+     },
+     "models/sub/M1.sql": {
+      "macros": [
+       "rnd_project.m2",
+       "rnd_project.m3",
+       "rnd_project.m8"
+      ]
+     },
+     "models/sub/M2.sql": {
+      "macros": [
+       "rnd_project.m0",
+       "rnd_project.m1",
+       "rnd_project.m2",
+       "rnd_project.m7",
+       "rnd_project.m8"
+      ]
+     }
+    },
+    "operations": {}
+   },
+   "files": {
+    "dbt_project.yml": "name: rnd_project\nversion: \"1.0.0\"\nconfig-version: 2\nprofile: segcra_reference\nmodel-paths: [\"models\"]\nmacro-paths: [\"macros\"]\nflags:\n  send_anonymous_usage_stats: false\n",
+    "macros/a/f3.sql": "{% macro m8() %}1{% endmacro %}\n",
+    "macros/b/f0.sql": "{% macro m4() %}{% set f_m6 = m6 %}{{ f_m6() }}{% endmacro %}\n",
+    "macros/b/f1.sql": "{% macro m2() %}{% set f_m7 = m7 %}{{ f_m7() }}{% endmacro %}\n{% macro m7() %}1{% endmacro %}\n",
+    "macros/b/f3.sql": "{% macro m3() %}1{% endmacro %}\n",
+    "macros/c/d/f0.sql": "{% macro m1() %}{% set f_m8 = m8 %}{{ f_m8() }}{% endmacro %}\n",
+    "macros/c/d/f1.sql": "{% macro default__m5() %}{{ rnd_project.m7() }}{% endmacro %}\n",
+    "macros/c/d/f2.sql": "{% macro m0() %}{% set f_m1 = m1 %}{{ f_m1() }} {{ m3() }} {{ m4() }} {{ adapter.dispatch('m5')() }}{% endmacro %}\n{% macro m6() %}1{% endmacro %}\n",
+    "models/M0.sql": "SELECT 0 AS c \n",
+    "models/M3.sql": "SELECT 3 AS c {% set f_m0 = m0 %}{{ f_m0() }} {{ rnd_project.m2() }} {{ m3() }} {{ rnd_project.m6() }} {% set f_m7 = m7 %}{{ f_m7() }}\n",
+    "models/M4.sql": "SELECT 4 AS c {{ rnd_project.m0() }} {{ adapter.dispatch('m5')() }} {% set f_m7 = m7 %}{{ f_m7() }}\n",
+    "models/sub/M1.sql": "SELECT 1 AS c {% set f_m2 = m2 %}{{ f_m2() }} {{ rnd_project.m3() }} {% set f_m8 = m8 %}{{ f_m8() }}\n",
+    "models/sub/M2.sql": "{{ config(post_hook='{{ m0() }}') }}\nSELECT 2 AS c {{ m0() }} {{ rnd_project.m1() }} {{ rnd_project.m2() }} {% set f_m7 = m7 %}{{ f_m7() }} {{ m8() }}\n"
+   }
+  },
+  {
+   "deps": {
+    "macros": {
+     "default__m5": {
+      "macros": [],
+      "path": "macros/c/d/f1.sql"
+     },
+     "m0": {
+      "macros": [
+       "rnd_project.default__m5",
+       "rnd_project.m1",
+       "rnd_project.m6"
+      ],
+      "path": "macros/a/f3.sql"
+     },
+     "m1": {
+      "macros": [],
+      "path": "macros/c/d/f3.sql"
+     },
+     "m2": {
+      "macros": [
+       "rnd_project.m6"
+      ],
+      "path": "macros/b/f3.sql"
+     },
+     "m3": {
+      "macros": [
+       "rnd_project.m6"
+      ],
+      "path": "macros/b/f3.sql"
+     },
+     "m4": {
+      "macros": [
+       "rnd_project.default__m5",
+       "rnd_project.m6"
+      ],
+      "path": "macros/a/f3.sql"
+     },
+     "m6": {
+      "macros": [],
+      "path": "macros/b/f3.sql"
+     }
+    },
+    "models": {
+     "models/sub/M0.sql": {
+      "macros": [
+       "rnd_project.m1",
+       "rnd_project.m2",
+       "rnd_project.m4"
+      ]
+     },
+     "models/sub/M1.sql": {
+      "macros": [
+       "rnd_project.default__m5",
+       "rnd_project.m4"
+      ]
+     }
+    },
+    "operations": {
+     "rnd_project-on-run-end-0": {
+      "macros": [
+       "rnd_project.m6"
+      ]
+     }
+    }
+   },
+   "files": {
+    "dbt_project.yml": "name: rnd_project\nversion: \"1.0.0\"\nconfig-version: 2\nprofile: segcra_reference\nmodel-paths: [\"models\"]\nmacro-paths: [\"macros\"]\non-run-end:\n  - \"{{ m6() }}\"\nflags:\n  send_anonymous_usage_stats: false\n",
+    "macros/a/f3.sql": "{% macro m0() %}{{ rnd_project.m1() }} {{ adapter.dispatch('m5')() }} {{ m6() }}{% endmacro %}\n{% macro m4() %}{{ adapter.dispatch('m5')() }} {{ rnd_project.m6() }}{% endmacro %}\n",
+    "macros/b/f3.sql": "{% macro m2() %}{{ rnd_project.m6() }}{% endmacro %}\n{% macro m3() %}{{ rnd_project.m6() }}{% endmacro %}\n{% macro m6() %}1{% endmacro %}\n",
+    "macros/c/d/f1.sql": "{% macro default__m5() %}{% set f_m6 = m6 %}{{ f_m6() }}{% endmacro %}\n",
+    "macros/c/d/f3.sql": "{% macro m1() %}1{% endmacro %}\n",
+    "models/sub/M0.sql": "SELECT 0 AS c {{ rnd_project.m1() }} {% set f_m2 = m2 %}{{ f_m2() }} {{ rnd_project.m4() }}\n",
+    "models/sub/M1.sql": "{{ config(post_hook='{{ adapter.dispatch(\\'m5\\')() }}') }}\nSELECT 1 AS c {{ m4() }}\n"
+   }
+  },
+  {
+   "deps": {
+    "macros": {
+     "m0": {
+      "macros": [
+       "rnd_project.m3"
+      ],
+      "path": "macros/a/f3.sql"
+     },
+     "m1": {
+      "macros": [],
+      "path": "macros/c/d/f0.sql"
+     },
+     "m2": {
+      "macros": [],
+      "path": "macros/c/d/f1.sql"
+     },
+     "m3": {
+      "macros": [],
+      "path": "macros/b/f3.sql"
+     }
+    },
+    "models": {
+     "models/M1.sql": {
+      "macros": [
+       "rnd_project.m2"
+      ]
+     },
+     "models/sub/M0.sql": {
+      "macros": [
+       "rnd_project.m1"
+      ]
+     },
+     "models/sub/M2.sql": {
+      "macros": [
+       "rnd_project.m3"
+      ]
+     }
+    },
+    "operations": {}
+   },
+   "files": {
+    "dbt_project.yml": "name: rnd_project\nversion: \"1.0.0\"\nconfig-version: 2\nprofile: segcra_reference\nmodel-paths: [\"models\"]\nmacro-paths: [\"macros\"]\nflags:\n  send_anonymous_usage_stats: false\n",
+    "macros/a/f3.sql": "{% macro m0() %}{{ rnd_project.m3() }}{% endmacro %}\n",
+    "macros/b/f3.sql": "{% macro m3() %}1{% endmacro %}\n",
+    "macros/c/d/f0.sql": "{% macro m1() %}1{% endmacro %}\n",
+    "macros/c/d/f1.sql": "{% macro m2() %}1{% endmacro %}\n",
+    "models/M1.sql": "SELECT 1 AS c {{ rnd_project.m2() }}\n",
+    "models/sub/M0.sql": "SELECT 0 AS c {{ rnd_project.m1() }}\n",
+    "models/sub/M2.sql": "SELECT 2 AS c {% set f_m3 = m3 %}{{ f_m3() }}\n"
+   }
+  },
+  {
+   "deps": {
+    "macros": {
+     "default__m4": {
+      "macros": [],
+      "path": "macros/a/f3.sql"
+     },
+     "m0": {
+      "macros": [
+       "rnd_project.default__m4"
+      ],
+      "path": "macros/a/f0.sql"
+     },
+     "m1": {
+      "macros": [
+       "rnd_project.default__m4",
+       "rnd_project.m3",
+       "rnd_project.m7"
+      ],
+      "path": "macros/a/f0.sql"
+     },
+     "m2": {
+      "macros": [
+       "rnd_project.default__m4"
+      ],
+      "path": "macros/a/f3.sql"
+     },
+     "m3": {
+      "macros": [],
+      "path": "macros/c/d/f2.sql"
+     },
+     "m5": {
+      "macros": [],
+      "path": "macros/a/f1.sql"
+     },
+     "m6": {
+      "macros": [],
+      "path": "macros/a/f2.sql"
+     },
+     "m7": {
+      "macros": [],
+      "path": "macros/c/d/f1.sql"
+     }
+    },
+    "models": {
+     "models/M2.sql": {
+      "macros": [
+       "rnd_project.default__m4",
+       "rnd_project.m3",
+       "rnd_project.m7"
+      ]
+     },
+     "models/M4.sql": {
+      "macros": []
+     },
+     "models/sub/M0.sql": {
+      "macros": [
+       "rnd_project.m3",
+       "rnd_project.m7"
+      ]
+     },
+     "models/sub/M1.sql": {
+      "macros": [
+       "rnd_project.m2",
+       "rnd_project.m7"
+      ]
+     },
+     "models/sub/M3.sql": {
+      "macros": [
+       "rnd_project.m0"
+      ]
+     },
+     "models/sub/M5.sql": {
+      "macros": [
+       "rnd_project.default__m4",
+       "rnd_project.m0",
+       "rnd_project.m3"
+      ]
+     }
+    },
+    "operations": {}
+   },
+   "files": {
+    "dbt_project.yml": "name: rnd_project\nversion: \"1.0.0\"\nconfig-version: 2\nprofile: segcra_reference\nmodel-paths: [\"models\"]\nmacro-paths: [\"macros\"]\nflags:\n  send_anonymous_usage_stats: false\n",
+    "macros/a/f0.sql": "{% macro m0() %}{{ adapter.dispatch('m4')() }}{% endmacro %}\n{% macro m1() %}{{ rnd_project.m3() }} {{ adapter.dispatch('m4')() }} {{ rnd_project.m7() }}{% endmacro %}\n",
+    "macros/a/f1.sql": "{% macro m5() %}{% set f_m7 = m7 %}{{ f_m7() }}{% endmacro %}\n",
+    "macros/a/f2.sql": "{% macro m6() %}1{% endmacro %}\n",
+    "macros/a/f3.sql": "{% macro m2() %}{% set f_m3 = m3 %}{{ f_m3() }} {{ adapter.dispatch('m4')() }}{% endmacro %}\n{% macro default__m4() %}1{% endmacro %}\n",
+    "macros/c/d/f1.sql": "{% macro m7() %}1{% endmacro %}\n",
+    "macros/c/d/f2.sql": "{% macro m3() %}1{% endmacro %}\n",
+    "models/M2.sql": "{{ config(post_hook='{{ adapter.dispatch(\\'m4\\')() }}') }}\nSELECT 2 AS c {% set f_m3 = m3 %}{{ f_m3() }} {{ adapter.dispatch('m4')() }} {{ m7() }}\n",
+    "models/M4.sql": "SELECT 4 AS c \n",
+    "models/sub/M0.sql": "SELECT 0 AS c {{ m3() }} {% set f_m7 = m7 %}{{ f_m7() }}\n",
+    "models/sub/M1.sql": "SELECT 1 AS c {{ rnd_project.m2() }} {{ rnd_project.m7() }}\n",
+    "models/sub/M3.sql": "{{ config(post_hook='{{ m0() }}') }}\nSELECT 3 AS c {{ m0() }}\n",
+    "models/sub/M5.sql": "{{ config(post_hook='{{ m0() }}') }}\nSELECT 5 AS c {{ m3() }} {{ adapter.dispatch('m4')() }}\n"
+   }
+  }
+ ],
+ "seed": 20260918
+}

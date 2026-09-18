@@ -1,0 +1,131 @@
+{
+  "adapter": "sqlserver",
+  "dbt_version": "1.12.5",
+  "macros": {
+    "audit_hook": {
+      "macros": [],
+      "path": "macros/hooks/audit.sql"
+    },
+    "call_by_name": {
+      "macros": [],
+      "path": "macros/logic/dynamic.sql"
+    },
+    "dead_macro": {
+      "macros": [],
+      "path": "macros/unused/dead.sql"
+    },
+    "default__fmt_amount": {
+      "macros": [],
+      "path": "macros/logic/format.sql"
+    },
+    "flag_large": {
+      "macros": [
+        "segcra_impact.get_rules"
+      ],
+      "path": "macros/logic/flags.sql"
+    },
+    "flag_small": {
+      "macros": [
+        "segcra_impact.get_rules"
+      ],
+      "path": "macros/logic/flags.sql"
+    },
+    "generate_schema_name": {
+      "macros": [],
+      "path": "macros/global/schema_name.sql"
+    },
+    "get_rules": {
+      "macros": [],
+      "path": "macros/registry/rules.sql"
+    },
+    "log_run_end": {
+      "macros": [],
+      "path": "macros/hooks/run_end.sql"
+    },
+    "materialization_noop_default": {
+      "macros": [],
+      "path": "macros/materializations/noop.sql"
+    },
+    "sqlserver__fmt_amount": {
+      "macros": [],
+      "path": "macros/logic/format.sql"
+    },
+    "test_not_negative": {
+      "macros": [],
+      "path": "macros/tests/not_negative.sql"
+    }
+  },
+  "models": {
+    "models/BETA.sql": {
+      "macros": [
+        "segcra_impact.sqlserver__fmt_amount"
+      ],
+      "name": "BETA",
+      "refs": [
+        "stg_TXN"
+      ]
+    },
+    "models/EPSILON.sql": {
+      "macros": [],
+      "name": "EPSILON",
+      "refs": []
+    },
+    "models/GAMMA.sql": {
+      "macros": [
+        "segcra_impact.audit_hook",
+        "segcra_impact.flag_small"
+      ],
+      "name": "GAMMA",
+      "refs": [
+        "stg_TXN"
+      ]
+    },
+    "models/ZETA.sql": {
+      "macros": [
+        "segcra_impact.call_by_name"
+      ],
+      "name": "ZETA",
+      "refs": [
+        "stg_TXN"
+      ]
+    },
+    "models/intermediate/int_DELTA.sql": {
+      "macros": [
+        "segcra_impact.flag_large"
+      ],
+      "name": "int_DELTA",
+      "refs": [
+        "mrt_ALPHA"
+      ]
+    },
+    "models/mrt_ALPHA.sql": {
+      "macros": [
+        "segcra_impact.flag_large"
+      ],
+      "name": "mrt_ALPHA",
+      "refs": [
+        "mrt_ALPHA_earlyjob",
+        "stg_TXN"
+      ]
+    },
+    "models/mrt_ALPHA_earlyjob.sql": {
+      "macros": [],
+      "name": "mrt_ALPHA_earlyjob",
+      "refs": [
+        "stg_TXN"
+      ]
+    },
+    "models/stg_TXN.sql": {
+      "macros": [],
+      "name": "stg_TXN",
+      "refs": []
+    }
+  },
+  "operations": {
+    "segcra_impact-on-run-end-0": {
+      "macros": [
+        "segcra_impact.log_run_end"
+      ]
+    }
+  }
+}

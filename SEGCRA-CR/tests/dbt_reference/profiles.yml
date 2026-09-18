@@ -1,0 +1,30 @@
+# 對照專案的連線設定。本檔不得出現任何實際帳號、密碼或主機位址。
+#
+# sqlserver:結構比照正式環境(type: sqlserver、單一資料庫、dbo),資料庫為假名。
+#   dbt-sqlserver 即使 --no-introspect 仍會實際連線,需要 ODBC Driver 18 與
+#   一台可連的 SQL Server;帳密一律走環境變數。
+# duckdb:內嵌式資料庫,不需伺服器與驅動。樣板展開由 dbt-core 負責、與轉接器無關;
+#   以檔名 SAMPLE_DW 讓資料庫名與 sqlserver 目標一致,產出格式同為
+#   "SAMPLE_DW"."dbo"."<表>"。
+segcra_reference:
+  target: sqlserver
+  outputs:
+    duckdb:
+      type: duckdb
+      path: SAMPLE_DW.duckdb
+      schema: dbo
+    sqlserver:
+      type: sqlserver
+      driver: "ODBC Driver 18 for SQL Server"
+      # 沙盒只綁 IPv4;ODBC 連 localhost 會逾時,預設用 127.0.0.1
+      server: "{{ env_var('SEGCRA_REF_DB_SERVER', '127.0.0.1') }}"
+      port: 1433
+      database: SAMPLE_DW
+      schema: dbo
+      user: "{{ env_var('SEGCRA_REF_DB_USER') }}"
+      password: "{{ env_var('SEGCRA_REF_DB_PASSWORD') }}"
+      encrypt: true
+      # 預設不信任自簽憑證(關閉驗證的連線可被中間人攔截,也不應被照抄到正式環境)。
+      # 只有對本機測試沙盒產生標準答案時,才以 SEGCRA_REF_DB_TRUST_CERT=True 臨時覆蓋
+      # (必須是大寫開頭的 True)。
+      trust_cert: "{{ env_var('SEGCRA_REF_DB_TRUST_CERT', 'False') | as_bool }}"

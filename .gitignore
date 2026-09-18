@@ -5,10 +5,23 @@
 __pycache__/
 *.pyc
 .venv/
+# 例如產生標準答案用的 .venv-dbt
+.venv-*/
+.pytest_cache/
 
 # 執行產物
 review_output/
 **/eval/_output/
+
+# dbt 對照專案(若直接在該目錄手動執行 dbt 會產生這些)
+**/dbt_reference/target/
+**/dbt_reference/logs/
+**/dbt_reference/dbt_packages/
+**/dbt_impact_reference/target/
+**/dbt_impact_reference/logs/
+**/dbt_impact_reference/dbt_packages/
+*.duckdb
+*.duckdb.wal
 
 # 憑證 / 環境變數(絕不提交)
 config/gitlab.env
