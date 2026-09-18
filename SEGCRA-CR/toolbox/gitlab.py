@@ -37,7 +37,7 @@ MAX_DIFF_PAGES = 50
 def _api_pages(path: str, params: dict | None = None) -> tuple[list, bool]:
     """取回分頁 API 的全部資料。回傳 (資料, 是否因超過頁數上限而截斷)。
 
-    甲方 PR #10 review 指出:`get_mr_diff()` 用的 `/merge_requests/:iid/diffs`
+    PR #10 review 指出:`get_mr_diff()` 用的 `/merge_requests/:iid/diffs`
     沒有處理分頁,GitLab 這個 API 預設一頁 20 筆(上限 100)——第 21 個檔案
     之後不會被注入掃描、不會進規則預掃、不會被模型審查,diff 行數也不會算
     進去,MR 可能因此被誤判成小改而自動放行。

@@ -498,7 +498,7 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     """決策閘門(確定性):auto_approved / needs_human / blocked。
     刻意不用「模型自信分數」當依據——實測會漂移;改用客觀訊號:
     severity 組成、rubric 分數、diff 大小、未回應的檢核點、執行驗證結果。"""
-    # 注入掃描命中是硬條件(甲方 PR #10 review 指出的嚴重漏洞):不看 finding、
+    # 注入掃描命中是硬條件(PR #10 review 指出的嚴重漏洞):不看 finding、
     # 不看 policy 設定,直接擋下。跟 spec_exec 一樣不可由設定關閉——finding 的
     # 內容可能被模型輸出或後處理影響,_injection_scan 是掃描器直接寫入的、
     # 沒有經過模型手的訊號,只有它才靠得住。放在 `if not policy` 之前:
@@ -554,7 +554,7 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
 def enforce_injection(report: dict, hits: list[dict]) -> dict:
     """確定性注入防線:掃描器命中 → 一律加 blocker,不參考模型輸出。
 
-    **更正(甲方 PR #10 review 找到的嚴重漏洞)**:上一版在補 blocker 前會先看
+    **更正(PR #10 review 找到的嚴重漏洞)**:上一版在補 blocker 前會先看
     模型有沒有自己報過(標題含「注入」或「規避」),這個判斷不看嚴重度——而
     `apply_policy` 決策時只看 `findings`,不看 `_injection_scan`。所以被注入
     成功的模型只要自己吐一條 `info` 等級、標題含「注入」的 finding,確定性
@@ -583,7 +583,7 @@ def enforce_injection(report: dict, hits: list[dict]) -> dict:
 
 
 def enforce_unreviewable(report: dict, mr: dict) -> dict:
-    """有內容沒被審查到時,不得自動放行(甲方 PR #10 review 第 2 點,嚴重)。
+    """有內容沒被審查到時,不得自動放行(PR #10 review 第 2 點,嚴重)。
 
     真實 GitLab 模式下,`toolbox.gitlab.get_mr_diff` 用的分頁 API 過去沒有
     處理分頁(預設一頁只有 20 個檔案),而且 GitLab 對過大或被摺疊的檔案

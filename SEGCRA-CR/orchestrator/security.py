@@ -7,7 +7,7 @@
 
 比對前一律先正規化:攻擊者可以讓文字「人看起來一樣、字元不一樣」
 (零寬字元、全形字母、Unicode 標籤字元、關鍵字用底線或換行拆開),
-直接對原始文字跑正規表示式會全部漏掉——這是甲方 PR #10 review 指出的
+直接對原始文字跑正規表示式會全部漏掉——這是 PR #10 review 指出的
 「掃描器可以被 18 種寫法繞過」問題,已針對每種手法各自加上對應的正規化或
 偵測規則(見下方個別註解),並補上第 4 點指出的誤判(`fake_authority_zh`
 單獨比對常見詞、`output_coercion` 比對任何 `print(`,在異常交易規則的
@@ -39,7 +39,7 @@ _PATTERNS = [
                 r"override)|developer\s+mode|admin\s+mode|note\s+to\s+(ai|assistant|reviewer)|"
                 r"you\s+are\s+now|as\s+an?\s+ai|dan\s+mode)", re.I)),
     # 只在「對審查器下指令」的語境命中。單獨的「已核准」「管理員」「人工審核」「主管授權」
-    # 在異常交易規則的註解與欄位名裡很常見,不能當成攻擊(甲方 PR #10 review 第 4 點)。
+    # 在異常交易規則的註解與欄位名裡很常見,不能當成攻擊(PR #10 review 第 4 點)。
     ("fake_authority_zh",
      re.compile(r"(系統訊息|系統指令|最高優先|開發者模式|prompt\s*注入|"
                 r"(AI|ai|模型|審查員|審查器|reviewer)\s*(請)?\s*(直接|逕行)?\s*"
@@ -49,7 +49,7 @@ _PATTERNS = [
                 r"(本|此|這個?)\s*(MR|變更|合併請求)[^。\n]{0,20}(已由|已經)[^。\n]{0,20}"
                 r"(預審|核准|放行)|"
                 r"(不需|不用|無須|毋須)(再)?(進行)?(任何)?(檢查|審查))")),
-    # T-SQL 有 PRINT 陳述式,單獨的 print( 不能當成攻擊(甲方 PR #10 review 第 4 點)
+    # T-SQL 有 PRINT 陳述式,單獨的 print( 不能當成攻擊(PR #10 review 第 4 點)
     ("output_coercion",
      re.compile(r"(respond\s+(only\s+)?with|reply\s+with|simply\s+(respond|say|output|print)|"
                 r"output\s+(approve|only|exactly)|score\s*[:=]\s*100|verdict\s*[:=]\s*"
@@ -119,7 +119,7 @@ def _split_words(text: str) -> str:
 
     **只能用在自然語言**(標題、描述、檔名、SQL 註解):套在程式碼本體上,
     `override_rule_flag`、`developer_mode` 這類完全正常的欄位/變數名會被
-    誤判成攻擊字樣——這正是甲方 PR #10 review 第 4 點提醒的誤判來源之一,
+    誤判成攻擊字樣——這正是 PR #10 review 第 4 點提醒的誤判來源之一,
     所以呼叫端(`scan_mr`)刻意把「自然語言」跟「程式碼」分開處理,只對
     前者套用這個轉換。
     """
@@ -199,7 +199,7 @@ def scan_injection(text: str, prose: str | None = None) -> list[dict]:
 
 
 def scan_mr(mr: dict) -> list[dict]:
-    """掃描整個 MR:標題 + 描述 + **檔名**(甲方 PR #10 review 指出「檔名沒有
+    """掃描整個 MR:標題 + 描述 + **檔名**(PR #10 review 指出「檔名沒有
     被掃描」)+ 每個檔案的 diff/內容(含程式註解)。"""
     files = mr.get("files", [])
     paths = [p for f in files for p in (f.get("path"), f.get("old_path")) if p]
