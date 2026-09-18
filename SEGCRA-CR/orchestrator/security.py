@@ -56,10 +56,12 @@ def _decode_check(text: str) -> list[dict]:
     hits = []
     for m in _B64.finditer(text):
         blob = m.group(1)
-        if len(blob) % 4:
-            continue
+        # _B64 結尾的 \b 在 '=' 後面成立不了(= 非單字字元),正規表示式會回溯、
+        # 把 padding 排除在捕捉之外。補回來才解得開——否則明文長度非 3 倍數的
+        # payload(三分之二的情況)會因長度不合而被整個跳過,等於偵測形同虛設。
+        padded = blob + "=" * (-len(blob) % 4)
         try:
-            decoded = b64decode(blob).decode("utf-8", "ignore")
+            decoded = b64decode(padded).decode("utf-8", "ignore")
         except Exception:
             continue
         if _B64_KEYWORDS.search(decoded):

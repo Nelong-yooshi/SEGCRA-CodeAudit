@@ -89,9 +89,13 @@ def _norm(s: str) -> str:
     return re.sub(r"[《》()()\s]", "", (s or "")).lower()
 
 
+# 引用來源裡指名的規則碼(_norm 已小寫化,所以只需比對小寫)
+_CITE_CODE = re.compile(r"r-?\d{2,4}")
+
+
 def validate_citations(report: dict, spec_code: str | None) -> dict:
     """引用白名單驗證(簡化版):引用只允許「spec 檔 / 團隊慣例」來源。
-    - spec:source 含規則碼(且該規格確實附上)或含「規格/spec」字樣
+    - spec:source 含規則碼(且該規格確實附上);或不指名規則碼的泛稱 + 含「規格/spec」
     - 慣例:source 含「慣例/convention」或對得上知識庫項目 id
     其餘(憑印象的法規、未附上的文件)一律剔除,防捏造。"""
     try:
@@ -105,9 +109,14 @@ def validate_citations(report: dict, spec_code: str | None) -> dict:
         kept = []
         for c in fd.get("citations", []):
             src = _norm(c.get("source", ""))
+            # 泛稱(「核定規格」「依 spec」)放行以容忍口語寫法;但來源**指名了規則碼**
+            # 時必須與本次附上的那份相符——否則「依據 specs/R-999.md」這種捏造出來的
+            # 具體依據會因為含 "spec" 字樣而被放行,而防捏造正是白名單的目的。
+            named_code = _CITE_CODE.search(src)
             allow = (("convention" in src or "慣例" in src or src in kb_ids)
                      or (spec_ok and spec_ok in src)
-                     or (spec_ok and ("規格" in src or "spec" in src)))
+                     or (spec_ok and not named_code
+                         and ("規格" in src or "spec" in src)))
             if allow:
                 kept.append(c)
             else:
