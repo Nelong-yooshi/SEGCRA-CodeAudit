@@ -14,7 +14,9 @@
 失敗,就能讓整份檔案逃過預掃。
 
 流程:
-  1. 讀入 <code_root>/macros/**.sql,把每個 macro 註冊成全域函式。
+  1. 讀入 <code_root>/<macro_dirs>/**.sql(預設 macros/,對應 dbt 的 macro-paths),
+     把每個 macro 註冊成全域函式;所有 macro 檔共用同一個命名空間,跨檔互相呼叫
+     與檔案順序無關(與 dbt 相同)。
      dbt 的 `{{ return(x) }}` 是靠丟例外實作的,這裡照做(_Return);否則
      get_config() 只會拿到渲染後的字串而不是 dict,`cfg['inward_codes']` 會炸。
   2. 比照 dbt:先去掉原始檔頭尾空白,再渲染,得到純 SQL。
@@ -73,8 +75,10 @@
   * `ref()` 以 model 名稱為表名,未讀取被引用 model 的 alias,也未套用專案自訂的
     `generate_schema_name` / `generate_alias_name`;有自訂時結果會與 dbt 不同。
     專案以 macro 覆寫 `ref` / `source`(dbt 允許)時,這裡會拒絕展開。
-  * `{{ this }}`、adapter 物件、`run_query`、`modules`、`fromjson` 等 dbt 內建
-    未支援,用到即 render 失敗。
+  * `adapter` 只提供 `dispatch`(依 `adapter` 參數先找 `<轉接器>__x`,再退回
+    `default__x`);不讀 `dbt_project.yml` 的 dispatch 搜尋順序設定,也不分辨套件。
+    `{{ this }}`、`run_query`、`modules`、`fromjson` 等其餘 dbt 內建未支援,
+    用到即 render 失敗。
   * macro 同名時 dbt 用套件命名空間解析,這裡是單一平面命名空間。遇到同名
     只能擇一,結果**可能與 dbt 不同** → 記進 `macro_conflicts` 讓上游看得到。
 """
@@ -121,6 +125,10 @@ _JINJA_EXTENSIONS = ["jinja2.ext.do", "jinja2.ext.loopcontrols"]
 
 # 正式環境所有表都在單一資料庫的 dbo 底下
 DEFAULT_SCHEMA = "dbo"
+# 正式環境的 dbt 轉接器;決定 adapter.dispatch 先找哪個前綴的實作
+DEFAULT_ADAPTER = "sqlserver"
+# dbt 的 macro-paths 預設值(專案可自訂,由呼叫端傳入)
+DEFAULT_MACRO_DIRS = ("macros",)
 
 # macro 不得使用的名稱:dbt 內建(含刻意不提供的 this / env_var / builtins)與 Jinja 內建。
 RESERVED_NAMES = frozenset({
@@ -280,9 +288,15 @@ def _make_relations(database: str | None, schema: str):
         return f'"{database}"."{schema}"."{_check_ident("表", name)}"'
 
     def ref(*args, **kwargs):
-        # ref('model') 或 ref('package', 'model');version 等關鍵字參數不影響表名
+        # ref('model') 或 ref('package', 'model')
         if len(args) not in (1, 2):
             raise DbtRenderError(f"ref() 參數個數不合法:{len(args)} 個")
+        if kwargs:
+            # dbt 的 ref('model', version=2) 指向的是另一個關聯(model_name_v2)。
+            # 我們沒有 manifest 可以解析版本,忽略它會靜靜產出錯的表名 → 拒絕展開。
+            names = ", ".join(sorted(kwargs))
+            raise DbtRenderError(
+                f"ref() 的關鍵字參數({names})會改變指向的關聯,本模組無法解析,拒絕展開。")
         for a in args[:-1]:
             _check_ident("套件", a)
         return relation(args[-1])
@@ -292,6 +306,33 @@ def _make_relations(database: str | None, schema: str):
         return relation(table_name)
 
     return ref, source
+
+
+class _Adapter:
+    """只提供 dispatch 的 adapter 樁。
+
+    dbt 的 `adapter.dispatch('x')` 會依轉接器挑實作:先找 `<轉接器>__x`,
+    再退回 `default__x`。這裡照同一順序在已載入的 macro 裡找;找不到就報錯,
+    不猜。其餘 adapter 方法(get_relation、run_query…)刻意不提供:那些要連
+    資料庫,展開階段本來就不該有,未定義會大聲失敗。
+    """
+
+    def __init__(self, macros: dict, adapter: str):
+        self._macros = macros
+        self._adapter = adapter
+
+    def dispatch(self, macro_name, macro_namespace=None):
+        _check_ident("macro", macro_name)
+        if macro_namespace is not None:
+            # 單一平面命名空間找不到「指定套件的同名 macro」,擇一的結果可能與 dbt 不同
+            _check_ident("套件", macro_namespace)
+        for candidate in (f"{self._adapter}__{macro_name}", f"default__{macro_name}"):
+            found = self._macros.get(candidate)
+            if callable(found):
+                return found
+        raise DbtRenderError(
+            f"adapter.dispatch('{macro_name}') 找不到實作:"
+            f"需要 {self._adapter}__{macro_name} 或 default__{macro_name}。")
 
 
 @dataclass
@@ -365,8 +406,12 @@ def _render_capped(template, limit: int) -> str:
 
 # ------------------------------------------------------- Jinja 環境與 dbt 樁
 def build_env(code_root=None, variables: dict | None = None,
-              database: str | None = None, schema: str = DEFAULT_SCHEMA):
+              database: str | None = None, schema: str = DEFAULT_SCHEMA,
+              macro_dirs=DEFAULT_MACRO_DIRS, adapter: str = DEFAULT_ADAPTER):
     """建好含 dbt 樁與 macro 的 Environment。code_root 為 None 時不載入任何 macro。
+
+    macro_dirs  專案的 macro 目錄(dbt 的 macro-paths;預設 macros/)
+    adapter     dbt 轉接器名稱,決定 adapter.dispatch 先找哪個前綴的實作
 
     回傳 (env, macro 名稱清單, 同名衝突清單)。
     """
@@ -394,8 +439,18 @@ def build_env(code_root=None, variables: dict | None = None,
     env.globals["var"] = _make_var(variables)
     env.globals["execute"] = True                   # compile 期為 True
     env.globals["is_incremental"] = lambda: False   # compile 期一律視為全量
+    # dbt 每次執行都會產生新的 invocation_id;這裡是固定值,樣板若真的輸出它,
+    # 結果會與 dbt compile 不同(已知限制,見模組 docstring)。
     env.globals["invocation_id"] = "segcra00"
-    env.globals["target"] = types.MappingProxyType({"database": database, "schema": schema})
+    _check_ident("轉接器", adapter)
+    # macro 在這之後才載入,dispatch 是呼叫時才查表,所以拿得到全部 macro
+    env.globals["adapter"] = _Adapter(env.globals, adapter)
+    # 沒給 database 時,target.database 不可展開成 "None" 這種看似成功的錯誤結果:
+    # 給未定義值,讓用到它的樣板大聲失敗(與 `this` / `env_var` 同一個原則)。
+    env.globals["target"] = types.MappingProxyType({
+        "database": database if database is not None else StrictUndefined(name="target.database"),
+        "schema": schema,
+    })
     # `this` 與 `env_var` 刻意不定義:前者給錯值會靜靜產出錯的 SQL,後者會把審查機
     # 的環境變數寫進 SQL。未定義則由 StrictUndefined 大聲失敗。
 
@@ -405,23 +460,39 @@ def build_env(code_root=None, variables: dict | None = None,
         return env, macros, conflicts
 
     root = pathlib.Path(code_root)
-    macro_dir = root / "macros"
-    if not macro_dir.is_dir() or macro_dir.is_symlink():
-        return env, macros, conflicts
-
     seen: dict[str, str] = {}
-    files = [f for f in sorted(macro_dir.rglob("*.sql"))
-             if not f.is_symlink() and f.is_file()]   # 符號連結可能指向任意檔案
+    files = []
+    for name in ((macro_dirs,) if isinstance(macro_dirs, str) else macro_dirs):
+        # 目錄設定由呼叫端給,不接受跳出專案或指向別處的路徑。判斷不依平台:
+        # Windows 上 `專案 / "/etc"` 會跳到磁碟根目錄,`is_absolute()` 卻是 False。
+        posix = name.replace("\\", "/") if isinstance(name, str) else ""
+        # 空字串 / None 會變成空的路徑段,一併被下面的檢查擋下
+        if (posix.startswith("/") or ":" in posix
+                or any(part in ("", ".", "..") for part in posix.split("/"))):
+            raise DbtRenderError(f"macro 目錄設定不合法:{name!r}")
+        macro_dir = root / posix
+        if not macro_dir.is_dir() or macro_dir.is_symlink():
+            continue
+        files += [f for f in sorted(macro_dir.rglob("*.sql"))
+                  if not f.is_symlink() and f.is_file()]   # 符號連結可能指向任意檔案
+    if not files:
+        return env, macros, conflicts
     if len(files) > MAX_MACRO_FILES:
         raise DbtRenderError(f"macro 檔案數超過 {MAX_MACRO_FILES} 個上限")
     total = 0
+    # 所有 macro 檔共用同一個命名空間:dbt 解析 macro 與檔案順序無關,逐檔各自
+    # 展開會讓「呼叫排在後面檔案的 macro」找不到名稱(跨檔互相呼叫在真實專案很常見)。
+    # 名稱在 macro 被呼叫時才解析,所以之後載入的 macro 也找得到。
+    shared: dict = dict(env.globals)
     for f in files:
         rel = f.relative_to(root).as_posix()
         text = f.read_bytes().decode("utf-8")
         total += len(text)
         if total > MAX_MACRO_CHARS:
             raise DbtRenderError(f"macro 檔案合計超過 {MAX_MACRO_CHARS} 字元上限")
-        module = env.from_string(text).module
+        # 模組層的 {% set %} 只寫進該模組自己的名稱空間,不會汙染 shared(已驗證);
+        # 進入 shared 的只有下面逐一檢查過的 macro。
+        module = env.from_string(text).make_module(vars=shared, shared=True)
         for name in dir(module):
             if name.startswith("_"):
                 continue
@@ -439,7 +510,7 @@ def build_env(code_root=None, variables: dict | None = None,
             else:
                 macros.append(name)
             seen[name] = rel
-            env.globals[name] = _wrap(obj)
+            shared[name] = env.globals[name] = _wrap(obj)
     return env, sorted(macros), conflicts
 
 
@@ -582,16 +653,19 @@ def _clamp(line_map: dict[int, int], n_src: int, n_out: int) -> dict[int, int]:
 # --------------------------------------------------------------------- 主入口
 def render_model(model_path, code_root=None, variables: dict | None = None,
                  source: str | None = None, database: str | None = None,
-                 schema: str = DEFAULT_SCHEMA) -> RenderResult:
+                 schema: str = DEFAULT_SCHEMA, macro_dirs=DEFAULT_MACRO_DIRS,
+                 adapter: str = DEFAULT_ADAPTER) -> RenderResult:
     """在同一行程內展開一份 dbt model。**待審的 MR 內容請改用 render_model_isolated()。**
 
     model_path  model 檔路徑(相對 code_root 或絕對路徑皆可)
-    code_root   dbt 專案根(要能找到 macros/)。未指定時:從磁碟讀檔則取 model 所在
+    code_root   dbt 專案根(要能找到 macro 目錄)。未指定時:從磁碟讀檔則取 model 所在
                 目錄;給定 source= 則不載入任何 macro(不猜目錄)
     variables   dbt var,例如 {"target_date": "2026-03-01"}
     source      直接給定原始碼(給「檔案不在磁碟上、來自 GitLab」的情境用)
     database    ref()/source() 展開用的資料庫名;model 有用到 ref/source 時必填
     schema      ref()/source() 展開用的綱要名,預設 dbo
+    macro_dirs  macro 目錄(dbt 的 macro-paths;專案有自訂時由呼叫端傳入)
+    adapter     dbt 轉接器名稱,決定 adapter.dispatch 先找哪個前綴的實作
 
     任何失敗都收斂成 ok=False 而不丟例外。
     """
@@ -608,7 +682,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
             source = model_path.read_bytes().decode("utf-8")
         if len(source) > MAX_SOURCE_CHARS:
             raise DbtRenderError(f"原始碼超過 {MAX_SOURCE_CHARS} 字元上限")
-        env, macros, conflicts = build_env(root, variables, database, schema)
+        env, macros, conflicts = build_env(root, variables, database, schema,
+                                           macro_dirs, adapter)
         # dbt 讀檔時會去掉頭尾空白再渲染(開頭空行不會出現在編譯結果裡)
         body = source.strip()
         clean = _render_capped(env.from_string(body), MAX_OUTPUT_CHARS)

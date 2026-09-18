@@ -437,6 +437,71 @@ def test_missing_base_files_is_uncertain():
     assert any("變更前" in r for r in report.uncertain)
 
 
+def test_base_files_missing_one_changed_file_fails_closed():
+    """有給 base_files 卻缺了被改的 macro 檔:不可當成新增檔,否則改名前的 macro
+    名稱不會被納入,還在呼叫舊名的 model 會靜靜漏判。"""
+    new = {"macros/logic.sql": "{% macro new_name() %}1{% endmacro %}",
+           "models/mrt_X.sql": "SELECT {{ old_name() }}"}   # 仍在呼叫改名前的 old_name
+    report = analyze_macro_impact(new, ["macros/logic.sql"],
+                                  base_files={"models/mrt_X.sql": "SELECT 1"})
+    assert report.needs_human
+    assert report.all_models_possibly_affected
+    assert any("未被宣告為新增檔" in r for r in report.uncertain)
+    assert "models/mrt_X.sql" in _all(report)
+
+
+def test_declared_added_file_needs_no_base_content():
+    """明確宣告是新增檔時,沒有變更前內容是正常的,不該標為不確定。"""
+    files = {"macros/logic.sql": "{% macro new_one() %}1{% endmacro %}",
+             "models/mrt_X.sql": "SELECT 1"}
+    report = analyze_macro_impact(files, ["macros/logic.sql"], base_files={},
+                                  added_paths=["macros/logic.sql"])
+    assert not report.needs_human
+    assert report.affected_models == ()
+
+
+def test_renamed_macro_is_traced_when_base_is_complete():
+    """對照組:base_files 完整時,呼叫舊名稱的 model 要被找出來。"""
+    old = {"macros/logic.sql": "{% macro old_name() %}1{% endmacro %}"}
+    new = {"macros/logic.sql": "{% macro new_name() %}1{% endmacro %}",
+           "models/mrt_X.sql": "SELECT {{ old_name() }}"}
+    report = analyze_macro_impact(new, ["macros/logic.sql"], base_files=old)
+    assert set(report.changed_macros) == {"old_name", "new_name"}
+    assert "models/mrt_X.sql" in _certain(report)
+    assert not report.needs_human
+
+
+# ---------------------------------------------------------------- 找不到 model 時不可判成沒有影響
+@pytest.mark.parametrize("files, kwargs, expect_reason", [
+    # model 不在 model 目錄下(例如範例專案原本的結構)
+    ({"macros/logic.sql": "{% macro f() %}1{% endmacro %}",
+      "code/mrt_X.sql": "SELECT {{ f() }}"}, {}, "不在 model / macro 目錄內"),
+    # 呼叫端只傳了 macro 檔,一個 model 都沒傳
+    ({"macros/logic.sql": "{% macro f() %}1{% endmacro %}"}, {}, "找不到任何 model"),
+    # model_dirs 設錯
+    ({"macros/logic.sql": "{% macro f() %}1{% endmacro %}",
+      "models/mrt_X.sql": "SELECT {{ f() }}"},
+     {"model_dirs": ("nonexistent",)}, "不在 model / macro 目錄內"),
+])
+def test_macro_change_without_models_is_not_silently_clean(files, kwargs, expect_reason):
+    report = analyze_macro_impact(files, ["macros/logic.sql"],
+                                  base_files={"macros/logic.sql": files["macros/logic.sql"]},
+                                  **kwargs)
+    assert report.needs_human, "找不到 model 時不可判成沒有影響"
+    assert any(expect_reason in r for r in report.uncertain), report.uncertain
+
+
+@pytest.mark.parametrize("model_dirs", [("",), (".",), "", "."])
+def test_project_root_can_be_the_model_dir(model_dirs):
+    """範例專案的 model 就放在根目錄;macros/ 仍然要被當成 macro。"""
+    files = {"macros/logic.sql": "{% macro f() %}1{% endmacro %}",
+             "mrt_X.sql": "SELECT {{ f() }}"}
+    report = analyze_macro_impact(files, ["macros/logic.sql"], base_files=files,
+                                  model_dirs=model_dirs)
+    assert _certain(report) == {"mrt_X.sql"}
+    assert not report.needs_human
+
+
 def test_renamed_macro_marks_callers_of_old_name():
     files = dict(FILES)
     base = {"macros/hooks/audit.sql": files["macros/hooks/audit.sql"]}
@@ -577,7 +642,7 @@ def test_case_only_match_is_not_used():
 
 
 def test_earlyjob_is_not_guessed():
-    """earlyjob model 該對應哪份規格尚未與甲方確認:不自行猜測。"""
+    """earlyjob model 該對應哪份規格尚未確認:不自行猜測。"""
     match = resolve_spec("models/mrt_RETAIL_M1_earlyjob.sql", SPECS)
     assert match.spec_path is None
 

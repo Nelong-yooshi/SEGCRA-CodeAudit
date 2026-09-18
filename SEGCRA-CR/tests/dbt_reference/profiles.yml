@@ -16,14 +16,15 @@ segcra_reference:
     sqlserver:
       type: sqlserver
       driver: "ODBC Driver 18 for SQL Server"
-      server: localhost
+      # 沙盒只綁 IPv4;ODBC 連 localhost 會逾時,預設用 127.0.0.1
+      server: "{{ env_var('SEGCRA_REF_DB_SERVER', '127.0.0.1') }}"
       port: 1433
       database: SAMPLE_DW
       schema: dbo
       user: "{{ env_var('SEGCRA_REF_DB_USER') }}"
       password: "{{ env_var('SEGCRA_REF_DB_PASSWORD') }}"
       encrypt: true
-      # 驗證伺服器憑證,不信任自簽憑證。產生標準答案用不到連線(duckdb 目標與 dbt parse
-      # 都不連線);若在本機測試機實際連線遇到憑證錯誤,請把測試機的 CA 加入信任,
-      # 不要改成 true —— 關閉驗證會讓連線可被中間人攔截,也不應被照抄到正式環境。
-      trust_cert: false
+      # 預設不信任自簽憑證(關閉驗證的連線可被中間人攔截,也不應被照抄到正式環境)。
+      # 只有對本機測試沙盒產生標準答案時,才以 SEGCRA_REF_DB_TRUST_CERT=True 臨時覆蓋
+      # (必須是大寫開頭的 True)。
+      trust_cert: "{{ env_var('SEGCRA_REF_DB_TRUST_CERT', 'False') | as_bool }}"

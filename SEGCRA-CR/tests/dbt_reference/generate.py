@@ -65,6 +65,8 @@ _ENV_ALLOWLIST = (
     "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE",
     "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "LANG", "LC_ALL", "VIRTUAL_ENV",
     "SEGCRA_REF_DB_USER", "SEGCRA_REF_DB_PASSWORD",
+    # 產生 sqlserver 標準答案時才需要:沙盒位址,以及「只對本機測試沙盒」信任自簽憑證
+    "SEGCRA_REF_DB_SERVER", "SEGCRA_REF_DB_TRUST_CERT",
 )
 
 
@@ -106,6 +108,8 @@ def build_project(tmp: pathlib.Path) -> None:
         _write_exact(tmp / "models" / f"{name}.sql", text)
     for p in (SAMPLE / "macros").rglob("*.sql"):
         _write_exact(tmp / p.relative_to(SAMPLE), read_canonical(p))
+    for p in (HERE / "macros").rglob("*.sql"):        # 探測檔專用的 macro
+        _write_exact(tmp / p.relative_to(HERE), read_canonical(p))
 
 
 def dbt_env(tmp: pathlib.Path) -> dict[str, str]:

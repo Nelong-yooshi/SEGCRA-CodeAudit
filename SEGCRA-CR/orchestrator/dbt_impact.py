@@ -55,7 +55,7 @@
   * 以檔案為單位判定變更:macro 檔有變更時,檔內所有 macro 都視為已變更
   * 不讀取 `dbt_project.yml` 的 model-paths / macro-paths 設定,目錄由呼叫端指定
   * 不分析第三方套件(packages)內的 macro
-  * 規格對應的檔名慣例(預設只去除 `mrt_` 前綴)需與甲方確認
+  * 規格對應的檔名慣例(預設只去除 `mrt_` 前綴)待確認
 """
 from dataclasses import dataclass, field
 
@@ -168,6 +168,21 @@ def normalize_path(path) -> str | None:
     if any(part in ("", ".", "..") for part in path.split("/")):
         return None
     return path
+
+
+def _normalize_dir(directory) -> str | None:
+    """正規化 model / macro 目錄設定。`""` 與 `"."` 代表專案根目錄(回傳 `""`)。
+
+    只放寬目錄「設定」;檔案路徑仍然一律走 normalize_path() 的白名單。
+    """
+    if isinstance(directory, str) and directory in ("", "."):
+        return ""
+    return normalize_path(directory)
+
+
+def _in_dirs(path: str, dirs) -> bool:
+    """path 是否位於這組目錄底下(`""` 代表專案根目錄,涵蓋所有檔案)。"""
+    return any(d == "" or path.startswith(d + "/") for d in dirs)
 
 
 def _is_ident(text) -> bool:
@@ -637,12 +652,15 @@ class _Scanner:
 
 # ------------------------------------------------------------------ 二、macro 反查
 def _kind(path: str, model_dirs, macro_dirs) -> str:
-    if path.endswith(".sql"):
-        if any(path.startswith(d + "/") for d in macro_dirs):
+    is_resource = path.endswith(_CONFIG_SUFFIXES) or path.split("/", 1)[0] in _RESOURCE_DIRS
+    if path.endswith(".sql") and not is_resource:
+        # macro 先判:model 目錄設為專案根目錄時,macros/ 仍然要算 macro;
+        # seeds / snapshots / analyses / tests 底下的 .sql 是別種資源,也不是 model
+        if _in_dirs(path, macro_dirs):
             return "macro"
-        if any(path.startswith(d + "/") for d in model_dirs):
+        if _in_dirs(path, model_dirs):
             return "model"
-    if path.endswith(_CONFIG_SUFFIXES) or path.split("/", 1)[0] in _RESOURCE_DIRS:
+    if is_resource:
         return "dbt_config"
     return "other"
 
@@ -688,21 +706,25 @@ def _walk(callers_of: dict, start, label):
     return model_hits, yml_hits, referenced
 
 
-def analyze_macro_impact(files, changed_paths, *, base_files=None,
+def analyze_macro_impact(files, changed_paths, *, base_files=None, added_paths=(),
                          model_dirs=DEFAULT_MODEL_DIRS,
                          macro_dirs=DEFAULT_MACRO_DIRS) -> ImpactReport:
     """反查 macro 變更影響到的 model。
 
     files          變更後的 dbt 專案檔案:相對於 dbt 專案根目錄的路徑 → 內容
     changed_paths  MR 變更的檔案路徑(相對於同一個根目錄)
-    base_files     變更前的內容:路徑 → 內容(新增的檔案不必提供)。未提供時,
-                   被刪除或改名的 macro 無法偵測,會標為不確定
-    model_dirs / macro_dirs  model 與 macro 所在目錄
+    base_files     變更前的內容:路徑 → 內容。未提供時,被刪除或改名的 macro 無法
+                   偵測,會標為不確定
+    added_paths    本次 MR **新增**的檔案路徑。有給 base_files 時,不在 base_files
+                   裡、也不在這份清單裡的變更檔,一律視為「呼叫端漏傳變更前內容」
+                   而保守處理——無法分辨「真的是新檔」與「漏傳」時不能猜
+    model_dirs / macro_dirs  model 與 macro 所在目錄;`""` 或 `"."` 代表專案根目錄
 
     任何無法確定的情況都收斂成 needs_human,不丟例外。
     """
     try:
-        return _Analysis(files, changed_paths, base_files, model_dirs, macro_dirs).run()
+        return _Analysis(files, changed_paths, base_files, added_paths,
+                         model_dirs, macro_dirs).run()
     except _LimitExceeded as e:
         return _fail_closed(f"超過資源上限({e}),無法完成分析,保守視為全部 model 可能受影響")
     except RecursionError:
@@ -710,10 +732,12 @@ def analyze_macro_impact(files, changed_paths, *, base_files=None,
 
 
 class _Analysis:
-    def __init__(self, files, changed_paths, base_files, model_dirs, macro_dirs):
+    def __init__(self, files, changed_paths, base_files, added_paths, model_dirs, macro_dirs):
         self.raw_files = files
         self.raw_changed = [changed_paths] if isinstance(changed_paths, str) else list(changed_paths)
         self.raw_base = base_files
+        self.added = {normalize_path(p) for p in
+                      ([added_paths] if isinstance(added_paths, str) else added_paths)}
         self.raw_model_dirs = (model_dirs,) if isinstance(model_dirs, str) else tuple(model_dirs)
         self.raw_macro_dirs = (macro_dirs,) if isinstance(macro_dirs, str) else tuple(macro_dirs)
         self.uncertain: list[str] = []
@@ -727,8 +751,8 @@ class _Analysis:
         if not _jinja_version_ok(jinja2.__version__):
             return _fail_closed(
                 f"jinja2 {jinja2.__version__} 低於 {'.'.join(map(str, MIN_JINJA_VERSION))},拒絕分析")
-        self.model_dirs = tuple(normalize_path(d) for d in self.raw_model_dirs)
-        self.macro_dirs = tuple(normalize_path(d) for d in self.raw_macro_dirs)
+        self.model_dirs = tuple(_normalize_dir(d) for d in self.raw_model_dirs)
+        self.macro_dirs = tuple(_normalize_dir(d) for d in self.raw_macro_dirs)
         if not self.model_dirs or not self.macro_dirs or None in self.model_dirs + self.macro_dirs:
             return _fail_closed("model / macro 目錄設定不合法,無法分析")
 
@@ -739,6 +763,18 @@ class _Analysis:
         changed_macros, change_problems = self._changed_macros(base)
 
         if self.changed_macro_files:
+            # 改了 macro 卻一個 model 都沒有:多半是目錄設定錯或呼叫端沒傳 model,
+            # 不是「真的沒有影響」。不標出來的話,設定錯誤會讓 macro 變更靜靜通過。
+            if not self.model_paths:
+                self.all_reasons.append(
+                    "專案中找不到任何 model(請檢查 model_dirs 與傳入的檔案),"
+                    "無法確認 macro 變更的影響範圍")
+            stray = sorted(p for p in self.project
+                           if p.endswith(".sql") and self._kind(p) == "other")
+            if stray:
+                self.uncertain.append(
+                    f"有 {len(stray)} 個 .sql 不在 model / macro 目錄內"
+                    f"(例:{stray[0]}),可能是目錄設定錯誤")
             if self.raw_base is None:
                 self.uncertain.append("未提供變更前的內容:被刪除或改名的 macro 無法偵測")
             self.all_reasons.extend(change_problems)
@@ -880,6 +916,12 @@ class _Analysis:
             if new_text is None and old_text is None:
                 problems.append(f"macro 檔 {path} 已不存在且沒有變更前內容,無法得知被刪除的 macro")
                 continue
+            if old_text is None and self.raw_base is not None and path not in self.added:
+                # 有給 base_files 卻缺這個檔:可能是新增檔,也可能是呼叫端漏傳。
+                # 猜成新增檔的話,改名前的 macro 名稱不會被納入,呼叫舊名的 model 會漏判。
+                problems.append(
+                    f"macro 檔 {path} 沒有變更前內容,也未被宣告為新增檔"
+                    f"(added_paths),無法確認是否有 macro 被刪除或改名")
             for label, text in (("變更後", new_text), ("變更前", old_text)):
                 if text is None:
                     continue
@@ -943,8 +985,7 @@ class _Analysis:
                 dynamic_scopes.append(("model", path))
         for path in sorted(self.project):
             if path.endswith(_CONFIG_SUFFIXES) and (
-                    path == "dbt_project.yml"
-                    or any(path.startswith(d + "/") for d in self.model_dirs)):
+                    path == "dbt_project.yml" or _in_dirs(path, self.model_dirs)):
                 refs = self.scanner.scan_yml(self.project[path])
                 for target in resolve(refs.names):
                     callers_of.setdefault(target, set()).add(("yml", path))

@@ -50,9 +50,16 @@ def run_isolated(fn, args: tuple = (), kwargs: dict | None = None, *,
     """
     ctx = multiprocessing.get_context("spawn")
     recv_conn, send_conn = ctx.Pipe(duplex=False)
-    proc = ctx.Process(target=_worker, daemon=True,
-                       args=(send_conn, fn, max_memory_mb, tuple(args), dict(kwargs or {})))
-    proc.start()
+    try:
+        proc = ctx.Process(target=_worker, daemon=True,
+                           args=(send_conn, fn, max_memory_mb, tuple(args), dict(kwargs or {})))
+        proc.start()
+    except BaseException as e:
+        # 啟動失敗(無法 pickle 參數、系統資源不足、環境不允許開子行程…)也要收斂成
+        # 失敗結果:兩個公開 API 都承諾不丟例外,呼叫端只依結果判斷。
+        recv_conn.close()
+        send_conn.close()
+        return on_failure(f"IsolationError: 無法啟動子行程({type(e).__name__})")
     send_conn.close()
     message = None
     timed_out = False

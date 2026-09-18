@@ -28,6 +28,7 @@ import pytest
 
 from orchestrator import dbt_render
 from orchestrator.dbt_render import (
+    DEFAULT_ADAPTER,
     MAX_ERROR_CHARS, RenderResult, _count_lines, _jinja_version_ok, _lines_inside_tag,
     _map_from_difflib, _mask_tags, build_env, is_dbt_template, render_model,
     render_model_isolated,
@@ -75,9 +76,14 @@ def _render(**kwargs) -> RenderResult:
     return render_model(**params)
 
 
-def _render_reference(name: str) -> RenderResult:
-    """以產生標準答案時相同的條件展開(同一組 macro、var、database)。"""
-    return _render(model_path=f"{name}.sql", source=REFERENCE_SOURCES[name])
+# 對照專案的 macro 來自兩處:範例的 macros/ 與探測檔專用的 macros/(見 generate.py)
+REFERENCE_MACRO_DIRS = ("examples/sample/RETAIL_M1_code/macros", "tests/dbt_reference/macros")
+
+
+def _render_reference(name: str, adapter: str = DEFAULT_ADAPTER) -> RenderResult:
+    """以產生標準答案時相同的條件展開(同一組 macro、var、database、轉接器)。"""
+    return _render(model_path=f"{name}.sql", source=REFERENCE_SOURCES[name],
+                   code_root=PKG_ROOT, macro_dirs=REFERENCE_MACRO_DIRS, adapter=adapter)
 
 
 @pytest.fixture(scope="module")
@@ -155,9 +161,10 @@ def test_matches_dbt_compile(target, name):
       probe_incremental  is_incremental() 在 compile 期為 False
       probe_bom          帶 BOM 的檔案(dbt 會把 BOM 保留在輸出裡)
       probe_crlf         CRLF 換行的檔案(Windows 編輯器常見)
+      probe_dispatch     adapter.dispatch 依轉接器挑實作(各目標答案不同)
     不一致代表我們與 dbt 行為有落差;若是原始檔改了,請重跑 generate.py。
     """
-    r = _render_reference(name)
+    r = _render_reference(name, adapter=target.name)
     assert r.ok, r.error
     # 標準答案不含 \r(見 generate.py);以文字模式讀,不受 git 換行設定影響
     expected = (target / f"{name}.sql").read_text(encoding="utf-8")
@@ -259,6 +266,131 @@ def test_render_is_deterministic():
     assert a.line_map == b.line_map
 
 
+@pytest.mark.parametrize("caller_file, callee_file", [
+    ("a_first.sql", "z_second.sql"),   # 呼叫排在後面檔案的 macro(dbt 可以,逐檔載入會失敗)
+    ("z_second.sql", "a_first.sql"),   # 呼叫排在前面檔案的 macro
+])
+def test_macro_can_call_macro_in_another_file(tmp_path, caller_file, callee_file):
+    """dbt 解析 macro 與檔案順序無關;跨檔互相呼叫在真實專案很常見。"""
+    _write_macro(tmp_path, caller_file, "{% macro caller() %}[{{ callee() }}]{% endmacro %}")
+    _write_macro(tmp_path, callee_file, "{% macro callee() %}CALLEE{% endmacro %}")
+    r = _render(code_root=tmp_path, source="SELECT {{ caller() }}")
+    assert r.ok, r.error
+    assert r.sql == "SELECT [CALLEE]"
+
+
+def test_macro_file_cannot_poison_shared_namespace(tmp_path):
+    """macro 檔共用同一個命名空間,但模組層的 {% set %} 只作用在該模組自己身上:
+    蓋掉 dbt 樁不會影響其他 macro 檔或 model(進共用空間的只有通過檢查的 macro)。"""
+    _write_macro(tmp_path, "a_poison.sql",
+                 "{% set ref = 'POISONED' %}{% set var = 'POISONED' %}"
+                 "{% macro noop() %}1{% endmacro %}")
+    _write_macro(tmp_path, "z_uses_ref.sql", "{% macro rel() %}{{ ref('t') }}{% endmacro %}")
+    r = _render(code_root=tmp_path, source="SELECT {{ rel() }}, {{ ref('u') }}")
+    assert r.ok, r.error
+    assert r.sql == f'SELECT "{SAMPLE_DB}"."dbo"."t", "{SAMPLE_DB}"."dbo"."u"'
+
+
+def _write_dispatch_macros(tmp_path) -> None:
+    _write_macro(tmp_path, "fmt.sql",
+                 "{% macro default__fmt(v) %}DEFAULT({{ v }}){% endmacro %}\n"
+                 "{% macro sqlserver__fmt(v) %}SQLSERVER({{ v }}){% endmacro %}")
+
+
+@pytest.mark.parametrize("adapter, expected", [
+    ("sqlserver", "SELECT SQLSERVER(x)"),   # 有 <轉接器>__ 實作:優先用
+    ("postgres", "SELECT DEFAULT(x)"),      # 沒有:退回 default__(與 dbt 相同順序)
+])
+def test_adapter_dispatch_picks_implementation(tmp_path, adapter, expected):
+    _write_dispatch_macros(tmp_path)
+    r = _render(code_root=tmp_path, source="SELECT {{ adapter.dispatch('fmt')('x') }}",
+                adapter=adapter)
+    assert r.ok, r.error
+    assert r.sql == expected
+
+
+def test_adapter_dispatch_without_implementation_fails_loudly(tmp_path):
+    """找不到實作時不可靜靜產出空字串——那會變成語法不完整的 SQL。"""
+    _write_dispatch_macros(tmp_path)
+    r = _render(code_root=tmp_path, source="SELECT {{ adapter.dispatch('missing')() }}")
+    assert not r.ok and r.sql == ""
+    assert "dispatch" in r.error
+
+
+@pytest.mark.parametrize("source", [
+    "SELECT {{ adapter.get_relation('a', 'b', 'c') }}",   # 要連資料庫的方法
+    "SELECT {{ adapter.execute('SELECT 1') }}",
+    "SELECT {{ adapter.config }}",
+])
+def test_adapter_exposes_only_dispatch(tmp_path, source):
+    """adapter 只提供 dispatch;其餘方法未定義(要連資料庫的東西展開期不該有)。"""
+    _write_dispatch_macros(tmp_path)
+    r = _render(code_root=tmp_path, source=source)
+    assert not r.ok and r.sql == ""
+
+
+@pytest.mark.parametrize("source", [
+    "{{ adapter._macros }}",                       # 內部持有整包 dbt 樁與 macro
+    "{{ adapter._adapter }}",
+    "{{ adapter|attr('_macros') }}",               # 換 filter 取屬性
+    "{{ adapter.dispatch.__globals__ }}",
+    "{% do adapter._macros.update({'ref': 1}) %}OK",   # 改寫內部字典
+    "{{ adapter.__class__.__mro__ }}",
+    "{{ adapter.dispatch('fmt') }}",               # 不呼叫直接輸出函式物件
+])
+def test_adapter_internals_are_not_reachable(tmp_path, source):
+    """adapter 樁持有 env.globals 的參照:樣板不可從它取到內部資料或改寫它。"""
+    _write_dispatch_macros(tmp_path)
+    r = _render(code_root=tmp_path, source=source)
+    assert not r.ok and r.sql == ""
+    assert "_macros" not in (r.error or "") or "SecurityError" in r.error
+
+
+@pytest.mark.parametrize("name", ['x"; DROP TABLE t; --', "x-y", "中文", ""])
+def test_dispatch_macro_name_must_pass_whitelist(tmp_path, name):
+    """dispatch 的名稱會被拼成 <轉接器>__<名稱> 去查表:不合法時要**明確說出原因**,
+    不能只回「找不到實作」讓人以為是專案少寫了 macro。"""
+    _write_dispatch_macros(tmp_path)
+    r = _render(code_root=tmp_path,
+                source="SELECT {{ adapter.dispatch(" + json.dumps(name) + ")() }}")
+    assert not r.ok and r.sql == ""
+    assert "名稱不合法" in r.error, r.error
+
+
+@pytest.mark.parametrize("adapter", ["sqlserver'; DROP TABLE t; --", "my-adapter", "", None])
+def test_adapter_name_must_pass_whitelist(tmp_path, adapter):
+    """轉接器名稱同樣過白名單,而且不等到用了 dispatch 才失敗(設定錯就該立刻知道)。"""
+    _write_dispatch_macros(tmp_path)
+    r = _render(code_root=tmp_path, source="SELECT 1", adapter=adapter)
+    assert not r.ok and r.sql == ""
+    assert "轉接器名稱不合法" in r.error, r.error
+
+
+def test_macro_dirs_can_be_configured(tmp_path):
+    """dbt 專案可自訂 macro-paths;預設 macros/,呼叫端可指定其他目錄。"""
+    (tmp_path / "shared_macros").mkdir()
+    (tmp_path / "shared_macros" / "m.sql").write_text(
+        "{% macro shared_one() %}SHARED{% endmacro %}", encoding="utf-8")
+    _write_macro(tmp_path, "m.sql", "{% macro normal_one() %}NORMAL{% endmacro %}")
+    both = _render(code_root=tmp_path, macro_dirs=("macros", "shared_macros"),
+                   source="SELECT {{ normal_one() }}{{ shared_one() }}")
+    assert both.ok and both.sql == "SELECT NORMALSHARED"
+    # 預設只看 macros/:另一個目錄的 macro 不該被載入
+    assert not _render(code_root=tmp_path, source="SELECT {{ shared_one() }}").ok
+
+
+@pytest.mark.parametrize("macro_dirs", [
+    ("../outside",), ("macros/../..",), ("/etc",), ("C:/Windows",),
+    (r"macros\..\..",), ("",), (".",), (None,),
+])
+def test_macro_dirs_reject_paths_outside_project(tmp_path, macro_dirs):
+    """目錄設定同樣不可跳出專案(與 dbt_impact 的路徑白名單一致)。"""
+    _write_macro(tmp_path, "m.sql", "{% macro one() %}1{% endmacro %}")
+    r = _render(code_root=tmp_path, macro_dirs=macro_dirs, source="SELECT 1")
+    assert not r.ok
+    assert "macro 目錄" in r.error
+
+
 def test_macro_name_conflict_is_reported(tmp_path):
     """同名 macro 只能擇一,結果可能與 dbt 不同 → 必須回報,不可靜靜吞掉。"""
     _write_macro(tmp_path, "a_first.sql", "{% macro dup() %}FIRST{% endmacro %}")
@@ -316,6 +448,29 @@ def test_this_is_not_silently_stubbed():
     r = _render(source="SELECT * FROM {{ this }}")
     assert not r.ok
     assert r.sql == ""
+
+
+def test_target_database_is_not_stubbed_when_unset():
+    """沒給 database 時 `{{ target.database }}` 不可展開成 'None' 還回報成功。"""
+    r = render_model("m.sql", source="SELECT '{{ target.database }}'")
+    assert not r.ok and r.sql == ""
+    assert "target.database" in r.error
+    ok = render_model("m.sql", source="SELECT '{{ target.database }}'", database=SAMPLE_DB)
+    assert ok.ok and ok.sql == f"SELECT '{SAMPLE_DB}'"
+    # schema 有預設值,沒給 database 時照常可用
+    assert render_model("m.sql", source="SELECT '{{ target.schema }}'").sql == "SELECT 'dbo'"
+
+
+@pytest.mark.parametrize("call", [
+    "{{ ref('t', version=2) }}",      # dbt 會指向 t_v2,我們沒有 manifest 可解析
+    "{{ ref('t', v=2) }}",
+    "{{ ref('t', nonsense=1) }}",
+])
+def test_ref_rejects_keyword_arguments(call):
+    """忽略會改變關聯的參數等於靜靜產出錯的表名 → 一律拒絕展開。"""
+    r = _render(source=f"SELECT {call}")
+    assert not r.ok and r.sql == ""
+    assert "ref()" in r.error
 
 
 # ---------------------------------------------------------------------- 資安
@@ -764,6 +919,13 @@ def test_isolation_returns_result_and_fails_closed_on_crash_or_exception():
     assert crashed[0] == "失敗" and "異常結束" in crashed[1] and "3" in crashed[1]
     raised = _isolated(int, "secret-input-value")
     assert raised == ("失敗", "ValueError: 子行程執行失敗")
+
+
+def test_isolation_start_failure_is_closed():
+    """子行程啟動失敗(例如參數不能 pickle)也要收斂成失敗,不可把例外丟給呼叫端。"""
+    result = _isolated(len, lambda x: x)      # lambda 不能 pickle
+    assert result[0] == "失敗"
+    assert "子行程" in result[1]
 
 
 @pytest.mark.skipif(importlib.util.find_spec("resource") is None,

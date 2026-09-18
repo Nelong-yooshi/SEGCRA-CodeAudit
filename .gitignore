@@ -5,6 +5,8 @@
 __pycache__/
 *.pyc
 .venv/
+# 例如產生標準答案用的 .venv-dbt
+.venv-*/
 .pytest_cache/
 
 # 執行產物
