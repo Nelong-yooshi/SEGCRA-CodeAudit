@@ -29,6 +29,32 @@ def _api(method: str, path: str, **kwargs):
     return r.json()
 
 
+# 每頁 100 筆(GitLab 上限)→ 最多 5,000 個檔案。一個 MR 動輒超過這個數字,
+# 代表拆分 MR 才是正解,不該無上限追下去(那會拖垮審查本身的時效)。
+MAX_DIFF_PAGES = 50
+
+
+def _api_pages(path: str, params: dict | None = None) -> tuple[list, bool]:
+    """取回分頁 API 的全部資料。回傳 (資料, 是否因超過頁數上限而截斷)。
+
+    甲方 PR #10 review 指出:`get_mr_diff()` 用的 `/merge_requests/:iid/diffs`
+    沒有處理分頁,GitLab 這個 API 預設一頁 20 筆(上限 100)——第 21 個檔案
+    之後不會被注入掃描、不會進規則預掃、不會被模型審查,diff 行數也不會算
+    進去,MR 可能因此被誤判成小改而自動放行。
+    """
+    import httpx
+    items, page = [], 1
+    while page and page <= MAX_DIFF_PAGES:
+        r = httpx.get(f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}{path}",
+                      headers={"PRIVATE-TOKEN": GITLAB_TOKEN}, timeout=30,
+                      params={**(params or {}), "per_page": 100, "page": page})
+        r.raise_for_status()
+        items.extend(r.json())
+        nxt = r.headers.get("X-Next-Page", "").strip()
+        page = int(nxt) if nxt else 0
+    return items, bool(page)
+
+
 # --- mock mode helpers ---------------------------------------------------
 
 def _mock_mr(mr_id: str) -> dict:
@@ -59,13 +85,24 @@ def _mock_output(mr_id: str, kind: str, payload: dict):
 # --- tools ---------------------------------------------------------------
 
 def get_mr_diff(mr_id: str) -> str:
-    """取得 MR 的標題、描述、head commit sha 與 diff(逐檔)。"""
+    """取得 MR 的標題、描述、head commit sha 與 diff(逐檔)。
+
+    real 模式的 `files` 每項多帶 `unreviewable`:GitLab 對過大或被摺疊的檔案
+    不會回傳 diff 內容(`too_large`/`collapsed`),這種檔案沒有經過任何審查,
+    `unreviewable=True` 讓後面的 `enforce_unreviewable` 能攔下來,而不是
+    靜默當成「這個檔案沒問題」。`truncated=True` 代表 MR 的檔案數超過
+    `MAX_DIFF_PAGES` 能取到的上限,同樣不得自動放行。
+    """
     if REAL_MODE:
         mr = _api("GET", f"/merge_requests/{mr_id}")
-        changes = _api("GET", f"/merge_requests/{mr_id}/diffs")
-        files = [{"path": c["new_path"], "diff": c["diff"]} for c in changes]
+        changes, truncated = _api_pages(f"/merge_requests/{mr_id}/diffs")
+        files = [{"path": c["new_path"], "old_path": c.get("old_path"),
+                  "diff": c.get("diff") or "",
+                  "unreviewable": bool(c.get("too_large") or c.get("collapsed"))}
+                 for c in changes]
         return json.dumps({"title": mr["title"], "description": mr.get("description", ""),
-                           "sha": mr.get("sha", ""), "files": files}, ensure_ascii=False)
+                           "sha": mr.get("sha", ""), "files": files,
+                           "truncated": truncated}, ensure_ascii=False)
     mr = _mock_mr(mr_id)
     return json.dumps({"title": mr["title"], "description": mr.get("description", ""),
                        "sha": mr.get("sha", f"mock-{mr_id}"), "files": mr["files"]},

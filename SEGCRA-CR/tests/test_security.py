@@ -25,7 +25,7 @@ from base64 import b64encode
 
 import pytest
 
-from orchestrator.pipeline import apply_policy, enforce_injection
+from orchestrator.pipeline import apply_policy, enforce_injection, enforce_unreviewable
 from orchestrator.security import scan_injection, scan_mr
 
 
@@ -289,3 +289,93 @@ def test_沒有注入命中時走原本的決策邏輯():
              "block": {"min_blockers": 1}}
     out = apply_policy(report, {"files": []}, policy)
     assert out["decision"] != "blocked"
+
+
+# ─────────────────── enforce_unreviewable(甲方 PR #10 review 第 2 點)───────────────────
+# real GitLab 模式下,過大/被摺疊的檔案(GitLab 標 too_large/collapsed)不會有
+# diff 內容,分頁沒接好時第 21 個檔案之後也拿不到——這些內容完全沒被審查過,
+# 不能讓它悄悄地跟「沒問題」長一樣。
+
+def test_有_unreviewable_檔案就補_major():
+    mr = {"files": [{"path": "sql/rules/huge.sql", "unreviewable": True},
+                    {"path": "sql/rules/normal.sql", "unreviewable": False}]}
+    report = enforce_unreviewable({"findings": []}, mr)
+    majors = [f for f in report["findings"] if f["severity"] == "major"]
+    assert len(majors) == 1
+    assert "huge.sql" in majors[0]["detail"]
+    assert "normal.sql" not in majors[0]["detail"]
+
+
+def test_truncated_也要補_major():
+    """檔案數超過分頁上限時,就算個別檔案都沒標 unreviewable,整份 MR 也要擋。"""
+    mr = {"files": [{"path": "a.sql", "unreviewable": False}], "truncated": True}
+    report = enforce_unreviewable({"findings": []}, mr)
+    assert any(f["severity"] == "major" for f in report["findings"])
+
+
+def test_全部檔案都審得到時不動報告():
+    mr = {"files": [{"path": "a.sql", "unreviewable": False}], "truncated": False}
+    report = enforce_unreviewable({"findings": []}, mr)
+    assert report["findings"] == []
+
+
+def test_mock_模式的_fixture_沒有_unreviewable_欄位也不誤觸發():
+    """mock 模式的 files 不會有 unreviewable/truncated 這兩個 key——用 .get()
+    要有正確的預設值,不能因為 key 不存在就出錯或誤判。"""
+    mr = {"files": [{"path": "a.sql", "diff": "@@ -1 +1 @@"}]}
+    report = enforce_unreviewable({"findings": []}, mr)
+    assert report["findings"] == []
+
+
+# ─────────────────── toolbox.gitlab._api_pages 分頁(甲方 PR #10 review 第 2 點)───────────────────
+# ⚠️ 只驗證分頁邏輯本身(用假的 httpx 回應),沒有對真實 GitLab 實測過——
+# 甲方原話「這部分還沒有在真實 GitLab 上實測」,要用測試用 GitLab 建一個超過
+# 20 個檔案、含一個過大檔案的 MR 才能真正驗證。
+
+def test_分頁邏輯會跟著_X_Next_Page_一直取到底(monkeypatch):
+    import httpx as _httpx
+    from toolbox import gitlab
+
+    pages = {1: (["a", "b"], "2"), 2: (["c"], "")}
+    calls = []
+
+    def fake_get(url, headers=None, timeout=None, params=None):
+        page = params["page"]
+        calls.append(page)
+        items, nxt = pages[page]
+        return _httpx.Response(200, json=items,
+                               headers={"X-Next-Page": nxt} if nxt else {},
+                               request=_httpx.Request("GET", url))
+
+    monkeypatch.setattr(gitlab, "GITLAB_URL", "http://fake")
+    monkeypatch.setattr(gitlab, "GITLAB_TOKEN", "t")
+    monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "1")
+    monkeypatch.setattr(_httpx, "get", fake_get)
+
+    items, truncated = gitlab._api_pages("/merge_requests/1/diffs")
+    assert items == ["a", "b", "c"]
+    assert truncated is False
+    assert calls == [1, 2]
+
+
+def test_超過分頁上限時標記_truncated(monkeypatch):
+    """MAX_DIFF_PAGES 是保護機制,不是「應該發生的事」——超過代表這個 MR
+    大到不正常,標記 truncated 讓 enforce_unreviewable 擋下,而不是無上限
+    一直打 API 拖慢審查。"""
+    import httpx as _httpx
+    from toolbox import gitlab
+
+    def fake_get(url, headers=None, timeout=None, params=None):
+        # 每頁都還有下一頁,模擬異常巨大的 MR
+        return _httpx.Response(200, json=["x"], headers={"X-Next-Page": str(params["page"] + 1)},
+                               request=_httpx.Request("GET", url))
+
+    monkeypatch.setattr(gitlab, "GITLAB_URL", "http://fake")
+    monkeypatch.setattr(gitlab, "GITLAB_TOKEN", "t")
+    monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "1")
+    monkeypatch.setattr(gitlab, "MAX_DIFF_PAGES", 3)
+    monkeypatch.setattr(_httpx, "get", fake_get)
+
+    items, truncated = gitlab._api_pages("/merge_requests/1/diffs")
+    assert len(items) == 3
+    assert truncated is True

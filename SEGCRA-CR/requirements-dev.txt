@@ -6,6 +6,8 @@
 #   openai   orchestrator/agent.py 最上面 from openai import AsyncOpenAI
 #            (orchestrator/pipeline.py 會 import agent,所以間接也需要)
 #   pyyaml   orchestrator/config.py 最上面 import yaml
+#   httpx    test_security.py 測 toolbox/gitlab.py 的分頁邏輯(_api_pages)時
+#            用 monkeypatch 換掉 httpx.get,需要真的匯入得到這個套件
 # 少任何一個,對應的測試檔是**收集階段就 ImportError**,不是某條斷言紅燈。
 #
 # 驗證方式:用 meta_path 擋掉套件跑這個範圍的測試(test_security.py + test_citations.py),
@@ -14,3 +16,4 @@ pytest>=8.0
 sqlglot>=25.0
 openai>=1.60
 pyyaml>=6.0
+httpx>=0.27

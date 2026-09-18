@@ -326,6 +326,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_hints(report, pre)
         report = enforce_style(report, pre)    # 已學會的風格(如前置逗號)確定性補報
         report = enforce_injection(report, injection_hits)  # 確定性 blocker,不論模型是否被攻陷
+        report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
 
         # 執行驗證(必跑;測資生成 → 沙盒執行 → 仲裁)——在 rubric 之前
         spec_result = await run_spec_exec(cfg, hub, mr, spec_code, spec_text)
@@ -578,6 +579,40 @@ def enforce_injection(report: dict, hits: list[dict]) -> dict:
         "suggestion": "移除 MR 描述/註解中試圖指示審查器的文字;若為誤植請改寫。",
         "citations": []})
     report["_injection_scan"] = hits
+    return report
+
+
+def enforce_unreviewable(report: dict, mr: dict) -> dict:
+    """有內容沒被審查到時,不得自動放行(甲方 PR #10 review 第 2 點,嚴重)。
+
+    真實 GitLab 模式下,`toolbox.gitlab.get_mr_diff` 用的分頁 API 過去沒有
+    處理分頁(預設一頁只有 20 個檔案),而且 GitLab 對過大或被摺疊的檔案
+    (`too_large`/`collapsed`)本來就不會回傳 diff 內容。這兩種情況下,
+    對應的檔案完全沒有經過注入掃描、規則預掃、模型審查,diff 行數也不會
+    算進 `apply_policy` 的變更量判斷——MR 可能因此被誤判成小改而自動放行,
+    而真正有問題的內容(第 21 個檔案之後、或刻意撐大到觸發摺疊的檔案)
+    完全沒人看過。
+
+    `mr["files"]` 裡個別檔案標了 `unreviewable`,或整份 MR 標了
+    `truncated`,兩者都視為「有東西沒審到」,補一條 major 擋下自動放行——
+    跟 `enforce_injection` 一樣是確定性補位,不看模型有沒有自己發現。
+    """
+    bad = [f["path"] for f in mr.get("files", []) if f.get("unreviewable")]
+    truncated = bool(mr.get("truncated"))
+    if not bad and not truncated:
+        return report
+    parts = []
+    if bad:
+        parts.append(f"以下檔案的 diff 過大或被摺疊,GitLab 未回傳內容:{', '.join(bad[:10])}"
+                     + ("等" if len(bad) > 10 else "") + "。")
+    if truncated:
+        parts.append("MR 變更的檔案數超過可取得的分頁上限,部分檔案未能取得。")
+    report.setdefault("findings", []).insert(0, {
+        "file": "(MR 內容)", "line": 0, "severity": "major",
+        "title": "部分變更內容無法取得,未經審查",
+        "detail": "".join(parts) + "這些內容沒有經過注入掃描、規則預掃與模型審查,需人工確認。",
+        "suggestion": "拆分 MR 讓每個檔案都能被完整取得;或人工審查上列檔案後再合併。",
+        "citations": []})
     return report
 
 
