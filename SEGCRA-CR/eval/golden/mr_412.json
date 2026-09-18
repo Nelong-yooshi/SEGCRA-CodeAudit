@@ -27,6 +27,11 @@
           "COALESCE"
         ]
       }
-    ]
+    ],
+    "expect_signals": {
+      "spec_exec_sql_fault": true,
+      "spec_found": true,
+      "spec_exec_passed": false
+    }
   }
 }

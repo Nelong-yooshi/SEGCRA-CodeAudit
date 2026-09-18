@@ -9,6 +9,10 @@
   python eval/run_eval.py --dry-run           # 不呼叫 LLM(只驗確定性層)
   python eval/run_eval.py --json out.json     # 另存機器可讀結果
 
+收集與評分是分開的兩件事,可以分兩次跑(改斷言時的關鍵):
+  python eval/run_eval.py --dump-reports d/   # 慢(要 GPU):跑管線並把完整報告存檔
+  python eval/run_eval.py --from-reports d/   # 快(毫秒):讀存檔重新評分,不碰模型
+
 golden case = mock MR fixture + 兩段標準答案:
   expected  逐條應被抓到的問題 → 量 recall / precision(沿用 POC 的比對語意)
   _golden   層級與行為斷言     → 證明「哪一道防線真的啟動」、決策落在哪一態
@@ -259,6 +263,25 @@ def load_cases(layer: str | None, only: str | None) -> list[tuple[str, dict]]:
     return cases
 
 
+def load_saved_report(d: Path, mr_id: str) -> dict:
+    """讀 --dump-reports 存下來的完整報告,取代呼叫模型那一段。
+
+    這是「收集/評分分離」的評分半邊。改一條 `_golden` 斷言、或修 `finding_matches`
+    這類計分邏輯時,原本要重跑整輪(18 小時、要 GPU、而且結果還會飄,飄了就不知道
+    是改壞了還是環境在晃);讀存檔重評是毫秒級,而且**輸入完全固定**,所以差異一定
+    來自這次改的斷言,不會混進模型的抖動。
+    """
+    p = d / f"mr_{mr_id}.json"
+    if not p.exists():
+        raise FileNotFoundError(f"找不到 {p}——該 case 沒有存檔,請先用 --dump-reports 跑過")
+    report = json.loads(p.read_text(encoding="utf-8"))
+    # 存檔時如果那次是環境失敗,報告裡會有 error;拿它來評分等於把環境問題
+    # 記成品質退步(「發現十一」踩過的坑),寧可當場喊停。
+    if isinstance(report, dict) and report.get("error"):
+        raise ValueError(f"{p.name} 是失敗的紀錄({report['error']}),不可用於評分")
+    return report
+
+
 async def run(args) -> int:
     cfg = load_config()
     cases = load_cases(args.layer, args.case)
@@ -291,7 +314,10 @@ async def run(args) -> int:
         # 單一 case 的例外不得中斷整輪:一輪要跑數小時,經 SSH tunnel 的長連線
         # 偶發斷線(httpx ReadError → APIConnectionError)是常態,不能讓它清空前面的成果。
         try:
-            report = await review_mr(cfg, mr_id, args.profile, dry_run=args.dry_run)
+            if args.from_reports:
+                report = load_saved_report(Path(args.from_reports), mr_id)
+            else:
+                report = await review_mr(cfg, mr_id, args.profile, dry_run=args.dry_run)
         except Exception as e:  # noqa: BLE001 - 蒐集所有失敗原因,不預設種類
             errors.append((mr_id, layer, f"{type(e).__name__}: {e}"))
             st = layer_stat.setdefault(layer, {"pass": 0, "fail": 0, "gap": 0, "error": 0})
@@ -299,6 +325,14 @@ async def run(args) -> int:
             rows.append({"case": mr_id, "layer": layer, "error": f"{type(e).__name__}: {e}"})
             print(f"‼ mr_{mr_id} [{layer}] 執行失敗:{type(e).__name__}(已跳過,續跑下一個)")
             continue
+        # 完整報告要在**算分之前**就落地:模型那一段是 15-20 分鐘、要 GPU、會飄;
+        # 斷言與計分是純函式、毫秒級。存下來之後改斷言就只要重新評分,不必重跑模型。
+        if args.dump_reports:
+            d = Path(args.dump_reports)
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"mr_{mr_id}.json").write_text(
+                json.dumps(report, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8")
         findings = report.get("findings", [])
         expected = case.get("expected", [])
 
@@ -454,4 +488,17 @@ if __name__ == "__main__":
                 help="只跑指定 case id,逗號分隔(如 405,406,408,410)")
     ap.add_argument("--dry-run", action="store_true", help="不呼叫 LLM,只驗確定性層")
     ap.add_argument("--json", default=None, help="另存機器可讀結果的路徑")
-    sys.exit(asyncio.run(run(ap.parse_args())))
+    ap.add_argument("--dump-reports", default=None, metavar="DIR",
+                    help="把每個 case 的**完整報告**存成 DIR/mr_<id>.json。"
+                         "存下來之後,改 _golden 斷言或計分邏輯時可以直接重新評分,"
+                         "不必再花 15-20 分鐘/case 重跑模型(見 eval/BASELINE.md)")
+    ap.add_argument("--from-reports", default=None, metavar="DIR",
+                    help="不跑管線,讀 DIR 底下 --dump-reports 存的報告重新評分(毫秒級、"
+                         "不用 GPU)。輸入固定,所以差異一定來自斷言或計分邏輯的改動")
+    _args = ap.parse_args()
+    if _args.from_reports and _args.dump_reports:
+        ap.error("--from-reports 是讀存檔評分、--dump-reports 是跑管線存檔,不能同時用")
+    if _args.from_reports and _args.dry_run:
+        ap.error("--from-reports 本來就不呼叫 LLM,不需要也不該再加 --dry-run"
+                 "(--dry-run 會跳過 LLM 之後的斷言,等於把存檔的價值丟掉)")
+    sys.exit(asyncio.run(run(_args)))

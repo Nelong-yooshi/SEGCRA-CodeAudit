@@ -75,6 +75,8 @@ python eval/run_eval.py --json out.json     # 另存機器可讀結果(給報告
 | `spec_exec_passed` | `_spec_exec.passed` | 執行驗證是否通過(自動放行的硬條件) |
 | `citations_removed` | `_removed_citations` | 引用白名單是否剔除過捏造引用 |
 | `pending_hints` | `_policy_signals.pending_hints` | 有無待人工確認的檢核點 |
+| `arbiter_dropped` | `_spec_exec.dropped_cases[].by == "arbiter"` | 角色三仲裁判過「測資錯」並剔除案例 |
+| `spec_exec_sql_fault` | findings 含「執行驗證失敗」 | **執行驗證自己**抓到實作與規格不符(分得出不是靜態審查抓的) |
 
 ## 為什麼要 `_golden`,`expected` 不夠嗎
 
@@ -95,6 +97,30 @@ finding 同理不算誤報。
 
 id 依層分段:`1xx` 注入、`2xx` rule-base、`3xx` binding、`4xx` spec_exec、
 `5xx` 引用白名單、`6xx` 決策閘門。
+
+> **哪些部分已經不需要靠 golden case 覆蓋了**
+>
+> 每個 golden case 要 13-20 分鐘、要 GPU、環境還會卡死;而下面這些機制其實是
+> **確定性純函式**,用單元測試幾毫秒就驗得完、100% 可重現、可以掛 CI 每次 PR 都跑。
+> 它們現在的覆蓋落在 `tests/` 底下:
+>
+> | 機制 | 單元測試 |
+> |---|---|
+> | 注入掃描的九個類別、base64 解碼、`enforce_injection` | `tests/test_security.py` |
+> | `sanitize_findings`、`enforce_rules/hints/parse/style` | `tests/test_postprocess.py` |
+> | 決策閘門六條件、rubric 扣分與 verdict | `tests/test_policy.py` |
+> | 引用白名單、eval 訊號 | `tests/test_citations.py` |
+> | `binding`/`guideline`/`observed` 三層與權威衝突 | `tests/test_knowledge.py` |
+> | 測資形狀/覆蓋檢查、仲裁後的分支 | `tests/test_spec_exec.py` |
+> | skill 載入、context 預算 | `tests/test_skills.py` |
+> | **評測工具自己的計分邏輯**(`finding_matches`、`match_expected` 等) | `tests/test_eval_scoring.py` |
+> | `extract_json`、`_sql_from_diff`、`prepare_sql`、仲裁保底 | `tests/test_parsing.py` |
+>
+> **所以 golden case 的定位變窄也變清楚了**:它要回答的是「**只有問模型才答得出來**」
+> 的問題——模型會不會被越獄壓制、會不會抓到規格不符、測資生成的覆蓋度有多穩。
+> 各層的**偵測邏輯本身**不必再靠 golden case 去覆蓋 pattern 的排列組合;
+> 下面的 case 表保留的是「端到端有沒有真的變成 blocker、決策有沒有落對」這一層價值。
+> 之後要縮減跑批範圍時,依這張表判斷哪些可以少跑。
 
 ### 注入掃描(7)
 
@@ -416,6 +442,10 @@ dict 永遠不等於任何字串,所以**只要模型回報任何引用(即使�
 | 2 | OR-of-ANDs 測資覆蓋 | `mr_408` | 契約假設「條件彼此獨立可翻轉」 | 否(回報缺口並拒絕放行) |
 | 3 | 時間窗邊界 | `mr_403` | 契約規定測資一律落在窗內起始日 | 否(靜態審查補位) |
 
+> `mr_405`/`mr_406` 正向對照的斷言脆弱性(要求「零覆蓋缺口」,而覆蓋度本身會抖)
+> 是另一個獨立的觀察,見另一份 PR——那是要不要把硬性斷言降級為觀測指標的決定,
+> 影響回歸閘門的嚴格度,值得單獨審查,不跟其餘測試覆蓋一起送。
+
 ### 缺口 1:中文角色扮演越獄(`mr_102`)
 
 `orchestrator/security.py` 的 `role_hijack` 只涵蓋英文
@@ -551,6 +581,18 @@ dict 永遠不等於任何字串,所以**只要模型回報任何引用(即使�
 要主張穩定的品質水準,參考 PoC 的建議規模:20–50 個 case,涵蓋各類問題
 (效能 / 正確性 / 個資 / 規格不符 / 乾淨對照),並以去識別化的真實歷史 MR 為主。
 
-另外,LLM 層有隨機性(`config/models.yaml` 的 `temperature` 目前 0.1),
-同一個 case 重跑結果可能不同。做正式成效報告時需先決定:固定 `temperature` 為 0 求可重現,
-或保留隨機性改用多次取樣取平均——這會影響數據的呈現方式與可信度。
+**更重要的一點:目前所有 case 都是簡化的單檔 SQL,尚未涵蓋真實規則程式的形狀**
+(跨檔案的 macro 間接層、model 只負責呼叫而關鍵條件寫在別處)——現有 case 的 SQL
+大多只有 10-20 行、什麼都是 inline 的,跟正式環境會有結構性落差。
+
+所以現有的 recall / precision 數字**量的是「手寫片段」上的表現,不代表正式環境**。
+這個落差比隨機性的影響更根本:隨機性影響「數字穩不穩」,這個影響「數字量的是不是我們
+關心的東西」。真實形狀的量測與對應的 case,要等管線支援樣板展開與規格路徑對應
+(#7,由另一條分支處理)完成後才做得起來——在那之前,不要把這些數字當成正式環境的
+品質承諾。
+
+另外,LLM 層有隨機性,同一個 case 重跑結果可能不同。**注意:設定檔曾經以
+`seed` 追求可重現,但實測 `seed` 在目前的模型端點上完全沒有生效**
+(端點是一個名為 `ollama-gate` 的代理層,它的 OpenAI 相容路徑會接受但忽略該參數;
+改走原生 `/api/chat` 才有效)。因此**目前無法靠固定 seed 取得可重現的結果**,
+正式成效報告一律採「同一個 case 跑多次、報告分布」的方式。
