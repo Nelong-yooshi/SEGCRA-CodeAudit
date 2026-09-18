@@ -4,6 +4,15 @@ endpoint: http://localhost:11434/v1
 api_key: ollama          # Ollama 不驗證,佔位即可
 default_profile: review
 
+# temperature/seed 的方針(對應 eval/README.md「發現三:測資生成覆蓋度不穩定」):
+# - 正式審查(webhook / demo.py):用這裡的值。
+# - 回歸比較(eval/run_eval.py):腳本預設自動固定 temperature 0、並傳送 seed 42。
+#   **更正(2026-09-18)**:seed 在目前的端點(ollama-gate 代理,/v1 路徑)上從未生效,
+#   細節見 eval/FINDINGS.md「附錄:seed 根因追查」。temperature=0 仍會送,能降低變異,
+#   但不保證可重現——回歸比較要當作不能重現,跑多次看分布,不能只跑一次就下結論。
+# - 出能力報告(看模型真實表現的分布):跑的時候用環境變數覆蓋 run_eval.py 的預設:
+#     LLM_TEMPERATURE=0.1 LLM_SEED= .venv/bin/python eval/run_eval.py ...
+#   (LLM_SEED 設空字串 = 取消固定 seed;目前無論設不設,seed 本身都不生效)
 profiles:
   review:                # 審查主力(tag 以 ollama registry 實際名稱為準)
     model: gemma4:31b
