@@ -38,8 +38,8 @@ MUTANTS = {
         "    if False:"),
     # ---- 讀檔 / 環境變數 / 目錄
     "Jinja 環境掛回檔案載入器(include 可讀檔)": (
-        "        extensions=_JINJA_EXTENSIONS,\n        finalize=_finalize,\n    )",
-        "        extensions=_JINJA_EXTENSIONS,\n        finalize=_finalize,\n"
+        "        extensions=[*_JINJA_EXTENSIONS, _DbtBlocks],\n        finalize=_finalize,\n    )",
+        "        extensions=[*_JINJA_EXTENSIONS, _DbtBlocks],\n        finalize=_finalize,\n"
         "        loader=__import__('jinja2').FileSystemLoader(str(code_root or '.')),\n    )"),
     "提供 env_var": (
         '    env.globals["execute"] = True                   # compile 期為 True',
@@ -204,6 +204,21 @@ MUTANTS = {
     "行數改用 splitlines": (
         '    return text.count("\\n") + (0 if text.endswith("\\n") else 1)',
         "    return len(text.splitlines())"),
+    # ---- dbt 專屬區塊 / macro 逐檔隔離 / config
+    "dbt 專屬區塊在 model 檔也吞掉(整段 SQL 逃過預掃)": (
+        '        if not getattr(self.environment, "segcra_macro_phase", False):',
+        "        if False:"),
+    "macro 階段旗標不關閉(model 檔跟著被吞)": (
+        "    env.segcra_macro_phase = False" + NL + "    return env, sorted(macros), conflicts, problems",
+        "    return env, sorted(macros), conflicts, problems"),
+    "壞掉的 macro 檔略過但不記錄": (
+        '            problems.append(f"{rel}:{_safe_error(e)}")' + NL + "            continue" + NL
+        + "        for name in dir(module):",
+        "            continue" + NL + "        for name in dir(module):"),
+    "config.get 讀不到就拿預設值頂替(猜值)": (
+        "        raise DbtRenderError(" + NL + "            f\"config.get('{name}') 讀不到值",
+        "        return \"\" if default is _MISSING else default" + NL
+        + "        raise DbtRenderError(" + NL + "            f\"config.get('{name}') 讀不到值"),
 }
 
 I = "dbt_impact.py"

@@ -162,6 +162,8 @@ def test_matches_dbt_compile(target, name):
       probe_bom          帶 BOM 的檔案(dbt 會把 BOM 保留在輸出裡)
       probe_crlf         CRLF 換行的檔案(Windows 編輯器常見)
       probe_dispatch     adapter.dispatch 依轉接器挑實作(各目標答案不同)
+      probe_blocks_config  macro 目錄含 dbt 專屬區塊(materialization / test)時,
+                         同檔的一般 macro 仍可用;config.get 讀得回 config() 設的值
     不一致代表我們與 dbt 行為有落差;若是原始檔改了,請重跑 generate.py。
     """
     r = _render_reference(name, adapter=target.name)
@@ -225,7 +227,7 @@ def test_get_config_returns_dict():
 
     這是整個做法的成敗點:拿到字串的話 cfg['inward_codes'] 會直接炸。
     """
-    env, _, _ = build_env(CODE_ROOT)
+    env, _, _, _ = build_env(CODE_ROOT)
     cfg = env.globals["get_config"]()
     assert isinstance(cfg, dict)
     assert cfg["RETAIL_M1"]["inward_threshold"] == "1000"
@@ -289,6 +291,137 @@ def test_macro_file_cannot_poison_shared_namespace(tmp_path):
     r = _render(code_root=tmp_path, source="SELECT {{ rel() }}, {{ ref('u') }}")
     assert r.ok, r.error
     assert r.sql == f'SELECT "{SAMPLE_DB}"."dbo"."t", "{SAMPLE_DB}"."dbo"."u"'
+
+
+@pytest.mark.parametrize("block", [
+    "{% materialization my_mat, default %}SELECT 1{% endmaterialization %}",
+    "{% test not_neg(model, column_name) %}SELECT 1{% endtest %}",
+    "{% docs my_doc %}說明{% enddocs %}",
+    "{% snapshot snap %}SELECT 1{% endsnapshot %}",
+])
+def test_dbt_only_block_in_macro_dir_does_not_break_everything(tmp_path, block):
+    """自訂 materialization、generic test 在真實 dbt 專案很常見。
+
+    Jinja 不認得這些標籤,少了處理,macro 目錄裡只要有一個檔案用到,整包 macro
+    就解析失敗,連帶讓**所有** model 都展不開——那等於這個功能在真實專案上不能用。
+    """
+    _write_macro(tmp_path, "logic.sql", "{% macro amt() %}amount > 1000{% endmacro %}")
+    _write_macro(tmp_path, "dbt_only.sql", block)
+    r = _render(code_root=tmp_path, source="SELECT * FROM t WHERE {{ amt() }}")
+    assert r.ok, r.error
+    assert r.sql == "SELECT * FROM t WHERE amount > 1000"
+    assert r.macro_problems == []
+
+
+def test_dbt_only_block_does_not_hide_macros_in_the_same_file(tmp_path):
+    """同一個檔案裡既有 generic test 又有一般 macro(dbt 允許):macro 必須還在。"""
+    _write_macro(tmp_path, "mix.sql",
+                 "{% test t1(model) %}SELECT 1{% endtest %}\n"
+                 "{% macro amt() %}amount > 1000{% endmacro %}")
+    r = _render(code_root=tmp_path, source="SELECT * FROM t WHERE {{ amt() }}")
+    assert r.ok, r.error
+    assert r.sql == "SELECT * FROM t WHERE amount > 1000"
+
+
+@pytest.mark.parametrize("source", [
+    "{% test x(model) %}SELECT secret{% endtest %}\nSELECT 1",
+    "{% materialization m, default %}SELECT secret{% endmaterialization %}\nSELECT 1",
+])
+def test_dbt_only_block_in_model_is_a_hard_failure(tmp_path, source):
+    """model 檔裡用這些標籤不是合法的 dbt 寫法。
+
+    默默把那段丟掉,我們會產出「比 dbt 少一段」的 SQL 卻回報展開成功——
+    整段 SQL 就這樣逃過預掃。寧可硬失敗。
+    """
+    r = _render(code_root=tmp_path, source=source)
+    assert not r.ok
+    assert "unknown tag" in r.error
+    assert "secret" not in r.sql
+
+
+def test_dbt_only_block_in_model_still_fails_after_macros_are_loaded(tmp_path):
+    """載入 macro 時才放行這些標籤,載完必須關掉。
+
+    旗標留著沒關,同一個 env 接著渲染 model 時就會把 `{% test %}` 裡的 SQL
+    一起吞掉——而且只有在專案真的有 macro 檔時才會發生,所以這條要有 macro。
+    """
+    _write_macro(tmp_path, "blocks.sql",
+                 "{% test t(model) %}SELECT 1{% endtest %}"
+                 "{% macro amt() %}1{% endmacro %}")
+    r = _render(code_root=tmp_path,
+                source="{% test z(model) %}SELECT secret{% endtest %}SELECT {{ amt() }}")
+    assert not r.ok
+    assert "unknown tag" in r.error
+    assert "secret" not in r.sql
+
+
+def test_broken_macro_file_is_skipped_and_reported(tmp_path):
+    """一個 macro 檔壞掉,不該讓用不到它的 model 也展不開;但必須被記錄下來。"""
+    _write_macro(tmp_path, "good.sql", "{% macro amt() %}amount > 1000{% endmacro %}")
+    _write_macro(tmp_path, "bad.sql", "{% macro broken() %} {% endfor %}")
+    r = _render(code_root=tmp_path, source="SELECT * FROM t WHERE {{ amt() }}")
+    assert r.ok, r.error
+    assert r.sql == "SELECT * FROM t WHERE amount > 1000"
+    assert len(r.macro_problems) == 1
+    assert r.macro_problems[0].startswith("macros/bad.sql:")
+
+
+def test_macro_from_skipped_file_fails_loudly(tmp_path):
+    """略過壞掉的檔案不能變成「靜靜少了一段邏輯」:真的用到它就必須失敗。"""
+    _write_macro(tmp_path, "bad.sql", "{% macro broken() %}x{% endfor %}")
+    r = _render(code_root=tmp_path, source="SELECT {{ broken() }}")
+    assert not r.ok
+    assert "broken" in r.error
+
+
+def test_undecodable_macro_file_is_skipped(tmp_path):
+    """macro 目錄裡混進非 UTF-8 的檔案,不該讓整個專案都展不開。"""
+    _write_macro(tmp_path, "good.sql", "{% macro amt() %}1{% endmacro %}")
+    (tmp_path / "macros" / "binary.sql").write_bytes(b"\xff\xfe{% macro x() %}")
+    r = _render(code_root=tmp_path, source="SELECT {{ amt() }}")
+    assert r.ok, r.error
+    assert any(p.startswith("macros/binary.sql:") for p in r.macro_problems)
+
+
+def test_config_get_reads_value_set_in_file(tmp_path):
+    """`config.get()` 在真實 dbt 專案很常見(例如依 materialized 切分支)。"""
+    r = _render(code_root=tmp_path,
+                source="{{ config(materialized='table') }}\n"
+                       "SELECT '{{ config.get('materialized') }}' AS m")
+    assert r.ok, r.error
+    assert r.sql.strip() == "SELECT 'table' AS m"
+
+
+def test_config_accepts_dict_form(tmp_path):
+    """dbt 也允許 config({'materialized': 'view'})。"""
+    r = _render(code_root=tmp_path,
+                source="{{ config({'materialized': 'view'}) }}\n"
+                       "SELECT '{{ config.get('materialized') }}' AS m")
+    assert r.ok, r.error
+    assert r.sql.strip() == "SELECT 'view' AS m"
+
+
+@pytest.mark.parametrize("source", [
+    "SELECT '{{ config.get('materialized') }}' AS m",
+    "SELECT '{{ config.get('materialized', 'view') }}' AS m",   # 給了預設值也不能猜
+    "SELECT '{{ config.get('materialized') }}' AS m\n{{ config(materialized='table') }}",
+])
+def test_config_get_without_value_fails_loudly(tmp_path, source):
+    """dbt 還會合併 dbt_project.yml 的設定,而且解析期就拿得到全檔的 config。
+
+    我們兩者都做不到,所以讀不到就硬失敗;用預設值頂替會產出與 dbt 不同、
+    卻回報成功的 SQL。
+    """
+    r = _render(code_root=tmp_path, source=source)
+    assert not r.ok
+    assert "config.get" in r.error
+
+
+def test_config_object_cannot_be_printed(tmp_path):
+    """`{{ config }}` 少了括號不可印出物件(字串表示含記憶體位址)。"""
+    r = _render(code_root=tmp_path, source="SELECT {{ config }}")
+    assert not r.ok
+    assert "_Config" in r.error
 
 
 def _write_dispatch_macros(tmp_path) -> None:
@@ -395,7 +528,7 @@ def test_macro_name_conflict_is_reported(tmp_path):
     """同名 macro 只能擇一,結果可能與 dbt 不同 → 必須回報,不可靜靜吞掉。"""
     _write_macro(tmp_path, "a_first.sql", "{% macro dup() %}FIRST{% endmacro %}")
     _write_macro(tmp_path, "z_second.sql", "{% macro dup() %}SECOND{% endmacro %}")
-    _, macros, conflicts = build_env(tmp_path)
+    _, macros, conflicts, _ = build_env(tmp_path)
     assert macros.count("dup") == 1, "同名不應在清單裡重複出現"
     assert len(conflicts) == 1
     assert "dup" in conflicts[0]
@@ -508,7 +641,7 @@ def test_template_injection_is_blocked(payload):
 def test_environment_is_sandboxed():
     from jinja2.sandbox import SandboxedEnvironment
 
-    env, _, _ = build_env(CODE_ROOT)
+    env, _, _, _ = build_env(CODE_ROOT)
     assert isinstance(env, SandboxedEnvironment)
 
 
@@ -586,7 +719,7 @@ def test_symlinked_macro_files_are_skipped(tmp_path):
         (tmp_path / "proj" / "macros" / "link.sql").symlink_to(outside)
     except OSError:
         pytest.skip("此環境無法建立符號連結(Windows 需要額外權限)")
-    _, macros, _ = build_env(tmp_path / "proj")
+    _, macros, _, _ = build_env(tmp_path / "proj")
     assert "leaked" not in macros
 
 
@@ -597,7 +730,7 @@ def test_symlink_check_is_applied(tmp_path, monkeypatch):
     original = pathlib.Path.is_symlink
     monkeypatch.setattr(pathlib.Path, "is_symlink",
                         lambda self: self.name == "link.sql" or original(self))
-    _, macros, _ = build_env(tmp_path)
+    _, macros, _, _ = build_env(tmp_path)
     assert macros == ["kept"]
 
 

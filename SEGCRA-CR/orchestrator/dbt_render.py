@@ -81,6 +81,10 @@
     用到即 render 失敗。
   * macro 同名時 dbt 用套件命名空間解析,這裡是單一平面命名空間。遇到同名
     只能擇一,結果**可能與 dbt 不同** → 記進 `macro_conflicts` 讓上游看得到。
+  * `config.get()` 只讀得到同一份 model 檔內、排在前面的 `config()` 所設定的鍵;
+    dbt 還會合併 `dbt_project.yml` 的設定,且不受先後順序影響。讀不到即硬失敗。
+  * 載入失敗的 macro 檔會被略過並記進 `macro_problems`,其餘檔案照常可用。
+    用到被略過檔案裡的 macro 時,該 model 會因名稱未定義而展開失敗(fail closed)。
 """
 import copy
 import difflib
@@ -93,6 +97,7 @@ from dataclasses import dataclass, field
 import jinja2
 from jinja2 import StrictUndefined, Undefined
 from jinja2.defaults import DEFAULT_NAMESPACE
+from jinja2.ext import Extension
 from jinja2.sandbox import SandboxedEnvironment
 
 from .isolation import run_isolated
@@ -210,6 +215,36 @@ def _too_big(value) -> bool:
     return isinstance(value, (str, list, tuple)) and len(value) > MAX_OUTPUT_CHARS
 
 
+class _DbtBlocks(Extension):
+    """dbt 自己加上去的區塊標籤,解析掉但不輸出任何內容。
+
+    `{% materialization %}`(自訂實體化)、`{% test %}`(generic test)、
+    `{% docs %}`、`{% snapshot %}` 都是 dbt 以 Jinja 擴充加的語法,Jinja 本身
+    不認得。少了它們,macro 目錄裡只要有**一個**檔案用到(這兩者在真實專案都
+    很常見),整包 macro 就解析失敗,連帶讓**所有** model 都展不開。
+
+    dbt 自己也是以擴充處理這幾個標籤,而且同樣不會把內容編進 model 的 SQL,
+    所以「解析掉並丟棄」與 dbt 的輸出一致。
+
+    **只在載入 macro 檔時生效**:model 檔裡出現這些標籤並不是合法的 dbt 寫法,
+    默默把那段丟掉會讓我們產出「比 dbt 少一段」的 SQL,還回報展開成功。
+    所以 model 階段一律照 Jinja 原本的行為當成未知標籤,硬失敗。
+    """
+
+    tags = {"materialization", "test", "docs", "snapshot"}
+
+    def parse(self, parser):
+        tag = parser.stream.current.value
+        if not getattr(self.environment, "segcra_macro_phase", False):
+            raise jinja2.TemplateSyntaxError(
+                f"Encountered unknown tag '{tag}'.", parser.stream.current.lineno)
+        next(parser.stream)
+        while parser.stream.current.type != "block_end":   # 標籤上的參數一律略過
+            next(parser.stream)
+        parser.parse_statements((f"name:end{tag}",), drop_needle=True)
+        return []
+
+
 class _DbtSandbox(SandboxedEnvironment):
     """在 Jinja 沙箱之上,再擋住以 * / + / ** 做出的超大結果。
 
@@ -264,6 +299,39 @@ def _make_var(variables: dict):
         return default
 
     return var
+
+
+class _Config:
+    """dbt 的 `config`:`{{ config(...) }}` 設定,`config.get(...)` 讀回。
+
+    只認得**同一份 model 檔內、而且排在前面**的 config() 所設定的鍵。dbt 還會
+    合併 dbt_project.yml 的 `models:` 設定(本模組不讀取),且它在解析期就取得
+    全檔的 config,不受先後順序影響。所以讀不到的鍵一律硬失敗,連呼叫端給了
+    預設值也不例外——用預設值頂替會掩蓋「dbt 其實有值而且不一樣」的情況,
+    產出看似成功、實則與 dbt 不同的 SQL。
+    """
+
+    def __init__(self):
+        self._values: dict = {}
+
+    def __call__(self, *args, **kwargs):
+        # dbt 允許 config(materialized='table') 與 config({'materialized': 'table'})
+        for a in args:
+            if isinstance(a, dict):
+                self._values.update(a)
+        self._values.update(kwargs)
+        return ""                                   # config 不產生 SQL
+
+    def get(self, name, default=_MISSING):
+        if name in self._values:
+            return copy.deepcopy(self._values[name])
+        raise DbtRenderError(
+            f"config.get('{name}') 讀不到值:這份檔案裡沒有(或還沒有)以 config() "
+            f"設定過它。dbt 會再合併 dbt_project.yml 的設定,本模組不讀取,"
+            f"因此不猜值。")
+
+    def require(self, name):
+        return self.get(name)
 
 
 def _check_ident(kind: str, value) -> str:
@@ -350,6 +418,9 @@ class RenderResult:
     map_method: str = "none"          # sentinel | difflib | none
     macros: list[str] = field(default_factory=list)
     macro_conflicts: list[str] = field(default_factory=list)
+    # 載入失敗而被略過的 macro 檔(路徑:原因)。ok 仍可能為 True——只用到其他
+    # macro 的 model 照常展開;呼叫到被略過檔案裡的 macro 則會展開失敗。
+    macro_problems: list[str] = field(default_factory=list)
     source_lines: int = 0
     rendered_lines: int = 0
     error: str | None = None
@@ -427,14 +498,14 @@ def build_env(code_root=None, variables: dict | None = None,
     # 其餘設定比照 dbt-core 的 Jinja 環境,輸出才能與 dbt compile 逐字一致。
     env = _DbtSandbox(
         undefined=StrictUndefined,   # 沒樁到的 dbt 內建要大聲失敗,不可悄悄變空字串
-        extensions=_JINJA_EXTENSIONS,
+        extensions=[*_JINJA_EXTENSIONS, _DbtBlocks],
         finalize=_finalize,
     )
 
     ref, source = _make_relations(database, schema)
     env.globals["ref"] = ref
     env.globals["source"] = source
-    env.globals["config"] = lambda *a, **k: ""      # config 不產生 SQL
+    env.globals["config"] = _Config()
     env.globals["return"] = _return
     env.globals["var"] = _make_var(variables)
     env.globals["execute"] = True                   # compile 期為 True
@@ -456,8 +527,9 @@ def build_env(code_root=None, variables: dict | None = None,
 
     macros: list[str] = []
     conflicts: list[str] = []
+    problems: list[str] = []
     if code_root is None:
-        return env, macros, conflicts
+        return env, macros, conflicts, problems
 
     root = pathlib.Path(code_root)
     seen: dict[str, str] = {}
@@ -476,7 +548,7 @@ def build_env(code_root=None, variables: dict | None = None,
         files += [f for f in sorted(macro_dir.rglob("*.sql"))
                   if not f.is_symlink() and f.is_file()]   # 符號連結可能指向任意檔案
     if not files:
-        return env, macros, conflicts
+        return env, macros, conflicts, problems
     if len(files) > MAX_MACRO_FILES:
         raise DbtRenderError(f"macro 檔案數超過 {MAX_MACRO_FILES} 個上限")
     total = 0
@@ -484,15 +556,30 @@ def build_env(code_root=None, variables: dict | None = None,
     # 展開會讓「呼叫排在後面檔案的 macro」找不到名稱(跨檔互相呼叫在真實專案很常見)。
     # 名稱在 macro 被呼叫時才解析,所以之後載入的 macro 也找得到。
     shared: dict = dict(env.globals)
+    # dbt 專用的區塊標籤只在這個階段解析得掉(理由見 _DbtBlocks)
+    env.segcra_macro_phase = True
     for f in files:
         rel = f.relative_to(root).as_posix()
-        text = f.read_bytes().decode("utf-8")
+        try:
+            text = f.read_bytes().decode("utf-8")
+        except UnicodeDecodeError as e:
+            problems.append(f"{rel}:{_safe_error(e)}")
+            continue
         total += len(text)
         if total > MAX_MACRO_CHARS:
             raise DbtRenderError(f"macro 檔案合計超過 {MAX_MACRO_CHARS} 字元上限")
-        # 模組層的 {% set %} 只寫進該模組自己的名稱空間,不會汙染 shared(已驗證);
-        # 進入 shared 的只有下面逐一檢查過的 macro。
-        module = env.from_string(text).make_module(vars=shared, shared=True)
+        try:
+            # 模組層的 {% set %} 只寫進該模組自己的名稱空間,不會汙染 shared(已驗證);
+            # 進入 shared 的只有下面逐一檢查過的 macro。
+            module = env.from_string(text).make_module(vars=shared, shared=True)
+        except DbtRenderError:
+            raise                       # 資源上限等我們自己的硬失敗照舊往上拋
+        except Exception as e:
+            # 單一 macro 檔壞掉(語法錯誤、模組層執行失敗)不該讓整個專案都展不開:
+            # 略過它並記錄。真的需要它的 model 仍會因為名稱未定義而大聲失敗,
+            # 不會靜靜產出少了那段邏輯的 SQL。
+            problems.append(f"{rel}:{_safe_error(e)}")
+            continue
         for name in dir(module):
             if name.startswith("_"):
                 continue
@@ -511,7 +598,8 @@ def build_env(code_root=None, variables: dict | None = None,
                 macros.append(name)
             seen[name] = rel
             shared[name] = env.globals[name] = _wrap(obj)
-    return env, sorted(macros), conflicts
+    env.segcra_macro_phase = False
+    return env, sorted(macros), conflicts, problems
 
 
 # ------------------------------------------------------------- 哨兵行號對應
@@ -682,8 +770,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
             source = model_path.read_bytes().decode("utf-8")
         if len(source) > MAX_SOURCE_CHARS:
             raise DbtRenderError(f"原始碼超過 {MAX_SOURCE_CHARS} 字元上限")
-        env, macros, conflicts = build_env(root, variables, database, schema,
-                                           macro_dirs, adapter)
+        env, macros, conflicts, problems = build_env(root, variables, database, schema,
+                                                     macro_dirs, adapter)
         # dbt 讀檔時會去掉頭尾空白再渲染(開頭空行不會出現在編譯結果裡)
         body = source.strip()
         clean = _render_capped(env.from_string(body), MAX_OUTPUT_CHARS)
@@ -719,6 +807,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
         map_method=method,
         macros=macros,
         macro_conflicts=conflicts,
+        macro_problems=problems,
         source_lines=n_src,
         rendered_lines=n_out,
     )
