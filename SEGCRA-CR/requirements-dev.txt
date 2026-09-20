@@ -3,6 +3,8 @@
 #
 # 這裡列的是「import 得起來」的最小集合,不是「測試會用到」的集合——
 # 測試不呼叫 LLM、不連資料庫,但 import 管線模組時 module 層的 import 就會被執行:
+#   jinja2   orchestrator/dbt_render.py 的樣板展開
+#   sqlglot  規則預掃的 SQL 解析
 #   openai   orchestrator/agent.py 最上面 from openai import AsyncOpenAI
 #            (orchestrator/pipeline.py 會 import agent,所以間接也需要)
 #   pyyaml   orchestrator/config.py 最上面 import yaml
@@ -10,9 +12,9 @@
 #            用 monkeypatch 換掉 httpx.get,需要真的匯入得到這個套件
 # 少任何一個,對應的測試檔是**收集階段就 ImportError**,不是某條斷言紅燈。
 #
-# 驗證方式:用 meta_path 擋掉套件跑這個範圍的測試(test_security.py + test_citations.py),
-# 應為全數通過。
+# 驗證方式:用乾淨的虛擬環境只裝這份清單,跑 tests/ 應全數通過。
 pytest>=8.0
+jinja2>=3.1.6
 sqlglot>=25.0
 openai>=1.60
 pyyaml>=6.0

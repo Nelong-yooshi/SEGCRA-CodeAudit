@@ -1,0 +1,20 @@
+# macro 反查的對照專案 —— 只用來讓 `dbt parse` 產生依賴關係的標準答案,不部署、不執行。
+# 名稱全為去識別化的假名(ALPHA、BETA…、T_SAMPLE_*)。
+# 刻意放入各種容易漏判的 macro 呼叫方式,見 models/ 與 macros/ 各檔開頭說明。
+name: segcra_impact
+version: "1.0.0"
+config-version: 2
+profile: segcra_reference
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets: ["target", "logs"]
+
+# macro 藏在專案設定的 hook 字串裡
+on-run-end:
+  - "{{ log_run_end() }}"
+
+flags:
+  # dbt 預設會回傳匿名使用統計給 dbt Labs;地端環境不允許對外送資料,關閉。
+  send_anonymous_usage_stats: false
