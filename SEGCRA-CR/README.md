@@ -65,6 +65,7 @@ SEGCRA-CR/
 | `docs/06-決策與merge閘門.md` | 評分公式、三態全部條件、CE 閘門三件套 |
 | `docs/07-webhook自動化.md` | token 驗證、事件路由、debounce、已知限制 |
 | `docs/08-學習迴路autopin.md` | 判例入庫 → 分群起草 → binding MR 人閘全鏈 |
+| `docs/09-dbt展開與反查.md` | dbt 樣板展開成純 SQL、行號對回原始檔、macro 變更反查 model 與規格(尚未接進管線) |
 
 ## ADR
 ### ADR-00（棄用RAG）

@@ -3,20 +3,25 @@
 #
 # 這裡列的是「import 得起來」的最小集合,不是「測試會用到」的集合——
 # 測試不呼叫 LLM、不連資料庫,但 import 管線模組時 module 層的 import 就會被執行:
+#   jinja2       orchestrator/dbt_render.py 的樣板展開(#10 的範圍)
+#   sqlglot      規則預掃的 SQL 解析
 #   openai       orchestrator/agent.py 最上面 from openai import AsyncOpenAI
 #                (orchestrator/pipeline.py 會 import agent,所以間接也需要)
 #   pyyaml       orchestrator/config.py 最上面 import yaml
+#   httpx        test_security.py 測 toolbox/gitlab.py 的分頁邏輯(_api_pages)時
+#                用 monkeypatch 換掉 httpx.get,需要真的匯入得到這個套件
 #   json-repair  agent.py 的 extract_json 退路(test_parsing.py 會驗到)
 # 少任何一個,對應的測試檔是**收集階段就 ImportError**,不是某條斷言紅燈。
 #
-# 尚未加 jinja2 / sqlfluff / pymssql:目前這個分支的範圍不需要——jinja2 是 dbt
-# 展開專用(#10 的範圍),sqlfluff 只有 toolbox/sqltools.lint() 內部才 import(還沒有
-# 測試走到那條路徑),pymssql 是 spec_exec.execute_cases() 函式內部才 import(module
-# 層不需要)。哪天測試真的用到再加,不要先裝不用的。
+# 尚未加 sqlfluff / pymssql:sqlfluff 只有 toolbox/sqltools.lint() 內部才 import
+# (還沒有測試走到那條路徑),pymssql 是 spec_exec.execute_cases() 函式內部才
+# import(module 層不需要)。哪天測試真的用到再加,不要先裝不用的。
 #
-# 驗證方式:用 meta_path 擋掉套件跑全套件,應為全數通過。
+# 驗證方式:用乾淨的虛擬環境只裝這份清單,跑 tests/ 應全數通過。
 pytest>=8.0
+jinja2>=3.1.6
 sqlglot>=25.0
 openai>=1.60
 pyyaml>=6.0
+httpx>=0.27
 json-repair>=0.30
