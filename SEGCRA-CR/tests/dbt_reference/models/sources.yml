@@ -1,0 +1,10 @@
+# 去識別化的來源表宣告。結構比照正式環境:來源不另指定 database,
+# 沿用 profile 的資料庫;schema 為 dbo。
+version: 2
+
+sources:
+  - name: raw                  # dbt 內的邏輯代稱
+    schema: dbo
+    tables:
+      - name: T_SAMPLE_TXN
+      - name: T_SAMPLE_ACCT
