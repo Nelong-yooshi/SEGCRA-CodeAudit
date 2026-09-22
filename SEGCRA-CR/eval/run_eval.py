@@ -36,10 +36,9 @@ os.environ["REVIEW_OUTPUT"] = str(EVAL_DIR / "_output")
 # 回歸比較預設固定 temperature 0、並傳送 seed 42;正式審查不受影響(models.yaml 維持原值)。
 # 用 setdefault:呼叫端明確設的環境變數優先(含 LLM_SEED= 空字串代表取消固定 seed)。
 #
-# **更正(2026-09-18)**:seed 在目前的端點(ollama-gate 代理,管線走的 /v1 路徑)上從未
-# 生效——代理接受但忽略它(原生 /api/chat 路徑才有效,已實測對照,見
-# eval/FINDINGS.md「附錄:seed 根因追查」)。temperature=0 仍會送、仍能降低變異,但
-# **不能當成可重現的依據**;回歸比較要跑多次看分布,單次比對不足以下結論。
+# seed 經對照實驗證實是有生效的(細節見 eval/FINDINGS.md「附錄:seed 根因追查」)。但同一份
+# 輸入兩次跑出不同結果的現象仍觀察過、原因未定(較可能是 prompt 內容本身有變動,而非取樣
+# 隨機性)——**不能當成可重現的依據**;回歸比較要跑多次看分布,單次比對不足以下結論。
 os.environ.setdefault("LLM_TEMPERATURE", "0")
 os.environ.setdefault("LLM_SEED", "42")
 

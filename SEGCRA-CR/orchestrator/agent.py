@@ -40,6 +40,17 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
             **seed_kwargs,
         )
         msg = resp.choices[0].message
+        usage = getattr(resp, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+        if prompt_tokens is not None:
+            sent_estimate = sum(estimate_tokens(m.get("content") or "") for m in messages)
+            # 超過 context 上限時,端點可能不會報錯,只會默默截掉 prompt 開頭再繼續生成
+            # (HTTP 200、無錯誤訊息)。用回應回報的 prompt_tokens 跟我們估計送出的量比對,
+            # 差距過大就代表這次生成很可能讀到被截斷的 prompt,結果不可信。
+            if prompt_tokens < sent_estimate * 0.5:
+                print(f"[agent] 警告:估計送出 prompt ≈{sent_estimate} tokens,"
+                      f"但端點回報只讀到 {prompt_tokens} tokens——context 可能被靜默截斷,"
+                      f"這次生成結果可能不可信。")
         messages.append(msg.model_dump(exclude_none=True))
 
         if not msg.tool_calls:
