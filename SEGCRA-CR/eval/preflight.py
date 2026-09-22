@@ -3,12 +3,15 @@
 
 **為什麼需要這支程式**:上一輪 golden set 跑了 18 小時,結束後才發現數據不能用:
 
-  * `config/models.yaml` 寫 `seed: 42`,實際上從未生效(端點是一層叫 `ollama-gate`
-    的代理,它的 `/v1` 路徑接受但忽略 `options.*`)→ 整輪「可重現」的前提是假的
-  * `num_ctx` 宣告 32768,但 `agent.py` 從來沒把它送出去 → prompt 可能被靜默截斷,
-    而模型不會說它只看到後半截
+  * 以為「固定 temperature 0 + 固定 seed」就等於結果可重現,於是把單次結果當結論。
+    實際上那一輪**確實帶了 seed**,還是跨時段翻了盤(`mr_406`)——seed 固定的是
+    「同輸入下的取樣」,不是「輸入」,而管線是多輪 agent loop,後一輪的輸入含
+    前一輪的工具結果。**帶了 seed 不等於可重現**,這件事沒有被量過就當成前提了
+  * `num_ctx` 宣告 32768 卻沒送出去,而且就算送了也沒用——OpenAI 相容路徑
+    本來就不吃它(見 check_num_ctx)
   * 4 個 case 其實是連線失敗,被計成成功(只檢查了檔案存不存在)
-  * `/api/ps` 報 20.5GB 但本機 GPU 只有 12GB → 模型根本不在這台機器上跑
+  * 同一個短呼叫觀測到 53s → 681s(輸出量相同),但沒有留計時紀錄,
+    所以當下無從判斷那一輪的數據還能不能跟前一輪比
 
 這些全部都可以在**開跑前兩分鐘內**測出來。所以這支程式的原則是:
 
@@ -30,6 +33,7 @@ baseline 目錄。指紋的用途是**結構上強制**「換了環境就不准�
 """
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import statistics
@@ -60,9 +64,10 @@ MARK = {"ok": "✓", "warn": "⚠", "fail": "✗", "skip": "–"}
 # 程式碼改變正是回歸比較要量的東西,把它列進來等於永遠不能比。
 INCOMPARABLE = [
     ("model", "digest", "模型權重換了(tag 可以被重新指向別的權重,只看名稱看不出來)"),
-    ("endpoint", "url", "端點換了"),
+    ("endpoint", "id", "端點換了"),
     ("endpoint", "api_version", "端點版本換了"),
-    ("params", "seed_effective", "可重現性的前提改變了"),
+    ("params", "seed_effective", "端點對 seed 的行為改變了"),
+    ("params", "seed_configured", "跑批帶的 seed 改變了(帶 vs 不帶、或換了值)"),
     ("params", "num_ctx_effective", "模型看得到的 context 長度改變了"),
     ("sandbox", "engine", "執行驗證的資料庫換了(方言語意會變)"),
     ("deps", "sqlglot", "AST 預掃的解析器換版,確定性規則的命中會變"),
@@ -132,8 +137,17 @@ def check_deps() -> Check:
 
 # ─────────────────────── 二、端點與沙盒(連網路,但不呼叫模型) ───────────────────────
 
+def _endpoint_id(endpoint: str) -> str:
+    """端點的穩定識別碼 = 正規化 URL 的 sha256 前 12 碼。
+
+    指紋只需要回答「還是不是同一個端點」,不需要知道是哪一個。雜湊剛好只提供前者;
+    baseline 目錄會進公開 repo,原始位址寫進去沒有必要。
+    """
+    return hashlib.sha256(_base_url(endpoint).encode()).hexdigest()[:12]
+
+
 def _base_url(endpoint: str) -> str:
-    """把 OpenAI 相容路徑削回主機根:http://h:11435/v1 → http://h:11435。
+    """把 OpenAI 相容路徑削回主機根:http://h:11434/v1 → http://h:11434。
 
     Ollama 的原生 API(/api/version、/api/tags)掛在根上,不在 /v1 底下。
     """
@@ -151,37 +165,34 @@ def _http_get(url: str, timeout: float = 10.0) -> tuple[int, dict, str]:
 
 
 def check_endpoint(cfg) -> Check:
-    """先問「我在跟誰講話」。
+    """先問「我在跟誰講話」,並把答案釘進指紋。
 
-    這一項是上一輪所有誤判的源頭:大家以為 `:11435` 是 Ollama,實際上是一層
-    Python 代理(`Server: ollama-gate Python/3.9.6`)。代理層會**接受但忽略**
-    `options.*`(seed、num_ctx),所以參數沒生效卻也沒有任何錯誤訊息。
-    只要把 Server header 記進指紋,下一個人一眼就看得到。
+    目的是讓「換了模型端點卻拿舊 baseline 來比」這件事變成結構上做不到的:
+    端點一換,指紋的 `endpoint.id` 就不同,`--compare` 直接判不可比。
+
+    **記的是 URL 的雜湊,不是 URL 本身。** 指紋會跟著 baseline 目錄進公開 repo,
+    而端點位址屬於部署環境的資訊,不該寫在這裡;雜湊足以回答「還是不是同一個端點」,
+    那正是指紋唯一需要回答的問題。
     """
     base = _base_url(cfg.endpoint)
-    data = {"url": cfg.endpoint, "base": base, "server_header": None,
-            "api_version": None, "is_proxy": None}
+    data = {"id": _endpoint_id(cfg.endpoint), "api_version": None}
     try:
         status, headers, body = _http_get(f"{base}/api/version")
     except Exception as e:
+        # 連不到就連不到,但訊息不要把端點位址印出來(同上:這份輸出會被貼進 PR)
         return Check("端點身分", "fail",
-                     f"連不到 {base}:{type(e).__name__}: {str(e)[:120]}", data)
-    data["server_header"] = headers.get("Server")
+                     f"連不到模型端點:{type(e).__name__}: {str(e)[:120]}", data)
     if status == 200:
         try:
             data["api_version"] = json.loads(body).get("version")
         except Exception:
             data["api_version"] = body[:40]
-    srv = (data["server_header"] or "").lower()
-    # 純 Ollama 的 Server header 不會出現 python/gate 這類字樣;出現就代表中間有一層
-    data["is_proxy"] = bool(srv) and ("python" in srv or "gate" in srv or "proxy" in srv)
-    if data["is_proxy"]:
+    if not data["api_version"]:
         return Check("端點身分", "warn",
-                     f"{base} 前面有代理層(Server: {data['server_header']})——"
-                     "它可能吞掉 seed / num_ctx,下面的探針會實測", data)
+                     f"模型端點 {data['id']} 沒有回報 API 版本(HTTP {status})——"
+                     "指紋少了一個可比對的欄位,但不影響跑批", data)
     return Check("端點身分", "ok",
-                 f"{base}(version {data['api_version']}, Server: {data['server_header']})",
-                 data)
+                 f"模型端點 {data['id']}(API 版本 {data['api_version']})", data)
 
 
 def check_model(cfg, profiles: list[str]) -> Check:
@@ -198,7 +209,7 @@ def check_model(cfg, profiles: list[str]) -> Check:
         tags = json.loads(body).get("models", []) if status == 200 else []
     except Exception as e:
         return Check("模型 digest", "warn",
-                     f"問不到 /api/tags({type(e).__name__})——代理層可能沒開這條路徑,"
+                     f"問不到 /api/tags({type(e).__name__})——模型端點可能沒開這條路徑,"
                      "這輪就無法偵測權重是否被換掉", data)
     data["available"] = sorted(m.get("name", "") for m in tags)
     for m in tags:
@@ -312,9 +323,10 @@ async def check_seed(client, model: str) -> Check:
     if a != b:
         data["effective"] = False
         return Check("seed 是否生效", "warn",
-                     "❗同一個 seed 兩次結果不同 → **seed 無效**。"
-                     "這輪沒有任何取得可重現結果的機制,只能跑多次看分布"
-                     "(指紋已記 seed_effective: false)", data)
+                     "❗同一個 seed 兩次結果不同 → **seed 在這條路徑上無效**。"
+                     "連單次呼叫都不可重現,這輪只能跑多次看分布"
+                     "(指紋已記 seed_effective: false)。"
+                     "這與先前的實測結果相反,代表端點那側變了,舊 baseline 不可比", data)
     if a == c:
         data["effective"] = None
         return Check("seed 是否生效", "warn",
@@ -323,15 +335,21 @@ async def check_seed(client, model: str) -> Check:
     data["effective"] = True
     return Check("seed 是否生效", "ok",
                  "同 seed 逐字一致、無 seed 對照組不同 → seed 真的生效。"
-                 "**這與上一輪的結論相反,代表環境變了,舊 baseline 不可比**", data)
+                 "注意:這只證明**單次呼叫**可重現;整條管線是多輪 agent loop,"
+                 "後一輪的輸入含前一輪的工具結果,仍然可能每輪不同"
+                 "(見 BASELINE.md §1)", data)
 
 
 async def check_num_ctx(client, model: str, budget_tokens: int) -> Check:
     """實測「模型看得到多長的 prompt」——直接對上 `budget.diff`。
 
-    `config/models.yaml` 宣告 `num_ctx: 32768`,但 `agent.py` 從來沒有把它送出去
-    (這是我們自己的 bug,不是代理層的問題)。沒送的話端點會用它自己的預設值,
-    Ollama 的預設遠小於 32768,而**超長的 prompt 是從開頭被截掉的**。
+    `config/models.yaml` 宣告 `num_ctx: 32768`,但 `agent.py` 從來沒有把它送出去。
+    **而且就算送了也沒用**:OpenAI 相容路徑本來就不吃 `num_ctx`(放在頂層、
+    放進 `options`,兩種都試過,都不會改變實際的 context 長度)——那是 Ollama
+    原生 API 的參數。實際長度由端點自己的預設值決定,目前是 32,768。
+
+    所以這一項**不是「我們忘了送」的 bug,而是這條路徑上根本沒有這個旋鈕**:
+    我們調不動它,只能實測「現在這個長度夠不夠」。而**超長的 prompt 是從開頭被截掉的**,
 
     後果很惡劣:`build_diff_section` 把 SQL 放在前面,系統指示與問題放在後面,
     所以被截掉的正是受審的 SQL——模型照樣會產出一份看起來完整的報告,
@@ -409,7 +427,8 @@ def build_fingerprint(checks: list[Check], cfg, profiles: list[str]) -> dict:
     def d(name: str) -> dict:
         return by[name].data if name in by else {}
 
-    prof = {p: vars(cfg.profile(p)) for p in profiles}
+    prof_obj = {p: cfg.profile(p) for p in profiles}
+    prof = {p: vars(prof_obj[p]) for p in profiles}
     seed_chk = d("seed 是否生效")
     ctx_chk = d("context 長度")
     return {
@@ -422,11 +441,18 @@ def build_fingerprint(checks: list[Check], cfg, profiles: list[str]) -> dict:
             # temperature / max_output_tokens 是我們真的送出去的(agent.py 有送)
             "temperature": {p: prof[p]["temperature"] for p in prof},
             "max_output_tokens": {p: prof[p]["max_output_tokens"] for p in prof},
-            # num_ctx 在 yaml 裡有宣告,但 agent.py 沒送 → 記「宣告值」與「實測結果」兩欄,
-            # 免得下一個人又以為宣告就等於生效
+            # num_ctx 在 yaml 裡有宣告,但 agent.py 沒送,而且 OpenAI 相容路徑本來
+            # 也不吃它 → 宣告值純粹是個沒有作用的設定。記「宣告值」與「實測結果」
+            # 兩欄,免得下一個人又以為宣告就等於生效
             "num_ctx_declared": {p: prof[p]["num_ctx"] for p in prof},
             "num_ctx_effective": ctx_chk.get("num_ctx_effective", "未測"),
+            # 這兩個很像但是兩件事,混在一起正是上一輪 seed 誤判的成因:
+            #   seed_effective  —— **端點**認不認 seed(探針明確帶 seed 測出來的)
+            #   seed_configured —— **這輪跑批**實際帶了什麼 seed(從 profile 解析)
+            # 端點認 seed、而跑批沒帶,兩者可以同時成立;只記前者會讓人以為
+            # 跑批是可重現的。所以兩個都記,而且 seed_configured 也列入不可比欄位。
             "seed_effective": seed_chk.get("effective", "未測"),
+            "seed_configured": {p: getattr(prof_obj[p], "seed", "不支援") for p in prof},
         },
         "sandbox": d("執行驗證沙盒"),
         "timing": d("推論延遲"),
@@ -525,8 +551,12 @@ async def run(args) -> int:
         print("\n⛔ 中止:上面有 ✗ 的項目。修好再跑,不要跑完十幾小時才發現數據不能用。")
         return 1
     if v == "go-with-caveats":
-        print("\n⚠ 可以起飛,但上面 ⚠ 的限制**必須寫進報告**"
-              "(尤其 seed / context 兩項會決定數字怎麼解讀)。")
+        # 不要在 --offline/--quick 下提「seed / context」:那兩項根本沒跑,
+        # 提了會讓人以為它們量過而且是警告項——把「沒量到」講成「量到有問題」,
+        # 正是上一輪 seed 誤判的起手式。
+        probed = {"seed 是否生效", "context 長度"} & {c.name for c in checks}
+        extra = "(尤其 seed / context 兩項會決定數字怎麼解讀)" if probed else ""
+        print(f"\n⚠ 可以起飛,但上面 ⚠ 的限制**必須寫進報告**{extra}。")
     else:
         print("\n✓ 環境檢查全部通過,可以起飛。")
     return 1 if incomparable else 0
