@@ -15,6 +15,38 @@ MAX_ITERATIONS = 12
 # 上限 1 小時、不自動重試;可用環境變數 LLM_TIMEOUT(秒)覆蓋。
 REQUEST_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "3600"))
 
+# 診斷用:設成一個目錄路徑,就把每一次**實際送出的** messages 原文落檔。
+# 預設空字串 = 完全不啟用,對正式流程沒有任何影響。
+#
+# 用途只有一個,但那是目前唯一沒有結論的問題:整條管線跑兩次結果不同,
+# 到底是「模型取樣」還是「送出去的輸入本來就不一樣」。把兩次的 prompt diff 一下
+# 就分得出來——prompt 相同 → 取樣;prompt 不同 → 輸入,而且 diff 直接指出哪一段在變。
+# 詳見 eval/BASELINE.md §1 與 §7。
+DUMP_PROMPTS = os.environ.get("SEGCRA_DUMP_PROMPTS", "")
+_dump_seq = 0
+
+
+def _dump(profile_model: str, messages: list, iteration: int) -> None:
+    """把一次呼叫的完整 messages 寫成一個檔。失敗一律吞掉——診斷功能不該弄垮跑批。"""
+    global _dump_seq
+    if not DUMP_PROMPTS:
+        return
+    try:
+        from pathlib import Path
+        _dump_seq += 1
+        d = Path(DUMP_PROMPTS)
+        d.mkdir(parents=True, exist_ok=True)
+        # 檔名帶 PID:per-case 是各自的子行程,同一個目錄不會互相蓋掉
+        f = d / f"{os.getpid()}_{_dump_seq:03d}_iter{iteration}_{profile_model.replace(':','-')}.txt"
+        parts = [f"# model={profile_model} iteration={iteration} messages={len(messages)}"]
+        for m in messages:
+            parts.append(f"\n===== role={m.get('role')} =====\n{m.get('content') or ''}")
+            if m.get("tool_calls"):
+                parts.append(f"----- tool_calls -----\n{json.dumps(m['tool_calls'], ensure_ascii=False, sort_keys=True, indent=2)}")
+        f.write_text("\n".join(parts), encoding="utf-8")
+    except Exception:
+        pass
+
 
 async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
                     hub: ToolHub, verbose: bool = True, use_tools: bool = True,
@@ -31,6 +63,7 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
     tool_kwargs = ({"tools": hub.openai_tools, "tool_choice": "auto"}
                    if use_tools and hub else {})
     for i in range(MAX_ITERATIONS):
+        _dump(profile.model, messages, i)
         resp = await client.chat.completions.create(
             model=profile.model, messages=messages, **tool_kwargs,
             temperature=profile.temperature,

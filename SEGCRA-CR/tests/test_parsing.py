@@ -246,3 +246,44 @@ def test_合法的仲裁判定原樣返回(monkeypatch, who):
     verdict = asyncio.run(arbitrate(_FakeCfg(), "規格", "SELECT 1;", _MISMATCH))
     assert verdict["who_is_wrong"] == who
     assert "arbiter_unparseable" not in verdict
+
+
+# ─────────────────── prompt 落檔(診斷用,預設關閉) ───────────────────
+
+def test_預設不落檔(tmp_path, monkeypatch):
+    """`SEGCRA_DUMP_PROMPTS` 沒設就什麼都不做。
+
+    這是正式流程上的預設值,所以它必須是零影響:不建目錄、不寫檔、不丟例外。
+    """
+    import orchestrator.agent as agent
+    monkeypatch.setattr(agent, "DUMP_PROMPTS", "")
+    agent._dump("m", [{"role": "user", "content": "x"}], 0)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_落檔會寫出實際送出的每一段(tmp_path, monkeypatch):
+    """開啟後,每次呼叫的完整 messages 要能原文還原。
+
+    用途是把兩次跑的 prompt diff 起來,分辨「跑兩次不一樣」是模型取樣還是
+    送出去的輸入本來就不同(見 eval/BASELINE.md §1、§7)。所以 system 與 user
+    兩段都必須在檔案裡,少一段 diff 就看不出差在哪。
+    """
+    import orchestrator.agent as agent
+    monkeypatch.setattr(agent, "DUMP_PROMPTS", str(tmp_path))
+    monkeypatch.setattr(agent, "_dump_seq", 0)
+    agent._dump("gemma4:31b", [{"role": "system", "content": "SYS-MARKER"},
+                               {"role": "user", "content": "USER-MARKER"}], 3)
+    files = list(tmp_path.glob("*.txt"))
+    assert len(files) == 1
+    text = files[0].read_text(encoding="utf-8")
+    assert "SYS-MARKER" in text and "USER-MARKER" in text
+    assert "iteration=3" in text
+    # 模型名含冒號,檔名不能直接用——冒號在部分檔案系統上是非法字元
+    assert ":" not in files[0].name
+
+
+def test_落檔失敗不可以弄垮跑批(monkeypatch):
+    """診斷功能寫不出去就算了,不該讓一輪十幾小時的跑批中途爆掉。"""
+    import orchestrator.agent as agent
+    monkeypatch.setattr(agent, "DUMP_PROMPTS", "/proc/不可能建得起來/x")
+    agent._dump("m", [{"role": "user", "content": "x"}], 0)   # 不得丟例外
