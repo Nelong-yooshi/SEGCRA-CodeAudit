@@ -4,9 +4,19 @@
 方法書:`eval/BASELINE.md`(為什麼這樣設計、每個判定規則的理由都在那裡)。
 這支程式只負責執行方法書:跑批、驗結果有效、分級、彙總、比對。
 
-核心前提(已實測,不是假設):**同一份程式碼、同一個環境,跑兩次結果不一定一樣。**
-`seed` 在這套基礎設施上從未生效,所以我們**沒有任何**取得可重現結果的機制。
-因此:
+核心前提(已實測,不是假設):**跑批已經固定 temperature=0 + seed=42,跑兩次結果
+還是不一定一樣。**
+
+量測模式是有的:`run_eval.py` 帶 `LLM_TEMPERATURE=0` / `LLM_SEED=42` 的預設,
+正式審查不受影響(`models.yaml` 維持 0.1、不帶 seed)。而 `run_baseline.py` 正是
+透過 `run_eval.py` 跑每個 case 的,所以跑批自動吃到這組設定。
+
+問題是**那樣還是會翻盤**(`mr_406` 跨 6 小時:18 案例/0 缺口/通過 → 11 案例/5 缺口/
+不通過)。seed 固定的是「同輸入下的取樣」,不是「輸入」;管線是多輪 agent loop,
+後一輪送出去的 prompt 含前一輪的工具結果,那裡面有會變的東西。輸入一變,
+同一個 seed 也救不了。確切機制尚未證實,驗法見 BASELINE.md §1/§7。
+
+也就是說,**已經做到「固定 seed」這一步了,而它不夠**,所以下面這套方法仍然需要:
 
   * 單次結果的差異**無法判讀**——不知道是改壞了,還是它本來就會晃
   * 「跑三次取平均」也不夠:平均會丟掉最關鍵的資訊,也就是
@@ -74,9 +84,15 @@ BOUNDARY_CASE_SPREAD = 3     # 測資案例數的極差在此之內算「小範�
 # ─────────────────────── 跑一個 case ───────────────────────
 
 def case_ids(only: str | None) -> list[str]:
+    """case id 一律是去掉 `mr_` 的那一段(`406`),因為 `run_eval.py --case` 吃的是這個。
+
+    但**人記得的是檔名**(`mr_406.json`),文件裡的例子也多半寫 `mr_406`。
+    照那樣打會篩不到任何 case、直接以「golden set 為空」離開——訊息還會指向
+    golden 目錄,看起來像目錄壞了,而不是參數寫法不對。所以兩種寫法都收。
+    """
     ids = sorted(p.stem.removeprefix("mr_") for p in GOLDEN_DIR.glob("mr_*.json"))
     if only:
-        wanted = {c.strip() for c in only.split(",") if c.strip()}
+        wanted = {c.strip().removeprefix("mr_") for c in only.split(",") if c.strip()}
         ids = [i for i in ids if i in wanted]
     return ids
 
@@ -127,6 +143,11 @@ def run_one(mr_id: str, run_idx: int, out: Path, args, cwd: Path) -> dict:
     # 單次 LLM 呼叫上限。實測合理上限約 750 秒,預設的 3600 秒等於「卡死就等一小時」。
     # 收到 900 秒會讓病態的呼叫早一點失敗,由下面的重試決定要不要再給一次機會。
     env.setdefault("LLM_TIMEOUT", str(args.llm_timeout))
+    if getattr(args, "dump_prompts", False):
+        # 每個 (case, run) 一個目錄,diff 的時候才對得起來是哪一次
+        ppath = out / "prompts" / f"{mr_id}_run{run_idx}"
+        ppath.mkdir(parents=True, exist_ok=True)
+        env["SEGCRA_DUMP_PROMPTS"] = str(ppath)
 
     last = ""
     for attempt in range(1, args.attempts + 1):
@@ -352,25 +373,46 @@ def write_report(out: Path, summary: dict, rulings: list[dict] | None) -> None:
     L += ["## 環境", "", "| 項目 | 值 |", "|---|---|"]
     code = fp.get("code") or {}
     params = fp.get("params") or {}
+    def _v(x):
+        """指紋缺項時印「未記錄」而不是 None——None 看起來像量到了一個空值。"""
+        return "未記錄" if x in (None, "", {}) else x
+
     L += [f"| 程式碼 | {code.get('branch')}@{code.get('sha')}"
           f"{'(**有未 commit 的改動**)' if code.get('dirty') else ''} |",
-          f"| 端點 | {(fp.get('endpoint') or {}).get('url')} "
-          f"(Server: {(fp.get('endpoint') or {}).get('server_header')}) |",
-          f"| 模型 digest | {(fp.get('model') or {}).get('digest')} |",
-          f"| seed 實測是否生效 | **{params.get('seed_effective')}** |",
-          f"| context 實測 | {params.get('num_ctx_effective')} |",
-          f"| 沙盒 | {(fp.get('sandbox') or {}).get('engine')} |",
-          f"| 跑批耗時 | {summary.get('wall_hours')} 小時 |", ""]
+          # 記端點的雜湊而非位址:REPORT.md 會進公開 repo,而「還是不是同一個端點」
+          # 是這一列唯一需要回答的問題,雜湊就夠了
+          f"| 模型端點 | {_v((fp.get('endpoint') or {}).get('id'))} "
+          f"(API 版本 {_v((fp.get('endpoint') or {}).get('api_version'))}) |",
+          f"| 模型 digest | {_v((fp.get('model') or {}).get('digest'))} |",
+          f"| seed 實測是否生效 | **{_v(params.get('seed_effective'))}** |",
+          f"| context 實測 | {_v(params.get('num_ctx_effective'))} |",
+          f"| 沙盒 | {_v((fp.get('sandbox') or {}).get('engine'))} |",
+          f"| 跑批耗時 | {_v(summary.get('wall_hours'))} 小時 |", ""]
 
     # 「沒有指紋」和「量到 seed 無效」是兩件不同的事,不能用同一句話帶過:
     # 前者代表這份 baseline 連環境都沒記錄(更嚴重,完全不可當基準),
     # 後者代表環境記錄完整、而且已知不可重現(可用,只是數字要當抽樣讀)。
+    seed_eff = params.get("seed_effective")
     if not fp:
         L += ["> ⛔ **這份 baseline 沒有環境指紋**(跑批時略過了起飛前檢查),",
               "> 無法確認它跑在什麼環境上 → **不可當回歸基準**,只能當一次性觀測。", ""]
-    elif params.get("seed_effective") is not True:
-        L += ["> `seed` 實測未生效 → **這份 baseline 不是可重現的**。",
+    elif seed_eff is False:
+        L += ["> `seed` 實測未生效 → **連單次模型呼叫都不可重現**。",
               "> 底下每個數字都要當成「一次抽樣」,不是「這個系統的值」。", ""]
+    elif seed_eff is not True:
+        # 「沒量到」與「量到無效」是兩件事,不能用同一句話帶過——把前者講成後者,
+        # 就是在報告裡放一個我們其實沒有的結論。這正是上一輪 seed 誤判的成因。
+        L += [f"> ⚠ **`seed` 這一項沒有量到**(指紋記的是 `{seed_eff}`)。",
+              "> 這**不等於** seed 無效,只代表這輪沒有跑模型探針——",
+              "> 要嘛是 `--skip-preflight`、要嘛是 `--offline`/`--quick` 模式的指紋。",
+              "> 在補量之前,底下的數字只能當一次性觀測,不要當回歸基準。", ""]
+    else:
+        # seed 生效不等於這份 baseline 可重現,別讓讀的人自己接錯這一步:
+        # 可重現的是單次呼叫,不是整條多輪 agent loop 的管線。
+        L += ["> `seed` 實測生效 → **單次模型呼叫**是可重現的。",
+              "> 但**整條管線不是**:它是多輪 agent loop,後一輪送出去的 prompt 含有",
+              "> 前一輪的工具結果,那裡面有會變的東西。所以底下的數字仍然要當成抽樣讀",
+              "> (詳見 `eval/BASELINE.md` §1)。", ""]
 
     L += ["## 分級表", "",
           "這張表本身就是交付物:它回答「這套測試能信到什麼程度」,",
@@ -480,9 +522,20 @@ def main(args) -> int:
         found = [int(p.stem.rsplit("run", 1)[-1])
                  for p in (out / "cases").glob("mr_*.run*.json")]
         args.runs = max(found or [1])
-        summary = summarize(out, args, {"mode": "summarize-only"})
-        write_report(out, summary, None)
+        summary = summarize(out, args, {"mode": "summarize-only",
+                                        "compared_to": args.compare})
+        # --compare 在這裡也要生效。回歸判定只讀兩份 summary.json,不需要模型;
+        # 若只在「重跑」那條路支援,等於要花十幾小時才能重新判一次回歸,
+        # 而這套工具存在的理由正是不要那樣。
+        rulings = None
+        if args.compare:
+            old = json.loads((Path(args.compare) / "summary.json").read_text(encoding="utf-8"))
+            rulings = judge(summary, old)
+        write_report(out, summary, rulings)
         print(f"已重新彙總 {out}(未重跑任何 case)")
+        if rulings and any(r["verdict"] == "🔴" for r in rulings):
+            print("🔴 有穩定案例翻盤 → 判定為回歸。")
+            return 1
         return 0
 
     per_case = plan_runs(args)
@@ -608,7 +661,8 @@ if __name__ == "__main__":
                     help="與這份 baseline 比對(指紋不同會直接判不可比)")
     ap.add_argument("--summarize-only", default=None, metavar="DIR",
                     help="只重新彙總既有結果,不跑任何 case")
-    ap.add_argument("--case", default=None, help="只跑指定 case id,逗號分隔")
+    ap.add_argument("--case", default=None,
+                help="只跑指定 case,逗號分隔;`406` 與 `mr_406` 都收")
     ap.add_argument("--profile", default=None, help="模型 profile")
     ap.add_argument("--tag", default=None, help="目錄名後綴(如 noise / after-speedup)")
     ap.add_argument("--out", default=None, help="自訂輸出目錄名或絕對路徑")
@@ -622,6 +676,10 @@ if __name__ == "__main__":
                     help="傳給子行程的 LLM_TIMEOUT(預設 900;實測合理上限約 750s)")
     ap.add_argument("--no-resume", dest="resume", action="store_false",
                     help="不續跑,已有的有效結果也重跑")
+    ap.add_argument("--dump-prompts", action="store_true",
+                    help="把每一次實際送出的 prompt 存進 prompts/<case>_run<n>/。"
+                         "用來分辨「跑兩次不一樣」是取樣還是輸入差異(見 BASELINE.md §7)。"
+                         "預設關閉:prompt 原文很大,而且含受審的 SQL")
     ap.add_argument("--skip-preflight", action="store_true",
                     help="略過起飛前檢查(那輪不可當回歸基準)")
     sys.exit(main(ap.parse_args()))
