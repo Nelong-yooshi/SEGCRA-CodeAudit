@@ -2,8 +2,9 @@
 
 MR 的 SQL 不只要「看起來對」,還要「跑起來對」。流程:
 
-  0. 找 spec(確定性):從 MR 抓規則碼 R-xxx → 對應 specs/<code>.md。
-     **找不到 spec = major finding「無規格可驗」→ 一律 needs_human**
+  0. 找 spec(確定性):從 MR 抓規則碼 R-xxx → 對應 specs/<code>.md;完全沒有
+     R 編號時(dbt model 常見情境),改依 model 檔名對應(見 dbt_impact.resolve_spec,
+     #7 第 2 點)。**找不到 spec = major finding「無規格可驗」→ 一律 needs_human**
      (「必跑」的意思:不是沒 spec 就跳過,而是沒 spec 就不能自動放行)。
   1. 角色一 測資生成 agent(LLM):讀 spec → 產出 schema DDL + 原子條件清單 +
      逐條件 true/false 兩向 + 邊界值的測資案例(嚴格 JSON)。
@@ -48,7 +49,13 @@ def extract_rule_codes(mr: dict) -> list[str]:
 
 async def find_spec(hub, mr: dict) -> tuple[str | None, str | None]:
     """回傳 (rule_code, spec_text)。mock 模式讀本地 specs/;real 模式用
-    gitlab get_file 抓 repo 內 specs/<code>.md。都找不到 → (code|None, None)。"""
+    gitlab get_file 抓 repo 內 specs/<code>.md。都找不到 → (code|None, None)。
+
+    R 編號的比對邏輯不變(即使多個編號都對到既有規格,一律取第一個找到的)。
+    只有**完全沒有** R 編號時,才改依 model 檔名對應規格——避免蓋掉「MR 提到了
+    編號、但規格真的不存在」這種需要如實回報成「無規格」的情況;也因此對現有的
+    (全部含 R 編號的)golden case 不會有任何行為變化。
+    """
     codes = extract_rule_codes(mr)
     for code in codes:
         local = SPECS_DIR / f"{code}.md"
@@ -63,7 +70,48 @@ async def find_spec(hub, mr: dict) -> tuple[str | None, str | None]:
                 continue
             if txt and txt.lstrip().startswith("#"):
                 return code, txt
+    if not codes:
+        by_path = await _find_spec_by_path(hub, mr)
+        if by_path is not None:
+            return by_path
     return (codes[0] if codes else None), None
+
+
+async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
+    """依 model 檔名對應規格(dbt_impact.resolve_spec)。只由 find_spec() 在完全
+    沒有 R 編號時呼叫,找不到回 None。
+
+    mock 模式可以直接列出 specs/ 底下實際有哪些檔,拿到完整語意(大小寫落差提示、
+    多個候選不自行擇一)。real 模式目前沒有列目錄的 GitLab 工具(見
+    docs/09-dbt展開與反查.md 的已知限制),改成逐一探測候選路徑——跟上面 R 編號
+    的做法一致,不新增任何 API 面。
+    """
+    from .dbt_impact import resolve_spec   # 延遲匯入,避免無關呼叫端多背一份相依
+
+    paths = [f["path"] for f in mr.get("files", []) if f.get("path")]
+    if not paths:
+        return None
+
+    if hub is None:
+        available = ([f"specs/{p.name}" for p in SPECS_DIR.glob("*.md")]
+                     if SPECS_DIR.is_dir() else [])
+        for path in paths:
+            match = resolve_spec(path, available)
+            if match.spec_path:
+                local = SPECS_DIR / match.spec_path.rsplit("/", 1)[-1]
+                if local.exists():   # available 就是列這個目錄得來的,理論上必成立
+                    return local.stem, local.read_text(encoding="utf-8")
+        return None
+
+    for path in paths:
+        for candidate in resolve_spec(path, ()).candidates:   # 只要候選路徑,不比對存在與否
+            try:
+                txt = await hub.call("gitlab__get_file", {"path": candidate}, truncate=False)
+            except Exception:
+                continue
+            if txt and txt.lstrip().startswith("#"):
+                return candidate.rsplit("/", 1)[-1][:-len(".md")], txt
+    return None
 
 
 # ------------------------------------------------------------------ 1. 測資生成
