@@ -469,9 +469,10 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
     passed = bool(effective) and not sql_faults and not coverage_gaps
     if passed:
         findings.append(_finding(path, "info",
-                                 f"執行驗證通過({len(effective)} 案例全數相符)",
-                                 f"規則 {spec_code} 的每個原子條件 true/false 兩向與邊界案例"
-                                 f"皆與規格預期一致。"))
+                                 f"執行驗證:{len(effective)} 個生成測試案例皆符合預期",
+                                 f"測資由模型依規格 {spec_code} 產生,涵蓋每個條件成立與不成立"
+                                 f"兩種情況,以及門檻邊界值;再於沙盒實際編譯執行。"
+                                 f"執行本身是確定性的,但測資與驗證出自模型,AI 可能有幻覺。"))
     return {"passed": passed, "spec_code": spec_code, "engine": ex["engine"],
             "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
             "case_results": ex["case_results"], "dropped_cases": dropped_cases,

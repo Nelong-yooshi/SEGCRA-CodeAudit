@@ -30,13 +30,27 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
 
     tool_kwargs = ({"tools": hub.openai_tools, "tool_choice": "auto"}
                    if use_tools and hub else {})
+    # seed 沒設定(None)時不傳這個參數,讓模型維持原本的隨機性(能力報告用)
+    seed_kwargs = {"seed": profile.seed} if profile.seed is not None else {}
     for i in range(MAX_ITERATIONS):
         resp = await client.chat.completions.create(
             model=profile.model, messages=messages, **tool_kwargs,
             temperature=profile.temperature,
             max_tokens=profile.max_output_tokens,
+            **seed_kwargs,
         )
         msg = resp.choices[0].message
+        usage = getattr(resp, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+        if prompt_tokens is not None:
+            sent_estimate = sum(estimate_tokens(m.get("content") or "") for m in messages)
+            # 超過 context 上限時,端點可能不會報錯,只會默默截掉 prompt 開頭再繼續生成
+            # (HTTP 200、無錯誤訊息)。用回應回報的 prompt_tokens 跟我們估計送出的量比對,
+            # 差距過大就代表這次生成很可能讀到被截斷的 prompt,結果不可信。
+            if prompt_tokens < sent_estimate * 0.5:
+                print(f"[agent] 警告:估計送出 prompt ≈{sent_estimate} tokens,"
+                      f"但端點回報只讀到 {prompt_tokens} tokens——context 可能被靜默截斷,"
+                      f"這次生成結果可能不可信。")
         messages.append(msg.model_dump(exclude_none=True))
 
         if not msg.tool_calls:
