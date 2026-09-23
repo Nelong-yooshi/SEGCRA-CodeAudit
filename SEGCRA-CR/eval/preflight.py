@@ -93,16 +93,39 @@ def _git(*args: str) -> str:
         return ""
 
 
+# 這些路徑底下的東西是**跑批的產物**,不是程式碼:baseline 目錄(交付物,會被
+# commit 起來當基準)與 run_eval 的報告輸出。判斷「程式碼有沒有未 commit 的改動」
+# 時要排掉它們,否則跑批會把自己標成 dirty——而 dirty 的 baseline 依設計
+# 「不該當成別人可以回頭對照的基準」,於是從第二輪起每一份都失格,
+# 那個警告也就變成沒人看的雜訊。實跑時撞到:第一行警告的那「1 個未 commit 的改動」
+# 就是它自己的輸出目錄。
+#
+# 注意**不是**把它們加進 .gitignore:baseline 目錄是交付物,要能 commit、
+# 能被別人拿去比對(見 BASELINE.md §10)。該修的是 dirty 的判準,不是追蹤與否。
+_OUTPUT_PATHS = ("eval/baselines/", "eval/_output/")
+
+
+def _is_output(porcelain_line: str) -> bool:
+    """`git status --porcelain` 的一行是不是跑批產物?
+
+    格式是 `XY <path>`,重新命名則是 `XY <old> -> <new>`,路徑可能被引號包起來。
+    """
+    path = porcelain_line[3:].strip().strip('"')
+    path = path.split(" -> ")[-1].strip().strip('"')
+    return any(seg in path for seg in _OUTPUT_PATHS)
+
+
 def check_code() -> Check:
     """記下這輪跑的到底是哪份程式碼。
 
     工作區有未 commit 的改動時只給 warn 而不中止——開發途中想先跑一輪是常態;
     但指紋裡會標 `dirty: true`,而 dirty 的結果**不該當成別人可以回頭對照的基準**
-    (沒有人能重建那份程式碼)。
+    (沒有人能重建那份程式碼)。跑批自己的產物不算(見 `_OUTPUT_PATHS`)。
     """
     sha = _git("rev-parse", "--short", "HEAD")
     branch = _git("rev-parse", "--abbrev-ref", "HEAD")
-    dirty_files = [l for l in _git("status", "--porcelain").splitlines() if l.strip()]
+    dirty_files = [l for l in _git("status", "--porcelain").splitlines()
+                   if l.strip() and not _is_output(l)]
     data = {"sha": sha or "(不在 git 工作區)", "branch": branch,
             "dirty": bool(dirty_files), "dirty_count": len(dirty_files)}
     if not sha:

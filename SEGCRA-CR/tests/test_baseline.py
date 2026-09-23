@@ -657,3 +657,39 @@ def test_真的品質問題不可以被誤判成環境失敗(tmp_path, gap):
     p.write_text(json.dumps({"cases": [_row_with_gap(gap)], "errors": []},
                             ensure_ascii=False), encoding="utf-8")
     assert rb.result_ok(p, "406") is True
+
+
+# ─────────────────── dirty 判定不該把跑批產物算進去 ───────────────────
+
+@pytest.mark.parametrize("line", [
+    "?? SEGCRA-CR/eval/baselines/",
+    "?? eval/baselines/full-baseline/",
+    " M SEGCRA-CR/eval/_output/case_406.json",
+    'R  a.py -> SEGCRA-CR/eval/baselines/b.json',       # 重新命名取箭頭右邊
+    ' M "SEGCRA-CR/eval/baselines/q w.json"',           # 含空白會被引號包起來
+])
+def test_跑批產物不算未commit的程式碼改動(line):
+    """跑批把輸出寫進 repo,那是**產物**不是程式碼。
+
+    不排掉的話,第二輪起每一份 baseline 都會因為前一輪的輸出而被自己標成 dirty,
+    而 dirty 的 baseline 依設計「不該當成別人可以回頭對照的基準」——於是每一份
+    都失格,那個警告就變成沒人看的雜訊。實跑時撞到過。
+
+    注意這**不是**用 .gitignore 解決:baseline 目錄是交付物,要能 commit、
+    能被別人拿去比對(BASELINE.md §10)。該修的是 dirty 的判準。
+    """
+    assert preflight._is_output(line) is True
+
+
+@pytest.mark.parametrize("line", [
+    " M SEGCRA-CR/orchestrator/agent.py",
+    "?? SEGCRA-CR/eval/run_baseline.py",
+    " M SEGCRA-CR/eval/golden/mr_406.json",
+    "?? SEGCRA-CR/specs/R-140.md",
+])
+def test_真的程式碼改動仍然算dirty(line):
+    """反方向更重要:漏判會讓「這輪跑的是沒人能重建的程式碼」這件事被藏起來。
+
+    golden case 與規格檔也算——它們是模型看得到的輸入,改了就不是同一份測量。
+    """
+    assert preflight._is_output(line) is False
