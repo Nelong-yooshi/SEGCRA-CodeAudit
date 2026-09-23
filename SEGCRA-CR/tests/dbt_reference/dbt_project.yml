@@ -1,0 +1,16 @@
+# 對照用的最小 dbt 專案 —— 只用來產生 `dbt compile` 的標準答案,不部署、不執行。
+# 所有名稱皆為去識別化的假名(資料庫 SAMPLE_DW、來源表 T_SAMPLE_*),
+# 格式與正式環境一致:"<資料庫>"."dbo"."<表>"。
+name: segcra_reference
+version: "1.0.0"
+config-version: 2
+profile: segcra_reference
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+target-path: "target"
+clean-targets: ["target", "logs"]
+
+flags:
+  # dbt 預設會回傳匿名使用統計給 dbt Labs;地端環境不允許對外送資料,關閉。
+  send_anonymous_usage_stats: false

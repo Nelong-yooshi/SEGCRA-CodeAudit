@@ -170,8 +170,20 @@ def read_signal(report: dict, key: str):
     if key == "pending_hints":
         # decision=blocked 時管線提早 return,不會寫 _policy_signals
         return report.get("_policy_signals", {}).get("pending_hints")
+    if key == "arbiter_dropped":
+        # 角色三仲裁判定「測資錯」→ 剔除該案例。剔除後那個條件方向就沒驗到,
+        # 會一併補進 coverage_gaps;分得出「測資爛」與「SQL 錯」才知道要修哪邊。
+        return any(d.get("by") == "arbiter"
+                   for d in report.get("_spec_exec", {}).get("dropped_cases", []))
+    if key == "spec_exec_sql_fault":
+        # 執行驗證**自己**抓到實作與規格不符(相對於靜態審查抓到的)。
+        # 沒有這個訊號時,expect_findings 只能驗「有人抓到」,分不出是哪一道防線——
+        # 執行驗證默默失效、靜態審查剛好補上時,測試仍是綠的,看不出防線已經退化。
+        return any("執行驗證失敗" in f.get("title", "")
+                   for f in report.get("findings", []))
     raise KeyError(f"未知的訊號名稱: {key}(可用: injection_hit / spec_exec_passed / "
-                   f"spec_found / citations_removed / pending_hints)")
+                   f"spec_found / citations_removed / pending_hints / "
+                   f"arbiter_dropped / spec_exec_sql_fault)")
 
 
 # ─────────────────────────── 斷言 ───────────────────────────
