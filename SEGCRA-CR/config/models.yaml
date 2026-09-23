@@ -52,3 +52,22 @@ policy:
   block:                        # 任一條件符合 → 擋下並要求處理
     min_blockers: 1
 # 其餘 → needs_human(停下來通知人工檢驗)
+
+# dbt 樣板展開接線(#7):model 是 dbt 樣板時,先展開成純 T-SQL 再交給規則預掃,
+# 否則 `{% set %}` 等語法讓 sqlglot 直接解析失敗,規則層完全看不到 macro 裡的邏輯。
+# **enabled 預設 false**——關閉時審查流程與現有 32 個 golden case 的結果完全不變
+# (含這個區塊本身:設定檔沒寫 dbt: 也一樣視為關閉)。
+#
+# 開啟前務必確認:
+#   1. database 已填成正式環境的實際資料庫名——ref()/source() 靠它展開成完整表名,
+#      留空時任何用到 ref()/source() 的 model 一律展開失敗(安全預設,但等於沒用)。
+#      **不要把這裡的值當範例照抄**:填真正的資料庫名,且不可提交進版控的地方
+#      (這個檔案本身會進 git)存放正式帳密等機密——資料庫名不是機密,可以寫在這裡。
+#   2. 目前還沒有列 GitLab 目錄的工具,所以這裡展開時**沒有 macro 目錄**——只有
+#      ref() / source() / var() / config() 會生效,呼叫到專案自訂 macro 的 model
+#      會展開失敗(StrictUndefined,fail closed),跟現在完全沒展開時一樣落到
+#      「無法解析,需人工確認」,不會誤判成功。macro 目錄要等目錄列表工具到位
+#      (見 docs/09-dbt展開與反查.md 的已知限制)才能真正支援。
+dbt:
+  enabled: false
+  database: ""

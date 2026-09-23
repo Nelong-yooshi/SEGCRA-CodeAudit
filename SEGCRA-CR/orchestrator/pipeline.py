@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .agent import extract_json, run_agent
 from .config import PKG_ROOT, Config, estimate_tokens
+from .dbt_render import is_dbt_template, render_model_isolated
 from .security import scan_mr
 from .skills_loader import always_skills, load_skills, skills_index
 from .spec_exec import find_spec, run_spec_exec
@@ -158,13 +159,44 @@ def _sql_from_diff(diff: str) -> str:
     return "\n".join(lines)
 
 
-async def prescan(hub: ToolHub, files: list[dict]) -> list[dict]:
-    """對每個變更檔跑 rule-base + lint(不經 LLM)。"""
+def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, str | None]:
+    """dbt 樣板先展開成純 SQL 再交給規則層(#7)。回傳 (交給規則層的 sql, 展開失敗原因或 None)。
+
+    展開失敗時**原樣退回未展開的 sql**,不試著猜、不吞掉錯誤——sqlglot 一樣會在
+    Jinja 標記上失敗,走既有 parse_error → enforce_parse 強制揭露這條路徑,不會
+    因為「展開失敗」就多開一條新的靜默放行後門。待審內容一律走
+    render_model_isolated()(子行程隔離 + 逾時 + Linux 上限記憶體)。
+
+    尚無列 GitLab 目錄的工具,所以這裡沒有 macro 目錄可餵(code_root 不給、只給
+    source);呼叫到專案自訂 macro 的 model 會如預期展開失敗,原因見
+    config/models.yaml 的 dbt 區塊註解。
+    """
+    rendered = render_model_isolated(path or "model.sql", source=sql,
+                                     database=dbt_cfg.get("database") or None)
+    if rendered.ok:
+        return rendered.sql, None
+    return sql, rendered.error
+
+
+async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None) -> list[dict]:
+    """對每個變更檔跑 rule-base + lint(不經 LLM)。
+
+    dbt_cfg 給定且 enabled 時,含 dbt 樣板標記的檔案先展開成純 SQL 再交給規則層
+    (見 _dbt_expand_for_prescan)。**預設關閉**:dbt_cfg 為 None、空字典、或
+    enabled 不是 True,行為與展開器上線前完全相同——不會因為呼叫端忘記傳
+    dbt_cfg 而默默改變審查結果。
+    """
+    dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True
     results = []
     for f in files:
         sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or f.get("diff", "")
         entry = {"path": f["path"]}
-        rules = await hub.call_json("sqltools__run_rules", {"sql": sql})
+        rule_sql = sql
+        if dbt_enabled and sql and is_dbt_template(sql):
+            rule_sql, dbt_error = _dbt_expand_for_prescan(f.get("path", ""), sql, dbt_cfg)
+            if dbt_error is not None:
+                entry["dbt_render_error"] = dbt_error
+        rules = await hub.call_json("sqltools__run_rules", {"sql": rule_sql})
         if isinstance(rules, dict):
             hits = rules.get("hits")
             entry["rules"] = hits if isinstance(hits, list) else []
@@ -172,6 +204,13 @@ async def prescan(hub: ToolHub, files: list[dict]) -> list[dict]:
                 entry["parse_error"] = rules["error"]
         else:
             entry["rules"] = rules if isinstance(rules, list) else []
+        # lint 刻意用**原始**文字,不用展開後的 rule_sql:sqlfluff 的違規結果帶行號
+        # (start_line_no),而 LLM 看到的 diff(build_diff_section)是原始行號——
+        # 兩者混在同一份 prescan JSON 裡若行號基準不同,LLM 很可能把展開後的行號
+        # 誤植進 finding,指向原始檔案中錯誤的位置。展開後 SQL 的行號要能可靠地
+        # 對回原始檔,需要哨兵行對應機制(#7 第 4 點),目前尚未接上;在那之前,
+        # 寧可讓 lint 對 Jinja 文字跑出較少或較不準的結果,也不要送出「看起來
+        # 對、實際上指錯行」的資訊——這正是本專案一貫的原則。
         lint = await hub.call_json("sqltools__lint", {"sql": sql})
         entry["lint"] = lint[:15] if isinstance(lint, list) else []
         results.append(entry)
@@ -196,7 +235,14 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                     dry_run: bool = False, baseline: bool = False,
                     capture: dict | None = None) -> dict:
     """capture 給定時,記錄各階段中間產物(預掃前後、檢索到的知識、模型原始輸出、
-    agent 工具對話、最終報告),供產生逐字 transcript。"""
+    agent 工具對話、最終報告),供產生逐字 transcript。
+
+    cfg.dbt["enabled"] 為 True 時,prescan() 會呼叫 render_model_isolated()
+    (multiprocessing 的 spawn context)。**呼叫端的進入點程式必須有
+    `if __name__ == "__main__":` 保護**,否則 Windows 上 spawn 會重新匯入整個
+    頂層模組,連帶把呼叫 review_mr() 的那段程式碼也重跑一次——demo.py 與
+    scripts/webhook_server.py 都已經這樣寫,寫新的進入點時比照辦理。
+    """
     import copy
     profile = cfg.profile(profile_name)
     skills = load_skills()
@@ -229,7 +275,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             report["_mode"] = "baseline"
             return report
 
-        pre = await prescan(hub, mr["files"])
+        pre = await prescan(hub, mr["files"], cfg.dbt)
         if capture is not None:
             capture["mr"] = mr
             capture["prescan_raw"] = copy.deepcopy(pre)

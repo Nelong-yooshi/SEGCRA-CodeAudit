@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -69,6 +69,10 @@ class Config:
     roles: dict
     budget: dict
     policy: dict
+    # 預設關閉(field 預設,不是只在 load_config() 補):任何直接建構 Config(...)
+    # 而沒指定 dbt 的呼叫端(測試、其他腳本)一律落在「未接線」的安全狀態,
+    # 不會因為漏寫這個欄位就意外開啟。
+    dbt: dict = field(default_factory=lambda: {"enabled": False, "database": ""})
 
     def profile(self, name: str | None = None) -> ModelProfile:
         p = self.profiles[name or self.default_profile]
@@ -87,6 +91,30 @@ class Config:
         return self.profile(self.roles.get(role) or self.default_profile)
 
 
+def _load_dbt_section(raw: dict) -> dict:
+    """dbt 展開接線的設定。**預設關閉**——合併後現有審查流程與評測結果不受影響,
+    確認後才開(見 docs/09-dbt展開與反查.md)。
+
+    `enabled` 故意只接受真正的布林值,不接受任何字串:YAML 裡 `enabled: "false"`
+    是一個非空字串,Python 的 `bool("false")` 是 True——這種筆誤會讓「以為關著、
+    其實開著」的功能默默上線,對審查流程是看不見的行為變化,所以當場擋下。
+    """
+    section = raw.get("dbt") or {}
+    if not isinstance(section, dict):
+        raise ValueError("設定檔的 dbt 區塊必須是物件(key: value),"
+                         f"目前是 {type(section).__name__}")
+    enabled = section.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError(
+            f"設定檔 dbt.enabled 必須是布林值 true/false,目前是 {enabled!r}"
+            f"({type(enabled).__name__})。字串 \"false\" 在 Python 裡會被當成"
+            f"真值,為避免誤開,一律不接受字串。")
+    database = section.get("database", "")
+    if not isinstance(database, str):
+        raise ValueError(f"設定檔 dbt.database 必須是字串,目前是 {database!r}")
+    return {"enabled": enabled, "database": database}
+
+
 def load_config(path: Path | None = None) -> Config:
     raw = yaml.safe_load((path or PKG_ROOT / "config" / "models.yaml").read_text(encoding="utf-8"))
     # endpoint 可用環境變數覆蓋(如 Ollama 掛在遠端或 tunnel 上)
@@ -95,7 +123,7 @@ def load_config(path: Path | None = None) -> Config:
         endpoint=endpoint, api_key=raw.get("api_key", "ollama"),
         default_profile=raw["default_profile"], profiles=raw["profiles"],
         roles=raw.get("roles", {}), budget=raw["budget"],
-        policy=raw.get("policy", {}),
+        policy=raw.get("policy", {}), dbt=_load_dbt_section(raw),
     )
 
 

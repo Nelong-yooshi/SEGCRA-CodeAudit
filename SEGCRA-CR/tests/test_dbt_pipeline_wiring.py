@@ -12,6 +12,8 @@ import pathlib
 
 import pytest
 
+from orchestrator.config import Config, _load_dbt_section, load_config
+from orchestrator.pipeline import prescan
 from orchestrator.spec_exec import find_spec
 
 
@@ -198,3 +200,217 @@ def test_real_path_fallback_rejects_path_traversal(empty_specs_dir, malicious_pa
     mr = _mr([{"path": malicious_path, "full_content": "SELECT 1"}])
     assert _run(find_spec(hub, mr)) == (None, None)
     assert hub.calls == []
+
+
+# =================================================================
+# 第二步:預掃前先展開(#7 第 1 點的管線端;config.dbt 開關)
+# =================================================================
+
+class _FakePrescanHub:
+    """只實作 prescan() 用得到的 call_json(),記錄每次呼叫實際送出的 sql,
+    用來驗證「展開後的 SQL 有沒有真的被拿去跑規則層」。"""
+
+    def __init__(self):
+        self.rules_calls: list[str] = []
+        self.lint_calls: list[str] = []
+
+    async def call_json(self, name, args):
+        if name == "sqltools__run_rules":
+            self.rules_calls.append(args["sql"])
+            return []
+        if name == "sqltools__lint":
+            self.lint_calls.append(args["sql"])
+            return []
+        raise AssertionError(f"未預期的工具呼叫:{name}")
+
+
+DBT_MODEL = "SELECT * FROM {{ ref('txn_log') }} WHERE amount > 1000"
+PLAIN_SQL = "SELECT * FROM txn_log WHERE amount > 1000"
+
+
+def _files(path, content):
+    return [{"path": path, "full_content": content}]
+
+
+# ---------------------------------------------- 關閉時(預設)行為完全不變
+def test_prescan_dbt_cfg_none_leaves_dbt_file_unrendered():
+    """dbt_cfg 完全不給(呼叫端沒傳,例如舊程式碼)——必須是安全的預設,
+    不能因為忘記傳這個參數就意外展開。"""
+    hub = _FakePrescanHub()
+    _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL)))
+    assert hub.rules_calls == [DBT_MODEL]   # 原樣送進規則層,樣板沒被展開
+
+
+def test_prescan_dbt_cfg_disabled_leaves_dbt_file_unrendered():
+    hub = _FakePrescanHub()
+    _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
+                {"enabled": False, "database": "SAMPLE_DW"}))
+    assert hub.rules_calls == [DBT_MODEL]
+
+
+def test_prescan_dbt_cfg_missing_enabled_key_defaults_off():
+    """dbt_cfg 給了字典,但沒有 enabled 這個鍵——一樣視為關閉,不是預設開啟。"""
+    hub = _FakePrescanHub()
+    _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL), {"database": "SAMPLE_DW"}))
+    assert hub.rules_calls == [DBT_MODEL]
+
+
+def test_prescan_dbt_cfg_truthy_but_not_bool_true_does_not_enable():
+    """enabled 是非布林的真值(例如字串)時**不能**被當成開啟。config.py 的
+    _load_dbt_section() 會在設定檔載入時就擋掉這種值,但 prescan() 自己也要有
+    這道防線——它是這個模組唯一真正決定「要不要展開」的地方,不能只依賴
+    上游有做過檢查。"""
+    hub = _FakePrescanHub()
+    _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
+                {"enabled": "true", "database": "SAMPLE_DW"}))
+    assert hub.rules_calls == [DBT_MODEL]
+
+
+def test_prescan_plain_sql_never_touched_even_when_enabled():
+    """不是 dbt 樣板的檔案,開啟時也不該被送去展開(沒有 Jinja 標記,
+    is_dbt_template() 為 False,直接跳過,省一次子行程開銷)。"""
+    hub = _FakePrescanHub()
+    _run(prescan(hub, _files("sql/rules/r201.sql", PLAIN_SQL),
+                {"enabled": True, "database": "SAMPLE_DW"}))
+    assert hub.rules_calls == [PLAIN_SQL]
+
+
+# ---------------------------------------------------------- 開啟時的行為
+def test_prescan_enabled_expands_dbt_template():
+    """核心行為:開啟後,dbt 樣板展開成純 SQL 才送進規則層。"""
+    hub = _FakePrescanHub()
+    entries = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
+                           {"enabled": True, "database": "SAMPLE_DW"}))
+    assert hub.rules_calls == ['SELECT * FROM "SAMPLE_DW"."dbo"."txn_log" WHERE amount > 1000']
+    assert "dbt_render_error" not in entries[0]
+
+
+def test_prescan_lint_stays_on_original_text_not_rendered_sql():
+    """lint 的違規結果帶行號(sqlfluff 的 start_line_no),但 LLM 看到的 diff
+    用的是原始檔案行號——兩個基準不一致時,LLM 有機會把展開後的行號誤植進
+    finding,指向原始檔案中錯誤的位置。行號能可靠對回原始檔前(#7 第 4 點,
+    尚未接上),lint 必須一直吃原始文字,只有 rule-base(不帶行號)才吃
+    展開後的 SQL。這條測試把這個決定鎖住,不讓未來的重構不小心把兩者對齊。"""
+    hub = _FakePrescanHub()
+    _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
+                {"enabled": True, "database": "SAMPLE_DW"}))
+    assert hub.lint_calls == [DBT_MODEL]                      # 原始 Jinja 文字
+    assert hub.rules_calls != hub.lint_calls                   # 規則層吃的是展開後的
+
+
+def test_prescan_enabled_without_database_fails_closed_not_silently():
+    """database 沒填(config 預設值)時,用到 ref()/source() 的 model 一定展開
+    失敗——這是刻意的安全預設(見 config/models.yaml 的 dbt 區塊註解),不是 bug。
+    展開失敗要退回原樣文字,讓既有的 parse_error 路徑接手,而不是憑空造一個
+    看似合理的表名。"""
+    hub = _FakePrescanHub()
+    entries = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
+                           {"enabled": True, "database": ""}))
+    assert hub.rules_calls == [DBT_MODEL]              # 退回原樣,不是亂猜的 SQL
+    assert entries[0]["dbt_render_error"]               # 但原因要留痕,不能無聲無息
+
+
+def test_prescan_enabled_macro_not_available_fails_closed():
+    """呼叫到自訂 macro 的 model——目前沒有列目錄的 GitLab 工具,沒有 macro 目錄
+    可餵,展開一定失敗。這跟現在完全沒接線時的行為(sqlglot 直接在 Jinja 標記上
+    解析失敗)效果一致:都是 fail closed,不會因為「有試著展開」就多一種
+    看似成功、實則錯誤的 SQL。"""
+    hub = _FakePrescanHub()
+    src = "SELECT * FROM t WHERE {{ is_large_amount('t') }}"
+    entries = _run(prescan(hub, _files("models/mrt_x.sql", src),
+                           {"enabled": True, "database": "SAMPLE_DW"}))
+    assert hub.rules_calls == [src]
+    assert entries[0]["dbt_render_error"]
+
+
+def test_prescan_render_error_recorded_and_not_mixed_into_sql():
+    """展開失敗時,錯誤原因只記在 entry["dbt_render_error"],不會混進
+    送給規則層/LLM 的 sql 字串本身——兩者要嚴格分開,不能把錯誤訊息
+    意外串進使用者看到的 SQL 內容裡。"""
+    hub = _FakePrescanHub()
+    src = "SELECT {{ target.database }}"   # 沒給 database,一定展開失敗
+    entries = _run(prescan(hub, _files("models/mrt_x.sql", src),
+                           {"enabled": True, "database": ""}))
+    assert hub.rules_calls == [src]
+    assert entries[0]["dbt_render_error"] not in hub.rules_calls[0]
+
+
+def test_prescan_multiple_files_only_dbt_ones_expanded():
+    """一個 MR 同時改了 dbt model 與一般 SQL 檔:只有前者被展開。"""
+    hub = _FakePrescanHub()
+    files = [{"path": "models/mrt_x.sql", "full_content": DBT_MODEL},
+            {"path": "sql/rules/r201.sql", "full_content": PLAIN_SQL}]
+    _run(prescan(hub, files, {"enabled": True, "database": "SAMPLE_DW"}))
+    assert hub.rules_calls == [
+        'SELECT * FROM "SAMPLE_DW"."dbo"."txn_log" WHERE amount > 1000',
+        PLAIN_SQL,
+    ]
+
+
+def test_prescan_model_path_with_traversal_does_not_touch_filesystem():
+    """f["path"] 來自待審 MR,是攻擊者可控字串。source= 已經給了完整內容,
+    render_model_isolated 不該因為 path 長得像逃逸路徑就嘗試讀取檔案系統——
+    這裡驗證的是展開仍然成功、用的是 source 給的內容,不是意外讀到某個
+    真實檔案(讀到的話結果會明顯不同,或直接失敗)。"""
+    hub = _FakePrescanHub()
+    src = "SELECT {{ 1 + 1 }} AS two"
+    entries = _run(prescan(hub, _files("../../../../etc/passwd", src),
+                           {"enabled": True, "database": "SAMPLE_DW"}))
+    assert hub.rules_calls == ["SELECT 2 AS two"]
+    assert "dbt_render_error" not in entries[0]
+
+
+def test_prescan_undefined_var_fails_closed_cleanly():
+    """展開失敗的路徑(缺 macro、缺 var、缺 database……)都要乾淨地收斂成
+    ok=False,不能卡住或丟未捕捉的例外一路炸穿 prescan()——子行程逾時與
+    記憶體保護本身由 dbt_render 自己的測試涵蓋,這裡只驗證 prescan 這層
+    確實把控制權交給 render_model_isolated,而不是繞過它直接同步渲染。"""
+    hub = _FakePrescanHub()
+    src = "SELECT {{ var('undeclared_var') }}"
+    entries = _run(prescan(hub, _files("models/mrt_x.sql", src),
+                           {"enabled": True, "database": "SAMPLE_DW"}))
+    assert hub.rules_calls == [src]
+    assert entries[0]["dbt_render_error"]
+
+
+# --------------------------------------------------------- config.dbt 驗證
+def test_load_dbt_section_defaults_to_disabled_when_key_missing():
+    assert _load_dbt_section({}) == {"enabled": False, "database": ""}
+
+
+def test_load_dbt_section_accepts_explicit_values():
+    raw = {"dbt": {"enabled": True, "database": "SAMPLE_DW"}}
+    assert _load_dbt_section(raw) == {"enabled": True, "database": "SAMPLE_DW"}
+
+
+@pytest.mark.parametrize("bad_enabled", ["true", "false", "1", "0", 1, 0, None, [], {}])
+def test_load_dbt_section_rejects_non_bool_enabled(bad_enabled):
+    """尤其是字串 "false":Python 的 bool("false") 是 True,這種筆誤絕不能
+    被靜默接受成「真的開啟了」。"""
+    with pytest.raises(ValueError):
+        _load_dbt_section({"dbt": {"enabled": bad_enabled}})
+
+
+def test_load_dbt_section_rejects_non_string_database():
+    with pytest.raises(ValueError):
+        _load_dbt_section({"dbt": {"enabled": False, "database": 123}})
+
+
+def test_load_dbt_section_rejects_non_dict_section():
+    with pytest.raises(ValueError):
+        _load_dbt_section({"dbt": "enabled"})
+
+
+def test_config_dataclass_default_is_disabled():
+    """直接建構 Config(...)(例如測試、或未來新腳本)沒給 dbt 時,
+    落在安全狀態,不是拋例外也不是意外開啟。"""
+    cfg = Config(endpoint="http://x/v1", api_key="k", default_profile="review",
+                profiles={}, roles={}, budget={}, policy={})
+    assert cfg.dbt == {"enabled": False, "database": ""}
+
+
+def test_real_models_yaml_defaults_dbt_disabled():
+    """對正式的 config/models.yaml 做一次真的載入——不是造假資料,是驗證
+    這次改動真的以安全的狀態進到設定檔裡,而不是只有測試裡的假設定安全。"""
+    cfg = load_config()
+    assert cfg.dbt["enabled"] is False
