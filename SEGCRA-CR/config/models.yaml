@@ -4,6 +4,19 @@ endpoint: http://localhost:11434/v1
 api_key: ollama          # Ollama 不驗證,佔位即可
 default_profile: review
 
+# temperature/seed 的方針(對應 eval/README.md「發現三:測資生成覆蓋度不穩定」):
+# - 正式審查(webhook / demo.py):用這裡的值。
+# - 回歸比較(eval/run_eval.py):腳本預設自動固定 temperature 0、並傳送 seed 42。
+#   seed 經對照實驗證實是有生效的(細節見 eval/FINDINGS.md「附錄:seed 根因追查」),
+#   但同一份輸入兩次跑出不同結果的現象仍觀察過、原因未定(較可能是 prompt 內容本身有
+#   變動,而非取樣隨機性)——回歸比較仍當作不能重現,跑多次看分布,不能只跑一次就下結論。
+# - 出能力報告(看模型真實表現的分布):跑的時候用環境變數覆蓋 run_eval.py 的預設:
+#     LLM_TEMPERATURE=0.1 LLM_SEED= .venv/bin/python eval/run_eval.py ...
+#   (LLM_SEED 設空字串 = 取消固定 seed,恢復隨機)
+# num_ctx 目前是無效設定:orchestrator/agent.py 呼叫模型時根本沒有把這個欄位送出去,
+# 只是紀錄在 profile 上供人參考,實際的 context 長度由模型端點那邊的設定決定。真正的防線
+# 是 agent.py 用回應的 usage.prompt_tokens 檢查有沒有比預期少很多——那才是「超過 context
+# 會被靜默截斷」的實際偵測手段,不是這裡的 num_ctx。
 profiles:
   review:                # 審查主力(tag 以 ollama registry 實際名稱為準)
     model: gemma4:31b

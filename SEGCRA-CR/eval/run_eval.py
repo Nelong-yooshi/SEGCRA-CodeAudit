@@ -37,6 +37,15 @@ GOLDEN_DIR = EVAL_DIR / "golden"
 os.environ["FIXTURES_DIR"] = str(GOLDEN_DIR)
 os.environ["REVIEW_OUTPUT"] = str(EVAL_DIR / "_output")
 
+# 回歸比較預設固定 temperature 0、並傳送 seed 42;正式審查不受影響(models.yaml 維持原值)。
+# 用 setdefault:呼叫端明確設的環境變數優先(含 LLM_SEED= 空字串代表取消固定 seed)。
+#
+# seed 經對照實驗證實是有生效的(細節見 eval/FINDINGS.md「附錄:seed 根因追查」)。但同一份
+# 輸入兩次跑出不同結果的現象仍觀察過、原因未定(較可能是 prompt 內容本身有變動,而非取樣
+# 隨機性)——**不能當成可重現的依據**;回歸比較要跑多次看分布,單次比對不足以下結論。
+os.environ.setdefault("LLM_TEMPERATURE", "0")
+os.environ.setdefault("LLM_SEED", "42")
+
 sys.path.insert(0, str(PKG_ROOT))
 
 from orchestrator.config import load_config  # noqa: E402
