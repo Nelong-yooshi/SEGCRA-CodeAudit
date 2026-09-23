@@ -12,11 +12,6 @@ __pycache__/
 # 執行產物
 review_output/
 **/eval/_output/
-# baseline 跑批的輸出。不追蹤是刻意的,而且有第二個理由:preflight 用
-# `git status --porcelain` 判斷程式碼是不是 dirty,而 dirty 的 baseline 會被標成
-# 「不可當共用基準」。跑批把輸出寫進 repo 裡,不 ignore 的話**第二輪起每一份
-# baseline 都會因為前一輪的輸出而被自己標成 dirty**——工具自己弄髒自己。
-**/eval/baselines/
 
 # dbt 對照專案(若直接在該目錄手動執行 dbt 會產生這些)
 **/dbt_reference/target/
