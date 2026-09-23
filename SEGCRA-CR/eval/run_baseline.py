@@ -53,6 +53,7 @@
 import argparse
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -97,13 +98,48 @@ def case_ids(only: str | None) -> list[str]:
     return ids
 
 
+# 基礎設施失敗的特徵字樣。**管線遇到這些會優雅降級**——照樣跑完、照樣產出一份
+# 看起來正常的結果,只是把原因寫進 spec_exec 的降級訊息裡。那是管線該有的行為
+# (正式審查不該因為端點抖一下就整個炸掉),但對跑批來說是陷阱:結果檔通過了
+# 每一項既有檢查,於是環境失敗被計成「品質退步」。
+#
+# 這不是假設,是實測撞到的:2026-09-23 凌晨端點中斷,某一次跑批的結果是
+# spec_exec 案例數 0、缺口 1,gap_detail 寫著
+# 「測資生成失敗(LLM 呼叫失敗:APIConnectionError: Connection error.)」——
+# 頂層沒有 error、errors 清單是空的,所以舊的 result_ok 判它有效。
+_INFRA_FAILURE = re.compile(
+    r"APIConnectionError|APITimeoutError|ConnectError|Connection error"
+    r"|LLM 呼叫失敗|連不到|連線失敗"
+    r"|沙盒不可用|無法連線執行驗證沙盒|未設定 SANDBOX_MSSQL_PASSWORD|沙盒執行異常"
+    r"|Timeout|timed out|逾時")
+
+
+def infra_failure(row: dict) -> str | None:
+    """這一列是不是「環境壞了」而不是「品質不好」?是的話回傳原因。
+
+    刻意只認**明確的基礎設施特徵**。像「測資生成失敗(兩次皆無合法輸出)」這種
+    就不算——那是模型沒產出合法輸出,是真的品質問題,誤判成環境失敗會把真實的
+    退步藏起來,比漏抓更糟。
+    """
+    gaps = ((row.get("spec_exec") or {}).get("gap_detail")) or []
+    for g in gaps:
+        if _INFRA_FAILURE.search(str(g)):
+            return str(g)[:200]
+    return None
+
+
 def result_ok(path: Path, mr_id: str) -> bool:
     """**檔案存在不等於跑成功。**
 
     上一輪就是在這裡吃到虧:`run_percase.sh` 只檢查 `case_<id>.json` 存不存在,
     結果 4 個「連不到本機 Ollama:timed out」的錯誤紀錄被計成成功,
     32 個裡宣稱 30 個成功、實際只有 26 個(FINDINGS「發現十一」)。
-    所以這裡驗內容:JSON 解得開、有這個 case 的那一列、而且那一列沒有 error。
+    所以這裡驗內容:JSON 解得開、有這個 case 的那一列、那一列沒有 error,
+    **而且那一列不是基礎設施失敗降級來的**(見 infra_failure)。
+
+    > **已知限制**:沙盒中途掛掉偵測不到。沙盒失敗只進 findings,不進
+    > `coverage_gaps`,所以結果列裡看不到。起飛前檢查會在開跑前擋掉沙盒不可用,
+    > 但跑到一半才掛的情況目前只能靠人看 REPORT.md 的異常數字。
     """
     if not path.exists() or path.stat().st_size == 0:
         return False
@@ -114,7 +150,9 @@ def result_ok(path: Path, mr_id: str) -> bool:
     if d.get("errors"):
         return False
     rows = [r for r in d.get("cases", []) if str(r.get("case")) == mr_id]
-    return len(rows) == 1 and not rows[0].get("error")
+    if len(rows) != 1 or rows[0].get("error"):
+        return False
+    return not infra_failure(rows[0])
 
 
 def run_one(mr_id: str, run_idx: int, out: Path, args, cwd: Path) -> dict:
@@ -186,7 +224,12 @@ def _why_failed(jpath: Path, mr_id: str) -> str:
     rows = [r for r in d.get("cases", []) if str(r.get("case")) == mr_id]
     if not rows:
         return "結果檔裡沒有這個 case"
-    return str(rows[0].get("error", "(原因不明)"))[:200]
+    if rows[0].get("error"):
+        return str(rows[0]["error"])[:200]
+    # 降級來的環境失敗要講明白是環境,不要只說「原因不明」——報告上
+    # 「環境失敗」與「測試失敗」分在兩節,講錯了整段就讀錯了
+    infra = infra_failure(rows[0])
+    return f"(基礎設施失敗,非品質問題){infra}" if infra else "(原因不明)"
 
 
 # ─────────────────────── 從結果檔抽觀測值 ───────────────────────
@@ -289,9 +332,9 @@ def aggregate(cases: dict) -> dict:
 def judge(new: dict, old: dict) -> list[dict]:
     """回歸判定。規則明確到可以直接寫進 CI 說明,理由見 BASELINE.md。
 
-    最重要的一條:**翻盤不等於回歸。** 邊界案例單次翻盤只補跑、不判定——
-    在一個不可重現的系統上,單次翻盤是噪音的正常表現,拿它當紅燈會讓
-    所有人學會忽略紅燈。
+    最重要的一條:**翻盤不等於回歸。** 對一個**量過、而且量到會晃**的 case,
+    單次翻盤是噪音的正常表現,拿它當紅燈會讓所有人學會忽略紅燈。
+    所以邊界案例單次翻盤只補跑、不判定;硬閘門只放在量過、而且量到穩定的 case 上。
     """
     rows = []
     for mr_id, n in sorted(new.get("cases", {}).items()):

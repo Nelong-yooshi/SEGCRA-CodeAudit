@@ -607,3 +607,53 @@ def test_端點認不認_seed_與跑批有沒有帶_seed_是兩件事():
     diffs = preflight.compare_fingerprint(bare, seeded)
     assert any("seed_configured" in d for d in diffs), \
         "跑批的 seed 變了卻判成可比 —— 那會讓兩組不同條件下的數字被直接相減"
+
+
+# ─────────────────── 優雅降級造成的假成功 ───────────────────
+
+def _row_with_gap(*gaps) -> dict:
+    return {"case": "406", "layer": "spec_exec", "failed": 1, "decision": "needs_human",
+            "spec_exec": {"passed": False, "cases": 0, "coverage_gaps": len(gaps),
+                          "dropped_cases": 0, "gap_detail": list(gaps)}}
+
+
+@pytest.mark.parametrize("gap", [
+    # 實際撞到的那一筆(2026-09-23 凌晨端點中斷)
+    "測資生成失敗(LLM 呼叫失敗:APIConnectionError: Connection error.)",
+    "測資生成失敗(LLM 呼叫失敗:APITimeoutError: timed out)",
+    "無法連線執行驗證沙盒 127.0.0.1:1433:connection refused",
+    "未設定 SANDBOX_MSSQL_PASSWORD(見 config/sandbox.env.example)",
+])
+def test_降級來的環境失敗不可以算成有效結果(tmp_path, gap):
+    """管線遇到基礎設施失敗會**優雅降級**:照樣跑完、照樣產出看起來正常的結果。
+
+    那是管線該有的行為(正式審查不該因為端點抖一下就整個炸掉),但對跑批是陷阱:
+    結果檔通過了每一項既有檢查——JSON 解得開、有這個 case、那一列沒有 error、
+    errors 清單是空的——於是環境失敗被計成「品質退步」。
+
+    這正是 FINDINGS「發現十一」那個 bug 的下一層:上一輪擋掉了頂層的 error,
+    但沒擋降級訊息裡的。實測撞到過,不是想像的邊界。
+    """
+    p = tmp_path / "mr_406.run1.json"
+    p.write_text(json.dumps({"cases": [_row_with_gap(gap)], "errors": []},
+                            ensure_ascii=False), encoding="utf-8")
+    assert rb.result_ok(p, "406") is False
+    why = rb._why_failed(p, "406")
+    assert "基礎設施失敗" in why, "報告要分得出環境問題與品質問題,否則整段會讀錯"
+
+
+@pytest.mark.parametrize("gap", [
+    # 模型沒產出合法輸出 —— 那是真的品質問題,不是環境
+    "測資生成失敗(兩次皆無合法輸出)",
+    # 正常的覆蓋缺口
+    "條件 C2 的反向案例沒有被覆蓋",
+])
+def test_真的品質問題不可以被誤判成環境失敗(tmp_path, gap):
+    """誤判的方向很重要:把真實的退步藏進「環境失敗」那一節,比漏抓更糟——
+
+    環境失敗不計入通過率,所以誤判等於讓一次真的品質退步從數字裡消失。
+    """
+    p = tmp_path / "mr_406.run1.json"
+    p.write_text(json.dumps({"cases": [_row_with_gap(gap)], "errors": []},
+                            ensure_ascii=False), encoding="utf-8")
+    assert rb.result_ok(p, "406") is True
