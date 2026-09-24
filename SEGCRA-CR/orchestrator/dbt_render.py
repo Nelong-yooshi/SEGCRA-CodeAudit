@@ -72,9 +72,13 @@
   * 記憶體上限依賴作業系統(Linux 的 RLIMIT_AS);Windows 上只有逾時與上述上限。
   * `source()` 依正式環境慣例展開(沿用 profile 的 database 與 dbo),未讀取
     sources.yml;若某來源另外指定 schema / database / identifier,結果會與 dbt 不同。
-  * `ref()` 以 model 名稱為表名,未讀取被引用 model 的 alias,也未套用專案自訂的
-    `generate_schema_name` / `generate_alias_name`;有自訂時結果會與 dbt 不同。
+  * `ref()` 以 model 名稱為表名,不驗證被引用的 model 是否存在(沒有 manifest 可查),
+    未讀取被引用 model 的 alias,也未套用專案自訂的 `generate_schema_name` /
+    `generate_alias_name`;有自訂或指到不存在的 model 時,結果會與 dbt 不同。
     專案以 macro 覆寫 `ref` / `source`(dbt 允許)時,這裡會拒絕展開。
+    以上三項不影響規則層判斷(規則檢查的是語法結構,不檢查表名/表是否存在),
+    但用到 `ref()`/`source()` 時 `RenderResult.relation_notice` 會帶上提醒,
+    呼叫端應呈現給審查者,不要讓表名看起來像是已經過完整驗證。
   * `adapter` 只提供 `dispatch`(依 `adapter` 參數先找 `<轉接器>__x`,再退回
     `default__x`);不讀 `dbt_project.yml` 的 dispatch 搜尋順序設定,也不分辨套件。
     `{{ this }}`、`run_query`、`modules`、`fromjson` 等其餘 dbt 內建未支援,
@@ -149,6 +153,19 @@ _DEFAULT_VARS: dict = {}
 
 _MISSING = object()
 _PLAIN_SCALARS = (str, int, float, bool, type(None))
+
+# ref()/source() 展開出的表名有三個已知落差,PR review 要求接線時要讓審查者看得到,
+# 不能只寫在模組文件裡沒人會翻:
+#   1. 不驗證被引用的 model 是否真的存在(沒有 manifest 可查)
+#   2. source() 不讀 sources.yml,固定套用正式環境慣例(profile 的 database、dbo)
+#   3. ref() 不套用被引用 model 的 alias,也不套用專案自訂的 generate_schema_name
+# 三者都不影響規則層判斷(R001/R002/R003 等檢查的是語法結構,不檢查表名/表是否存在),
+# 但展開出的表名可能與 dbt compile 的正式結果不同,呼叫端應標明「未經完整驗證」。
+_RELATION_NOTICE = (
+    "此檔用到 ref()/source():展開出的表名不保證與 dbt compile 逐字相同"
+    "(不驗證被引用的 model 是否存在、不讀取 sources.yml、不套用 alias 與"
+    "自訂 generate_schema_name)。若專案有用到這些進階寫法,表名可能有落差,"
+    "建議人工核對。")
 
 
 class DbtRenderError(Exception):
@@ -345,10 +362,15 @@ def _check_ident(kind: str, value) -> str:
     return value
 
 
-def _make_relations(database: str | None, schema: str):
-    """dbt 的 ref() / source(),比照正式環境展開成 "<database>"."<schema>"."<表>"。"""
+def _make_relations(database: str | None, schema: str, usage: dict):
+    """dbt 的 ref() / source(),比照正式環境展開成 "<database>"."<schema>"."<表>"。
+
+    usage 是呼叫端給的共用字典,呼叫到 ref()/source() 就記一筆,讓呼叫端知道
+    這份 model 是否用了這兩個「不保證與 dbt 逐字相同」的展開(見 _RELATION_NOTICE)。
+    """
 
     def relation(name) -> str:
+        usage["used"] = True
         if database is None:
             raise DbtRenderError(
                 "未設定 database,無法展開 ref()/source()。dbt 由 profile 決定資料庫名稱,"
@@ -424,6 +446,10 @@ class RenderResult:
     source_lines: int = 0
     rendered_lines: int = 0
     error: str | None = None
+    # ok=True 且這份 model 用到 ref()/source() 時才會有值(見 _RELATION_NOTICE)。
+    # 展開出的表名不保證與 dbt 逐字相同——見下方三個已知限制;呼叫端應在報告中
+    # 一併呈現,而不是讓審查者誤以為表名已經過完整驗證。
+    relation_notice: str | None = None
 
     def src_line(self, rendered_line: int) -> int:
         """渲染行(1-based)→ 原始行(1-based)。對應不到回 0 = 檔案層留言。"""
@@ -502,7 +528,11 @@ def build_env(code_root=None, variables: dict | None = None,
         finalize=_finalize,
     )
 
-    ref, source = _make_relations(database, schema)
+    # 是否用到 ref()/source() 記在這裡,render_model() 展開成功後讀出來決定
+    # relation_notice 要不要帶上。掛在 env 上是既有作法(見 segcra_macro_phase),
+    # 不改 build_env() 的回傳簽章,呼叫端(含既有測試)不受影響。
+    env.segcra_relation_usage = {"used": False}
+    ref, source = _make_relations(database, schema, env.segcra_relation_usage)
     env.globals["ref"] = ref
     env.globals["source"] = source
     env.globals["config"] = _Config()
@@ -810,6 +840,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
         macro_problems=problems,
         source_lines=n_src,
         rendered_lines=n_out,
+        relation_notice=(_RELATION_NOTICE if env.segcra_relation_usage["used"] else None),
     )
 
 

@@ -357,11 +357,28 @@ MUTANTS.update({
 
 
 def copy_project(src: pathlib.Path, dst: pathlib.Path) -> None:
-    ignore = shutil.ignore_patterns("__pycache__", ".pytest_cache")
-    for name in ("orchestrator", "toolbox", "examples", "tests"):
-        shutil.copytree(src / name, dst / name, ignore=ignore)
-    for name in ("conftest.py", "requirements.txt", "requirements-dev.txt"):
-        shutil.copyfile(src / name, dst / name)
+    """複製整個專案(除了下面明列的建置產物/快取/憑證),不是手動列出「測試會用到
+    哪些目錄」。
+
+    原本是列舉式(只複製 orchestrator/toolbox/examples/tests),曾經漏複製
+    config/、memory/、eval/——這些目錄裡沒有任何一個是 dbt_render.py 本身需要
+    的,但 test_config_env.py、test_citations.py 等測試會間接讀到,漏複製的話
+    那些測試檔在複製出去的專案裡連收集(collect)都做不到,pytest 會直接以
+    非 0 回傳碼中止,**每個突變都會被誤判成「被抓到」**,而且不會有任何警訊——
+    這正是要有基準檢查(_run_baseline)的理由,但事前把複製範圍變成「整個專案
+    減去明確不需要的東西」,比每次有新測試依賴新目錄就要記得回來加一行更穩。
+    """
+    ignore = shutil.ignore_patterns(
+        "__pycache__", "*.pyc", ".venv", ".venv-*", ".pytest_cache",
+        "review_output", "_output", "target", "logs", "dbt_packages",
+        "*.duckdb", "*.duckdb.wal", "*.env", ".git")
+    for item in src.iterdir():
+        if item.name in (".git",):
+            continue
+        if item.is_dir():
+            shutil.copytree(item, dst / item.name, ignore=ignore)
+        else:
+            shutil.copyfile(item, dst / item.name)
 
 
 MUTANTS.update({
@@ -428,7 +445,40 @@ MUTANTS.update({
  "屬性:unique 位置錯": (I, '{"sort": 2, "unique": 1,', '{"sort": 2, "unique": 0,'),
  "隔離:poll 例外外洩": ("isolation.py", "        except (EOFError, OSError):" + NL + "            message = None       #", "        except ():" + NL + "            message = None       #"),
  "隔離:例外訊息帶出內容": ("isolation.py", '        message = ("error", f"{type(e).__name__}: 子行程執行失敗")', '        message = ("error", f"{type(e).__name__}: {e}")'),
+ "relation_notice 不回報 ref()/source() 已知落差": (
+     'relation_notice=(_RELATION_NOTICE if env.segcra_relation_usage["used"] else None),',
+     "relation_notice=None,"),
+ "relation_notice 沒用到 ref()/source() 也照樣回報": (
+     'relation_notice=(_RELATION_NOTICE if env.segcra_relation_usage["used"] else None),',
+     "relation_notice=_RELATION_NOTICE,"),
 })
+
+
+def _run_baseline(src: pathlib.Path, python: str, timeout: int) -> str | None:
+    """複製一份未突變的專案,跑一次測試套件,確認完全乾淨才能開始判斷突變。
+
+    「被抓到」的判斷依據是測試套件回傳碼非 0——如果套件本身就有一條失敗或收集
+    (collect)不起來的測試(例如漏複製了某個依賴的目錄),**每個突變都會被誤判
+    成被抓到**,結果全部失去意義,而且不會有任何警訊。回傳 None 代表基準乾淨;
+    否則回傳失敗原因(供 main() 直接中止並印出來)。
+    """
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="sgc_mut_baseline_"))
+    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    try:
+        copy_project(src, tmp)
+        try:
+            proc = subprocess.run([python, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+                                  cwd=tmp, capture_output=True, text=True, env=env,
+                                  encoding="utf-8", errors="replace", timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return f"基準套件跑超過 {timeout} 秒未完成"
+        if proc.returncode != 0:
+            lines = proc.stdout.splitlines()
+            tail = "\n".join(lines[-30:]) if lines else proc.stdout
+            return f"基準套件(未突變)沒有全部通過,回傳碼 {proc.returncode}:\n{tail}"
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def main() -> int:
@@ -440,11 +490,23 @@ def main() -> int:
     ap.add_argument("--only", default="")
     ap.add_argument("--timeout", type=int, default=240)
     ap.add_argument("--start", type=int, default=0)
+    ap.add_argument("--skip-baseline", action="store_true",
+                    help="跳過開始前的基準套件檢查(例如 --start 續跑、已確認過基準乾淨時)")
     args = ap.parse_args()
     src = pathlib.Path(args.src)
     only = [s for s in args.only.split(",") if s]
     selected = {k: v for k, v in MUTANTS.items() if not only or any(o in k for o in only)}
     selected = dict(list(selected.items())[args.start:])
+
+    if not args.skip_baseline:
+        print("先跑一次未突變的基準套件,確認乾淨才開始判斷突變...", flush=True)
+        problem = _run_baseline(src, args.python, args.timeout)
+        if problem is not None:
+            print(f"[中止] {problem}", flush=True)
+            print("基準套件本身沒過,突變測試的「被抓到」結果沒有意義,不繼續執行。",
+                 flush=True)
+            return 1
+        print("基準套件乾淨,開始跑突變。", flush=True)
 
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     survived, config_errors = [], []

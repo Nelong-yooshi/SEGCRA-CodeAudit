@@ -285,6 +285,31 @@ def test_prescan_enabled_expands_dbt_template():
     assert "dbt_render_error" not in entries[0]
 
 
+def test_prescan_surfaces_relation_notice_when_ref_used():
+    """#10 review 要求:ref()/source() 展開出的表名有已知精確度落差,接線時要讓
+    審查者看得到,不能只是展開「成功」就沒事——DBT_MODEL 用了 ref(),提醒要出現。"""
+    hub = _FakePrescanHub()
+    entries = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
+                           {"enabled": True, "database": "SAMPLE_DW"}))
+    assert "ref()" in entries[0]["dbt_render_notice"]
+
+
+def test_prescan_no_relation_notice_when_ref_not_used():
+    """沒用到 ref()/source() 的 dbt 樣板(例如只用了 var())不該被貼提醒。"""
+    hub = _FakePrescanHub()
+    src = "SELECT {{ var('threshold', 1000) }} AS threshold"
+    entries = _run(prescan(hub, _files("models/mrt_x.sql", src),
+                           {"enabled": True, "database": "SAMPLE_DW"}))
+    assert "dbt_render_notice" not in entries[0]
+
+
+def test_prescan_no_relation_notice_when_disabled():
+    """開關關閉時完全不展開,自然也不會有這個提醒——確認它不會憑空冒出來。"""
+    hub = _FakePrescanHub()
+    entries = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL)))
+    assert "dbt_render_notice" not in entries[0]
+
+
 def test_prescan_lint_stays_on_original_text_not_rendered_sql():
     """lint 的違規結果帶行號(sqlfluff 的 start_line_no),但 LLM 看到的 diff
     用的是原始檔案行號——兩個基準不一致時,LLM 有機會把展開後的行號誤植進

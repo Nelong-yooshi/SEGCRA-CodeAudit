@@ -1287,3 +1287,44 @@ def test_unrendered_template_is_blind_spot():
     assert isinstance(out, dict), "預期原始樣板應解析失敗並回 {'error':...}"
     assert "parse failed" in out["error"]
     assert out["hits"] == [], "未展開時不應命中任何規則(這正是盲區)"
+
+
+# ------------------------------------------------------------ relation_notice
+# ref()/source() 展開出的表名有三個已知落差(不驗證 model 是否存在、不讀
+# sources.yml、不套用 alias)。#10 review 要求接線時要讓審查者看得到,
+# 不能只寫在模組文件裡沒人會翻——這裡驗證 RenderResult 真的會帶上提醒。
+
+def test_relation_notice_set_when_ref_used(tmp_path):
+    r = _render(code_root=tmp_path, source="SELECT * FROM {{ ref('t') }}")
+    assert r.ok, r.error
+    assert r.relation_notice is not None
+    assert "ref()" in r.relation_notice
+
+
+def test_relation_notice_set_when_source_used(tmp_path):
+    r = _render(code_root=tmp_path, source="SELECT * FROM {{ source('s', 't') }}")
+    assert r.ok, r.error
+    assert r.relation_notice is not None
+
+
+def test_relation_notice_absent_when_neither_used(tmp_path):
+    """完全沒用到 ref()/source() 的 model(例如純字面量 SQL)不該被貼上這個
+    提醒——提醒要精準對應到真的有落差風險的地方,不是每次展開都固定附上。"""
+    r = _render(code_root=tmp_path, source="SELECT 1 AS a")
+    assert r.ok, r.error
+    assert r.relation_notice is None
+
+
+def test_relation_notice_absent_when_ref_fails_to_render(tmp_path):
+    """展開失敗時不該有 relation_notice(ok=False 時這個欄位本來就沒意義,
+    呼叫端該看的是 error,不是 relation_notice)。"""
+    r = _render(code_root=tmp_path, source="SELECT * FROM {{ ref('t') }}", database=None)
+    assert not r.ok
+    assert r.relation_notice is None
+
+
+def test_relation_notice_present_on_real_sample_model():
+    """拿專案自己的範例(真的用到 ref())驗證,不是只驗合成的最小案例。"""
+    r = _render()
+    assert r.ok, r.error
+    assert r.relation_notice is not None

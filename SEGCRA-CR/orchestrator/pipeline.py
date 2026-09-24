@@ -159,8 +159,9 @@ def _sql_from_diff(diff: str) -> str:
     return "\n".join(lines)
 
 
-def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, str | None]:
-    """dbt 樣板先展開成純 SQL 再交給規則層(#7)。回傳 (交給規則層的 sql, 展開失敗原因或 None)。
+def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, str | None, str | None]:
+    """dbt 樣板先展開成純 SQL 再交給規則層(#7)。
+    回傳 (交給規則層的 sql, 展開失敗原因或 None, ref()/source() 精確度提醒或 None)。
 
     展開失敗時**原樣退回未展開的 sql**,不試著猜、不吞掉錯誤——sqlglot 一樣會在
     Jinja 標記上失敗,走既有 parse_error → enforce_parse 強制揭露這條路徑,不會
@@ -170,12 +171,16 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, st
     尚無列 GitLab 目錄的工具,所以這裡沒有 macro 目錄可餵(code_root 不給、只給
     source);呼叫到專案自訂 macro 的 model 會如預期展開失敗,原因見
     config/models.yaml 的 dbt 區塊註解。
+
+    用到 ref()/source() 時,展開出的表名有已知的精確度落差(不驗證 model 是否
+    存在、不讀 sources.yml、不套用 alias——見 dbt_render 模組文件),不影響
+    規則層判斷,但要讓審查者看得到,不能只寫在程式註解裡沒人會翻。
     """
     rendered = render_model_isolated(path or "model.sql", source=sql,
                                      database=dbt_cfg.get("database") or None)
     if rendered.ok:
-        return rendered.sql, None
-    return sql, rendered.error
+        return rendered.sql, None, rendered.relation_notice
+    return sql, rendered.error, None
 
 
 async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None) -> list[dict]:
@@ -193,9 +198,11 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None) 
         entry = {"path": f["path"]}
         rule_sql = sql
         if dbt_enabled and sql and is_dbt_template(sql):
-            rule_sql, dbt_error = _dbt_expand_for_prescan(f.get("path", ""), sql, dbt_cfg)
+            rule_sql, dbt_error, dbt_notice = _dbt_expand_for_prescan(f.get("path", ""), sql, dbt_cfg)
             if dbt_error is not None:
                 entry["dbt_render_error"] = dbt_error
+            if dbt_notice is not None:
+                entry["dbt_render_notice"] = dbt_notice
         rules = await hub.call_json("sqltools__run_rules", {"sql": rule_sql})
         if isinstance(rules, dict):
             hits = rules.get("hits")
