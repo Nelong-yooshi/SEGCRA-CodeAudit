@@ -1,11 +1,11 @@
-"""dbt 接進審查管線(#7 第 2、3 點的管線端)。
+"""dbt 接進審查管線(#7 第 1、2 點的管線端)。
 
 檔名刻意跟 dbt_render / dbt_impact 自己的單元測試檔分開,也跟 #12 即將加入的
-tests/test_spec_exec.py 分開——這裡只測「接線」本身(find_spec 的路徑備援、
-之後幾步的預掃/反查接線),不重覆模組自己的單元測試範圍。
+tests/test_spec_exec.py 分開——這裡只測「接線」本身(find_spec 的檔名對應、
+預掃前展開、樣板不送進沙盒),不重覆模組自己的單元測試範圍。
 
-每一步都要能獨立驗證「現有 golden case 的行為完全不變」,所以大多數測試案例
-都成對出現:一個確認新行為生效,一個確認舊行為(有 R 編號時)分毫不變。
+每一步都要能獨立驗證「開關關閉時,行為與接線前完全相同」,所以大多數測試案例
+都成對出現:一個確認新行為生效,一個確認舊行為分毫不變。
 """
 import asyncio
 import pathlib
@@ -14,7 +14,7 @@ import pytest
 
 from orchestrator.config import Config, _load_dbt_section, load_config
 from orchestrator.pipeline import prescan
-from orchestrator.spec_exec import find_spec
+from orchestrator.spec_exec import find_spec, run_spec_exec
 
 
 def _run(coro):
@@ -31,155 +31,148 @@ def _mr(files, title="", description=""):
 
 
 class _FakeHub:
-    """只實作 find_spec 會用到的 call(),記錄呼叫次數以驗證「有 R 編號時
-    不會多探測路徑對應」。"""
+    """只實作 find_spec 會用到的 call(),記錄呼叫次數。
 
-    def __init__(self, contents: dict):
-        self.contents = contents   # path -> 內容(或例外)
+    contents 沒有的路徑,回傳的是 mock 模式的佔位文字(與 toolbox/gitlab.py 的
+    get_file 相同:不丟例外、回一段不以 # 開頭的說明)——管線實際跑的時候 hub
+    一定存在,這才是 find_spec 真正會遇到的情境。
+    """
+
+    def __init__(self, contents: dict | None = None):
+        self.contents = contents or {}
         self.calls: list[str] = []
 
     async def call(self, name, params, truncate=False):
         assert name == "gitlab__get_file"
         path = params["path"]
         self.calls.append(path)
-        val = self.contents.get(path)
-        if val is None:
-            raise FileNotFoundError(path)
-        return val
+        return self.contents.get(path, f"(mock 模式無 {path} 的完整內容,請依 diff 判斷)")
 
-
-# --------------------------------------------------------- mock 模式(hub=None)
-def test_mock_path_fallback_used_when_no_rule_code(tmp_path, monkeypatch):
-    """#7 第 2 點的原始情境:純程式名的 model,完全沒有 R 編號。"""
-    import orchestrator.spec_exec as spec_exec_mod
-
-    _write_spec(tmp_path, "RETAIL_M1", "# R-201\n單日提領規則")
-    monkeypatch.setattr(spec_exec_mod, "SPECS_DIR", tmp_path)
-
-    mr = _mr([{"path": "models/mrt_RETAIL_M1.sql", "full_content": "SELECT 1"}])
-    code, text = _run(find_spec(None, mr))
-    assert code == "RETAIL_M1"
-    assert text == "# R-201\n單日提領規則"
-
-
-def test_mock_path_fallback_none_when_nothing_matches(tmp_path, monkeypatch):
-    import orchestrator.spec_exec as spec_exec_mod
-    monkeypatch.setattr(spec_exec_mod, "SPECS_DIR", tmp_path)
-
-    mr = _mr([{"path": "models/mrt_UNKNOWN.sql", "full_content": "SELECT 1"}])
-    assert _run(find_spec(None, mr)) == (None, None)
-
-
-def test_mock_path_fallback_not_used_when_rule_code_present(tmp_path, monkeypatch):
-    """有 R 編號時維持現行行為:即使檔名也對得到規格,一律以 R 編號為準。
-
-    這是安全性的核心保證——現有 32 個 golden case 全部含 R 編號,這條測試
-    確認新增的路徑對應分支對它們是不可觸達的死碼,不會改變任何既有結果。
-    """
-    import orchestrator.spec_exec as spec_exec_mod
-
-    _write_spec(tmp_path, "R-201", "# R-201 規格全文")
-    _write_spec(tmp_path, "RETAIL_M1", "# 這份不該被用到")
-    monkeypatch.setattr(spec_exec_mod, "SPECS_DIR", tmp_path)
-
-    mr = _mr([{"path": "models/mrt_RETAIL_M1.sql", "full_content": "SELECT 1"}],
-             description="對應 R-201")
-    code, text = _run(find_spec(None, mr))
-    assert (code, text) == ("R-201", "# R-201 規格全文")
-
-
-def test_mock_path_fallback_no_files_returns_none(tmp_path, monkeypatch):
-    import orchestrator.spec_exec as spec_exec_mod
-    monkeypatch.setattr(spec_exec_mod, "SPECS_DIR", tmp_path)
-    assert _run(find_spec(None, _mr([]))) == (None, None)
-
-
-def test_mock_path_fallback_first_matching_file_wins(tmp_path, monkeypatch):
-    """一個 MR 改了多個檔案時,依檔案清單順序取第一個對得到規格的。"""
-    import orchestrator.spec_exec as spec_exec_mod
-
-    _write_spec(tmp_path, "SECOND", "# 第二個")
-    monkeypatch.setattr(spec_exec_mod, "SPECS_DIR", tmp_path)
-
-    mr = _mr([
-        {"path": "models/mrt_FIRST.sql", "full_content": "SELECT 1"},   # 對不到規格
-        {"path": "models/mrt_SECOND.sql", "full_content": "SELECT 2"},  # 對得到
-    ])
-    code, _ = _run(find_spec(None, mr))
-    assert code == "SECOND"
-
-
-def test_mock_path_fallback_non_sql_file_skipped(tmp_path, monkeypatch):
-    """非 .sql 檔案(例如 yml)沒有辦法依檔名對應,不該讓函式炸掉。"""
-    import orchestrator.spec_exec as spec_exec_mod
-    monkeypatch.setattr(spec_exec_mod, "SPECS_DIR", tmp_path)
-
-    mr = _mr([{"path": "models/sources.yml", "full_content": "version: 2"}])
-    assert _run(find_spec(None, mr)) == (None, None)
-
-
-# ------------------------------------------------------------- real 模式(hub)
-# 這些案例都把 SPECS_DIR 指到空的 tmp_path:find_spec() 對有 R 編號的情況一律
-# 先查本機 SPECS_DIR(mock 與 real 共用這段,見程式碼),不清掉的話會讀到 repo
-# 裡真正的 specs/*.md,真假答案混在一起,測試就驗不到「hub 真的被呼叫了」。
 
 @pytest.fixture
-def empty_specs_dir(tmp_path, monkeypatch):
+def specs_dir(tmp_path, monkeypatch):
+    """把 SPECS_DIR 指到空的暫存目錄:不清掉的話會讀到 repo 裡真正的 specs/*.md,
+    真假答案混在一起,測試就驗不到要驗的那條路徑。"""
     import orchestrator.spec_exec as spec_exec_mod
     monkeypatch.setattr(spec_exec_mod, "SPECS_DIR", tmp_path)
     return tmp_path
 
 
-def test_real_path_fallback_probes_gitlab(empty_specs_dir):
+DBT_MR = _mr([{"path": "models/mrt_RETAIL_M1.sql", "full_content": "SELECT 1"}])
+
+
+# ---------------------------------------------------- 開關:預設關閉,行為不變
+def test_path_fallback_off_by_default(specs_dir):
+    """by_path 預設 False:規格檔就在那裡,也不依檔名對應——與接線前完全相同。
+    這是「合併後正式審查行為不變」這句話成立的依據。"""
+    _write_spec(specs_dir, "RETAIL_M1")
+    hub = _FakeHub({"specs/RETAIL_M1.md": "# 規格"})
+    assert _run(find_spec(hub, DBT_MR)) == (None, None)
+    assert _run(find_spec(None, DBT_MR)) == (None, None)
+    assert hub.calls == []
+
+
+def test_pipeline_passes_dbt_flag_to_find_spec():
+    """review_mr() 呼叫 find_spec 時必須帶上 dbt 開關,不能寫死開啟或漏傳。"""
+    import inspect
+    import orchestrator.pipeline as pipeline_mod
+    src = inspect.getsource(pipeline_mod.review_mr)
+    assert 'find_spec(hub, mr, by_path=cfg.dbt.get("enabled") is True)' in src
+
+
+# --------------------------------------------------- 開啟後:先查本機 specs/
+def test_local_spec_found_when_hub_present(specs_dir):
+    """管線實際執行時 hub 一定存在(mock 模式也是)。本機 specs/ 有對應規格時必須
+    找得到——曾經只在 hub 為 None 時查本機,導致 demo 與 golden set 永遠找不到。"""
+    _write_spec(specs_dir, "RETAIL_M1", "# 本機規格")
+    hub = _FakeHub()
+    assert _run(find_spec(hub, DBT_MR, by_path=True)) == ("RETAIL_M1", "# 本機規格")
+    assert hub.calls == []          # 本機找到就不必再問 GitLab
+
+
+def test_local_spec_found_without_hub(specs_dir):
+    _write_spec(specs_dir, "RETAIL_M1", "# 本機規格")
+    assert _run(find_spec(None, DBT_MR, by_path=True)) == ("RETAIL_M1", "# 本機規格")
+
+
+def test_local_spec_case_mismatch_not_used(specs_dir):
+    """只有大小寫不同的規格檔不採用(resolve_spec 的語意),交人工確認。"""
+    _write_spec(specs_dir, "retail_m1")
+    assert _run(find_spec(None, DBT_MR, by_path=True)) == (None, None)
+
+
+def test_local_spec_directory_named_like_spec_ignored(specs_dir):
+    """specs/ 底下剛好有名為 X.md 的**資料夾**時不可當成規格(不可讀取失敗炸掉)。"""
+    (specs_dir / "RETAIL_M1.md").mkdir(parents=True)
+    assert _run(find_spec(None, DBT_MR, by_path=True)) == (None, None)
+
+
+def test_first_matching_file_wins(specs_dir):
+    _write_spec(specs_dir, "SECOND", "# 第二個")
+    mr = _mr([{"path": "models/mrt_FIRST.sql", "full_content": "SELECT 1"},
+              {"path": "models/mrt_SECOND.sql", "full_content": "SELECT 2"}])
+    assert _run(find_spec(None, mr, by_path=True))[0] == "SECOND"
+
+
+@pytest.mark.parametrize("files", [
+    [],
+    [{"path": "models/sources.yml", "full_content": "version: 2"}],   # 不是 .sql
+])
+def test_nothing_to_match(specs_dir, files):
+    assert _run(find_spec(_FakeHub(), _mr(files), by_path=True)) == (None, None)
+
+
+# ------------------------------------------ 開啟後:本機沒有才探測 GitLab
+def test_gitlab_probed_when_local_missing(specs_dir):
     hub = _FakeHub({"specs/RETAIL_M1.md": "# 從 GitLab 讀到的規格"})
-    mr = _mr([{"path": "models/mrt_RETAIL_M1.sql", "full_content": "SELECT 1"}])
-    code, text = _run(find_spec(hub, mr))
-    assert (code, text) == ("RETAIL_M1", "# 從 GitLab 讀到的規格")
+    assert _run(find_spec(hub, DBT_MR, by_path=True)) == ("RETAIL_M1", "# 從 GitLab 讀到的規格")
     # 候選順序是「完整檔名優先」:先探測 mrt_RETAIL_M1(不存在),才退到 RETAIL_M1
     assert hub.calls == ["specs/mrt_RETAIL_M1.md", "specs/RETAIL_M1.md"]
 
 
-def test_real_path_fallback_full_name_candidate_wins_first(empty_specs_dir):
-    """完整檔名(含 mrt_ 前綴)本身就有對應規格時,不必再探測第二個候選。"""
+def test_gitlab_full_name_candidate_wins_first(specs_dir):
     hub = _FakeHub({"specs/mrt_BOTH.md": "# 完整檔名優先"})
     mr = _mr([{"path": "models/mrt_BOTH.sql", "full_content": "SELECT 1"}])
-    code, text = _run(find_spec(hub, mr))
-    assert (code, text) == ("mrt_BOTH", "# 完整檔名優先")
+    assert _run(find_spec(hub, mr, by_path=True)) == ("mrt_BOTH", "# 完整檔名優先")
     assert hub.calls == ["specs/mrt_BOTH.md"]
 
 
-def test_real_path_fallback_none_when_gitlab_has_nothing(empty_specs_dir):
-    hub = _FakeHub({})
-    mr = _mr([{"path": "models/mrt_UNKNOWN.sql", "full_content": "SELECT 1"}])
-    assert _run(find_spec(hub, mr)) == (None, None)
+def test_gitlab_placeholder_or_non_spec_content_rejected(specs_dir):
+    """get_file 對不存在的路徑回傳佔位文字或錯誤頁,不是丟例外——必須確認長得像
+    規格(以 # 開頭),跟 R 編號那條路徑的判斷一致。"""
+    hub = _FakeHub({"specs/RETAIL_M1.md": "<html>not a spec</html>"})
+    assert _run(find_spec(hub, DBT_MR, by_path=True)) == (None, None)
 
 
-def test_real_path_fallback_rejects_non_markdown_content(empty_specs_dir):
-    """gitlab__get_file 對不存在的路徑可能回傳空字串或非規格內容(例如 GitLab
-    的錯誤頁面文字),不是丟例外——不能只判斷「有沒有拿到東西」,要確認長得
-    像規格(以 # 開頭),跟 R 編號那條路徑的判斷一致。"""
-    hub = _FakeHub({"specs/mrt_RETAIL_M1.md": "not a spec, just some html or empty page",
-                    "specs/RETAIL_M1.md": "also not a spec"})
-    mr = _mr([{"path": "models/mrt_RETAIL_M1.sql", "full_content": "SELECT 1"}])
-    assert _run(find_spec(hub, mr)) == (None, None)
+def test_gitlab_exception_is_swallowed_and_next_candidate_tried(specs_dir):
+    class _Flaky(_FakeHub):
+        async def call(self, name, params, truncate=False):
+            self.calls.append(params["path"])
+            if params["path"] == "specs/mrt_RETAIL_M1.md":
+                raise ConnectionError("暫時性網路錯誤")
+            return "# 第二個候選"
+    hub = _Flaky()
+    assert _run(find_spec(hub, DBT_MR, by_path=True)) == ("RETAIL_M1", "# 第二個候選")
 
 
-def test_real_path_fallback_not_used_when_rule_code_present(empty_specs_dir):
-    """有 R 編號時走原本的路徑,完全不會多打任何 gitlab__get_file 探測路徑對應
-    的請求——避免真實環境下對有編號的 MR 產生不必要的額外 API 呼叫。"""
-    hub = _FakeHub({"specs/R-201.md": "# R-201 規格"})
-    mr = _mr([{"path": "models/mrt_RETAIL_M1.sql", "full_content": "SELECT 1"}],
-             description="對應 R-201")
-    code, text = _run(find_spec(hub, mr))
-    assert (code, text) == ("R-201", "# R-201 規格")
-    assert hub.calls == ["specs/R-201.md"]
+# ------------------------------------------------------ R 編號永遠優先
+@pytest.mark.parametrize("by_path", [False, True])
+def test_rule_code_path_unchanged(specs_dir, by_path):
+    """有 R 編號時走原本的路徑,不論開關——即使檔名也對得到另一份規格。"""
+    _write_spec(specs_dir, "R-201", "# R-201 規格全文")
+    _write_spec(specs_dir, "RETAIL_M1", "# 這份不該被用到")
+    mr = _mr(DBT_MR["files"], description="對應 R-201")
+    assert _run(find_spec(_FakeHub(), mr, by_path=by_path)) == ("R-201", "# R-201 規格全文")
 
 
-def test_real_path_fallback_no_files_returns_none(empty_specs_dir):
-    hub = _FakeHub({})
-    assert _run(find_spec(hub, _mr([]))) == (None, None)
+def test_rule_code_without_spec_not_rescued_by_path(specs_dir):
+    """MR 提到了 R 編號但那份規格不存在:要如實回報「無規格」,不能被檔名對應蓋掉。"""
+    _write_spec(specs_dir, "RETAIL_M1", "# 檔名對得到")
+    mr = _mr(DBT_MR["files"], description="對應 R-999")
+    assert _run(find_spec(_FakeHub(), mr, by_path=True)) == ("R-999", None)
 
 
+# ------------------------------------------------------------ 路徑逃逸
 @pytest.mark.parametrize("malicious_path", [
     "../../../etc/passwd.sql",
     "..\\..\\config\\sandbox.env.sql",
@@ -188,18 +181,66 @@ def test_real_path_fallback_no_files_returns_none(empty_specs_dir):
     "models/../../specs/../../../etc/shadow.sql",
     "models/\x00null.sql",
 ])
-def test_real_path_fallback_rejects_path_traversal(empty_specs_dir, malicious_path):
-    """model_path 來自待審的 MR,是攻擊者可控的字串。resolve_spec()(dbt_impact 的
-    normalize_path 白名單)必須先擋下逃逸路徑,產生的候選清單要是空的——不能讓
-    這裡把 ../../config/sandbox.env 這種路徑原樣傳給 gitlab__get_file。
-
-    這裡不是要重測 normalize_path 本身(dbt_impact 自己的測試已經涵蓋),而是
-    確認*這條新接線*確實把攻擊面留給了那層白名單擋,自己沒有另開後門。
-    """
-    hub = _FakeHub({})   # 只要 hub 完全沒被呼叫就代表候選清單是空的
+def test_path_traversal_produces_no_candidates(specs_dir, malicious_path):
+    """model 路徑來自待審 MR,是攻擊者可控字串。resolve_spec 的路徑白名單必須先擋下,
+    本機不讀、GitLab 一次都不問——確認這條新接線沒有另開後門。"""
+    hub = _FakeHub()
     mr = _mr([{"path": malicious_path, "full_content": "SELECT 1"}])
-    assert _run(find_spec(hub, mr)) == (None, None)
+    assert _run(find_spec(hub, mr, by_path=True)) == (None, None)
     assert hub.calls == []
+
+
+# ============================================================ 執行驗證
+# 規格找到了,但 SQL 是 dbt 樣板:不可原樣送進沙盒(只會得到語法錯誤,然後回報
+# 「SQL 無法在測資上執行、請修正 SQL」——錯誤地指控開發者的程式壞了)。
+
+class _Cfg:
+    dbt = {"enabled": True, "database": "SAMPLE_DW"}
+
+
+@pytest.fixture
+def no_llm_no_sandbox(monkeypatch):
+    """任何 LLM 呼叫或沙盒執行都視為失敗:樣板的情境必須在這兩步之前就停下來。"""
+    import orchestrator.spec_exec as spec_exec_mod
+
+    async def _no_llm(*a, **k):
+        raise AssertionError("不該呼叫測資生成 LLM")
+
+    def _no_sandbox(*a, **k):
+        raise AssertionError("不該把 SQL 送進沙盒")
+    monkeypatch.setattr(spec_exec_mod, "generate_cases", _no_llm)
+    monkeypatch.setattr(spec_exec_mod, "execute_cases", _no_sandbox)
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT * FROM {{ ref('txn_log') }}",
+    "{% set x = 1 %}SELECT {{ x }}",
+    "{# 註解 #}SELECT 1",
+])
+def test_dbt_template_never_sent_to_sandbox(no_llm_no_sandbox, sql):
+    mr = _mr([{"path": "models/mrt_x.sql", "full_content": sql}])
+    result = _run(run_spec_exec(_Cfg(), None, mr, "RETAIL_M1", "# 規格"))
+    assert result["passed"] is False
+    assert result["dbt_template"] is True
+    [finding] = result["findings"]
+    assert finding["severity"] == "major"
+    assert "dbt 樣板" in finding["title"]
+    assert "修正 SQL" not in finding["suggestion"]    # 不可暗示是開發者的程式有錯
+
+
+def test_no_spec_takes_precedence_over_template_guard(no_llm_no_sandbox):
+    """沒有規格時維持原本的「無規格可驗」訊息,不被樣板檢查蓋掉。"""
+    mr = _mr([{"path": "models/mrt_x.sql", "full_content": "SELECT {{ 1 }}"}])
+    result = _run(run_spec_exec(_Cfg(), None, mr, None, None))
+    assert result.get("no_spec") is True
+
+
+def test_run_spec_exec_tolerates_cfg_without_dbt(no_llm_no_sandbox, specs_dir):
+    """呼叫端可能傳沒有 dbt 欄位的替身 cfg(例如其他測試):視為未開啟,不可炸掉。"""
+    class _BareCfg:
+        pass
+    result = _run(run_spec_exec(_BareCfg(), None, DBT_MR))
+    assert result.get("no_spec") is True
 
 
 # =================================================================
@@ -399,11 +440,11 @@ def test_prescan_undefined_var_fails_closed_cleanly():
 
 
 # --------------------------------------------------------- config.dbt 驗證
-def test_load_dbt_section_defaults_to_disabled_when_key_missing():
+def test_load_dbt_section_defaults_to_disabled_when_key_missing(no_db_env):
     assert _load_dbt_section({}) == {"enabled": False, "database": ""}
 
 
-def test_load_dbt_section_accepts_explicit_values():
+def test_load_dbt_section_accepts_explicit_values(no_db_env):
     raw = {"dbt": {"enabled": True, "database": "SAMPLE_DW"}}
     assert _load_dbt_section(raw) == {"enabled": True, "database": "SAMPLE_DW"}
 
@@ -421,6 +462,39 @@ def test_load_dbt_section_rejects_non_string_database():
         _load_dbt_section({"dbt": {"enabled": False, "database": 123}})
 
 
+@pytest.fixture
+def no_db_env(monkeypatch):
+    monkeypatch.delenv("SEGCRA_DBT_DATABASE", raising=False)
+
+
+def test_database_from_env_var_overrides_file(monkeypatch):
+    """正式資料庫名只放在部署機的環境變數:repo 是公開的,不可寫進進版控的設定檔。"""
+    monkeypatch.setenv("SEGCRA_DBT_DATABASE", "PROD_DW")
+    raw = {"dbt": {"enabled": True, "database": "IGNORED"}}
+    assert _load_dbt_section(raw)["database"] == "PROD_DW"
+
+
+def test_database_falls_back_to_file_without_env(no_db_env):
+    assert _load_dbt_section({"dbt": {"database": "SAMPLE_DW"}})["database"] == "SAMPLE_DW"
+
+
+@pytest.mark.parametrize("bad", ['PROD"; DROP TABLE t; --', "PROD DW", "PROD-DW",
+                                 "PROD.dbo", "ＰＲＯＤ", " PROD_DW", "1PROD"])
+def test_database_must_be_identifier(monkeypatch, bad):
+    """名稱會被拼進 SQL 識別字,載入時就過白名單;填錯要在啟動時就報錯,
+    不是等到每份 model 審查時才各自展開失敗。"""
+    monkeypatch.setenv("SEGCRA_DBT_DATABASE", bad)
+    with pytest.raises(ValueError) as exc:
+        _load_dbt_section({})
+    # 錯誤訊息不回顯名稱本身:正式資料庫名不該因此出現在日誌裡
+    assert bad.strip() not in str(exc.value)
+
+
+def test_empty_env_var_means_unset(monkeypatch):
+    monkeypatch.setenv("SEGCRA_DBT_DATABASE", "")
+    assert _load_dbt_section({})["database"] == ""
+
+
 def test_load_dbt_section_rejects_non_dict_section():
     with pytest.raises(ValueError):
         _load_dbt_section({"dbt": "enabled"})
@@ -434,7 +508,7 @@ def test_config_dataclass_default_is_disabled():
     assert cfg.dbt == {"enabled": False, "database": ""}
 
 
-def test_real_models_yaml_defaults_dbt_disabled():
+def test_real_models_yaml_defaults_dbt_disabled(no_db_env):
     """對正式的 config/models.yaml 做一次真的載入——不是造假資料,是驗證
     這次改動真的以安全的狀態進到設定檔裡,而不是只有測試裡的假設定安全。"""
     cfg = load_config()

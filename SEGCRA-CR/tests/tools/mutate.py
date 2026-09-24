@@ -16,17 +16,31 @@
 是否剛好出現一次,不符會印出「設定錯誤」。
 """
 import argparse
+import ast
 import os
 import pathlib
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 MOD = pathlib.Path("orchestrator") / "dbt_render.py"
 
 REGEX = r'r"\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}"'
 NL = "\n"     # 突變點含多行時用它接,字串裡不寫跳脫比較好讀
+
+# 每次跑測試套件共用的參數。tests/test_mutate_tool.py 測的是本工具,不是被突變的
+# 程式;其中「每個突變點剛好出現一次」那條在突變後必然失敗(那行已被改掉),若不
+# 排除,**每個突變都會被誤判成被抓到**。
+PYTEST_ARGS = ("-p", "no:cacheprovider", "--ignore=tests/test_mutate_tool.py")
+
+# 金絲雀:改一行不影響任何行為的註解。它**必須存活**——若連它都被「抓到」,代表
+# 有某個與突變無關的原因讓套件失敗(漏複製檔案、測試互相干擾、工具自己的測試
+# 被捲進來……),整次結果都不可信,直接中止。
+CANARY = ("dbt_render.py",
+          "# 與 dbt-core 的 Jinja 環境相同的擴充",
+          "# 與 dbt-core 的 Jinja 環境相同的擴充(canary)")
 
 MUTANTS = {
     # ---- 沙箱與版本
@@ -167,8 +181,8 @@ MUTANTS = {
         "            shared[name] = env.globals[name] = _wrap(obj)",
         "            env.globals[name] = _wrap(obj)"),
     "隔離:啟動失敗不收斂": ("isolation.py",
-        "    try:\n        proc = ctx.Process(target=_worker, daemon=True,",
-        "    if True:\n        proc = ctx.Process(target=_worker, daemon=True,"),
+        '        return on_failure(f"IsolationError: 無法啟動子行程({type(e).__name__})")',
+        "        raise"),
     "ref 改回裸表名": (
         "        return f'\"{database}\".\"{schema}\".\"{_check_ident(\"表\", name)}\"'",
         "        return name"),
@@ -372,8 +386,12 @@ def copy_project(src: pathlib.Path, dst: pathlib.Path) -> None:
         "__pycache__", "*.pyc", ".venv", ".venv-*", ".pytest_cache",
         "review_output", "_output", "target", "logs", "dbt_packages",
         "*.duckdb", "*.duckdb.wal", "*.env", ".git")
+    # ignore_patterns 只套用在 copytree 的**子項目**,不會套用在傳進去的最上層
+    # 項目本身——最上層要自己先過一次同樣的規則,否則 .venv(數百 MB)、
+    # review_output 會在每個突變都整包複製一次。
+    skipped = ignore(str(src), [p.name for p in src.iterdir()])
     for item in src.iterdir():
-        if item.name in (".git",):
+        if item.name in skipped:
             continue
         if item.is_dir():
             shutil.copytree(item, dst / item.name, ignore=ignore)
@@ -451,32 +469,127 @@ MUTANTS.update({
  "relation_notice 沒用到 ref()/source() 也照樣回報": (
      'relation_notice=(_RELATION_NOTICE if env.segcra_relation_usage["used"] else None),',
      "relation_notice=_RELATION_NOTICE,"),
+ "relation_notice 不排除 macro 檔模組層的 ref()": (
+     '    env.segcra_relation_usage["used"] = False' + NL + "    env.segcra_macro_phase = False",
+     "    env.segcra_macro_phase = False"),
+})
+
+# ---- 接進審查管線(#7 管線端):開關、檔名對應、樣板不進沙盒、資料庫名
+MUTANTS.update({
+ "接線:預掃開關接受任何真值": ("pipeline.py",
+     '    dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True',
+     "    dbt_enabled = bool(dbt_cfg)"),
+ "接線:展開失敗時送出不完整結果": ("pipeline.py",
+     "    return sql, rendered.error, None",
+     "    return rendered.sql, rendered.error, None"),
+ "接線:lint 吃展開後的 SQL(行號基準錯位)": ("pipeline.py",
+     '        lint = await hub.call_json("sqltools__lint", {"sql": sql})',
+     '        lint = await hub.call_json("sqltools__lint", {"sql": rule_sql})'),
+ "接線:find_spec 檔名對應寫死開啟": ("pipeline.py",
+     'find_spec(hub, mr, by_path=cfg.dbt.get("enabled") is True)',
+     "find_spec(hub, mr, by_path=True)"),
+ "接線:檔名對應不看開關": ("spec_exec.py",
+     "    if by_path and not codes:",
+     "    if not codes:"),
+ "接線:有 R 編號仍走檔名對應": ("spec_exec.py",
+     "    if by_path and not codes:",
+     "    if by_path:"),
+ "接線:hub 存在時不查本機規格": ("spec_exec.py",
+     "    for path in paths:" + NL + "        match = resolve_spec(path, available)",
+     "    for path in (paths if hub is None else []):" + NL
+     + "        match = resolve_spec(path, available)"),
+ "接線:dbt 樣板照樣送進沙盒": ("spec_exec.py",
+     "    if is_dbt_template(sql):",
+     "    if False:"),
+ "設定:enabled 接受字串": ("config.py",
+     "    if not isinstance(enabled, bool):",
+     "    if False:"),
+ "設定:資料庫名不過白名單": ("config.py",
+     "        if not _IDENT.fullmatch(database):",
+     "        if False:"),
+ "設定:資料庫名不讀環境變數": ("config.py",
+     'os.environ.get("SEGCRA_DBT_DATABASE", section.get("database", ""))',
+     'section.get("database", "")'),
 })
 
 
-def _run_baseline(src: pathlib.Path, python: str, timeout: int) -> str | None:
+def _run_baseline(src: pathlib.Path, python: str, timeout: int) -> tuple[str | None, float]:
     """複製一份未突變的專案,跑一次測試套件,確認完全乾淨才能開始判斷突變。
 
     「被抓到」的判斷依據是測試套件回傳碼非 0——如果套件本身就有一條失敗或收集
     (collect)不起來的測試(例如漏複製了某個依賴的目錄),**每個突變都會被誤判
-    成被抓到**,結果全部失去意義,而且不會有任何警訊。回傳 None 代表基準乾淨;
-    否則回傳失敗原因(供 main() 直接中止並印出來)。
+    成被抓到**,結果全部失去意義,而且不會有任何警訊。
+
+    回傳 (失敗原因或 None, 基準套件實際耗時秒數)。耗時供 main() 校正每個突變的
+    逾時,見 _effective_timeout()。
     """
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="sgc_mut_baseline_"))
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
     try:
         copy_project(src, tmp)
+        started = time.monotonic()
         try:
-            proc = subprocess.run([python, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+            proc = subprocess.run([python, "-m", "pytest", "-q", *PYTEST_ARGS],
                                   cwd=tmp, capture_output=True, text=True, env=env,
                                   encoding="utf-8", errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired:
-            return f"基準套件跑超過 {timeout} 秒未完成"
+            return f"基準套件跑超過 {timeout} 秒未完成", float(timeout)
+        elapsed = time.monotonic() - started
         if proc.returncode != 0:
             lines = proc.stdout.splitlines()
             tail = "\n".join(lines[-30:]) if lines else proc.stdout
-            return f"基準套件(未突變)沒有全部通過,回傳碼 {proc.returncode}:\n{tail}"
-        return None
+            return f"基準套件(未突變)沒有全部通過,回傳碼 {proc.returncode}:\n{tail}", elapsed
+        return None, elapsed
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _effective_timeout(requested: int, baseline_seconds: float) -> int:
+    """每個突變的逾時至少要是「正常跑完整個套件」的 3 倍。
+
+    逾時會被計為「被抓到」(拿掉資源上限造成的無窮迴圈確實該算被抓到),但若逾時
+    比正常跑一次還短,**存活的突變會因為跑不完而被誤判成被抓到**——例如在 WSL 上
+    整個套件要 4 分多鐘,固定 240 秒的逾時會把每個存活者都算成抓到。3 倍的餘裕
+    仍然抓得到真正卡住的情況。
+    """
+    return max(requested, int(baseline_seconds * 3) + 30)
+
+
+def _run_mutant(src: pathlib.Path, mutant, python: str, timeout: int, env: dict):
+    """在快照的複本上套用一個突變並跑測試套件。回傳 (判定, 說明)。
+
+    判定:"config"(突變點不是剛好出現一次)、"survived"(套件全過)、
+    "caught"(套件失敗或卡住逾時)。
+    """
+    module, old, new = mutant
+    tmp = pathlib.Path(tempfile.mkdtemp(prefix="sgc_mut_"))
+    try:
+        copy_project(src, tmp)
+        path = tmp / "orchestrator" / module
+        text = path.read_text(encoding="utf-8")
+        if text.count(old) != 1:
+            return "config", f"突變點出現 {text.count(old)} 次"
+        mutated = text.replace(old, new)
+        try:
+            ast.parse(mutated)
+        except SyntaxError as e:
+            # 語法錯誤的突變讓模組連匯入都失敗,任何測試都會紅——那不是「測試抓到了
+            # 這道防線」,而是這個突變根本沒驗到任何行為。
+            return "config", f"突變後的程式無法解析(第 {e.lineno} 行語法錯誤),驗不到任何行為"
+        path.write_text(mutated, encoding="utf-8")
+        try:
+            proc = subprocess.run([python, "-m", "pytest", "-x", "-q", *PYTEST_ARGS],
+                                  cwd=tmp, capture_output=True, text=True, env=env,
+                                  encoding="utf-8", errors="replace", timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return "caught", f"測試套件卡住超過 {timeout} 秒"
+        lines = proc.stdout.splitlines()
+        if proc.returncode == 0:
+            summary = next((l for l in reversed(lines)
+                            if "passed" in l or "failed" in l or "error" in l), proc.stdout[-160:])
+            return "survived", summary
+        first = next((l for l in lines if l.startswith(("FAILED", "ERROR"))), "")
+        return "caught", first.split(" - ")[0][:110]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -493,53 +606,59 @@ def main() -> int:
     ap.add_argument("--skip-baseline", action="store_true",
                     help="跳過開始前的基準套件檢查(例如 --start 續跑、已確認過基準乾淨時)")
     args = ap.parse_args()
-    src = pathlib.Path(args.src)
+    # 開跑時先拍一份快照,之後的基準檢查與每個突變都從這份複製。若直接從工作目錄
+    # 複製,跑到一半有人改了檔案(例如新增的測試剛好有錯),後面的突變會因為那個
+    # 無關的失敗被誤判成「被抓到」——而開頭那次基準檢查看不到後來的變化。
+    snapshot = pathlib.Path(tempfile.mkdtemp(prefix="sgc_mut_snapshot_"))
+    try:
+        copy_project(pathlib.Path(args.src), snapshot)
+        return _mutate_all(args, snapshot)
+    finally:
+        shutil.rmtree(snapshot, ignore_errors=True)
+
+
+def _mutate_all(args, src: pathlib.Path) -> int:
     only = [s for s in args.only.split(",") if s]
     selected = {k: v for k, v in MUTANTS.items() if not only or any(o in k for o in only)}
     selected = dict(list(selected.items())[args.start:])
 
+    timeout = args.timeout
     if not args.skip_baseline:
         print("先跑一次未突變的基準套件,確認乾淨才開始判斷突變...", flush=True)
-        problem = _run_baseline(src, args.python, args.timeout)
+        # 基準套件本身給寬裕的上限:它的用途就是量出正常要跑多久
+        problem, baseline_seconds = _run_baseline(src, args.python, args.timeout * 10)
         if problem is not None:
             print(f"[中止] {problem}", flush=True)
             print("基準套件本身沒過,突變測試的「被抓到」結果沒有意義,不繼續執行。",
                  flush=True)
             return 1
-        print("基準套件乾淨,開始跑突變。", flush=True)
+        timeout = _effective_timeout(args.timeout, baseline_seconds)
+        print(f"基準套件乾淨(耗時 {baseline_seconds:.0f} 秒),每個突變的逾時設為 "
+              f"{timeout} 秒,開始跑突變。", flush=True)
+    else:
+        print(f"[注意] 已跳過基準檢查:逾時固定為 {timeout} 秒。若這台機器跑完整個套件"
+              f"要更久,存活的突變會因逾時被誤判成被抓到。", flush=True)
 
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    canary_verdict, canary_detail = _run_mutant(src, CANARY, args.python, timeout, env)
+    if canary_verdict != "survived":
+        print(f"[中止] 金絲雀突變(只改註解,不影響任何行為)沒有存活:{canary_detail}", flush=True)
+        print("代表測試套件會因為與突變無關的原因失敗,每個突變都會被誤判成被抓到,"
+              "結果不可信,不繼續執行。", flush=True)
+        return 1
+
     survived, config_errors = [], []
     for label, entry in selected.items():
-        module, old, new = entry if len(entry) == 3 else ("dbt_render.py", *entry)
-        tmp = pathlib.Path(tempfile.mkdtemp(prefix="sgc_mut_"))
-        try:
-            copy_project(src, tmp)
-            path = tmp / "orchestrator" / module
-            text = path.read_text(encoding="utf-8")
-            if text.count(old) != 1:
-                print(f"[設定錯誤] {label}:突變點出現 {text.count(old)} 次", flush=True)
-                config_errors.append(label)
-                continue
-            path.write_text(text.replace(old, new), encoding="utf-8")
-            try:
-                proc = subprocess.run([args.python, "-m", "pytest", "-x", "-q", "-p", "no:cacheprovider"],
-                                      cwd=tmp, capture_output=True, text=True, env=env,
-                                      encoding="utf-8", errors="replace", timeout=args.timeout)
-            except subprocess.TimeoutExpired:
-                print(f"[被抓 ✓] {label}:測試套件卡住超過 {args.timeout} 秒", flush=True)
-                continue
-            lines = proc.stdout.splitlines()
-            summary = next((l for l in reversed(lines)
-                            if "passed" in l or "failed" in l or "error" in l), proc.stdout[-160:])
-            if proc.returncode == 0:
-                print(f"[存活 ✗] {label}:{summary}", flush=True)
-                survived.append(label)
-            else:
-                first = next((l for l in lines if l.startswith(("FAILED", "ERROR"))), "")
-                print(f"[被抓 ✓] {label}:{first.split(' - ')[0][:110]}", flush=True)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+        mutant = entry if len(entry) == 3 else ("dbt_render.py", *entry)
+        verdict, detail = _run_mutant(src, mutant, args.python, timeout, env)
+        if verdict == "config":
+            print(f"[設定錯誤] {label}:{detail}", flush=True)
+            config_errors.append(label)
+        elif verdict == "survived":
+            print(f"[存活 ✗] {label}:{detail}", flush=True)
+            survived.append(label)
+        else:
+            print(f"[被抓 ✓] {label}:{detail}", flush=True)
     print()
     print(f"共 {len(selected)} 個突變;存活 {len(survived)};設定錯誤 {len(config_errors)}")
     if survived:

@@ -288,8 +288,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             capture["prescan_raw"] = copy.deepcopy(pre)
         injection_hits = scan_mr(mr)   # 確定性注入掃描(不經 LLM)
 
-        # 找 spec(確定性;執行驗證與 prompt 的規格段共用)
-        spec_code, spec_text = await find_spec(hub, mr)
+        # 找 spec(確定性;執行驗證與 prompt 的規格段共用)。依檔名對應與展開器
+        # 同一個開關:關閉時行為與接線前完全相同。
+        spec_code, spec_text = await find_spec(hub, mr, by_path=cfg.dbt.get("enabled") is True)
 
         # 分層知識檢索:依變更內容的 scope + query,
         # 只注入 binding 恆常規範(scope 內全數)+ 相關 guideline top_k。

@@ -1323,6 +1323,24 @@ def test_relation_notice_absent_when_ref_fails_to_render(tmp_path):
     assert r.relation_notice is None
 
 
+def test_relation_notice_not_leaked_from_macro_module_level(tmp_path):
+    """macro 檔在模組層就呼叫 ref()(載入時執行),不代表 model 本身用了——
+    model 完全沒用到 ref()/source() 時不可因此被貼上提醒。"""
+    _write_macro(tmp_path, "top.sql",
+                 "{% set upstream = ref('t') %}{% macro amt() %}1{% endmacro %}")
+    r = _render(code_root=tmp_path, source="SELECT {{ amt() }}")
+    assert r.ok, r.error
+    assert r.relation_notice is None
+
+
+def test_relation_notice_set_when_macro_called_by_model_uses_ref(tmp_path):
+    """model 透過 macro 間接用到 ref(),表名一樣有落差,提醒要出現。"""
+    _write_macro(tmp_path, "rel.sql", "{% macro src() %}{{ ref('t') }}{% endmacro %}")
+    r = _render(code_root=tmp_path, source="SELECT * FROM {{ src() }}")
+    assert r.ok, r.error
+    assert r.relation_notice is not None
+
+
 def test_relation_notice_present_on_real_sample_model():
     """拿專案自己的範例(真的用到 ref())驗證,不是只驗合成的最小案例。"""
     r = _render()

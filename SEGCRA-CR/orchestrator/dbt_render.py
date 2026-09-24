@@ -628,6 +628,10 @@ def build_env(code_root=None, variables: dict | None = None,
                 macros.append(name)
             seen[name] = rel
             shared[name] = env.globals[name] = _wrap(obj)
+    # macro 檔的模組層(例如檔案開頭的 {% set t = ref('x') %})在載入時就會跑到
+    # ref()/source();那是 macro 檔的事,不代表 model 本身用了——歸零,之後只記
+    # model 展開(含它呼叫到的 macro)時真的用到的。
+    env.segcra_relation_usage["used"] = False
     env.segcra_macro_phase = False
     return env, sorted(macros), conflicts, problems
 

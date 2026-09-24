@@ -15,7 +15,9 @@
 
 兩者共用 **`orchestrator/isolation.py`**(子行程隔離:逾時、記憶體上限)。
 
-對應 Issue #7 的四點;**尚未接進審查管線**。
+對應 Issue #7 的四點。接進審查管線的部分以 `config/models.yaml` 的 `dbt.enabled`
+控制,**預設關閉**:目前已接上「預掃前展開」與「依檔名對應規格」;macro 反查尚未
+接上(見下方「接線狀態」)。
 
 ## 防的是什麼
 
@@ -163,13 +165,22 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 
 ## 對決策的影響
 
-接線前:含樣板的檔案維持現行行為——預掃解析失敗 → `enforce_parse` 補 major → 不得自動
-放行。
+`dbt.enabled` 關閉時(預設):含樣板的檔案維持現行行為——預掃解析失敗 →
+`enforce_parse` 補 major → 不得自動放行。
 
-接線後(尚未實作,見下方「後續」):
+### 接線狀態(`dbt.enabled` 開啟時)
 
-- 展開失敗、反查 `needs_human`、dbt 專案檔案抓不齊 → 補 finding,**不得自動放行**
-- 反查出的受影響 model 一併展開、預掃,並附上呼叫鏈進 prompt
+| 項目 | 狀態 | 行為 |
+|---|---|---|
+| 預掃前展開 | 已接上 | 含樣板的檔案先以 `render_model_isolated()` 展開再交給規則層;展開失敗則原樣退回,走既有 `parse_error` → `enforce_parse` 路徑。lint 刻意仍吃原始文字(帶行號,基準要與 diff 一致) |
+| 依檔名對應規格 | 已接上 | 完全沒有 R 編號時,先查本機 `specs/`、再逐一探測 GitLab 的候選路徑 |
+| `ref()`/`source()` 精確度提醒 | 已接上 | 預掃結果帶 `dbt_render_notice` |
+| 執行驗證(沙盒) | **不支援** | SQL 是樣板時不送進沙盒,回報「尚未支援」major、交人工——原樣執行只會得到語法錯誤,會錯誤地指控程式有誤 |
+| macro 反查 | **未接上** | 需要整個專案的檔案,目前沒有列 GitLab 目錄的工具 |
+
+資料庫名稱以環境變數 `SEGCRA_DBT_DATABASE` 提供,**不寫進任何進版控的檔案**
+(repo 是公開的);未設定時,用到 `ref()`/`source()` 的 model 一律展開失敗。
+目前沒有 macro 目錄可餵,呼叫到專案自訂 macro 的 model 也會展開失敗(fail closed)。
 
 呼叫端約定(接線時必須遵守):
 
@@ -187,7 +198,7 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 | 方法 | 內容 |
 |---|---|
 | 與 dbt 逐字對照 | 展開結果比 `dbt compile`;反查結果比 `dbt parse` 的依賴 |
-| 隨機專案差異測試 | 固定種子產生的 dbt 專案,每個都讓 dbt 實際解析過(`tests/fixtures/dbt_manifest/random_projects.json`);反查必須涵蓋 dbt 判定的全部依賴 |
+| 隨機專案差異測試 | 固定種子產生的 dbt 專案,每個都讓 dbt 實際解析過(`tests/fixtures/dbt_manifest/random_projects.json`);`test_random_project_matches_dbt` 逐一改動每個 macro 檔,dbt 判定受影響的 model 必須全部判為確定受影響(不需安裝 dbt,CI 直接跑) |
 | 攻擊與規避測試 | 沙箱逃逸(含兩個 CVE 手法)、讀檔、注入、覆寫內建、偽造標記、資訊洩漏、資源耗盡、各種隱藏 macro 呼叫的寫法 |
 | 不誤報測試 | 常見正常寫法不可被判為不確定 |
 | 隨機輸入測試 | 固定種子產生大量怪異樣板,驗證不丟例外、行號不越界、輸出有上限、結果可重現 |
@@ -204,9 +215,11 @@ python tests/dbt_impact_reference/random_projects.py --dbt <dbt 執行檔>
 
 ## 後續
 
-- **接進審查管線**(另開 PR):展開 → 預掃 → 反查 → 規格對應 → 決策訊號
-- 展開結果已在 MS SQL 沙盒執行成功;接線時資料庫名要對應沙盒每次建立的資料庫,且 model
-  引用的上游表與規格建立的測資表名稱不同,需要處理
+- **macro 反查接進管線**:需要列 GitLab 目錄(或以 `/repository/archive` 依 commit
+  一次取回 `models/`、`macros/`)的工具,並先定好下載量上限
+- **展開結果尚未在 MS SQL 沙盒實際執行過**(目前只驗證了展開字串與 `dbt compile`
+  逐字一致)。要支援樣板的執行驗證,需把 `ref()`/`source()` 對應到沙盒每次建立的
+  資料庫,且 model 引用的上游表與規格建立的測資表名稱不同,需要處理
 - `{% if is_incremental() %}` 內的 SQL 不會被掃到(比照 compile 固定為 False),接線時
   需另以 True 再展開一次
 - `source()` 尚未讀取 `sources.yml`;`ref()` 尚未套用 alias 與自訂 `generate_schema_name`;
