@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .agent import extract_json, run_agent
 from .config import PKG_ROOT, Config, estimate_tokens
+from .dbt_render import is_dbt_template, render_model_isolated
 from .security import scan_mr
 from .skills_loader import always_skills, load_skills, skills_index
 from .spec_exec import find_spec, run_spec_exec
@@ -158,13 +159,51 @@ def _sql_from_diff(diff: str) -> str:
     return "\n".join(lines)
 
 
-async def prescan(hub: ToolHub, files: list[dict]) -> list[dict]:
-    """對每個變更檔跑 rule-base + lint(不經 LLM)。"""
+def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, str | None, str | None]:
+    """dbt 樣板先展開成純 SQL 再交給規則層(#7)。
+    回傳 (交給規則層的 sql, 展開失敗原因或 None, ref()/source() 精確度提醒或 None)。
+
+    展開失敗時**原樣退回未展開的 sql**,不試著猜、不吞掉錯誤——sqlglot 一樣會在
+    Jinja 標記上失敗,走既有 parse_error → enforce_parse 強制揭露這條路徑,不會
+    因為「展開失敗」就多開一條新的靜默放行後門。待審內容一律走
+    render_model_isolated()(子行程隔離 + 逾時 + Linux 上限記憶體)。
+
+    尚無列 GitLab 目錄的工具,所以這裡沒有 macro 目錄可餵(code_root 不給、只給
+    source);呼叫到專案自訂 macro 的 model 會如預期展開失敗,原因見
+    config/models.yaml 的 dbt 區塊註解。
+
+    用到 ref()/source() 時,展開出的表名有已知的精確度落差(不驗證 model 是否
+    存在、不讀 sources.yml、不套用 alias——見 dbt_render 模組文件),不影響
+    規則層判斷,但要讓審查者看得到,不能只寫在程式註解裡沒人會翻。
+    """
+    rendered = render_model_isolated(path or "model.sql", source=sql,
+                                     database=dbt_cfg.get("database") or None)
+    if rendered.ok:
+        return rendered.sql, None, rendered.relation_notice
+    return sql, rendered.error, None
+
+
+async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None) -> list[dict]:
+    """對每個變更檔跑 rule-base + lint(不經 LLM)。
+
+    dbt_cfg 給定且 enabled 時,含 dbt 樣板標記的檔案先展開成純 SQL 再交給規則層
+    (見 _dbt_expand_for_prescan)。**預設關閉**:dbt_cfg 為 None、空字典、或
+    enabled 不是 True,行為與展開器上線前完全相同——不會因為呼叫端忘記傳
+    dbt_cfg 而默默改變審查結果。
+    """
+    dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True
     results = []
     for f in files:
         sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or f.get("diff", "")
         entry = {"path": f["path"]}
-        rules = await hub.call_json("sqltools__run_rules", {"sql": sql})
+        rule_sql = sql
+        if dbt_enabled and sql and is_dbt_template(sql):
+            rule_sql, dbt_error, dbt_notice = _dbt_expand_for_prescan(f.get("path", ""), sql, dbt_cfg)
+            if dbt_error is not None:
+                entry["dbt_render_error"] = dbt_error
+            if dbt_notice is not None:
+                entry["dbt_render_notice"] = dbt_notice
+        rules = await hub.call_json("sqltools__run_rules", {"sql": rule_sql})
         if isinstance(rules, dict):
             hits = rules.get("hits")
             entry["rules"] = hits if isinstance(hits, list) else []
@@ -172,6 +211,13 @@ async def prescan(hub: ToolHub, files: list[dict]) -> list[dict]:
                 entry["parse_error"] = rules["error"]
         else:
             entry["rules"] = rules if isinstance(rules, list) else []
+        # lint 刻意用**原始**文字,不用展開後的 rule_sql:sqlfluff 的違規結果帶行號
+        # (start_line_no),而 LLM 看到的 diff(build_diff_section)是原始行號——
+        # 兩者混在同一份 prescan JSON 裡若行號基準不同,LLM 很可能把展開後的行號
+        # 誤植進 finding,指向原始檔案中錯誤的位置。展開後 SQL 的行號要能可靠地
+        # 對回原始檔,需要哨兵行對應機制(#7 第 4 點),目前尚未接上;在那之前,
+        # 寧可讓 lint 對 Jinja 文字跑出較少或較不準的結果,也不要送出「看起來
+        # 對、實際上指錯行」的資訊——這正是本專案一貫的原則。
         lint = await hub.call_json("sqltools__lint", {"sql": sql})
         entry["lint"] = lint[:15] if isinstance(lint, list) else []
         results.append(entry)
@@ -196,7 +242,14 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                     dry_run: bool = False, baseline: bool = False,
                     capture: dict | None = None) -> dict:
     """capture 給定時,記錄各階段中間產物(預掃前後、檢索到的知識、模型原始輸出、
-    agent 工具對話、最終報告),供產生逐字 transcript。"""
+    agent 工具對話、最終報告),供產生逐字 transcript。
+
+    cfg.dbt["enabled"] 為 True 時,prescan() 會呼叫 render_model_isolated()
+    (multiprocessing 的 spawn context)。**呼叫端的進入點程式必須有
+    `if __name__ == "__main__":` 保護**,否則 Windows 上 spawn 會重新匯入整個
+    頂層模組,連帶把呼叫 review_mr() 的那段程式碼也重跑一次——demo.py 與
+    scripts/webhook_server.py 都已經這樣寫,寫新的進入點時比照辦理。
+    """
     import copy
     profile = cfg.profile(profile_name)
     skills = load_skills()
@@ -229,14 +282,15 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             report["_mode"] = "baseline"
             return report
 
-        pre = await prescan(hub, mr["files"])
+        pre = await prescan(hub, mr["files"], cfg.dbt)
         if capture is not None:
             capture["mr"] = mr
             capture["prescan_raw"] = copy.deepcopy(pre)
         injection_hits = scan_mr(mr)   # 確定性注入掃描(不經 LLM)
 
-        # 找 spec(確定性;執行驗證與 prompt 的規格段共用)
-        spec_code, spec_text = await find_spec(hub, mr)
+        # 找 spec(確定性;執行驗證與 prompt 的規格段共用)。依檔名對應與展開器
+        # 同一個開關:關閉時行為與接線前完全相同。
+        spec_code, spec_text = await find_spec(hub, mr, by_path=cfg.dbt.get("enabled") is True)
 
         # 分層知識檢索:依變更內容的 scope + query,
         # 只注入 binding 恆常規範(scope 內全數)+ 相關 guideline top_k。

@@ -52,3 +52,25 @@ policy:
   block:                        # 任一條件符合 → 擋下並要求處理
     min_blockers: 1
 # 其餘 → needs_human(停下來通知人工檢驗)
+
+# dbt 樣板展開接線(#7):model 是 dbt 樣板時,先展開成純 T-SQL 再交給規則預掃,
+# 並在沒有 R 編號時改依 model 檔名對應規格。
+# **enabled 預設 false**——關閉時這兩件事都不會發生,審查流程與接線前完全相同
+# (設定檔沒寫 dbt: 也一樣視為關閉)。
+#
+# 開啟前務必確認:
+#   1. 資料庫名稱以**環境變數** SEGCRA_DBT_DATABASE 提供,**不要寫在這個檔案裡**:
+#      這個檔案會進版控,而 repo 是公開的,正式環境的資料庫名不可出現在任何
+#      進版控的地方(與 config/sandbox.env 的帳密同樣只放在部署機上)。
+#      ref()/source() 靠它展開成完整表名;沒設定時,用到 ref()/source() 的 model
+#      一律展開失敗(安全預設,但等於沒用)。下面的 database 只留空字串當後備。
+#   2. 目前還沒有列 GitLab 目錄的工具,所以這裡展開時**沒有 macro 目錄**——只有
+#      ref() / source() / var() / config() 會生效,呼叫到專案自訂 macro 的 model
+#      會展開失敗(StrictUndefined,fail closed),跟現在完全沒展開時一樣落到
+#      「無法解析,需人工確認」,不會誤判成功。macro 目錄要等目錄列表工具到位
+#      (見 docs/09-dbt展開與反查.md 的已知限制)才能真正支援。
+#   3. dbt 樣板的執行驗證(沙盒)尚未支援:找到規格也只會回報「尚未支援」並交人工,
+#      不會把未展開的樣板送進沙盒。
+dbt:
+  enabled: false
+  database: ""

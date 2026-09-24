@@ -1143,8 +1143,12 @@ def test_unknown_rendered_line_degrades_to_zero(result):
     ("{%- set x = 1 -%}\n    SELECT {{ x }}", "SELECT 1", 2),
     # 上一行 -%} 連空白行一起吃掉:空白行不能插哨兵
     ("{%- set x = 1 -%}\n\n\n    SELECT {{ x }}", "SELECT 1", 4),
-    # {%- 會吃掉前面的換行:以它開頭的行不能插哨兵
+    # {%- 會吃掉前面的換行:哨兵不能插在它前面;接成的這行歸給內容開頭的第 1 行
     ("SELECT 1\n    {%- if true %} AS x{% endif %}", "SELECT 1 AS x", 1),
+    # 左修剪標記被拆成「只輸出哨兵」+ 原標記:註解、負號、字串內都不能改變語意
+    ("SELECT a\n{#- c #}, b", "SELECT a, b", 1),
+    ("SELECT\n{{--1 }} AS n", "SELECT-1 AS n", 1),
+    ("SELECT '\n{{- 1 }}'", "SELECT '1'", 1),
 ])
 def test_sentinel_survives_whitespace_control(text, expected_sql, content_src_line):
     r = _render(source=text)
@@ -1152,6 +1156,55 @@ def test_sentinel_survives_whitespace_control(text, expected_sql, content_src_li
     assert r.sql == expected_sql
     assert r.map_method == "sentinel"
     assert r.src_line(1) == content_src_line
+
+
+def _macro_project(tmp_path, macro_sql: str):
+    (tmp_path / "macros").mkdir()
+    (tmp_path / "macros" / "m.sql").write_text(macro_sql, encoding="utf-8")
+    return tmp_path
+
+
+def test_left_trim_line_gets_its_own_line_number(tmp_path):
+    """#10 review 列的「左側修剪標籤的行號對應」:`{{- 巨集() }}` 輸出多行時,
+    原本這幾行全部沿用上一行(FROM)的行號。現在必須指回呼叫巨集的那一行,
+    且 FROM 那行本身不能被搶走。"""
+    root = _macro_project(tmp_path, "{% macro m() %}\nWHERE a = 1\nAND b = 2\n{% endmacro %}\n")
+    r = _render(source="SELECT *\nFROM t\n{{- m() }}\nORDER BY 1\n", code_root=root)
+    assert r.ok, r.error
+    assert r.sql.split("\n") == ["SELECT *", "FROM t", "WHERE a = 1", "AND b = 2", "",
+                                 "ORDER BY 1"]
+    assert r.map_method == "sentinel"
+    assert [r.src_line(i) for i in range(1, 7)] == [1, 2, 3, 3, 3, 4]
+
+
+def test_content_joined_by_left_trim_keeps_first_line(tmp_path):
+    """左修剪把兩行接成一個輸出行時,這行歸給內容開頭所在的那行,不是被接上來的那行。"""
+    root = _macro_project(tmp_path, "{% macro m() %}, b{% endmacro %}\n")
+    r = _render(source="SELECT a\n{{- m() }}\nFROM t\n", code_root=root)
+    assert r.ok, r.error
+    assert r.sql.split("\n") == ["SELECT a, b", "FROM t"]
+    assert r.map_method == "sentinel"
+    assert [r.src_line(1), r.src_line(2)] == [1, 3]
+
+
+@pytest.mark.parametrize("text, expected_sql", [
+    # {%- endraw %}:拆出來的哨兵標記在 raw 區塊內只是文字 → 對不上 → 退回 difflib
+    ("{% raw %}\n{{ x }}\n{%- endraw %}\nSELECT 1", "\n{{ x }}\nSELECT 1"),
+    # {%- endfor %}:哨兵落在迴圈本體內,每輪都輸出一次
+    ("{% for i in range(2) %}\na{{ i }}\n{%- endfor %}\nFROM t", "\na0\na1\nFROM t"),
+    # {%- else %}:哨兵落在沒走到的分支
+    ("SELECT 1\n{% if false %}\nx\n{%- else %}\n, y\n{%- endif %}\nFROM t",
+     "SELECT 1\n\n, y\nFROM t"),
+    # {%- endset %}:哨兵被收進變數,取用時再輸出
+    ("{% set c %}\na\n{%- endset %}\nSELECT '{{ c }}'", "\nSELECT '\na'"),
+])
+def test_left_trim_split_never_changes_output(text, expected_sql):
+    """拆左修剪標記只影響行號:展開結果必須與不插哨兵時逐字相同,行號不得越界。"""
+    r = _render(source=text)
+    assert r.ok, r.error
+    assert r.sql == expected_sql
+    n_src = text.count("\n") + 1
+    assert all(1 <= v <= n_src for v in r.line_map.values())
 
 
 # 表達式中的字串含 "}}":哨兵掃描器會誤判標記在第 1 行就結束,於是在第 2 行(其實
@@ -1240,6 +1293,7 @@ FUZZ_FRAGMENTS = [
     "{# c #}", "{#- c -#}", "{{ ref('t') }}", "{{ var('target_date') }}",
     "{{ is_inward_all('RETAIL_M1') }}", "{% raw %}{{ x }}{% endraw %}",
     "'{{'", "}}", "{%", "#}", "/*__SEGCRA_SRC_L1__*/", "-- }}",
+    "\n{{--1 }}", "\n{%- if true %}x{%- endif %}", "\n  {#- c #}",
 ]
 
 
@@ -1287,3 +1341,62 @@ def test_unrendered_template_is_blind_spot():
     assert isinstance(out, dict), "預期原始樣板應解析失敗並回 {'error':...}"
     assert "parse failed" in out["error"]
     assert out["hits"] == [], "未展開時不應命中任何規則(這正是盲區)"
+
+
+# ------------------------------------------------------------ relation_notice
+# ref()/source() 展開出的表名有三個已知落差(不驗證 model 是否存在、不讀
+# sources.yml、不套用 alias)。#10 review 要求接線時要讓審查者看得到,
+# 不能只寫在模組文件裡沒人會翻——這裡驗證 RenderResult 真的會帶上提醒。
+
+def test_relation_notice_set_when_ref_used(tmp_path):
+    r = _render(code_root=tmp_path, source="SELECT * FROM {{ ref('t') }}")
+    assert r.ok, r.error
+    assert r.relation_notice is not None
+    assert "ref()" in r.relation_notice
+
+
+def test_relation_notice_set_when_source_used(tmp_path):
+    r = _render(code_root=tmp_path, source="SELECT * FROM {{ source('s', 't') }}")
+    assert r.ok, r.error
+    assert r.relation_notice is not None
+
+
+def test_relation_notice_absent_when_neither_used(tmp_path):
+    """完全沒用到 ref()/source() 的 model(例如純字面量 SQL)不該被貼上這個
+    提醒——提醒要精準對應到真的有落差風險的地方,不是每次展開都固定附上。"""
+    r = _render(code_root=tmp_path, source="SELECT 1 AS a")
+    assert r.ok, r.error
+    assert r.relation_notice is None
+
+
+def test_relation_notice_absent_when_ref_fails_to_render(tmp_path):
+    """展開失敗時不該有 relation_notice(ok=False 時這個欄位本來就沒意義,
+    呼叫端該看的是 error,不是 relation_notice)。"""
+    r = _render(code_root=tmp_path, source="SELECT * FROM {{ ref('t') }}", database=None)
+    assert not r.ok
+    assert r.relation_notice is None
+
+
+def test_relation_notice_not_leaked_from_macro_module_level(tmp_path):
+    """macro 檔在模組層就呼叫 ref()(載入時執行),不代表 model 本身用了——
+    model 完全沒用到 ref()/source() 時不可因此被貼上提醒。"""
+    _write_macro(tmp_path, "top.sql",
+                 "{% set upstream = ref('t') %}{% macro amt() %}1{% endmacro %}")
+    r = _render(code_root=tmp_path, source="SELECT {{ amt() }}")
+    assert r.ok, r.error
+    assert r.relation_notice is None
+
+
+def test_relation_notice_set_when_macro_called_by_model_uses_ref(tmp_path):
+    """model 透過 macro 間接用到 ref(),表名一樣有落差,提醒要出現。"""
+    _write_macro(tmp_path, "rel.sql", "{% macro src() %}{{ ref('t') }}{% endmacro %}")
+    r = _render(code_root=tmp_path, source="SELECT * FROM {{ src() }}")
+    assert r.ok, r.error
+    assert r.relation_notice is not None
+
+
+def test_relation_notice_present_on_real_sample_model():
+    """拿專案自己的範例(真的用到 ref())驗證,不是只驗合成的最小案例。"""
+    r = _render()
+    assert r.ok, r.error
+    assert r.relation_notice is not None
