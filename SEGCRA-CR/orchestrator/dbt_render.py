@@ -51,7 +51,7 @@
     繞過識別字白名單,或蓋掉呼叫端給的變數值(已實測可行)。遇到即拒絕展開。
   * `ref()` / `source()` 的名稱會被拼進 SQL 識別字,一律過白名單(英數與底線)。
     否則審查者在原始碼看到的是無害的 `{{ ref('...') }}`,展開後卻藏著另一段 SQL。
-    dbt 本身遇到不存在的 model 會編譯失敗,這裡同樣拒絕。
+    (白名單只擋名稱格式;被引用的 model 是否存在**不**驗證,見下方已知限制。)
   * 樣板不得直接輸出函式或物件(例如 `{{ ref }}` 少了括號):其字串表示含記憶體
     位址與內部名稱。
   * 呼叫端傳入的變數每次取用都給複本,樣板無法改到呼叫端的資料;`target` 唯讀。
@@ -677,19 +677,29 @@ def _inject_sentinels(src: str, token: str) -> str:
 
     * 行首在 Jinja 標記內部(會破壞語法)
     * 純空白行(上一行結尾的 `-%}` 會吃掉它;插了就擋住空白控制)
-    * 以 `{%-` / `{{-` / `{#-` 開頭(它會吃掉前面的空白;插了就擋住空白控制)
     插在縮排之後而非行首,是因為上一行的 `-%}` 會吃到本行第一個非空白字元為止。
     不插的行,其輸出沿用上一個哨兵的行號。
+
+    以 `{%-` / `{{-` / `{#-` 開頭的行:它會吃掉前面的空白(含換行),哨兵若插在它
+    前面就會擋住空白控制。改把左修剪拆成一個只輸出哨兵的標記,原標記去掉 `-`:
+    `{{- x }}` → `{{- '哨兵' }}{{ x }}`。前面的空白照樣被吃掉、兩個標記之間沒有
+    任何文字,輸出只多了哨兵;原標記的內容一個字都不動(不解析表達式)。
+    開頭符號之後補一個空白:否則 `{{--x }}`(負號)會變成 `{{-x }}` 而被當成左修剪。
+    哨兵只含英數與 `/*_`,放進單引號字串不會提早結束字串。
     """
     inside = _lines_inside_tag(src)
     out = []
     for idx, line in enumerate(src.split("\n")):
         body = line.lstrip()
-        if idx in inside or not body or body.startswith(_LEFT_TRIM_TAGS):
+        if idx in inside or not body:
             out.append(line)
+            continue
+        indent = line[:len(line) - len(body)]
+        mark = _sentinel(token, idx + 1)
+        if body.startswith(_LEFT_TRIM_TAGS):
+            out.append(f"{indent}{{{{- '{mark}' }}}}{body[:2]} {body[3:]}")
         else:
-            indent = line[:len(line) - len(body)]
-            out.append(indent + _sentinel(token, idx + 1) + body)
+            out.append(indent + mark + body)
     return "\n".join(out)
 
 
@@ -704,11 +714,18 @@ def _map_from_sentinels(marked: str, clean: str, token: str) -> dict[int, int] |
     mapping: dict[int, int] = {}
     cur = 0
     for line in marked.split("\n"):
-        hits = pattern.findall(line)
-        if hits:
-            cur = int(hits[-1])
+        # 空白控制會把幾行接成一個輸出行,一行可能含多個哨兵。這行歸給「第一段內容
+        # 之前的那個哨兵」:`FROM t` 後面接上 `{{- 巨集() }}` 時,這行仍屬 FROM 那行;
+        # `-%}` 吃掉換行後才出現的內容,則屬內容所在那行。後續的行沿用最後一個哨兵。
+        parts = pattern.split(line)          # 偶數位置是文字,奇數位置是哨兵行號
+        owner = None
+        for k, part in enumerate(parts):
+            if k % 2:
+                cur = int(part)
+            elif owner is None and part.strip():
+                owner = cur
         stripped.append(pattern.sub("", line))
-        mapping[len(stripped)] = cur
+        mapping[len(stripped)] = cur if owner is None else owner
     if "\n".join(stripped) != clean:
         return None
     return mapping

@@ -204,14 +204,23 @@ MUTANTS = {
         "        line_map=_clamp(line_map, n_src, n_out),",
         "        line_map=line_map,"),
     "哨兵插在行首(而非縮排之後)": (
-        "            out.append(indent + _sentinel(token, idx + 1) + body)",
-        "            out.append(_sentinel(token, idx + 1) + line)"),
+        "            out.append(indent + mark + body)",
+        "            out.append(mark + line)"),
     "空白行也插哨兵": (
-        "        if idx in inside or not body or body.startswith(_LEFT_TRIM_TAGS):",
-        "        if idx in inside or body.startswith(_LEFT_TRIM_TAGS):"),
-    "{%- 開頭的行也插哨兵": (
-        "        if idx in inside or not body or body.startswith(_LEFT_TRIM_TAGS):",
-        "        if idx in inside or not body:"),
+        "        if idx in inside or not body:\n            out.append(line)",
+        "        if idx in inside:\n            out.append(line)"),
+    "{%- 開頭的行把哨兵插在標記前(擋住空白控制)": (
+        "        if body.startswith(_LEFT_TRIM_TAGS):",
+        "        if False:"),
+    "{%- 開頭的行不給哨兵(行號沿用上一行)": (
+        "            out.append(f\"{indent}{{{{- '{mark}' }}}}{body[:2]} {body[3:]}\")",
+        "            out.append(line)"),
+    "拆左修剪標記時不補空白(負號被當成左修剪)": (
+        "{body[:2]} {body[3:]}",
+        "{body[:2]}{body[3:]}"),
+    "一行多個哨兵時改取最後一個": (
+        "        mapping[len(stripped)] = cur if owner is None else owner",
+        "        mapping[len(stripped)] = cur"),
     "哨兵渲染失敗時整份判失敗": (
         "    except Exception:\n        line_map = None",
         "    except Exception as e:\n        return RenderResult(ok=False, error=str(e))"),
