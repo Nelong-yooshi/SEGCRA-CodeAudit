@@ -693,3 +693,54 @@ def test_真的程式碼改動仍然算dirty(line):
     golden case 與規格檔也算——它們是模型看得到的輸入,改了就不是同一份測量。
     """
     assert preflight._is_output(line) is False
+
+
+# ─────────────────── 測資集也要進指紋 ───────────────────
+
+def test_改了_golden_set_兩份_baseline_就不可比(tmp_path):
+    """這是 `code.sha` 擋不住的缺口。
+
+    `code.sha` 刻意不列入不可比——改程式碼正是回歸比較要量的東西。
+    但 golden set 與 `specs/` 是**受測內容本身**:改了它們,兩份 baseline
+    量的就不是同一把尺,數字不該相減,而沒有別的欄位擋得住這件事。
+
+    這個缺口是實務上會踩到的:golden set 正要依「真實程式形狀」重建,
+    重建後若拿新數字去減舊數字,會把「換了測資集」誤讀成「品質變了」。
+    """
+    base = _fp()
+    base["testset"] = {"golden": "aaaaaaaaaaaa", "golden_count": 32,
+                       "specs": "bbbbbbbbbbbb", "specs_count": 6}
+
+    changed_golden = {**base, "testset": {**base["testset"], "golden": "cccccccccccc"}}
+    diffs = preflight.compare_fingerprint(base, changed_golden)
+    assert any("golden" in d for d in diffs), "改了 golden set 卻判成可比"
+
+    changed_specs = {**base, "testset": {**base["testset"], "specs": "dddddddddddd"}}
+    diffs = preflight.compare_fingerprint(base, changed_specs)
+    assert any("specs" in d for d in diffs), "改了規格檔卻判成可比"
+
+
+def test_測資集的雜湊看內容不看時間(tmp_path):
+    """同一份檔案重新 checkout 會換 mtime 但內容沒變,那不該讓兩份 baseline 不可比。
+
+    反過來,內容改了(哪怕只有一個字)就必須換雜湊——否則這道防線形同虛設。
+    """
+    d = tmp_path / "golden"
+    d.mkdir()
+    (d / "mr_101.json").write_text('{"a": 1}', encoding="utf-8")
+    (d / "mr_102.json").write_text('{"b": 2}', encoding="utf-8")
+    h1, n1 = preflight._dir_digest(d, "mr_*.json")
+    assert n1 == 2
+
+    # 只動 mtime,內容不變 → 雜湊要一樣
+    (d / "mr_101.json").touch()
+    assert preflight._dir_digest(d, "mr_*.json")[0] == h1
+
+    # 內容改一個字 → 雜湊要變
+    (d / "mr_101.json").write_text('{"a": 2}', encoding="utf-8")
+    assert preflight._dir_digest(d, "mr_*.json")[0] != h1
+
+    # 新增一個 case → 雜湊要變、數量要跟著變
+    (d / "mr_103.json").write_text('{"c": 3}', encoding="utf-8")
+    h3, n3 = preflight._dir_digest(d, "mr_*.json")
+    assert n3 == 3 and h3 != h1

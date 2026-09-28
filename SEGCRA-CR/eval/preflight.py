@@ -72,6 +72,11 @@ INCOMPARABLE = [
     ("sandbox", "engine", "執行驗證的資料庫換了(方言語意會變)"),
     ("deps", "sqlglot", "AST 預掃的解析器換版,確定性規則的命中會變"),
     ("deps", "jinja2", "樣板展開的結果可能變"),
+    # golden set 與規格檔是**受測內容本身**,不是程式碼。改了它們,
+    # 兩份 baseline 量的就不是同一把尺——而 code.sha 刻意不列入不可比
+    # (改程式碼正是回歸比較要量的東西),所以這件事沒有別的欄位擋得住。
+    ("testset", "golden", "golden set 改了(新增/刪除/修改 case,量的不是同一組輸入)"),
+    ("testset", "specs", "規格檔改了(規格是測資生成的唯一輸入,改了測資就會變)"),
 ]
 
 
@@ -113,6 +118,41 @@ def _is_output(porcelain_line: str) -> bool:
     path = porcelain_line[3:].strip().strip('"')
     path = path.split(" -> ")[-1].strip().strip('"')
     return any(seg in path for seg in _OUTPUT_PATHS)
+
+
+def _dir_digest(d: Path, pattern: str) -> tuple[str, int]:
+    """把一個目錄下的檔案內容收斂成一個雜湊 + 檔案數。
+
+    用**內容**而不是 mtime:同一份檔案重新 checkout 會換 mtime 但內容沒變,
+    那不該讓兩份 baseline 變成不可比。
+    """
+    import hashlib
+    h = hashlib.sha256()
+    n = 0
+    for f in sorted(d.glob(pattern)):
+        h.update(f.name.encode())
+        h.update(f.read_bytes())
+        n += 1
+    return h.hexdigest()[:12], n
+
+
+def check_testset() -> Check:
+    """記下這輪跑的是**哪一組測資**。
+
+    這是 `code.sha` 擋不住的一個缺口:改程式碼是回歸比較要量的東西,所以
+    `code.sha` 刻意不列入不可比;但 golden set 與 `specs/` 是**受測內容本身**,
+    改了它們,兩份 baseline 量的就不是同一把尺,數字不該相減。
+
+    只給 ok/warn,不中止——換測資集是正常的工作,只是換了就不能跟舊的比。
+    """
+    g_hash, g_n = _dir_digest(PKG_ROOT / "eval" / "golden", "mr_*.json")
+    s_hash, s_n = _dir_digest(PKG_ROOT / "specs", "*.md")
+    data = {"golden": g_hash, "golden_count": g_n,
+            "specs": s_hash, "specs_count": s_n}
+    if not g_n:
+        return Check("測資集", "warn", "golden set 是空的", data)
+    return Check("測資集", "ok",
+                 f"golden set {g_n} 個 case({g_hash})、規格 {s_n} 份({s_hash})", data)
 
 
 def check_code() -> Check:
@@ -457,6 +497,7 @@ def build_fingerprint(checks: list[Check], cfg, profiles: list[str]) -> dict:
     return {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "code": d("程式碼版本"),
+        "testset": d("測資集"),
         "deps": d("套件版本"),
         "endpoint": d("端點身分"),
         "model": {"profiles": prof, **d("模型 digest")},
@@ -515,7 +556,7 @@ def verdict(checks: list[Check]) -> str:
 async def run(args) -> int:
     cfg = load_config()
     profiles = sorted({cfg.default_profile, *cfg.roles.values()})
-    checks: list[Check] = [check_code(), check_deps()]
+    checks: list[Check] = [check_code(), check_testset(), check_deps()]
 
     if not args.offline:
         ep = check_endpoint(cfg)
