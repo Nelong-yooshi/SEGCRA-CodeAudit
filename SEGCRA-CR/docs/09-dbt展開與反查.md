@@ -178,12 +178,23 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 |---|---|---|
 | 預掃前展開 | 已接上 | 含樣板的檔案先以 `render_model_isolated()` 展開再交給規則層;展開失敗則原樣退回,走既有 `parse_error` → `enforce_parse` 路徑。lint 刻意仍吃原始文字(帶行號,基準要與 diff 一致) |
 | 依檔名對應規格 | 已接上 | 完全沒有 R 編號時,先查本機 `specs/`、再逐一探測 GitLab 的候選路徑 |
-| `ref()`/`source()` 精確度提醒 | 已接上 | 預掃結果帶 `dbt_render_notice` |
+| `ref()`/`source()` 精確度提醒 | 已接上 | 預掃結果帶 `dbt_render_notice`,後處理由 `enforce_dbt_notice()` 確定性補成 info finding(正式路徑與 dry-run 皆同) |
 | 執行驗證(沙盒) | **不支援** | SQL 是樣板時不送進沙盒,回報「尚未支援」major、交人工——原樣執行只會得到語法錯誤,會錯誤地指控程式有誤 |
 | macro 反查 | **未接上** | 需要整個專案的檔案,目前沒有列 GitLab 目錄的工具 |
 
-資料庫名稱以環境變數 `SEGCRA_DBT_DATABASE` 提供,**不寫進任何進版控的檔案**
-(repo 是公開的);未設定時,用到 `ref()`/`source()` 的 model 一律展開失敗。
+資料庫名稱以環境變數提供,**固定使用假名** `SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER`
+(#14 review 同意):它只用來把 `ref()`/`source()` 展開成完整表名給規則層掃描,
+不會連線;`toolbox/sqltools.py` 目前沒有任何規則看資料庫名,用假名不影響判斷。
+展開後的 SQL 片段會出現在審查結果裡,所以不放正式資料庫名。假名必須固定不變,
+golden set 的標準答案才不會跟著變;改名時要同步更新 `config/models.yaml` 的註解。
+未設定時,用到 `ref()`/`source()` 的 model 一律展開失敗。
+
+日後若改用正式資料庫名(例如要在持久化的測試資料庫上實際執行展開結果),只改
+環境變數,仍不寫進進版控的檔案;屆時要另加一道名稱正確性的檢查(例如確認資料庫
+確實存在),因為拼錯的名稱在只做文字展開時不會被發現。
+
+`ref()`/`source()` 精確度提醒由 `enforce_dbt_notice()` 在後處理鏈上**確定性**補成
+一條 info finding(#14 review):不靠模型轉述;info 不影響決策,但一定會出現在報告裡。
 目前沒有 macro 目錄可餵,呼叫到專案自訂 macro 的 model 也會展開失敗(fail closed)。
 
 呼叫端約定(接線時必須遵守):

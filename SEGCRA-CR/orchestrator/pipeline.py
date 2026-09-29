@@ -379,6 +379,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_parse(report, pre)    # 預掃解析失敗 = 確定性規則沒跑,必須看得見
         report = enforce_hints(report, pre)
         report = enforce_style(report, pre)    # 已學會的風格(如前置逗號)確定性補報
+        # 放在 enforce_hints / enforce_style 之後:它們以「報告全文含關鍵字」判斷模型
+        # 是否已回應,程式補的文字若先進報告,可能被誤當成模型的回應而吞掉檢核點
+        report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述
         report = enforce_injection(report, injection_hits)  # 確定性 blocker,不論模型是否被攻陷
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
 
@@ -507,6 +510,32 @@ def enforce_parse(report: dict, pre: list[dict]) -> dict:
     for entry in pre:
         if entry.get("parse_error") and (entry["path"], _PARSE_FAIL_TITLE) not in have:
             report.setdefault("findings", []).append(_parse_fail_finding(entry))
+    return report
+
+
+_DBT_NOTICE_TITLE = "展開後的表名未經驗證"
+
+
+def enforce_dbt_notice(report: dict, pre: list[dict]) -> dict:
+    """dbt 展開成功但用到 ref()/source() 時,一律補一條 info finding——不靠模型轉述。
+
+    展開失敗有 enforce_parse 強制揭露;展開成功時規則層解析得過、報告看起來乾淨,
+    審查者看到的表名卻從未被驗證過(見 dbt_render._RELATION_NOTICE)。這句提醒若只
+    放在 prescan 裡交給模型,報告有沒有它取決於模型願不願意轉述。
+    info 不影響決策(policy 允許 info 自動放行),但一定會出現在報告裡。
+    內容全是固定文字(dbt_render 的常數),不回顯 MR 內容。"""
+    have = {(f.get("file"), f.get("title")) for f in report.get("findings", [])}
+    for entry in pre:
+        notice = entry.get("dbt_render_notice")
+        if not notice or (entry["path"], _DBT_NOTICE_TITLE) in have:
+            continue
+        report.setdefault("findings", []).append({
+            "file": entry["path"], "line": 0, "severity": "info",
+            "title": _DBT_NOTICE_TITLE,
+            "detail": notice,
+            "suggestion": "確認 ref()/source() 指向的表名與實際專案一致後,再採信這段 SQL 的表名。",
+            "citations": []})
+        have.add((entry["path"], _DBT_NOTICE_TITLE))
     return report
 
 
@@ -721,7 +750,8 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
               "_plumbing": {"memory_ok": mem_sample is not None,
                             "spec_found": bool(spec_text), "spec_code": spec_code,
                             "files_scanned": len(pre)}}
-    for fd in findings:
+    report = enforce_dbt_notice(report, pre)   # 與正式路徑一致:表名未驗證的提醒不可少
+    for fd in report["findings"]:
         await hub.call("gitlab__post_inline_comment",
                        {"mr_id": mr_id, "file": fd["file"], "line": 0,
                         "severity": fd["severity"], "body": fd["title"]})

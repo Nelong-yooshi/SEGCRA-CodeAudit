@@ -519,6 +519,27 @@ MUTANTS.update({
  "設定:資料庫名不讀環境變數": ("config.py",
      'os.environ.get("SEGCRA_DBT_DATABASE", section.get("database", ""))',
      'section.get("database", "")'),
+ # ---- relation_notice 確定性揭露(#14 review):不可退回「靠模型轉述」
+ "提醒:後處理鏈不呼叫(退回靠模型轉述)": ("pipeline.py",
+     "        report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述\n",
+     ""),
+ "提醒:搬到檢核點關鍵字比對之前(可能吞掉檢核點)": ("pipeline.py",
+     "        report = enforce_hints(report, pre)\n",
+     "        report = enforce_dbt_notice(report, pre)\n        report = enforce_hints(report, pre)\n"),
+ "提醒:dry-run 不補": ("pipeline.py",
+     "    report = enforce_dbt_notice(report, pre)   # 與正式路徑一致:表名未驗證的提醒不可少\n",
+     ""),
+ "提醒:沒有提醒也補(每個檔都被貼)": ("pipeline.py",
+     '        if not notice or (entry["path"], _DBT_NOTICE_TITLE) in have:',
+     '        if (entry["path"], _DBT_NOTICE_TITLE) in have:'),
+ "提醒:不去重": ("pipeline.py",
+     '        if not notice or (entry["path"], _DBT_NOTICE_TITLE) in have:',
+     "        if not notice:"),
+ "提醒:嚴重度升高(改變決策)": ("pipeline.py",
+     '            "file": entry["path"], "line": 0, "severity": "info",\n'
+     '            "title": _DBT_NOTICE_TITLE,',
+     '            "file": entry["path"], "line": 0, "severity": "major",\n'
+     '            "title": _DBT_NOTICE_TITLE,'),
 })
 
 

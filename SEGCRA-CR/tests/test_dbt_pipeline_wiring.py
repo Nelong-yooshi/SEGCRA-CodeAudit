@@ -13,7 +13,9 @@ import pathlib
 import pytest
 
 from orchestrator.config import Config, _load_dbt_section, load_config
-from orchestrator.pipeline import prescan
+from orchestrator.dbt_render import _RELATION_NOTICE
+from orchestrator.pipeline import (_DBT_NOTICE_TITLE, _dry_run_report, apply_policy,
+                                   enforce_dbt_notice, enforce_hints, prescan)
 from orchestrator.spec_exec import find_spec, run_spec_exec
 
 
@@ -513,3 +515,161 @@ def test_real_models_yaml_defaults_dbt_disabled(no_db_env):
     這次改動真的以安全的狀態進到設定檔裡,而不是只有測試裡的假設定安全。"""
     cfg = load_config()
     assert cfg.dbt["enabled"] is False
+
+
+# ------------------------------- relation_notice 確定性揭露(#14 review 合併前要求)
+# prescan 的 dbt_render_notice 只會隨整包 JSON 送進模型的任務描述;報告裡有沒有這句
+# 提醒不能取決於模型願不願意轉述。enforce_dbt_notice 在後處理鏈上強制補一條 info。
+
+
+def _notice_findings(report):
+    return [f for f in report.get("findings", []) if f.get("title") == _DBT_NOTICE_TITLE]
+
+
+def test_notice_added_even_when_model_said_nothing():
+    """模型的報告完全沒提 → 程式一定補上,內容是固定文字,落在正確的檔案。"""
+    pre = [{"path": "models/mrt_x.sql", "rules": [], "dbt_render_notice": _RELATION_NOTICE}]
+    report = enforce_dbt_notice({"findings": []}, pre)
+    [f] = _notice_findings(report)
+    assert f == {"file": "models/mrt_x.sql", "line": 0, "severity": "info",
+                 "title": _DBT_NOTICE_TITLE, "detail": _RELATION_NOTICE,
+                 "suggestion": f["suggestion"], "citations": []}
+    assert f["suggestion"]
+
+
+def test_notice_added_when_report_has_no_findings_key():
+    """模型輸出連 findings 鍵都沒有(常見的格式漂移)也要補得進去,不可丟例外。"""
+    pre = [{"path": "models/mrt_x.sql", "rules": [], "dbt_render_notice": _RELATION_NOTICE}]
+    assert len(_notice_findings(enforce_dbt_notice({}, pre))) == 1
+
+
+@pytest.mark.parametrize("entry", [
+    {"path": "models/mrt_x.sql", "rules": []},                               # 沒用 ref()
+    {"path": "models/mrt_x.sql", "rules": [], "dbt_render_notice": None},
+    {"path": "models/mrt_x.sql", "rules": [], "dbt_render_notice": ""},
+    {"path": "models/mrt_x.sql", "rules": [], "parse_error": "x",            # 展開失敗
+     "dbt_render_error": "x"},
+])
+def test_no_notice_without_relation_usage(entry):
+    """沒有提醒時不可憑空補:否則每個 dbt 檔都被貼提醒,審查者會開始忽略它。"""
+    assert _notice_findings(enforce_dbt_notice({"findings": []}, [entry])) == []
+
+
+def test_notice_not_duplicated_and_idempotent():
+    """同一檔已有這條(例如管線重跑後處理)不重複;每個檔各自一條。"""
+    pre = [{"path": "models/a.sql", "rules": [], "dbt_render_notice": _RELATION_NOTICE},
+           {"path": "models/b.sql", "rules": [], "dbt_render_notice": _RELATION_NOTICE},
+           {"path": "models/a.sql", "rules": [], "dbt_render_notice": _RELATION_NOTICE}]
+    report = enforce_dbt_notice({"findings": []}, pre)
+    report = enforce_dbt_notice(report, pre)
+    assert sorted(f["file"] for f in _notice_findings(report)) == ["models/a.sql",
+                                                                   "models/b.sql"]
+
+
+def test_notice_keeps_model_findings_untouched():
+    """只追加,不改動、不刪除模型原本的 finding。"""
+    original = {"file": "models/a.sql", "line": 3, "severity": "major", "title": "t",
+                "detail": "d", "suggestion": "", "citations": []}
+    pre = [{"path": "models/a.sql", "rules": [], "dbt_render_notice": _RELATION_NOTICE}]
+    report = enforce_dbt_notice({"findings": [dict(original)]}, pre)
+    assert report["findings"][0] == original
+    assert len(report["findings"]) == 2
+
+
+def test_review_mr_enforces_notice_after_keyword_checks_and_before_policy():
+    """review_mr() 的後處理鏈必須呼叫它:
+    * 在 enforce_hints / enforce_style 之後——它們以「報告全文含關鍵字」判斷模型是否
+      已回應檢核點,程式補的文字若先進報告,可能被誤當成回應而吞掉檢核點
+    * 在 apply_policy 之前——決策要看得到它"""
+    import inspect
+    import orchestrator.pipeline as pipeline_mod
+    src = inspect.getsource(pipeline_mod.review_mr)
+    call = "report = enforce_dbt_notice(report, pre)"
+    assert src.count(call) == 1
+    assert src.index("report = enforce_hints(report, pre)") < src.index(call)
+    assert src.index("report = enforce_style(report, pre)") < src.index(call)
+    assert src.index(call) < src.index("report = apply_policy(")
+
+
+def test_notice_text_never_masks_an_unanswered_hint():
+    """就算提醒的措辭哪天含有檢核點關鍵字(例如 H003 的「規格」),依管線順序執行時,
+    模型沒回應的檢核點仍要被補出來,不能被程式自己補的文字吞掉。"""
+    notice ="表名與規格核定的不一定相同"          # 故意含 H003 的關鍵字
+    pre = [{"path": "models/mrt_x.sql", "dbt_render_notice": notice,
+            "rules": [{"rule": "H003", "severity": "hint", "message": "涉及 R-101"}]}]
+    report = enforce_dbt_notice(enforce_hints({"findings": []}, pre), pre)
+    titles = [f["title"] for f in report["findings"]]
+    assert any(t.startswith("[H003]") for t in titles), titles
+    assert _DBT_NOTICE_TITLE in titles
+
+
+class _FakeDryRunHub:
+    def __init__(self):
+        self.posted: list[dict] = []
+
+    async def call_json(self, name, args):
+        assert name == "memory__lookup_similar_reviews"
+        return []
+
+    async def call(self, name, args):
+        self.posted.append({"name": name, **args})
+
+
+def test_dry_run_also_surfaces_notice():
+    """不經 LLM 的 dry-run 也會揭露 parse_error;提醒也要一樣出現,並貼回 MR。"""
+    hub = _FakeDryRunHub()
+    pre = [{"path": "models/mrt_x.sql", "rules": [], "dbt_render_notice": _RELATION_NOTICE}]
+    report = _run(_dry_run_report(hub, "1", {"files": []}, pre, None, None))
+    assert len(_notice_findings(report)) == 1
+    assert any(p["name"] == "gitlab__post_inline_comment"
+               and p["body"] == _DBT_NOTICE_TITLE for p in hub.posted)
+
+
+def test_notice_end_to_end_from_real_render_and_does_not_change_decision():
+    """真的展開(子行程)→ prescan 帶提醒 → 補 finding → 決策閘門。
+    info 不影響決策:其他條件都乾淨時,有沒有提醒結果都一樣。"""
+    hub = _FakePrescanHub()
+    pre = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
+                       {"enabled": True, "database": "SAMPLE_DW"}))
+    policy = {"auto_approve": {"max_diff_lines": 30, "min_score": 95,
+                               "allowed_severities": ["info"],
+                               "forbid_pending_hints": True},
+              "block": {"min_blockers": 1}}
+    mr = {"files": [{"path": "models/mrt_x.sql", "diff": "+x"}]}
+
+    def _base():
+        return {"score": 100, "findings": [], "_spec_exec": {"passed": True}}
+
+    with_notice = apply_policy(enforce_dbt_notice(_base(), pre), mr, policy)
+    without = apply_policy(_base(), mr, policy)
+    assert len(_notice_findings(with_notice)) == 1
+    assert with_notice["decision"] == without["decision"] == "auto_approved"
+
+
+# ------------------------------------------ 資料庫假名固定並寫進文件(#14 review)
+_PLACEHOLDER_SETTING = "SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER"
+_REPO = pathlib.Path(__file__).resolve().parents[1]
+
+
+def test_placeholder_database_documented_identically_in_config_and_docs():
+    """假名必須固定(golden set 的標準答案才不會飄),而且設定檔註解與文件要寫同一個值。"""
+    yaml_text = (_REPO / "config" / "models.yaml").read_text(encoding="utf-8")
+    doc_text = (_REPO / "docs" / "09-dbt展開與反查.md").read_text(encoding="utf-8")
+    assert _PLACEHOLDER_SETTING in yaml_text
+    assert _PLACEHOLDER_SETTING in doc_text
+
+
+def test_placeholder_database_passes_loader_and_renders(monkeypatch):
+    """文件寫的假名要真的能用:過載入時的識別字白名單,且能展開 ref()。"""
+    monkeypatch.setenv("SEGCRA_DBT_DATABASE", _PLACEHOLDER_SETTING.split("=", 1)[1])
+    dbt = _load_dbt_section({"dbt": {"enabled": True}})
+    assert dbt["database"] == "DBT_PLACEHOLDER"
+    hub = _FakePrescanHub()
+    _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL), dbt))
+    assert hub.rules_calls == [
+        'SELECT * FROM "DBT_PLACEHOLDER"."dbo"."txn_log" WHERE amount > 1000']
+
+
+def test_tracked_config_still_has_no_database_value(no_db_env):
+    """假名走環境變數,設定檔的 database 仍是空字串(維持「不寫進版控」的做法)。"""
+    assert load_config().dbt["database"] == ""

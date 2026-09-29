@@ -59,11 +59,14 @@ policy:
 # (設定檔沒寫 dbt: 也一樣視為關閉)。
 #
 # 開啟前務必確認:
-#   1. 資料庫名稱以**環境變數** SEGCRA_DBT_DATABASE 提供,**不要寫在這個檔案裡**:
-#      這個檔案會進版控,而 repo 是公開的,正式環境的資料庫名不可出現在任何
-#      進版控的地方(與 config/sandbox.env 的帳密同樣只放在部署機上)。
-#      ref()/source() 靠它展開成完整表名;沒設定時,用到 ref()/source() 的 model
-#      一律展開失敗(安全預設,但等於沒用)。下面的 database 只留空字串當後備。
+#   1. 資料庫名稱以**環境變數**提供,固定使用假名:
+#        SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER
+#      只用來把 ref()/source() 展開成完整表名給規則層掃描,不會連線;目前沒有任何
+#      規則看資料庫名,用假名不影響判斷。展開後的 SQL 片段會出現在審查結果裡,所以
+#      不放正式資料庫名。假名要固定不變(golden set 的標準答案才不會跟著變),
+#      改名時要同步更新 docs/09-dbt展開與反查.md。
+#      不要寫在這個檔案裡(維持由環境變數提供);沒設定時,用到 ref()/source() 的
+#      model 一律展開失敗(安全預設,但等於沒用)。下面的 database 只留空字串當後備。
 #   2. 目前還沒有列 GitLab 目錄的工具,所以這裡展開時**沒有 macro 目錄**——只有
 #      ref() / source() / var() / config() 會生效,呼叫到專案自訂 macro 的 model
 #      會展開失敗(StrictUndefined,fail closed),跟現在完全沒展開時一樣落到

@@ -21,6 +21,7 @@ import json
 import os
 import pathlib
 import random
+import sys
 import time
 
 import jinja2
@@ -1061,8 +1062,11 @@ def test_isolation_start_failure_is_closed():
     assert "子行程" in result[1]
 
 
-@pytest.mark.skipif(importlib.util.find_spec("resource") is None,
-                    reason="記憶體上限依賴 Unix 的 RLIMIT_AS(Linux CI 上執行)")
+# 只在 Linux 跑:macOS 雖然有 resource 模組,RLIMIT_AS 卻不會生效(#14 review 在
+# macOS 上實測這條失敗)。isolation 文件本來就寫明
+# 「記憶體上限只支援 Linux」,測試條件要與文件一致,不能用「有沒有 resource 模組」判斷。
+@pytest.mark.skipif(not sys.platform.startswith("linux"),
+                    reason="記憶體上限只在 Linux 生效(RLIMIT_AS);Linux CI 上執行")
 def test_isolated_render_enforces_memory_limit():
     """`~` 串接不經過 binop 攔截,模組內上限擋不住;只能靠子行程的記憶體上限。"""
     bomb = ("{% set ns = namespace(s='a' * 1000000) %}"
