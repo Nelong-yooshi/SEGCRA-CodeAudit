@@ -13,6 +13,10 @@
   python eval/run_eval.py --dump-reports d/   # 慢(要 GPU):跑管線並把完整報告存檔
   python eval/run_eval.py --from-reports d/   # 快(毫秒):讀存檔重新評分,不碰模型
 
+只想跳過測資生成那次 LLM 呼叫、主審查仍即時跑,見 eval/testdata_cache.py:
+  python eval/freeze_testdata.py R-140        # 先凍結一次(0 缺口才會存檔)
+  python eval/run_eval.py --frozen-testdata   # 有凍結檔的規格直接用,沒凍結的照常生成
+
 golden case = mock MR fixture + 兩段標準答案:
   expected  逐條應被抓到的問題 → 量 recall / precision(沿用 POC 的比對語意)
   _golden   層級與行為斷言     → 證明「哪一道防線真的啟動」、決策落在哪一態
@@ -293,6 +297,13 @@ def load_saved_report(d: Path, mr_id: str) -> dict:
 
 async def run(args) -> int:
     cfg = load_config()
+    if getattr(args, "frozen_testdata", False):
+        # 只套在這次執行:規格有凍結檔(eval/freeze_testdata.py 存的)就跳過測資生成
+        # 的 LLM 呼叫、直接用凍結版;沒凍結的規格照常呼叫。只改這個 process 內的
+        # module 全域,不動 orchestrator/spec_exec.py,正式審查管線不受影響。
+        import testdata_cache
+        from orchestrator import spec_exec
+        spec_exec.generate_cases = testdata_cache.wrap(spec_exec.generate_cases)
     cases = load_cases(args.layer, args.case)
     if not cases:
         print(f"golden set 為空或篩選後無 case(目錄: {GOLDEN_DIR})")
@@ -504,10 +515,18 @@ if __name__ == "__main__":
     ap.add_argument("--from-reports", default=None, metavar="DIR",
                     help="不跑管線,讀 DIR 底下 --dump-reports 存的報告重新評分(毫秒級、"
                          "不用 GPU)。輸入固定,所以差異一定來自斷言或計分邏輯的改動")
+    ap.add_argument("--frozen-testdata", action="store_true",
+                    help="規格有凍結的測資計畫(見 eval/freeze_testdata.py)就直接用,"
+                         "跳過測資生成那次 LLM 呼叫;沒凍結的規格照常生成。"
+                         "只凍測資生成這一層,主審查仍即時呼叫——與 --from-reports"
+                         "(整份報告都凍住)是不同粒度,可以一起用")
     _args = ap.parse_args()
     if _args.from_reports and _args.dump_reports:
         ap.error("--from-reports 是讀存檔評分、--dump-reports 是跑管線存檔,不能同時用")
     if _args.from_reports and _args.dry_run:
         ap.error("--from-reports 本來就不呼叫 LLM,不需要也不該再加 --dry-run"
                  "(--dry-run 會跳過 LLM 之後的斷言,等於把存檔的價值丟掉)")
+    if _args.frozen_testdata and _args.dry_run:
+        ap.error("--dry-run 不會跑到測資生成(spec_exec 整段都跳過),"
+                 "加 --frozen-testdata 沒有效果")
     sys.exit(asyncio.run(run(_args)))
