@@ -185,13 +185,26 @@ def _shape_check(plan: dict) -> tuple[dict, list[str], list[dict]]:
 
 
 async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
-                         profile_name: str | None = None) -> tuple[dict, list[str], list[dict]]:
-    """角色一:LLM 依 spec 生成測資計畫,含一次重試;回傳 (plan, gaps, dropped)。"""
+                         profile_name: str | None = None,
+                         max_attempts: int = 3) -> tuple[dict, list[str], list[dict]]:
+    """角色一:LLM 依 spec 生成測資計畫,回傳 (plan, gaps, dropped)。
+
+    只要有合法案例就接受、不管 coverage_gaps 是否為空,曾經是這裡的行為——
+    但單次 LLM 取樣的覆蓋度本身會飄(同一份規格、同一個 prompt,不同次呼叫
+    可能拆出不同數量的條件與案例)。只在「解析失敗/零案例」才重試,等於把
+    這次取樣抽到的覆蓋度直接當結果收下,抽到不完整的就是不完整的結果。
+
+    所以現在 coverage_gaps 非空也算「這次不夠好」,一樣觸發重試;多次嘗試中
+    留**覆蓋缺口最少**的一版當候選,直到抽到 0 缺口才提前結束。仍然抽不到
+    0 缺口時,回傳嘗試過的最佳結果(而不是最後一次、也不是直接判定失敗)——
+    覆蓋不完整要如實反映在 coverage_gaps 裡,由後續判斷是否需要人工確認,
+    不能因為「retry 用完了」就悄悄退化成沒案例。"""
     system = TESTGEN_SYSTEM.replace("{win_start}", WIN_START).replace("{win_end}", WIN_END)
     user = f"規則 {spec_code} 的核定規格如下,請產出測資計畫 JSON:\n\n{spec_text}"
     profile = cfg.role_profile("testgen") if profile_name is None else cfg.profile(profile_name)
     llm_error = None
-    for attempt in range(2):
+    best: tuple[dict, list[str], list[dict]] | None = None
+    for attempt in range(max_attempts):
         try:
             raw = await run_agent(cfg, profile, system, user, hub=None,
                                   use_tools=False, verbose=False)
@@ -202,11 +215,17 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
         if plan:
             cleaned, gaps, dropped = _shape_check(plan)
             if cleaned["cases"]:
-                return cleaned, gaps, dropped
-        user = (f"上一次輸出無法解析或沒有任何合法案例,請重新只輸出符合格式的 JSON。\n\n"
+                if not gaps:
+                    return cleaned, gaps, dropped   # 這次抽到完整覆蓋,不用再試
+                if best is None or len(gaps) < len(best[1]):
+                    best = (cleaned, gaps, dropped)
+        user = (f"上一次輸出無法解析、沒有任何合法案例,或覆蓋不完整,"
+                f"請重新輸出**完整覆蓋每個條件 true/false 兩向**的 JSON。\n\n"
                 f"規則 {spec_code} 規格:\n{spec_text}")
+    if best is not None:
+        return best
     reason = (f"測資生成失敗(LLM 呼叫失敗:{llm_error})" if llm_error
-              else "測資生成失敗(兩次皆無合法輸出)")
+              else f"測資生成失敗({max_attempts} 次嘗試皆無合法輸出)")
     return {"schema_ddl": [], "conditions": [], "cases": []}, [reason], []
 
 

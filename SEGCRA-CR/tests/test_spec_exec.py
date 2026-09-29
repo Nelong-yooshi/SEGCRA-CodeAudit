@@ -20,11 +20,12 @@
   6. 仲裁 LLM 掛掉時保守倒向「SQL 錯」(寧可誤報待人工,不可誤放)。
 """
 import asyncio
+import json
 
 import pytest
 
 from orchestrator import spec_exec
-from orchestrator.spec_exec import _shape_check, extract_rule_codes, run_spec_exec
+from orchestrator.spec_exec import _shape_check, extract_rule_codes, generate_cases, run_spec_exec
 
 
 def _case(cid, cond, direction, flagged=True, table="transactions"):
@@ -102,6 +103,87 @@ def test_沒有合法_DDL_算缺口():
 def test_整份計畫不是物件時不炸():
     plan, gaps, _ = _shape_check("這不是 JSON 物件")
     assert plan["cases"] == [] and gaps
+
+
+# ─────────────────── 測資生成的重試(覆蓋不完整也要重試) ───────────────────
+#
+# 背景:舊行為只要解析出任何合法案例就直接收下,不管 coverage_gaps 是不是空的。
+# 同一份規格、同一個 prompt,不同次呼叫可能拆出不同數量的條件與案例——單次取樣
+# 抽到不完整覆蓋,舊版就把那次不完整的結果直接當成生成完成,不會再試。
+
+class _FakeCfg:
+    """只需要 role_profile 回傳一個有 model / temperature 等欄位的東西。"""
+    def role_profile(self, role):
+        from orchestrator.config import ModelProfile
+        return ModelProfile(model="fake", num_ctx=1024, temperature=0,
+                            max_output_tokens=256)
+
+
+def _raw(plan):
+    return json.dumps(plan)
+
+
+def test_第一次覆蓋不完整_補齊後就採用補齊的那版(monkeypatch):
+    incomplete = _plan([_case("C1-T", "C1", "true")])                        # 缺 false 向
+    complete = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)])
+    calls = [_raw(incomplete), _raw(complete)]
+
+    async def fake_run_agent(*a, **kw):
+        return calls.pop(0)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    plan, gaps, dropped = asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容"))
+    assert gaps == []
+    assert len(plan["cases"]) == 2
+    assert calls == [], "第一次不完整,必須觸發第二次呼叫"
+
+
+def test_多次都沒抽到完整覆蓋時保留缺口最少的一版(monkeypatch):
+    """三次都沒抽到 0 缺口——不能因為「試完了」就退化成空案例,也不能只認最後一次
+    (最後一次剛好抽差也要收較好的那次),要保留看過的裡面缺口最少的。"""
+    worse = _plan([_case("C1-T", "C1", "true")], conditions=("C1", "C2"))       # 3 個缺口
+    better = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False),
+                    _case("C2-T", "C2", "true")], conditions=("C1", "C2"))       # 1 個缺口
+    calls = [_raw(worse), _raw(better), _raw(worse)]
+
+    async def fake_run_agent(*a, **kw):
+        return calls.pop(0)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    plan, gaps, dropped = asyncio.run(
+        generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=3))
+    assert len(gaps) == 1
+    assert len(plan["cases"]) == 3, "留下的應該是缺口較少的 better,不是最後一次的 worse"
+    assert calls == [], "三次都沒抽到 0 缺口,應該用完全部嘗試次數"
+
+
+def test_全部嘗試都沒有合法案例才真的失敗(monkeypatch):
+    async def fake_run_agent(*a, **kw):
+        return "這次模型完全沒輸出 JSON"
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    plan, gaps, dropped = asyncio.run(
+        generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=2))
+    assert plan["cases"] == []
+    assert len(gaps) == 1 and "測資生成失敗" in gaps[0]
+    assert "2" in gaps[0], "失敗原因要帶出試了幾次,方便回溯"
+
+
+def test_LLM_呼叫失敗後仍能在下次成功時採用完整結果(monkeypatch):
+    """第一次連線失敗、第二次才拿到完整覆蓋——不能因為中途掛過一次就整體判失敗。"""
+    complete = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)])
+    calls = [ConnectionError("gate 連不到上游"), _raw(complete)]
+
+    async def fake_run_agent(*a, **kw):
+        nxt = calls.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    plan, gaps, dropped = asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容"))
+    assert gaps == []
+    assert len(plan["cases"]) == 2
 
 
 # ─────────────────── 規則碼抽取 ───────────────────
