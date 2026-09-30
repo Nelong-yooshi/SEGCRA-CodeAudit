@@ -9,6 +9,10 @@
 只做這一件事:呼叫真的 `generate_cases()`(不經任何快取),印出結果,
 再決定要不要存檔。凍結是人主動觸發的動作,不是自動發生的——不然凍住的
 可能是一次不完整的取樣,而且不會有人注意到 golden set 從此少測了幾個條件。
+
+**存檔後請 commit**:凍結檔與 `eval/golden/`、`specs/` 同類,是受測內容本身
+(理由見 `eval/testdata_cache.py`)。它也已列入 baseline 指紋,換了凍結檔
+兩份 baseline 就不可比——這正是它該被看見、該進 PR 的原因。
 """
 import argparse
 import asyncio

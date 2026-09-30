@@ -15,6 +15,13 @@
 凍結檔存在 eval/testdata_cache/<規則碼>.json,以規格內容的雜湊當快取鍵——
 規格改過,雜湊對不上,自動視為沒有凍結(不會用到過期的測資計畫)。
 
+**凍結檔要進版控**(與 `eval/golden/`、`specs/` 同類,不是暫存檔):
+  * 大家吃同一批案例,跑出來的數字才能互相比較;各自凍各自的等於各量各的
+  * 「這條規則以後都用這批案例驗」值得有人看過——進版控才進得了 PR
+  * 因此它也是**受測內容本身**,已列入 baseline 指紋的 `testset.frozen`
+    (`eval/preflight.py:check_testset`):換了凍結檔,兩份 baseline 不可比。
+    沒凍結任何規格時 `frozen_count` 為 0,不影響既有 baseline。
+
 只在呼叫端明確套用 wrap() 時才生效(見 run_eval.py 的 --frozen-testdata),
 不改 orchestrator/spec_exec.py 本身,正式審查管線的行為不受影響。
 """

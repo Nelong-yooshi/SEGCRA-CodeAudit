@@ -77,6 +77,10 @@ INCOMPARABLE = [
     # (改程式碼正是回歸比較要量的東西),所以這件事沒有別的欄位擋得住。
     ("testset", "golden", "golden set 改了(新增/刪除/修改 case,量的不是同一組輸入)"),
     ("testset", "specs", "規格檔改了(規格是測資生成的唯一輸入,改了測資就會變)"),
+    # 凍結的測資計畫(eval/freeze_testdata.py 存的)在 --frozen-testdata 模式下
+    # **直接取代**測資生成的產出,就是拿去驗 SQL 的那批案例——比 specs 更直接地
+    # 就是「受測內容本身」。換了凍結檔,執行驗證驗的案例就不同了。
+    ("testset", "frozen", "凍結的測資計畫改了(--frozen-testdata 驗的就是這批案例)"),
 ]
 
 
@@ -143,16 +147,24 @@ def check_testset() -> Check:
     `code.sha` 刻意不列入不可比;但 golden set 與 `specs/` 是**受測內容本身**,
     改了它們,兩份 baseline 量的就不是同一把尺,數字不該相減。
 
+    `eval/testdata_cache/` 的凍結測資計畫同理,而且更直接:`--frozen-testdata`
+    模式下它**取代**測資生成的產出,就是拿去驗 SQL 的那批案例。沒凍結任何規格時
+    數量為 0、雜湊固定,不影響既有 baseline 的可比性。
+
     只給 ok/warn,不中止——換測資集是正常的工作,只是換了就不能跟舊的比。
     """
     g_hash, g_n = _dir_digest(PKG_ROOT / "eval" / "golden", "mr_*.json")
     s_hash, s_n = _dir_digest(PKG_ROOT / "specs", "*.md")
+    f_hash, f_n = _dir_digest(PKG_ROOT / "eval" / "testdata_cache", "*.json")
     data = {"golden": g_hash, "golden_count": g_n,
-            "specs": s_hash, "specs_count": s_n}
+            "specs": s_hash, "specs_count": s_n,
+            "frozen": f_hash, "frozen_count": f_n}
+    frozen_desc = f"、凍結測資 {f_n} 份({f_hash})" if f_n else ""
     if not g_n:
         return Check("測資集", "warn", "golden set 是空的", data)
     return Check("測資集", "ok",
-                 f"golden set {g_n} 個 case({g_hash})、規格 {s_n} 份({s_hash})", data)
+                 f"golden set {g_n} 個 case({g_hash})、規格 {s_n} 份({s_hash})"
+                 + frozen_desc, data)
 
 
 def check_code() -> Check:

@@ -744,3 +744,39 @@ def test_測資集的雜湊看內容不看時間(tmp_path):
     (d / "mr_103.json").write_text('{"c": 3}', encoding="utf-8")
     h3, n3 = preflight._dir_digest(d, "mr_*.json")
     assert n3 == 3 and h3 != h1
+
+
+def test_改了凍結的測資計畫兩份_baseline_也不可比():
+    """`--frozen-testdata` 模式下,凍結檔**取代**測資生成的產出——它就是拿去驗 SQL
+    的那批案例,比 `specs/` 更直接地是「受測內容本身」。
+
+    換一份凍結檔,執行驗證驗的案例就變了:同一支 SQL 可能因為新那批案例多驗了
+    一個邊界而由通過變成不通過。那是「換了尺」,不是「品質退步」,兩份數字不該相減。
+    """
+    base = _fp()
+    base["testset"] = {"golden": "aaaaaaaaaaaa", "golden_count": 34,
+                       "specs": "bbbbbbbbbbbb", "specs_count": 7,
+                       "frozen": "cccccccccccc", "frozen_count": 2}
+
+    changed = {**base, "testset": {**base["testset"], "frozen": "dddddddddddd"}}
+    diffs = preflight.compare_fingerprint(base, changed)
+    assert any("frozen" in d for d in diffs), "換了凍結的測資計畫卻判成可比"
+
+
+def test_沒凍結任何測資時不影響既有的可比性():
+    """凍結是選用功能。沒用它的人(frozen_count=0、空目錄的固定雜湊)不該因為
+    這個欄位被加進指紋,就跟自己之前的 baseline 變成不可比。"""
+    base = _fp()
+    base["testset"] = {"golden": "aaaaaaaaaaaa", "golden_count": 34,
+                       "specs": "bbbbbbbbbbbb", "specs_count": 7,
+                       "frozen": preflight._dir_digest(Path("/nonexistent"), "*.json")[0],
+                       "frozen_count": 0}
+    same = {**base, "testset": dict(base["testset"])}
+    assert not [d for d in preflight.compare_fingerprint(base, same) if "frozen" in d]
+
+
+def test_凍結目錄不存在時不炸():
+    """凍結是選用功能,絕大多數 repo 狀態下這個目錄根本不存在;
+    preflight 是跑批的前置檢查,不能因為一個選用功能沒用就中止整輪。"""
+    h, n = preflight._dir_digest(Path("/nonexistent/testdata_cache"), "*.json")
+    assert n == 0 and h, "目錄不存在應回 (空目錄雜湊, 0),不是丟例外"
