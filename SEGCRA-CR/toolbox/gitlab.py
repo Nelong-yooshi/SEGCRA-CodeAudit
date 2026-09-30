@@ -3,9 +3,13 @@
 兩種模式(以環境變數切換):
 - mock(預設):MR 從 fixtures/*.json 讀,post_* 寫到 review_output/,離線 demo 用
 - real:設定 GITLAB_URL + GITLAB_TOKEN + GITLAB_PROJECT 後走 GitLab REST API v4
+
+打包下載(download_archive,#15)另外需要 GITLAB_READ_TOKEN(唯讀),見該函式說明。
 """
 import json
 import os
+import re
+import time
 from pathlib import Path
 
 PKG_ROOT = Path(__file__).resolve().parent.parent
@@ -16,6 +20,8 @@ GITLAB_URL = os.environ.get("GITLAB_URL", "")          # e.g. http://localhost:8
 GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "")
 GITLAB_PROJECT = os.environ.get("GITLAB_PROJECT", "")  # project id 或 URL-encoded path
 REAL_MODE = bool(GITLAB_URL and GITLAB_TOKEN and GITLAB_PROJECT)
+# 專案層級的唯讀 token(read_repository),只給打包下載用(#15 條件 1)
+GITLAB_READ_TOKEN = os.environ.get("GITLAB_READ_TOKEN", "")
 
 
 # --- real mode helpers ---------------------------------------------------
@@ -53,6 +59,80 @@ def _api_pages(path: str, params: dict | None = None) -> tuple[list, bool]:
         nxt = r.headers.get("X-Next-Page", "").strip()
         page = int(nxt) if nxt else 0
     return items, bool(page)
+
+
+# --- 打包下載(#15)------------------------------------------------------
+
+# 完整的 commit 編號(SHA-1 40 位或 SHA-256 64 位,小寫)。不接受分支名:分支在審查
+# 中途可能被推新 commit,抓到的就不是被審的那一版(#15 條件 8)
+_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+# 打包的子目錄:只接受英數與 _ . -,以 / 分段(不接受 ..、開頭的 /、空白、URL 字元)
+_ARCHIVE_PATH = re.compile(r"[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)*")
+ARCHIVE_DEADLINE_S = 120          # 整次下載的時間上限(防伺服器慢慢送、把審查卡住)
+
+
+class ArchiveDownloadError(Exception):
+    """打包下載失敗。訊息是固定文字,不含 token、URL、回應內容。"""
+
+
+def download_archive(sha: str, path: str = "", *, max_bytes: int) -> bytes:
+    """以 GitLab `/repository/archive.tar.gz` 取回某個 commit 的程式碼(tar.gz 原始位元組)。
+
+    **這不是給模型用的工具**:刻意不放進 orchestrator/tool_hub.py 的 TOOL_GROUPS。
+    模型能自己決定下載哪個 commit 的哪個目錄,等於讓 MR 內容操控審查機去抓任意程式碼。
+
+    sha        MR 的 head commit(完整編號,不接受分支名)
+    path       只取這個子目錄;空字串 = 整個 repo(舊版 GitLab 不支援 path 參數時)
+    max_bytes  壓縮檔大小上限,超過就中止(呼叫端傳 archive.MAX_COMPRESSED_BYTES)
+
+    權限:只用 GITLAB_READ_TOKEN(唯讀),**不退回用 GITLAB_TOKEN**——那把有寫入權,
+    #15 條件 1 要求兩者分開。缺了就失敗,由呼叫端交人工。
+    回傳內容仍是不可信的,必須交給 orchestrator/archive.py 的 extract_archive() 解。
+    任何失敗都丟 ArchiveDownloadError,訊息不含 token、URL 或回應內容。
+    """
+    if not (GITLAB_URL and GITLAB_PROJECT and GITLAB_READ_TOKEN):
+        raise ArchiveDownloadError(
+            "未設定 GITLAB_URL、GITLAB_PROJECT 或 GITLAB_READ_TOKEN,無法打包下載")
+    if not isinstance(sha, str) or not _SHA.fullmatch(sha):
+        raise ArchiveDownloadError("sha 必須是完整的 commit 編號(40 或 64 位小寫十六進位)")
+    if not isinstance(path, str) or (path and (
+            not _ARCHIVE_PATH.fullmatch(path)
+            or any(p in (".", "..") for p in path.split("/")))):
+        raise ArchiveDownloadError("打包的子目錄名稱不合法")
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+        raise ArchiveDownloadError("必須指定正整數的下載大小上限")
+    params = {"sha": sha, **({"path": path} if path else {})}
+    import httpx
+    buf = bytearray()
+    deadline = time.monotonic() + ARCHIVE_DEADLINE_S
+    try:
+        with httpx.stream(
+                "GET", f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}/repository/archive.tar.gz",
+                params=params,
+                # 要求不做傳輸層壓縮:否則 httpx 會先自動解開,一個小封包可能在我們
+                # 計算大小之前就在記憶體裡膨脹(下面也只讀原始位元組)
+                headers={"PRIVATE-TOKEN": GITLAB_READ_TOKEN, "Accept-Encoding": "identity"},
+                # 不跟隨轉址:自訂的 PRIVATE-TOKEN 標頭可能被帶到別的主機
+                follow_redirects=False, timeout=30) as r:
+            if r.status_code != 200:
+                raise ArchiveDownloadError(f"GitLab 回應 HTTP {r.status_code}")
+            if r.headers.get("Content-Encoding", "identity").lower() != "identity":
+                raise ArchiveDownloadError("GitLab 回應使用了傳輸層壓縮,拒絕處理")
+            declared = r.headers.get("Content-Length", "")
+            if declared.isdigit() and int(declared) > max_bytes:
+                raise ArchiveDownloadError(f"壓縮檔超過 {max_bytes} 位元組上限")
+            for chunk in r.iter_raw():
+                buf += chunk
+                if len(buf) > max_bytes:
+                    raise ArchiveDownloadError(f"壓縮檔超過 {max_bytes} 位元組上限")
+                if time.monotonic() > deadline:
+                    raise ArchiveDownloadError(f"下載超過 {ARCHIVE_DEADLINE_S} 秒上限")
+    except ArchiveDownloadError:
+        raise
+    except Exception as e:
+        # httpx 的例外訊息可能帶 URL;只留類型
+        raise ArchiveDownloadError(f"下載失敗({type(e).__name__})") from None
+    return bytes(buf)
 
 
 # --- mock mode helpers ---------------------------------------------------
