@@ -937,3 +937,67 @@ def test_fuzz_invariants(seed):
         model_paths = [p for p in files if p.startswith("models/") and p.endswith(".sql")]
         _assert_report_invariants(report, model_paths)
         assert report == analyze_macro_impact(files, list(reversed(changed)), base_files=base)
+
+
+# ------------------------------------------------ 隨機專案差異測試(dbt 為準)
+# tests/fixtures/dbt_manifest/random_projects.json:固定種子產生的 dbt 專案,每個都讓
+# dbt 實際解析過,存下「完整檔案內容 + dbt 判定的依賴」。這裡不需要安裝 dbt,直接拿
+# dbt 的判定當標準答案:**dbt 認為受影響的 model,反查必須全部判為確定受影響**。
+RANDOM_PROJECTS = json.loads(
+    (pathlib.Path(__file__).resolve().parent / "fixtures" / "dbt_manifest"
+     / "random_projects.json").read_text(encoding="utf-8"))
+
+
+def _random_local(names, project):
+    """dbt 的依賴是 "專案名.macro名";只留本專案的 macro 名稱。"""
+    prefix = project + "."
+    return {n[len(prefix):] for n in names if n.startswith(prefix)}
+
+
+def _random_dbt_expected(deps: dict, macro_file: str, project: str):
+    """依 dbt 的依賴圖算出:改了 macro_file 後,dbt 認為受影響的 model 與是否動到 hook。"""
+    macros = deps["macros"]
+    closure = {name for name, m in macros.items() if m["path"] == macro_file}
+    grew = True
+    while grew:                                       # 間接呼叫:呼叫到 closure 的 macro 也算
+        grew = False
+        for name, m in macros.items():
+            if name not in closure and _random_local(m["macros"], project) & closure:
+                closure.add(name)
+                grew = True
+    models = {path for path, m in deps["models"].items()
+              if _random_local(m["macros"], project) & closure}
+    hook = any(_random_local(op["macros"], project) & closure for op in deps["operations"].values())
+    return models, hook
+
+
+def _random_cases():
+    for i, proj in enumerate(RANDOM_PROJECTS["projects"]):
+        for macro_file in sorted({m["path"] for m in proj["deps"]["macros"].values()}):
+            yield pytest.param(i, macro_file, id=f"p{i}-{macro_file}")
+
+
+def test_random_projects_fixture_is_not_empty():
+    """fixture 被清空或格式改變時,下面的參數化測試會變成 0 條而靜靜通過——先擋下。"""
+    assert RANDOM_PROJECTS["seed"] and len(RANDOM_PROJECTS["projects"]) >= 5
+    assert sum(1 for _ in _random_cases()) >= 20
+
+
+@pytest.mark.parametrize("index, macro_file", list(_random_cases()))
+def test_random_project_matches_dbt(index, macro_file):
+    proj = RANDOM_PROJECTS["projects"][index]
+    project = RANDOM_PROJECTS["project"]
+    files = proj["files"]
+    expected, hook = _random_dbt_expected(proj["deps"], macro_file, project)
+
+    report = analyze_macro_impact(files, [macro_file], base_files=files)
+    certain = {a.path for a in report.affected_models if a.certain}
+
+    assert not (expected - certain), "漏判:dbt 判定受影響,反查沒有列為確定受影響"
+    if hook:
+        # 專案 hook 會在每次 dbt 執行時跑,影響範圍是全部 model:標為不確定、保守列全部
+        assert report.all_models_possibly_affected, "改到專案 hook 用的 macro,應判為可能影響全部"
+        assert all("hook" in u for u in report.uncertain), report.uncertain
+    else:
+        assert not report.uncertain, f"產生器只用 dbt 解析得過的寫法,不該有不確定:{report.uncertain}"
+        assert not report.all_models_possibly_affected

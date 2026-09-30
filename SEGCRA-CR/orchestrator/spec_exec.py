@@ -2,9 +2,13 @@
 
 MR 的 SQL 不只要「看起來對」,還要「跑起來對」。流程:
 
-  0. 找 spec(確定性):從 MR 抓規則碼 R-xxx → 對應 specs/<code>.md。
+  0. 找 spec(確定性):從 MR 抓規則碼 R-xxx → 對應 specs/<code>.md;完全沒有
+     R 編號、且 config 的 dbt.enabled 開啟時(dbt model 常見情境),改依 model
+     檔名對應(見 dbt_impact.resolve_spec,#7 第 2 點)。
      **找不到 spec = major finding「無規格可驗」→ 一律 needs_human**
      (「必跑」的意思:不是沒 spec 就跳過,而是沒 spec 就不能自動放行)。
+     SQL 是 dbt 樣板時不送進沙盒(原樣執行只會得到語法錯誤,不代表程式有錯),
+     改回報「尚未支援樣板的執行驗證」→ 一律 needs_human。
   1. 角色一 測資生成 agent(LLM):讀 spec → 產出 schema DDL + 原子條件清單 +
      逐條件 true/false 兩向 + 邊界值的測資案例(嚴格 JSON)。
      生成後做**確定性形狀/覆蓋檢查**(缺的列入 coverage_gaps)。
@@ -46,9 +50,17 @@ def extract_rule_codes(mr: dict) -> list[str]:
     return sorted(set(_RULE_CODE.findall(text)))
 
 
-async def find_spec(hub, mr: dict) -> tuple[str | None, str | None]:
+async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None, str | None]:
     """回傳 (rule_code, spec_text)。mock 模式讀本地 specs/;real 模式用
-    gitlab get_file 抓 repo 內 specs/<code>.md。都找不到 → (code|None, None)。"""
+    gitlab get_file 抓 repo 內 specs/<code>.md。都找不到 → (code|None, None)。
+
+    R 編號的比對邏輯不變(即使多個編號都對到既有規格,一律取第一個找到的)。
+    by_path 為 True **且完全沒有** R 編號時,才改依 model 檔名對應規格:
+      * by_path 由呼叫端依 config 的 dbt.enabled 傳入,**預設 False**——跟展開器
+        同一個開關,合併後正式審查的行為完全不變,確認後才一起開
+      * 只在沒有 R 編號時才試,避免蓋掉「MR 提到了編號、但規格真的不存在」
+        這種需要如實回報成「無規格」的情況
+    """
     codes = extract_rule_codes(mr)
     for code in codes:
         local = SPECS_DIR / f"{code}.md"
@@ -63,7 +75,51 @@ async def find_spec(hub, mr: dict) -> tuple[str | None, str | None]:
                 continue
             if txt and txt.lstrip().startswith("#"):
                 return code, txt
+    if by_path and not codes:
+        found = await _find_spec_by_path(hub, mr)
+        if found is not None:
+            return found
     return (codes[0] if codes else None), None
+
+
+async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
+    """依 model 檔名對應規格(dbt_impact.resolve_spec)。只由 find_spec() 在完全
+    沒有 R 編號時呼叫,找不到回 None。
+
+    查找順序與上面 R 編號那段相同:**先查本機 specs/,再問 GitLab**。管線呼叫時
+    hub 一定存在,所以本機這段不能只在 hub 為 None 時才走,否則 mock 模式(demo、
+    golden set)永遠找不到本機規格。
+      * 本機:列得出 specs/ 底下實際有哪些檔,拿到 resolve_spec 的完整語意
+        (大小寫落差不採用、多個候選不自行擇一)
+      * GitLab:目前沒有列目錄的工具(見 docs/09-dbt展開與反查.md 的已知限制),
+        改成逐一探測候選路徑——跟 R 編號的做法一致,不新增任何 API 面
+    """
+    from .dbt_impact import resolve_spec   # 延遲匯入,避免無關呼叫端多背一份相依
+
+    paths = [f["path"] for f in mr.get("files", []) if f.get("path")]
+    if not paths:
+        return None
+
+    available = ([f"specs/{p.name}" for p in SPECS_DIR.glob("*.md") if p.is_file()]
+                 if SPECS_DIR.is_dir() else [])
+    for path in paths:
+        match = resolve_spec(path, available)
+        if match.spec_path:
+            local = SPECS_DIR / match.spec_path.rsplit("/", 1)[-1]
+            if local.is_file():   # available 就是列這個目錄得來的,理論上必成立
+                return local.stem, local.read_text(encoding="utf-8")
+
+    if hub is None:
+        return None
+    for path in paths:
+        for candidate in resolve_spec(path, ()).candidates:   # 只要候選路徑,不比對存在與否
+            try:
+                txt = await hub.call("gitlab__get_file", {"path": candidate}, truncate=False)
+            except Exception:
+                continue
+            if txt and txt.lstrip().startswith("#"):
+                return candidate.rsplit("/", 1)[-1][:-len(".md")], txt
+    return None
 
 
 # ------------------------------------------------------------------ 1. 測資生成
@@ -374,7 +430,9 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
         sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or sql
 
     if spec_text is None:
-        spec_code, spec_text = await find_spec(hub, mr)
+        # getattr:呼叫端可能傳測試用的替身 cfg(沒有 dbt 欄位),視為未開啟
+        spec_code, spec_text = await find_spec(
+            hub, mr, by_path=(getattr(cfg, "dbt", None) or {}).get("enabled") is True)
 
     if not spec_text:
         detail = (f"MR 涉及規則 {spec_code},但找不到對應的規格檔 specs/{spec_code}.md。"
@@ -391,6 +449,24 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                 "coverage_gaps": [], "case_results": [], "dropped_cases": [],
                 "findings": [_finding(path, "major", "執行驗證無法進行:MR 無可執行的 SQL",
                                       "無法從 diff/檔案內容還原 SQL。")]}
+
+    from .dbt_render import is_dbt_template   # 延遲匯入,與上面 find_spec 的作法一致
+    if is_dbt_template(sql):
+        # 樣板原樣送進沙盒只會得到語法錯誤,接著回報成「SQL 無法在測資上執行、請修正
+        # SQL」——錯誤地指控開發者的程式壞了,還白白燒掉測資生成的 LLM 呼叫。
+        # 展開後再執行需要把 ref()/source() 對到沙盒每次建立的資料庫與測資表名,
+        # 尚未支援(docs/09 已知限制),所以直接如實回報,不自動放行。
+        # 保守的一側:純 SQL 的字串常量裡剛好出現 {{ / {% 也會被擋下 → needs_human。
+        return {"passed": False, "spec_code": spec_code, "conditions": [],
+                "coverage_gaps": [], "case_results": [], "dropped_cases": [],
+                "dbt_template": True,
+                "findings": [_finding(
+                    path, "major", "執行驗證無法進行:dbt 樣板尚未支援執行驗證",
+                    "此檔含 dbt / Jinja 樣板標記,原樣送進 MS SQL 沙盒只會得到語法錯誤,"
+                    "不代表程式有誤。展開後的 SQL 要在沙盒執行,需要把 ref()/source() "
+                    "對應到沙盒的資料庫與測資表名,目前尚未支援。未經執行驗證,"
+                    "本 MR 不得自動放行。",
+                    "請人工依核定規格核對實作邏輯。")]}
 
     findings, dropped_cases = [], []
 
