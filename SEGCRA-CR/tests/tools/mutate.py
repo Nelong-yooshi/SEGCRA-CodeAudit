@@ -698,5 +698,25 @@ def _mutate_all(args, src: pathlib.Path) -> int:
     return 1 if survived or config_errors else 0
 
 
+# ---- 測資生成的覆蓋度重試(spec_exec)
+# 這道防線的失效是**靜默**的:覆蓋不完整的測資照樣跑得完、報告看起來正常,
+# 只是執行驗證少驗了幾個條件。沒有突變點的話,測試是不是真的守著它無從得知。
+S = "spec_exec.py"
+MUTANTS.update({
+    "測資:有缺口也直接收下(回到舊行為)": (S,
+        "                if not gaps:\n"
+        "                    return cleaned, gaps, dropped   # 這次抽到完整覆蓋,不用再試",
+        "                if True:\n"
+        "                    return cleaned, gaps, dropped"),
+    "測資:不留缺口最少的一版(只認最後一次)": (S,
+        "                if best is None or len(gaps) < len(best[1]):\n"
+        "                    best = (cleaned, gaps, dropped)",
+        "                best = (cleaned, gaps, dropped)"),
+    "測資:重試用完就判失敗(丟掉已抽到的最佳版)": (S,
+        "    if best is not None:\n        return best",
+        "    if False:\n        return best"),
+})
+
+
 if __name__ == "__main__":
     sys.exit(main())
