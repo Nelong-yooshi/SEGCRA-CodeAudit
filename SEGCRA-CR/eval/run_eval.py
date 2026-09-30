@@ -29,6 +29,7 @@ import json
 import os
 import re
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 EVAL_DIR = Path(__file__).resolve().parent
@@ -163,6 +164,29 @@ def spec_desc(spec: dict) -> str:
     if "title_contains_any" in spec:
         bits.append("|".join(spec["title_contains_any"]))
     return "/".join(bits) or "(任意)"
+
+
+# dbt 接線開啟時的約定資料庫假名。正式環境由環境變數 SEGCRA_DBT_DATABASE 提供;
+# 這裡的後備值只給 golden set 用(評測不連任何資料庫,這個名字只會被拼進展開後的
+# 表名字串)。#16 會把這個約定值收成程式裡的共用常數,屆時改成 import。
+_DBT_PLACEHOLDER_DB = "DBT_PLACEHOLDER"
+
+
+def case_config(cfg, golden: dict):
+    """`_golden.dbt_enabled` 的 case 用「開啟 dbt 接線」的設定跑,其餘 case 原樣。
+
+    **不動 `config/models.yaml` 的預設值**:`dbt.enabled: false` 是 #14 刻意的安全
+    預設,改它等於把正式審查的行為一起改掉,而 golden set 只是想讓某幾個 case
+    走到那條路。所以這裡只換一份 Config 複本,影響範圍僅限這個 case。
+
+    目前唯一需要它的是**規格依 model 檔名對應**(`mrt_RETAIL_M1.sql` →
+    `specs/RETAIL_M1.md`):真實規則沒有 R 編號,不開這個開關就一律「無規格可驗」。
+    """
+    if not golden.get("dbt_enabled"):
+        return cfg
+    return replace(cfg, dbt={"enabled": True,
+                             "database": os.environ.get("SEGCRA_DBT_DATABASE")
+                             or _DBT_PLACEHOLDER_DB})
 
 
 def read_signal(report: dict, key: str):
@@ -337,7 +361,8 @@ async def run(args) -> int:
             if args.from_reports:
                 report = load_saved_report(Path(args.from_reports), mr_id)
             else:
-                report = await review_mr(cfg, mr_id, args.profile, dry_run=args.dry_run)
+                report = await review_mr(case_config(cfg, golden), mr_id, args.profile,
+                                         dry_run=args.dry_run)
         except Exception as e:  # noqa: BLE001 - 蒐集所有失敗原因,不預設種類
             errors.append((mr_id, layer, f"{type(e).__name__}: {e}"))
             st = layer_stat.setdefault(layer, {"pass": 0, "fail": 0, "gap": 0, "error": 0})

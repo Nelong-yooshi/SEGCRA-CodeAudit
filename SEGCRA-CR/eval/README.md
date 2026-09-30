@@ -241,6 +241,35 @@ id 依層分段:`1xx` 注入、`2xx` rule-base、`3xx` binding、`4xx` spec_exec
 
 每層刻意成對:**一個該抓的 + 一個不該吵的**,兩側都量得到才有意義。
 
+### 真實程式形狀(`7xx`,新增中)
+
+上面 `1xx`~`6xx` 的 case 都是 10~20 行的簡化 SQL,與正式環境有結構性落差:真實規則
+是 dbt model,`dbt compile` 展開後是 200 行、多層 CTE、視窗函式、OR-of-ANDs 的
+三組條件。**簡化 SQL 上量到的準確率,不能代表真實程式上的準確率**,這一層補的就是
+這個缺口(對應 issue #8 §3)。
+
+| case | 驗什麼 |
+|---|---|
+| `mr_701` | **正向對照(真實形狀)**:`dbt compile` 的實際輸出(200 行/4 層 CTE/20 項門檻),與 `specs/RETAIL_M1.md` 逐條相符 → 不得產生 blocker/major。同時是 spec 依 **model 檔名**對應(`mrt_RETAIL_M1.sql` → `specs/RETAIL_M1.md`)唯一的端到端 case |
+
+> **尚未實測**:`mr_701` 目前只跑過確定性的部分(規格對應、預掃、`prepare_sql`,
+> 見 `tests/test_golden_real_shape.py` 的 7 條測試)。端到端行為要模型 + MS SQL 沙盒
+> 才驗得完,所以它**還沒被計入上面那張實測結果表**——表裡的 32 個 case 是實際跑過
+> 的數字,不把沒跑過的混進去。
+>
+> **`dbt_enabled` 標記**:真實規則沒有 R 編號,規格只能依 model 檔名對應,而那條路
+> 由 `dbt.enabled` 控制(#14 的安全預設是關閉)。標了 `_golden.dbt_enabled` 的 case
+> 由 `run_eval.py` 的 `case_config()` 單獨換一份設定跑,**不動 `config/models.yaml`
+> 的預設值**——改預設等於把正式審查的行為一起改掉。
+>
+> **已知缺口(不是這個 case 的問題,是管線的)**:`dbt compile` 的輸出一定帶三段式
+> 表名(`"<database>"."<schema>"."<表>"`),但執行驗證的沙盒把測資建在隨機命名的
+> `segcra_sbx_*` 資料庫、表名是規格 DDL 的單純名稱,兩邊對不起來會以
+> 「Invalid object name」失敗。而「先 `dbt compile` 再送進管線」正是 README 寫的
+> **正式流程**,所以這不只是評測的問題。`mr_701` 目前是靠改寫表名繞過;真正的修法
+> (沙盒以同名資料庫承接,或在 `prepare_sql` 剝掉限定詞)要單獨設計與審。
+> 現況由 `tests/test_golden_real_shape.py` 釘住,實作了會變紅提醒回來拿掉繞道。
+
 > 標記 `known_gap` 的 case(`mr_102`、`mr_403`、`mr_408`)見下方
 > 「三個已知缺口」——斷言照跑照顯示,但不計入失敗,以免有人為了讓套件變綠而刪掉它們。
 
