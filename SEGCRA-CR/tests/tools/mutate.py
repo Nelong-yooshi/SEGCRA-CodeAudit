@@ -70,8 +70,10 @@ MUTANTS = {
         "    if not isinstance(value, str) or not _IDENT.fullmatch(value):",
         "    if False:"),
     "source() 忽略白名單": (
-        '        _check_ident("來源", source_name)\n        return relation(table_name)',
-        "        return f'\"{database}\".\"{schema}\".\"{table_name}\"'"),
+        '        _check_ident("來源", source_name)\n        _check_ident("表", table_name)\n'
+        "        if project is None:\n            return relation(table_name)",
+        "        if project is None:\n"
+        "            return f'\"{database}\".\"{schema}\".\"{table_name}\"'"),
     "允許 macro 覆寫內建": (
         "            if name in RESERVED_NAMES:",
         "            if False:"),
@@ -184,7 +186,8 @@ MUTANTS = {
         '        return on_failure(f"IsolationError: 無法啟動子行程({type(e).__name__})")',
         "        raise"),
     "ref 改回裸表名": (
-        "        return f'\"{database}\".\"{schema}\".\"{_check_ident(\"表\", name)}\"'",
+        "        return f'\"{database}\".\"{_check_ident(\"綱要\", rel_schema)}\"."
+        "\"{_check_ident(\"表\", name)}\"'",
         "        return name"),
     # ---- dbt 一致性
     "不去原始檔頭尾空白": (
@@ -473,14 +476,105 @@ MUTANTS.update({
  "隔離:poll 例外外洩": ("isolation.py", "        except (EOFError, OSError):" + NL + "            message = None       #", "        except ():" + NL + "            message = None       #"),
  "隔離:例外訊息帶出內容": ("isolation.py", '        message = ("error", f"{type(e).__name__}: 子行程執行失敗")', '        message = ("error", f"{type(e).__name__}: {e}")'),
  "relation_notice 不回報 ref()/source() 已知落差": (
-     'relation_notice=(_RELATION_NOTICE if env.segcra_relation_usage["used"] else None),',
-     "relation_notice=None,"),
+     '        return _RELATION_NOTICE if usage["used"] else None',
+     "        return None"),
  "relation_notice 沒用到 ref()/source() 也照樣回報": (
-     'relation_notice=(_RELATION_NOTICE if env.segcra_relation_usage["used"] else None),',
-     "relation_notice=_RELATION_NOTICE,"),
+     '        return _RELATION_NOTICE if usage["used"] else None',
+     "        return _RELATION_NOTICE"),
  "relation_notice 不排除 macro 檔模組層的 ref()": (
-     '    env.segcra_relation_usage["used"] = False' + NL + "    env.segcra_macro_phase = False",
-     "    env.segcra_macro_phase = False"),
+     '    env.segcra_relation_usage["used"] = False' + NL,
+     ""),
+ # ---- ref()/source() 精確度(有專案資訊時):找得到照 dbt 展開、確定不存在就失敗、
+ #      無法確定才提醒
+ "關聯:確定不存在也放行": (
+     '        if complete and not usage.get("loading_macros"):',
+     "        if False:"),
+ "關聯:載入 macro 檔時也判定不存在(冤枉開發者)": (
+     '        if complete and not usage.get("loading_macros"):',
+     "        if complete:"),
+ "關聯:載入 macro 後旗標不重設": (
+     '    env.segcra_relation_usage["loading_macros"] = False' + NL,
+     ""),
+ "關聯:ref 不查專案": (
+     "        if project is not None:\n            check_ref(",
+     "        if False:\n            check_ref("),
+ "關聯:其他套件當成本專案": (
+     "        if package is not None and package != project.project_name:",
+     "        if False:"),
+ "關聯:改表名的設定不標不確定": (
+     "            if project.global_uncertain or name in project.uncertain_models:",
+     "            if False:"),
+ "關聯:source 不套用 sources.yml": (
+     "        return relation(identifier or table_name, declared_schema or source_name)",
+     "        return relation(table_name)"),
+ "關聯:source 預設 schema 用 dbo 而非來源名": (
+     "declared_schema or source_name)",
+     "declared_schema or schema)"),
+ "關聯:source 樣板值不標不確定": (
+     "        if key in project.uncertain_sources:",
+     "        if False:"),
+ "關聯:有專案資訊仍用舊提醒": (
+     '    return _RELATION_UNCERTAIN_NOTICE if usage["uncertain"] else None',
+     '    return _RELATION_NOTICE if usage["used"] else None'),
+ "關聯:project 型別不檢查": (
+     "    if project is not None and not isinstance(project, DbtProjectInfo):",
+     "    if False:"),
+ "專案解析:輸入形狀不檢查": ("dbt_relations.py",
+     "    if (not isinstance(files, dict) or isinstance(model_paths, str)",
+     "    if (False or isinstance(model_paths, str)"),
+ "專案解析:沒確認根目錄也當作沒用套件": ("dbt_relations.py",
+     "    has_packages = (root_files_checked is not True",
+     "    has_packages = (False"),
+ "專案解析:根目錄確認旗標接受任何真值": ("dbt_relations.py",
+     "    has_packages = (root_files_checked is not True",
+     "    has_packages = (not root_files_checked"),
+ "專案解析:套件不影響完整性": ("dbt_relations.py",
+     "    complete = properties_ok and project_ok and not has_packages",
+     "    complete = properties_ok and project_ok"),
+ "專案解析:沒有 seed 名單也算完整": ("dbt_relations.py",
+     "        refs_complete=complete and other_ref_names is not None,",
+     "        refs_complete=complete,"),
+ "專案解析:屬性檔看不懂仍算完整": ("dbt_relations.py",
+     "            except _Unreadable:\n                properties_ok = False",
+     "            except _Unreadable:\n                pass"),
+ "專案解析:檔內 config 改表名不偵測": ("dbt_relations.py",
+     "            if _CONFIG_CALL.search(content) and _NAME_SETTING.search(content):",
+     "            if False:"),
+ "專案解析:屬性檔 config 改表名不偵測": ("dbt_relations.py",
+     "(isinstance(config, dict) and _has_name_key(config))",
+     "False"),
+ "專案解析:generate_*_name 不偵測": ("dbt_relations.py",
+     "            if _GENERATE_NAME_MACRO.search(content):",
+     "            if False:"),
+ "專案解析:dbt_project.yml 的改表名設定不偵測": ("dbt_relations.py",
+     "        if _sets_names(raw.get(block)):",
+     "        if False:"),
+ "專案解析:目錄(物件值)也當成設定": ("dbt_relations.py",
+     "                if key in _NAME_KEYS and not isinstance(value, dict):",
+     "                if key in _NAME_KEYS:"),
+ "專案解析:別名炸彈不記走過的節點": ("dbt_relations.py",
+     "        if id(cur) in seen:\n            continue",
+     "        if False:\n            continue"),
+ "專案解析:樣板值照樣採用": ("dbt_relations.py",
+     "            sources[key] = (None if _templated(schema) else schema,",
+     "            sources[key] = (schema,"),
+ "專案解析:屬性檔沒有處理量上限": ("dbt_relations.py",
+     "        if self.left < 0:\n            raise _Unreadable",
+     "        if False:\n            raise _Unreadable"),
+ "專案解析:處理量上限差一筆": ("dbt_relations.py",
+     "        if self.left < 0:", "        if self.left < -1:"),
+ "專案解析:處理量上限每個檔各自計算": ("dbt_relations.py",
+     "uncertain_models, budget)", "uncertain_models, _Budget(MAX_PROPERTY_ENTRIES))"),
+ "專案解析:來源不計入處理量": ("dbt_relations.py",
+     "        budget.spend()\n        if not isinstance(src", "        if not isinstance(src"),
+ "專案解析:表不計入處理量": ("dbt_relations.py",
+     "            budget.spend()\n            if not isinstance(table",
+     "            if not isinstance(table"),
+ "專案解析:model 不計入處理量": ("dbt_relations.py",
+     "        budget.spend()\n        if not isinstance(model", "        if not isinstance(model"),
+ "專案解析:設定鍵檢查走訪整個 config": ("dbt_relations.py",
+     "    return any(key in mapping for key in _NAME_KEYS)",
+     "    return bool(_NAME_KEYS & set(mapping))"),
 })
 
 # ---- 接進審查管線(#7 管線端):開關、檔名對應、樣板不進沙盒、資料庫名

@@ -237,8 +237,11 @@ python tests/dbt_impact_reference/random_projects.py --dbt <dbt 執行檔>
   資料庫,且 model 引用的上游表與規格建立的測資表名稱不同,需要處理
 - `{% if is_incremental() %}` 內的 SQL 不會被掃到(比照 compile 固定為 False),接線時
   需另以 True 再展開一次
-- `source()` 尚未讀取 `sources.yml`;`ref()` 尚未套用 alias 與自訂 `generate_schema_name`;
-  也不檢查 model 是否存在(接 manifest 時一起處理)
+- `ref()` / `source()` 的精確度:`dbt_relations.project_info_from_files()` 已實作(給專案
+  檔案就能驗證 model / source 是否存在、套用 sources.yml),**尚待接線**——需要取回的專案
+  檔案、seed / snapshot 名單,以及專案根目錄的 `packages.yml` / `dependencies.yml`。
+  alias / 自訂 schema / generate_*_name / 樣板值只偵測、不模擬(保留提醒);資料庫名一律
+  用約定假名。以 `tests/dbt_reference` 驗證:有專案資訊時與 `dbt compile` 逐字一致、不帶提醒
 - 反查以檔案為單位;不分析第三方套件內的 macro;目錄由呼叫端指定
 - `invocation_id` 為固定值,樣板若輸出它,結果會與 dbt compile 不同- 待確認:規格檔名慣例(目前只去除 `mrt_` 前綴);earlyjob model 應歸屬主規則的規格,
   確認前會交人工

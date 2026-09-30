@@ -1000,6 +1000,7 @@ def _imports_of(path: pathlib.Path) -> set[str]:
     ("dbt_render.py", {"copy", "dataclasses", "difflib", "jinja2", "pathlib", "re",
                        "secrets", "types", ".isolation"}),
     ("isolation.py", {"multiprocessing", "resource"}),
+    ("dbt_relations.py", {"re", "yaml", ".dbt_render"}),
 ])
 def test_module_imports_are_allowlisted(module, allowed):
     """處理不可信內容的模組不得悄悄獲得網路、指令執行、檔案寫入等能力。
@@ -1007,7 +1008,7 @@ def test_module_imports_are_allowlisted(module, allowed):
     assert _imports_of(PKG_ROOT / "orchestrator" / module) == allowed
 
 
-@pytest.mark.parametrize("module", ["dbt_render.py", "isolation.py"])
+@pytest.mark.parametrize("module", ["dbt_render.py", "isolation.py", "dbt_relations.py"])
 def test_modules_never_write_files_or_exec(module):
     """以語法樹檢查(不用子字串比對,避免誤判或換個寫法就漏判):不寫檔、不執行程式碼。"""
     tree = ast.parse((PKG_ROOT / "orchestrator" / module).read_text(encoding="utf-8"))
