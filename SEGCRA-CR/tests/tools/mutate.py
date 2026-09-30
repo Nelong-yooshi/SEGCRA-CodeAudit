@@ -750,6 +750,11 @@ MUTANTS.update({
  "專案:例外訊息回顯": ("dbt_project.py",
      'else f"{type(e).__name__}: 無法取得 dbt 專案")',
      'else f"{type(e).__name__}: {e}")'),
+ "下載:403 不提示需要 read_api": ("../toolbox/gitlab.py",
+     '    403: "GITLAB_READ_TOKEN 權限不足:需要 read_api,角色至少 Reporter",\n', ""),
+ "下載:狀態提示套到所有錯誤": ("../toolbox/gitlab.py",
+     "hint = _ARCHIVE_STATUS_HINTS.get(r.status_code)",
+     'hint = _ARCHIVE_STATUS_HINTS.get(r.status_code, "權限不足")'),
 })
 
 

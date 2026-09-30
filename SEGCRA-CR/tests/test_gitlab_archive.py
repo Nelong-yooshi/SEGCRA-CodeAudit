@@ -226,6 +226,30 @@ def test_non_200_fails_and_body_is_not_echoed(real_env, fake_http, status):
     assert str(status) in msg and "BODY-SECRET" not in msg
 
 
+@pytest.mark.parametrize("status, hint", [
+    (401, "無效、已過期或已撤銷"),
+    (403, "需要 read_api"),
+    (404, "看不到這個專案"),
+])
+def test_common_failures_say_how_to_fix(real_env, fake_http, status, hint):
+    """權限類失敗要說清楚怎麼處理(實測 read_repository 打包回 403),但只用固定文字:
+    不帶 token、網址或回應內容。"""
+    fake_http(response=_FakeResponse(status=status, chunks=[b"BODY-SECRET"]))
+    with pytest.raises(gitlab.ArchiveDownloadError) as e:
+        gitlab.download_archive(SHA, max_bytes=100)
+    msg = _err(e)
+    assert hint in msg
+    assert READ_TOKEN not in msg and "BODY-SECRET" not in msg and "://" not in msg
+
+
+@pytest.mark.parametrize("status", [301, 500, 502])
+def test_other_failures_have_no_misleading_hint(real_env, fake_http, status):
+    fake_http(response=_FakeResponse(status=status))
+    with pytest.raises(gitlab.ArchiveDownloadError) as e:
+        gitlab.download_archive(SHA, max_bytes=100)
+    assert _err(e) == f"GitLab 回應 HTTP {status}"
+
+
 @pytest.mark.parametrize("encoding", ["gzip", "br", "deflate", "GZIP"])
 def test_transport_compression_refused(real_env, fake_http, encoding):
     fake_http(response=_FakeResponse(headers={"Content-Encoding": encoding}))

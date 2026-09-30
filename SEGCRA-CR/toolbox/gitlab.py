@@ -20,7 +20,7 @@ GITLAB_URL = os.environ.get("GITLAB_URL", "")          # e.g. http://localhost:8
 GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "")
 GITLAB_PROJECT = os.environ.get("GITLAB_PROJECT", "")  # project id 或 URL-encoded path
 REAL_MODE = bool(GITLAB_URL and GITLAB_TOKEN and GITLAB_PROJECT)
-# 專案層級的唯讀 token(read_repository),只給打包下載用(#15 條件 1)
+# 專案層級的唯讀 token(read_api,角色 Reporter),只給打包下載用(#15 條件 1)
 GITLAB_READ_TOKEN = os.environ.get("GITLAB_READ_TOKEN", "")
 
 
@@ -69,6 +69,13 @@ _SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 # 打包的子目錄:只接受英數與 _ . -,以 / 分段(不接受 ..、開頭的 /、空白、URL 字元)
 _ARCHIVE_PATH = re.compile(r"[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)*")
 ARCHIVE_DEADLINE_S = 120          # 整次下載的時間上限(防伺服器慢慢送、把審查卡住)
+# 常見失敗的處理提示(固定文字)。打包與列目錄 API 要 read_api:實測 read_repository
+# 只能讀單檔,打包回 403
+_ARCHIVE_STATUS_HINTS = {
+    401: "GITLAB_READ_TOKEN 無效、已過期或已撤銷",
+    403: "GITLAB_READ_TOKEN 權限不足:需要 read_api,角色至少 Reporter",
+    404: "找不到專案或 commit,或 GITLAB_READ_TOKEN 看不到這個專案",
+}
 
 
 class ArchiveDownloadError(Exception):
@@ -148,7 +155,9 @@ def download_archive(sha: str, path: str = "", *, max_bytes: int) -> bytes:
                 # 不讀 HTTP_PROXY / HTTPS_PROXY / .netrc 等環境設定:token 不送往代理
                 trust_env=False, timeout=30) as r:
             if r.status_code != 200:
-                raise ArchiveDownloadError(f"GitLab 回應 HTTP {r.status_code}")
+                hint = _ARCHIVE_STATUS_HINTS.get(r.status_code)
+                raise ArchiveDownloadError(f"GitLab 回應 HTTP {r.status_code}"
+                                           + (f"({hint})" if hint else ""))
             if r.headers.get("Content-Encoding", "identity").lower() != "identity":
                 raise ArchiveDownloadError("GitLab 回應使用了傳輸層壓縮,拒絕處理")
             declared = r.headers.get("Content-Length", "")
