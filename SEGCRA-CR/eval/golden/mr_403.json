@@ -19,7 +19,8 @@
     ],
     "expect_signals": {
       "spec_found": true,
-      "spec_exec_passed": false
+      "spec_exec_passed": false,
+      "spec_exec_sql_fault": false
     },
     "expect_findings": [
       {

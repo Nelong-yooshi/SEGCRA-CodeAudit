@@ -12,14 +12,15 @@
   "expected": [],
   "_golden": {
     "layer": "spec_exec",
-    "intent": "埋雷:漏掉「排除行銷活動撥入(PROMO)」這條排除條件,會把行銷撥入一併計入累計金額 → 多報(誤報)。描述宣稱「不影響結果」是錯的。這類『少一條排除』是真實規格最常見的落差。\n實測補註:spec_exec 的 passed=False 並非來自「執行時抓到不符」,而是覆蓋缺口(C5 缺 false 向——能暴露漏排除 PROMO 的案例未生成)。真正指出問題的是 LLM 靜態審查。因此本 case 的關鍵斷言是 expect_findings,不是 spec_exec_passed。",
+    "intent": "埋雷:漏掉「排除行銷活動撥入(PROMO)」這條排除條件,會把行銷撥入一併計入累計金額 → 多報(誤報)。描述宣稱「不影響結果」是錯的。這類『少一條排除』是真實規格最常見的落差。\n實測補註(2026-09-18,MS SQL):spec_exec 現在是**自己抓到不符**(passed=False、18 案例、0 覆蓋缺口 → sql_faults 非空),與 DuckDB 時代記載的「僅因覆蓋缺口而 passed=False、真正指出問題的是靜態審查」**相反**——換引擎後測資生成成功生出了能暴露漏排除 PROMO 的案例。因此本 case 已不再是「縱深防禦」的實證,而是執行驗證正常運作的實證;斷言改為要求 spec_exec_sql_fault=true,若退回只靠靜態審查接住,會亮紅燈。",
     "expect_decision": [
       "needs_human",
       "blocked"
     ],
     "expect_signals": {
       "spec_found": true,
-      "spec_exec_passed": false
+      "spec_exec_passed": false,
+      "spec_exec_sql_fault": true
     },
     "expect_findings": [
       {
