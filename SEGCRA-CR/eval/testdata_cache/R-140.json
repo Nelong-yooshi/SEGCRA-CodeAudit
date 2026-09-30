@@ -1,0 +1,464 @@
+{
+  "spec_code": "R-140",
+  "spec_sha256": "af1bcc2871ac",
+  "generated_at": "2026-09-30T15:42:48+0800",
+  "profile": "review",
+  "coverage_gaps": [],
+  "case_count": 21,
+  "plan": {
+    "schema_ddl": [
+      "CREATE TABLE txn_log(account_id INT, tx_time DATETIME2, op_code NVARCHAR(10), amount DECIMAL(14,2), cash_flag NVARCHAR(10), rev_flag NVARCHAR(10), channel_name NVARCHAR(50));"
+    ],
+    "conditions": [
+      {
+        "id": "C1",
+        "desc": "op_code IN ('OP01','OP02','OP03')"
+      },
+      {
+        "id": "C2",
+        "desc": "cash_flag = 'Y'"
+      },
+      {
+        "id": "C3",
+        "desc": "COALESCE(rev_flag,'N') <> 'Y'"
+      },
+      {
+        "id": "C4",
+        "desc": "amount > 1000"
+      },
+      {
+        "id": "C5",
+        "desc": "COALESCE(channel_name,'') <> 'PROMO'"
+      },
+      {
+        "id": "C6",
+        "desc": "tx_time >= '2026-06-01' AND tx_time < '2026-06-02'"
+      },
+      {
+        "id": "C7",
+        "desc": "SUM(amount) >= 500000"
+      }
+    ],
+    "cases": [
+      {
+        "case_id": "C1-T",
+        "condition_id": "C1",
+        "direction": "true",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            500000.0,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": true,
+        "note": "Valid op_code OP01 should be counted"
+      },
+      {
+        "case_id": "C1-F",
+        "condition_id": "C1",
+        "direction": "false",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP21",
+            500000.0,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": false,
+        "note": "Invalid op_code OP21 should be ignored"
+      },
+      {
+        "case_id": "C2-T",
+        "condition_id": "C2",
+        "direction": "true",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            500000.0,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": true,
+        "note": "cash_flag='Y' should be counted"
+      },
+      {
+        "case_id": "C2-F",
+        "condition_id": "C2",
+        "direction": "false",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            500000.0,
+            "N",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": false,
+        "note": "cash_flag='N' should be ignored"
+      },
+      {
+        "case_id": "C3-T-Val",
+        "condition_id": "C3",
+        "direction": "true",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            500000.0,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": true,
+        "note": "rev_flag='N' is not a reversal"
+      },
+      {
+        "case_id": "C3-T-Null",
+        "condition_id": "C3",
+        "direction": "true",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            500000.0,
+            "Y",
+            null,
+            "ATM"
+          ]
+        ],
+        "expect_flagged": true,
+        "note": "rev_flag=NULL should be treated as not a reversal"
+      },
+      {
+        "case_id": "C3-F",
+        "condition_id": "C3",
+        "direction": "false",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            500000.0,
+            "Y",
+            "Y",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": false,
+        "note": "rev_flag='Y' must be excluded"
+      },
+      {
+        "case_id": "C4-T",
+        "condition_id": "C4",
+        "direction": "true",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            500000.0,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": true,
+        "note": "Amount > 1000 should be counted"
+      },
+      {
+        "case_id": "C4-F-Bound",
+        "condition_id": "C4",
+        "direction": "false",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            1000.0,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": false,
+        "note": "Amount exactly 1000 should be excluded"
+      },
+      {
+        "case_id": "C4-F-Below",
+        "condition_id": "C4",
+        "direction": "false",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            999.99,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": false,
+        "note": "Amount < 1000 should be excluded"
+      },
+      {
+        "case_id": "C5-T-Val",
+        "condition_id": "C5",
+        "direction": "true",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            500000.0,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": true,
+        "note": "channel_name='ATM' is not PROMO"
+      },
+      {
+        "case_id": "C5-T-Null",
+        "condition_id": "C5",
+        "direction": "true",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            500000.0,
+            "Y",
+            "N",
+            null
+          ]
+        ],
+        "expect_flagged": true,
+        "note": "channel_name=NULL should be treated as not PROMO"
+      },
+      {
+        "case_id": "C5-F",
+        "condition_id": "C5",
+        "direction": "false",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            500000.0,
+            "Y",
+            "N",
+            "PROMO"
+          ]
+        ],
+        "expect_flagged": false,
+        "note": "channel_name='PROMO' must be excluded"
+      },
+      {
+        "case_id": "C6-T",
+        "condition_id": "C6",
+        "direction": "true",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 12:00:00",
+            "OP01",
+            500000.0,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": true,
+        "note": "Transaction within window (June 1st)"
+      },
+      {
+        "case_id": "C6-F-Before",
+        "condition_id": "C6",
+        "direction": "false",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-05-31 23:59:59",
+            "OP01",
+            500000.0,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": false,
+        "note": "Transaction before window start"
+      },
+      {
+        "case_id": "C6-F-After",
+        "condition_id": "C6",
+        "direction": "false",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-02 00:00:00",
+            "OP01",
+            500000.0,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": false,
+        "note": "Transaction at window end (half-open interval)"
+      },
+      {
+        "case_id": "C7-T-Bound",
+        "condition_id": "C7",
+        "direction": "true",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            500000.0,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": true,
+        "note": "Sum exactly 500,000 should be flagged"
+      },
+      {
+        "case_id": "C7-T-Above",
+        "condition_id": "C7",
+        "direction": "true",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            500000.01,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": true,
+        "note": "Sum > 500,000 should be flagged"
+      },
+      {
+        "case_id": "C7-F-Below",
+        "condition_id": "C7",
+        "direction": "false",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            499999.99,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": false,
+        "note": "Sum < 500,000 should not be flagged"
+      },
+      {
+        "case_id": "C8-T-Agg",
+        "condition_id": "C7",
+        "direction": "true",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            300000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            1,
+            "2026-06-01 11:00:00",
+            "OP01",
+            200000.0,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": true,
+        "note": "Aggregation of multiple rows reaching threshold"
+      },
+      {
+        "case_id": "C8-F-Agg",
+        "condition_id": "C7",
+        "direction": "false",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            300000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            1,
+            "2026-06-01 11:00:00",
+            "OP01",
+            199999.99,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": false,
+        "note": "Aggregation of multiple rows below threshold"
+      }
+    ]
+  }
+}
