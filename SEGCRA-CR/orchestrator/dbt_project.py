@@ -71,7 +71,7 @@ def load_dbt_project(sha: str, project_dir: str = "", *, download=None) -> DbtPr
     try:
         if not isinstance(sha, str) or not _SHA.fullmatch(sha):
             raise DbtProjectError("commit 編號不合法")
-        prefix = _check_project_dir(project_dir)
+        prefix = check_project_dir(project_dir)
         key = (sha, prefix)
         with _cache_lock:
             if key in _cache:
@@ -140,7 +140,7 @@ def _path_list(raw: dict, key: str, default: tuple[str, ...]) -> tuple[str, ...]
     return tuple(paths)
 
 
-def _check_project_dir(project_dir) -> str:
+def check_project_dir(project_dir) -> str:
     """空字串 = repo 根目錄;其餘必須是 repo 內的相對目錄(只容許結尾的 /)。"""
     if not isinstance(project_dir, str):
         raise DbtProjectError("設定檔的 dbt.project_dir 必須是字串")

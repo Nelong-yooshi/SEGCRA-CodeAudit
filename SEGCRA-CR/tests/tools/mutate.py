@@ -770,6 +770,58 @@ MUTANTS.update({
      'hint = _ARCHIVE_STATUS_HINTS.get(r.status_code, "權限不足")'),
 })
 
+# ---- MR → macro 反查轉接層(#15 第 2 點)
+MUTANTS.update({
+ "MR反查:截斷的變更清單照常分析": ("dbt_mr_impact.py",
+     '    if mr_diff.get("truncated") is not False:',
+     '    if mr_diff.get("truncated") is True:'),
+ "MR反查:改名不列舊路徑": ("dbt_mr_impact.py",
+     '        for key in ("path", "old_path"):', '        for key in ("path",):'),
+ "MR反查:不合法路徑略過": ("dbt_mr_impact.py",
+     '            if path is None:\n                raise _Fail("MR 變更清單含不合法的路徑")',
+     '            if path is None:\n                continue'),
+ "MR反查:專案目錄外的變更也列入": ("dbt_mr_impact.py",
+     '            elif path.startswith(prefix + "/"):',
+     '            else:'),
+ "MR反查:專案目錄前綴不含斜線(dbt_other 誤判)": ("dbt_mr_impact.py",
+     '            elif path.startswith(prefix + "/"):',
+     '            elif path.startswith(prefix):'),
+ "MR反查:目錄設定晚於有無變更才檢查": ("dbt_mr_impact.py",
+     "    prefix = _project_prefix(project_dir)\n    changed = _changed_paths(mr_diff[\"files\"], prefix)\n"
+     "    if not changed:\n        return ImpactReport()",
+     "    try:\n        prefix = _project_prefix(project_dir)\n    except _Fail:\n        return ImpactReport()\n"
+     "    changed = _changed_paths(mr_diff[\"files\"], prefix)\n"
+     "    if not changed:\n        return ImpactReport()"),
+ "MR反查:取回失敗照常分析": ("dbt_mr_impact.py",
+     "        if not project.ok:\n            raise _Fail(",
+     "        if False:\n            raise _Fail("),
+ "MR反查:設定檔變更不保守處理": ("dbt_mr_impact.py",
+     "    root_changed = sorted(changed & set(ROOT_FILES))",
+     "    root_changed = []"),
+ "MR反查:目錄設定不同仍用 base": ("dbt_mr_impact.py",
+     "                     base_files=base.files if same_layout else None,",
+     "                     base_files=base.files,"),
+ "MR反查:不比對 base 判斷新增": ("dbt_mr_impact.py",
+     "    added = [p for p in paths if p in head.files and p not in base.files] if same_layout else []",
+     "    added = []"),
+ "MR反查:額外理由不標全部受影響": ("dbt_mr_impact.py",
+     "            all_models_possibly_affected=True)\n    return report",
+     "            all_models_possibly_affected=report.all_models_possibly_affected)\n    return report"),
+ "MR反查:反查回傳值不檢查": ("dbt_mr_impact.py",
+     "    if not isinstance(report, ImpactReport):\n        raise _Fail(",
+     "    if False:\n        raise _Fail("),
+ "MR反查:非預期例外回顯": ("dbt_mr_impact.py",
+     'return _fail(f"轉接層發生非預期錯誤({type(e).__name__})")',
+     'return _fail(f"轉接層發生非預期錯誤({e})")'),
+ "MR反查:理由不清控制字元": ("dbt_mr_impact.py",
+     '    text = "".join(ch if ch.isprintable() else " " for ch in str(text))',
+     "    text = str(text)"),
+ "MR反查:預設改用同一行程反查": ("dbt_mr_impact.py",
+     "from .dbt_impact import ImpactReport, analyze_macro_impact_isolated, normalize_path",
+     "from .dbt_impact import ImpactReport, normalize_path\n"
+     "from .dbt_impact import analyze_macro_impact as analyze_macro_impact_isolated"),
+})
+
 
 def _run_baseline(src: pathlib.Path, python: str, timeout: int) -> tuple[str | None, float]:
     """複製一份未突變的專案,跑一次測試套件,確認完全乾淨才能開始判斷突變。
