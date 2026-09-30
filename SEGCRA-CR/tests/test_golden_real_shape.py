@@ -34,12 +34,18 @@ from orchestrator.spec_exec import extract_rule_codes, find_spec, prepare_sql  #
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 CASE_PATH = PKG_ROOT / "eval" / "golden" / "mr_701.json"
+BUGGED_PATH = PKG_ROOT / "eval" / "golden" / "mr_702.json"
 COMPILED = PKG_ROOT / "tests" / "fixtures" / "dbt_compiled" / "sqlserver" / "mrt_RETAIL_M1.sql"
 
 
 @pytest.fixture
 def case() -> dict:
     return json.loads(CASE_PATH.read_text(encoding="utf-8"))
+
+
+@pytest.fixture
+def bugged() -> dict:
+    return json.loads(BUGGED_PATH.read_text(encoding="utf-8"))
 
 
 def _cfg(**dbt) -> Config:
@@ -95,6 +101,53 @@ def test_prepare_sql會宣告start_date(case):
     prepared = prepare_sql(case["files"][0]["full_content"])
     assert "DECLARE @start_date DATE" in prepared
     assert "SAMPLE_DW" not in prepared, "case 裡的 SQL 應已改成沙盒建得出來的單純表名"
+
+
+def test_埋雷版只動條件1的那一行(bugged):
+    """雷的位置本身就是這個 case 的難度來源,必須釘住。
+
+    三組條件的 `eod_balance` 那一行長得一模一樣,只改第一組——其餘兩組維持
+    `<= 1000`,掃過去會覺得「樣式一致」。哪天有人「順手把三組改一致」,
+    這個 case 就退化成一眼看得出來的錯,測不到原本要測的東西。
+    """
+    sql = bugged["files"][0]["full_content"]
+    assert sql.count("AND eod_balance < 1000") == 1, "條件 1 的雷不見了"
+    assert sql.count("AND eod_balance <= 1000") == 2, "另外兩組不該被一起改掉"
+
+
+def test_埋雷版的規格也對得到(bugged):
+    code, text = asyncio.run(find_spec(None, bugged, by_path=True))
+    assert code == "RETAIL_M1" and text
+
+
+def test_埋雷版是大檔裡只改一行的維護型diff(bugged):
+    """issue #8 §3 要的情境之一。其餘 case 不是新檔就是小檔全改,量不到
+    「改動很小、檔案很大」時管線還找不找得到問題。"""
+    f = bugged["files"][0]
+    added = [ln for ln in f["diff"].splitlines() if ln.startswith("+")]
+    assert len(added) == 1, "維護型 diff 應該只有一行變更"
+    assert len(f["full_content"].splitlines()) > 150, "但整份檔案要夠大"
+
+
+def test_執行驗證失敗時小diff也不得自動放行(bugged):
+    """**這個 case 最有價值的斷言**:diff 只有 1 行,遠低於 max_diff_lines(30),
+    又不是新規則檔——單看變更規模,它完全有資格自動放行。唯一擋下它的是
+    執行驗證沒過(config/models.yaml 寫明的硬條件,不可由設定關閉)。
+
+    政策層若哪天被改鬆,這條會紅;只靠「變更很小所以安全」放行,正是這套
+    系統最不該犯的錯。
+    """
+    from orchestrator.config import load_config
+    from orchestrator.pipeline import apply_policy
+
+    report = {"score": 85,
+              "findings": [{"severity": "major",
+                            "title": "執行驗證失敗:實作與規格行為不符"}]}
+    out = apply_policy(report, bugged, load_config().policy)
+
+    assert out["_policy_signals"]["change_lines"] == 1
+    assert out["_policy_signals"]["new_rule"] is False
+    assert out["decision"] == "needs_human", "執行驗證沒過就不得自動放行"
 
 
 def test_編譯輸出的三段式表名prepare_sql不會改寫():
