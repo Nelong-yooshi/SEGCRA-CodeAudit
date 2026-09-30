@@ -176,11 +176,23 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 
 | 項目 | 狀態 | 行為 |
 |---|---|---|
-| 預掃前展開 | 已接上 | 含樣板的檔案先以 `render_model_isolated()` 展開再交給規則層;展開失敗則原樣退回,走既有 `parse_error` → `enforce_parse` 路徑。lint 刻意仍吃原始文字(帶行號,基準要與 diff 一致) |
+| 預掃前展開 | 已接上 | 含樣板的檔案先以 `render_model_isolated()` 展開再交給規則層;展開失敗則原樣退回,由 `enforce_dbt_render_failure()` 一律補 major(見下方)。lint 刻意仍吃原始文字(帶行號,基準要與 diff 一致) |
 | 依檔名對應規格 | 已接上 | 完全沒有 R 編號時,先查本機 `specs/`、再逐一探測 GitLab 的候選路徑 |
 | `ref()`/`source()` 精確度提醒 | 已接上 | 預掃結果帶 `dbt_render_notice`,後處理由 `enforce_dbt_notice()` 確定性補成 info finding(正式路徑與 dry-run 皆同) |
 | 執行驗證(沙盒) | **不支援** | SQL 是樣板時不送進沙盒,回報「尚未支援」major、交人工——原樣執行只會得到語法錯誤,會錯誤地指控程式有誤 |
 | macro 反查 | **未接上** | 需要整個專案的檔案,目前沒有列 GitLab 目錄的工具 |
+
+**展開失敗一律補 major**(#16 review):展開失敗時規則層掃的是未展開的原文。以前只靠
+「原文會讓 sqlglot 解析失敗 → `enforce_parse`」間接揭露,但 model 主體就是一句 macro
+呼叫(`{{ purge_staging() }}`)時,原文解析得過、0 條規則命中,展開後卻是一條 DELETE
+無 WHERE 的 blocker。拿不到 macro 目錄時這是常態。同一個檔案若也解析失敗,只留展開
+失敗這一條。
+
+**不做「標記只在註解/字串裡就不報」的豁免**:SQL 註解擋不住 Jinja 執行(dbt 本身的
+已知陷阱),而 macro 的輸出可以帶換行結束行註解、帶 `*/` 結束區塊註解、帶引號結束字串
+或引號識別字,之後就是任意 SQL。四種位置都實測過能變成 R001 blocker
+(`test_macro_output_escapes_comments_and_strings`)。展開失敗 = 不知道輸出是什麼,
+無法證明它跳不出去,所以不看標記的位置。
 
 資料庫名稱以環境變數提供,**固定使用假名** `SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER`
 (#14 review 同意):它只用來把 `ref()`/`source()` 展開成完整表名給規則層掃描,
@@ -195,7 +207,7 @@ golden set 的標準答案才不會跟著變;約定值寫在 `orchestrator/confi
 
 - 載入設定時檢查,不符(含未設定、大小寫不同)就報錯,審查不會帶著錯的設定啟動
 - 預掃展開前再檢查一次(呼叫端可能不經 `load_config()` 直接傳入設定),不符就不展開,
-  走既有 `parse_error` → `enforce_parse` 交人工
+  以展開失敗處理(補 major、交人工)
 - 兩處的錯誤訊息都不回顯實際的值(填進來的可能正是不該外流的正式資料庫名)
 
 日後若改用正式資料庫名(例如要在持久化的測試資料庫上實際執行展開結果),只改環境

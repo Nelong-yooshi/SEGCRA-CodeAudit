@@ -532,6 +532,31 @@ MUTANTS.update({
  "接線:展開前不檢查約定假名": ("pipeline.py",
      '    if dbt_cfg.get("database") != DBT_DATABASE_PLACEHOLDER:',
      "    if False:"),
+ # ---- 展開失敗的確定性揭露(#16 review):不可退回「碰巧解析失敗才揭露」
+ "展開失敗:後處理鏈不呼叫": ("pipeline.py",
+     "        report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文\n",
+     ""),
+ "展開失敗:搬到檢核點關鍵字比對之前": ("pipeline.py",
+     "        report = enforce_hints(report, pre)\n",
+     "        report = enforce_dbt_render_failure(report, pre)\n"
+     "        report = enforce_hints(report, pre)\n"),
+ "展開失敗:dry-run 不報": ("pipeline.py",
+     '        if entry.get("dbt_render_error"):\n            findings.append(_render_fail_finding(entry))',
+     '        if False:\n            findings.append(_render_fail_finding(entry))'),
+ "展開失敗:enforce_parse 不讓位(同檔兩條)": ("pipeline.py",
+     '        if entry.get("dbt_render_error"):\n            continue',
+     '        if False:\n            continue'),
+ "展開失敗:沒失敗也報": ("pipeline.py",
+     '        if not entry.get("dbt_render_error") or (entry["path"], _RENDER_FAIL_TITLE) in have:',
+     '        if (entry["path"], _RENDER_FAIL_TITLE) in have:'),
+ "展開失敗:不去重": ("pipeline.py",
+     '        if not entry.get("dbt_render_error") or (entry["path"], _RENDER_FAIL_TITLE) in have:',
+     '        if not entry.get("dbt_render_error"):'),
+ "展開失敗:嚴重度降為 info(可自動放行)": ("pipeline.py",
+     '    return {"file": entry["path"], "line": 0, "severity": "major",\n'
+     '            "title": _RENDER_FAIL_TITLE,',
+     '    return {"file": entry["path"], "line": 0, "severity": "info",\n'
+     '            "title": _RENDER_FAIL_TITLE,'),
  # ---- relation_notice 確定性揭露(#14 review):不可退回「靠模型轉述」
  "提醒:後處理鏈不呼叫(退回靠模型轉述)": ("pipeline.py",
      "        report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述\n",

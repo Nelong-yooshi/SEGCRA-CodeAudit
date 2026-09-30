@@ -168,9 +168,10 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, st
     """dbt 樣板先展開成純 SQL 再交給規則層(#7)。
     回傳 (交給規則層的 sql, 展開失敗原因或 None, ref()/source() 精確度提醒或 None)。
 
-    展開失敗時**原樣退回未展開的 sql**,不試著猜、不吞掉錯誤——sqlglot 一樣會在
-    Jinja 標記上失敗,走既有 parse_error → enforce_parse 強制揭露這條路徑,不會
-    因為「展開失敗」就多開一條新的靜默放行後門。待審內容一律走
+    展開失敗時**原樣退回未展開的 sql**,不試著猜、不吞掉錯誤;失敗原因記進
+    entry["dbt_render_error"],後處理由 enforce_dbt_render_failure 一律補 major。
+    不能只靠「原文會讓 sqlglot 解析失敗 → enforce_parse」:model 主體就是一句
+    macro 呼叫時,原文解析得過、0 條規則命中(#16 review)。待審內容一律走
     render_model_isolated()(子行程隔離 + 逾時 + Linux 上限記憶體)。
 
     尚無列 GitLab 目錄的工具,所以這裡沒有 macro 目錄可餵(code_root 不給、只給
@@ -183,7 +184,7 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, st
     """
     if dbt_cfg.get("database") != DBT_DATABASE_PLACEHOLDER:
         # 設定載入時已擋過,這裡再擋一次:dbt_cfg 也可能不經 load_config() 直接傳入。
-        # 不符就不展開(fail closed),走既有 parse_error → enforce_parse 交人工。
+        # 不符就不展開(fail closed),由 enforce_dbt_render_failure 補 major 交人工。
         return sql, _DBT_DATABASE_MISMATCH, None
     rendered = render_model_isolated(path or "model.sql", source=sql,
                                      database=dbt_cfg["database"])
@@ -391,6 +392,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 放在 enforce_hints / enforce_style 之後:它們以「報告全文含關鍵字」判斷模型
         # 是否已回應,程式補的文字若先進報告,可能被誤當成模型的回應而吞掉檢核點
         report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述
+        report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
         report = enforce_injection(report, injection_hits)  # 確定性 blocker,不論模型是否被攻陷
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
 
@@ -514,11 +516,52 @@ def _parse_fail_finding(entry: dict) -> dict:
 
 def enforce_parse(report: dict, pre: list[dict]) -> dict:
     """預掃解析失敗的強制揭露。解析失敗時 AST 規則整組沒跑,若不補一條 finding,
-    這個缺口不會出現在報告任何地方,MR 還可能因「沒有命中」而被自動放行。"""
+    這個缺口不會出現在報告任何地方,MR 還可能因「沒有命中」而被自動放行。
+    dbt 展開失敗的檔案改由 enforce_dbt_render_failure 報(同一個檔案只留一條)。"""
     have = {(f.get("file"), f.get("title")) for f in report.get("findings", [])}
     for entry in pre:
+        if entry.get("dbt_render_error"):
+            continue
         if entry.get("parse_error") and (entry["path"], _PARSE_FAIL_TITLE) not in have:
             report.setdefault("findings", []).append(_parse_fail_finding(entry))
+    return report
+
+
+_RENDER_FAIL_TITLE = "dbt 樣板展開失敗,rule-base 規則掃的是未展開的原文"
+
+
+def _render_fail_finding(entry: dict) -> dict:
+    parse_note = ("未展開的原文也無法解析,語法樹規則整組沒有執行。" if entry.get("parse_error")
+                  else "未展開的原文雖然解析得過,但那不是實際會執行的 SQL,"
+                       "規則沒有命中不代表展開後沒有問題。")
+    return {"file": entry["path"], "line": 0, "severity": "major",
+            "title": _RENDER_FAIL_TITLE,
+            "detail": (f"展開失敗原因:{entry['dbt_render_error']}。{parse_note}"
+                       "樣板標記即使寫在 SQL 註解、字串或引號識別字裡,dbt 執行時一樣會展開,"
+                       "輸出可以跳出註解或字串、變成任何 SQL,所以這個檔案的確定性檢查不完整,"
+                       "不得自動放行。"),
+            "suggestion": "以 dbt compile 取得展開後的實際 SQL,人工確認沒有規則層該擋的寫法。",
+            "citations": []}
+
+
+def enforce_dbt_render_failure(report: dict, pre: list[dict]) -> dict:
+    """dbt 展開失敗的強制揭露(#16 review)——**不看標記出現在哪裡,一律報**。
+
+    展開失敗時規則層掃的是未展開的原文。以前只靠「原文會讓 sqlglot 解析失敗 →
+    enforce_parse」間接揭露,但 model 主體就是一句 macro 呼叫(`{{ purge() }}`)時,
+    原文解析得過、0 條規則命中,報告裡卻沒有任何訊號——而展開後其實是一條
+    DELETE 無 WHERE 的 blocker。拿不到 macro 目錄時,這是常態,不是邊角情況。
+
+    不做「標記只在註解/字串裡就不報」的豁免:macro 的輸出可以帶換行結束行註解、
+    帶 `*/` 結束區塊註解、帶引號結束字串或引號識別字,之後就是任意 SQL(四種位置
+    都實測過能變成 R001 blocker)。展開失敗 = 不知道輸出是什麼,無法證明它跳不出去。
+    """
+    have = {(f.get("file"), f.get("title")) for f in report.get("findings", [])}
+    for entry in pre:
+        if not entry.get("dbt_render_error") or (entry["path"], _RENDER_FAIL_TITLE) in have:
+            continue
+        report.setdefault("findings", []).append(_render_fail_finding(entry))
+        have.add((entry["path"], _RENDER_FAIL_TITLE))
     return report
 
 
@@ -528,7 +571,7 @@ _DBT_NOTICE_TITLE = "展開後的表名未經驗證"
 def enforce_dbt_notice(report: dict, pre: list[dict]) -> dict:
     """dbt 展開成功但用到 ref()/source() 時,一律補一條 info finding——不靠模型轉述。
 
-    展開失敗有 enforce_parse 強制揭露;展開成功時規則層解析得過、報告看起來乾淨,
+    展開失敗有 enforce_dbt_render_failure 強制揭露;展開成功時規則層解析得過、報告看起來乾淨,
     審查者看到的表名卻從未被驗證過(見 dbt_render._RELATION_NOTICE)。這句提醒若只
     放在 prescan 裡交給模型,報告有沒有它取決於模型願不願意轉述。
     info 不影響決策(policy 允許 info 自動放行),但一定會出現在報告裡。
@@ -749,7 +792,9 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                              "title": f"[{hit['rule']}] {hit['message']}",
                              "detail": hit.get("statement", ""), "suggestion": "",
                              "citations": []})
-        if entry.get("parse_error"):
+        if entry.get("dbt_render_error"):
+            findings.append(_render_fail_finding(entry))     # 與正式路徑一致,且只留一條
+        elif entry.get("parse_error"):
             findings.append(_parse_fail_finding(entry))
     report = {"score": max(0, 100 - 40 * sum(f["severity"] == "blocker" for f in findings)
                            - 15 * sum(f["severity"] == "major" for f in findings)

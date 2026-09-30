@@ -8,16 +8,20 @@ tests/test_spec_exec.py 分開——這裡只測「接線」本身(find_spec 的
 都成對出現:一個確認新行為生效,一個確認舊行為分毫不變。
 """
 import asyncio
+import json
 import pathlib
 
 import pytest
 
 import orchestrator.pipeline as _pipeline_mod
 from orchestrator.config import DBT_DATABASE_PLACEHOLDER, Config, _load_dbt_section, load_config
-from orchestrator.dbt_render import _RELATION_NOTICE
-from orchestrator.pipeline import (_DBT_NOTICE_TITLE, _dry_run_report, apply_policy,
-                                   enforce_dbt_notice, enforce_hints, prescan)
+from orchestrator.dbt_render import _RELATION_NOTICE, render_model
+from orchestrator.pipeline import (_DBT_NOTICE_TITLE, _PARSE_FAIL_TITLE, _RENDER_FAIL_TITLE,
+                                   _dry_run_report, apply_policy, enforce_dbt_notice,
+                                   enforce_dbt_render_failure, enforce_hints, enforce_parse,
+                                   prescan)
 from orchestrator.spec_exec import find_spec, run_spec_exec
+from toolbox.sqltools import run_rules as _run_rules
 
 
 def _run(coro):
@@ -749,3 +753,134 @@ def test_prescan_wrong_database_does_not_touch_plain_sql(render_must_not_run):
                            {"enabled": True, "database": "PROD_DW"}))
     assert hub.rules_calls == [PLAIN_SQL]
     assert "dbt_render_error" not in entries[0]
+
+
+# ------------------------------------ 展開失敗的確定性揭露(#16 review)
+# 以前只靠「未展開的原文讓 sqlglot 解析失敗 → enforce_parse」間接揭露。model 主體
+# 就是一句 macro 呼叫時,原文解析得過、0 條規則命中,報告卻沒有任何訊號。
+_INJECTION_MACROS = (
+    "{% macro purge() %}\nDELETE FROM txn_staging\n{% endmacro %}\n"
+    "{% macro q() %}'; DELETE FROM txn_staging; --{% endmacro %}\n"
+    "{% macro c() %}*/ DELETE FROM txn_staging; /*{% endmacro %}\n"
+    '{% macro dq() %}x"; DELETE FROM txn_staging; --{% endmacro %}\n')
+
+# 標記出現的位置 → model 原文。後四種是「看起來不影響 SQL」的位置
+_MACRO_POSITIONS = {
+    "whole-model": "{{ purge() }}",
+    "line-comment": "SELECT 1 AS a;\n-- {{ purge() }}",
+    "block-comment": "SELECT 1 AS a; /* {{ c() }} */",
+    "string-literal": "SELECT '{{ q() }}' AS a",
+    "quoted-identifier": 'SELECT 1 AS "{{ dq() }}"',
+}
+
+
+def _rule_codes(sql):
+    r = json.loads(_run_rules(sql))
+    return [h["rule"] for h in (r["hits"] if isinstance(r, dict) else r)]
+
+
+@pytest.mark.parametrize("position", list(_MACRO_POSITIONS))
+def test_macro_output_escapes_comments_and_strings(tmp_path, position):
+    """為什麼不能「標記只在註解/字串裡就不報」:macro 的輸出可以帶換行、*/、引號
+    跳出去。拿得到 macro 時,四種位置展開後都是 DELETE 無 WHERE(R001 blocker);
+    拿不到 macro 時展開失敗,規則層掃原文 0 命中。只有展開失敗的 finding 能揭露。"""
+    (tmp_path / "macros").mkdir()
+    (tmp_path / "macros" / "m.sql").write_text(_INJECTION_MACROS, encoding="utf-8")
+    src = _MACRO_POSITIONS[position]
+    with_macros = render_model("m.sql", code_root=tmp_path, source=src,
+                               database=DBT_DATABASE_PLACEHOLDER)
+    assert with_macros.ok, with_macros.error
+    assert "R001" in _rule_codes(with_macros.sql)               # 實際會執行的 SQL
+    assert _rule_codes(src) == []                               # 規則層看到的原文
+
+    hub = _FakePrescanHub()
+    pre = _run(prescan(hub, _files("models/m.sql", src),
+                       {"enabled": True, "database": DBT_DATABASE_PLACEHOLDER}))
+    assert pre[0]["dbt_render_error"]                           # 沒有 macro 目錄 → 失敗
+    report = enforce_dbt_render_failure(enforce_parse({"findings": []}, pre), pre)
+    [f] = report["findings"]
+    assert f["title"] == _RENDER_FAIL_TITLE and f["severity"] == "major"
+
+
+def test_render_failure_blocks_auto_approval_end_to_end():
+    """整句 macro 呼叫、模型什麼都沒報:仍然不得自動放行。"""
+    hub = _FakePrescanHub()
+    pre = _run(prescan(hub, _files("models/m.sql", "{{ purge_staging() }}"),
+                       {"enabled": True, "database": DBT_DATABASE_PLACEHOLDER}))
+    assert "parse_error" not in pre[0]                          # 以前靠的那條路不成立
+    policy = {"auto_approve": {"max_diff_lines": 30, "min_score": 95,
+                               "allowed_severities": ["info"],
+                               "forbid_pending_hints": True},
+              "block": {"min_blockers": 1}}
+    report = {"score": 100, "findings": [], "_spec_exec": {"passed": True}}
+    report = enforce_dbt_render_failure(enforce_parse(report, pre), pre)
+    report = apply_policy(report, {"files": [{"path": "models/m.sql", "diff": "+x"}]}, policy)
+    assert report["decision"] == "needs_human"
+
+
+def test_render_success_is_not_reported():
+    hub = _FakePrescanHub()
+    pre = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
+                       {"enabled": True, "database": DBT_DATABASE_PLACEHOLDER}))
+    assert enforce_dbt_render_failure({"findings": []}, pre)["findings"] == []
+
+
+def test_disabled_is_not_reported(render_must_not_run):
+    """關閉時不展開、也就沒有展開失敗:維持既有行為(樣板解析失敗走 enforce_parse)。"""
+    hub = _FakePrescanHub()
+    pre = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL), {"enabled": False}))
+    assert enforce_dbt_render_failure({"findings": []}, pre)["findings"] == []
+
+
+def test_database_mismatch_is_reported():
+    """資料庫名不符而不展開,也是「規則掃的是原文」,一樣要揭露。"""
+    hub = _FakePrescanHub()
+    pre = _run(prescan(hub, _files("models/m.sql", "{{ purge_staging() }}"),
+                       {"enabled": True, "database": "PROD_DW"}))
+    [f] = enforce_dbt_render_failure({"findings": []}, pre)["findings"]
+    assert DBT_DATABASE_PLACEHOLDER in f["detail"] and "PROD_DW" not in f["detail"]
+
+
+def test_parse_and_render_failure_on_same_file_yield_one_finding():
+    """同一個檔案兩條都成立時只留展開失敗那條(較具體,且會提到原文也解析失敗)。"""
+    pre = [{"path": "models/m.sql", "rules": [], "parse_error": "ParseError: x",
+            "dbt_render_error": "UndefinedError: 'm' is undefined"}]
+    report = enforce_dbt_render_failure(enforce_parse({"findings": []}, pre), pre)
+    [f] = report["findings"]
+    assert f["title"] == _RENDER_FAIL_TITLE and "也無法解析" in f["detail"]
+    assert _PARSE_FAIL_TITLE not in [x["title"] for x in report["findings"]]
+
+
+def test_parse_failure_without_dbt_is_still_reported_by_enforce_parse():
+    """一般的解析失敗(沒有展開這回事)維持原本的揭露,不受影響。"""
+    pre = [{"path": "sql/x.sql", "rules": [], "parse_error": "ParseError: x"}]
+    report = enforce_dbt_render_failure(enforce_parse({"findings": []}, pre), pre)
+    assert [f["title"] for f in report["findings"]] == [_PARSE_FAIL_TITLE]
+
+
+def test_render_failure_not_duplicated_and_model_findings_kept():
+    original = {"file": "models/m.sql", "line": 3, "severity": "minor", "title": "t",
+                "detail": "d", "suggestion": "", "citations": []}
+    pre = [{"path": "models/m.sql", "rules": [], "dbt_render_error": "E"}]
+    report = enforce_dbt_render_failure({"findings": [dict(original)]}, pre)
+    report = enforce_dbt_render_failure(report, pre)
+    assert report["findings"][0] == original
+    assert [f["title"] for f in report["findings"]].count(_RENDER_FAIL_TITLE) == 1
+
+
+def test_review_mr_enforces_render_failure_after_keyword_checks_and_before_policy():
+    import inspect
+    src = inspect.getsource(_pipeline_mod.review_mr)
+    call = "report = enforce_dbt_render_failure(report, pre)"
+    assert src.count(call) == 1
+    assert src.index("report = enforce_hints(report, pre)") < src.index(call)
+    assert src.index("report = enforce_style(report, pre)") < src.index(call)
+    assert src.index(call) < src.index("report = apply_policy(")
+
+
+def test_dry_run_reports_render_failure_once():
+    hub = _FakeDryRunHub()
+    pre = [{"path": "models/m.sql", "rules": [], "parse_error": "ParseError: x",
+            "dbt_render_error": "E"}]
+    report = _run(_dry_run_report(hub, "1", {"files": []}, pre, None, None))
+    assert [f["title"] for f in report["findings"]] == [_RENDER_FAIL_TITLE]
