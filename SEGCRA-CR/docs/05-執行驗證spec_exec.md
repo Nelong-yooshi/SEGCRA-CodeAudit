@@ -71,6 +71,14 @@
 4. 執行 prepared SQL;**這步例外 = SQL 側的錯**(語法/欄位/非 T-SQL 寫法)→ 回 `sql_error`,轉 major「SQL 無法在測資上執行」;
 
 連不上沙盒(沒啟動、密碼錯)→ 回 `sandbox_error`,轉 major「執行驗證無法完成(沙盒不可用)」,並註明是環境問題而非程式問題——照樣 `passed: False`,**沙盒不可用絕不等於驗證通過**。報告的 `_spec_exec.engine` 記錄實際執行的引擎版本,供稽核。
+
+> **第 3、4 步是在 per-case 迴圈裡 `return`,也就是第一個失敗的案例會中止整輪。**
+> 中止本身合理(SQL 真的壞掉時,跑完 46 個案例只會得到 46 個相同錯誤),但
+> **沒跑到的案例一律列入 `coverage_gaps`**(`_unrun_gaps()`)——這與仲裁剔除案例時
+> 的處理是同一個道理:**沒驗到就是沒驗到**。少了它,報告會顯示「跑了 3 個案例、
+> 零缺口」,讀起來像全覆蓋,實際上計畫裡多數案例根本沒執行,而 `coverage_gaps`
+> 正是人用來判斷「這次到底驗了多少」的欄位。決策層本來就會因 major 擋下自動放行,
+> 所以這不是放行漏洞,修的是**報告的誠實度**。
 5. 比對邏輯:`actual_flagged = 輸出列數 > 0`,與 `expect_flagged` 相等即 `ok`;不等進 `mismatches`(帶原始 rows 供仲裁)。每案記錄 `case_id/condition_id/direction/note/expect_flagged/actual_flagged/actual_rows(前5列)/ok`。
 
 ### 第 3 步:角色三 仲裁(LLM;`arbitrate`)

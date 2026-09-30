@@ -437,6 +437,28 @@ def _finding(path: str, severity: str, title: str, detail: str, suggestion: str 
             "detail": detail, "suggestion": suggestion, "citations": []}
 
 
+def _unrun_gaps(plan: dict, case_results: list[dict]) -> list[str]:
+    """執行中止後,還沒跑到的案例一律列入覆蓋缺口。
+
+    `execute_cases` 的 per-case 迴圈裡,測資建不起來或 SQL 跑不起來會直接
+    `return out`,放棄剩下的案例——這個行為本身是合理的(SQL 真的壞掉時,
+    跑完 46 個案例只會得到 46 個相同錯誤)。**不合理的是報告沒有交代這件事**:
+    `coverage_gaps` 維持原樣,報告看起來像「跑了 N 個案例、零缺口」,
+    但實際上計畫裡多數案例根本沒執行。
+
+    仲裁剔除案例時已經有對應處理(見下方「被剔除的案例 = 該條件該向未經驗證」),
+    這裡補的是同一個道理的另一半:**沒跑到 = 沒驗到**,兩者都必須反映在
+    coverage_gaps 上,人才讀得出「這次到底驗了多少」。
+
+    決策層本來就會因為 major finding 擋下自動放行,所以這不是放行漏洞;
+    修的是報告的誠實度——而那正是人用來判斷「這次驗證可不可信」的依據。
+    """
+    ran = {c.get("case_id") for c in case_results}
+    missing = [c for c in plan.get("cases", []) if c.get("case_id") not in ran]
+    return [f"案例 {c.get('case_id')}(條件 {c.get('condition_id')} "
+            f"{c.get('direction')} 向)因執行中止而未驗證" for c in missing]
+
+
 async def run_spec_exec(cfg: Config, hub, mr: dict,
                         spec_code: str | None = None,
                         spec_text: str | None = None) -> dict:
@@ -517,7 +539,8 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                                  f"測資生成 agent 產出的 schema/資料無法建置:"
                                  f"{ex['testdata_error']}。需人工執行驗證。"))
         return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],
-                "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
+                "conditions": plan["conditions"],
+                "coverage_gaps": coverage_gaps + _unrun_gaps(plan, ex["case_results"]),
                 "case_results": ex["case_results"], "dropped_cases": dropped_cases,
                 "findings": findings}
     if ex["sql_error"]:
@@ -525,7 +548,8 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                                  f"執行錯誤(語法/欄位):{ex['sql_error']}",
                                  "修正 SQL 使其可依規格的資料表定義在 MS SQL 上執行。"))
         return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],
-                "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
+                "conditions": plan["conditions"],
+                "coverage_gaps": coverage_gaps + _unrun_gaps(plan, ex["case_results"]),
                 "case_results": ex["case_results"], "dropped_cases": dropped_cases,
                 "findings": findings}
 

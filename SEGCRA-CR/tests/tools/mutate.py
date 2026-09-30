@@ -715,6 +715,29 @@ MUTANTS.update({
     "測資:重試用完就判失敗(丟掉已抽到的最佳版)": (S,
         "    if best is not None:\n        return best",
         "    if False:\n        return best"),
+    # 執行中止後,沒跑到的案例必須列入覆蓋缺口。少了它,報告會顯示「跑了 N 個
+    # 案例、零缺口」,讀起來像全覆蓋,實際上多數案例根本沒執行——而 coverage_gaps
+    # 正是人用來判斷「這次到底驗了多少」的欄位。兩個早退點各一個突變點。
+    "執行中止:SQL 錯時沒跑到的案例不算缺口": (S,
+        '"執行錯誤(語法/欄位):{ex[\'sql_error\']}",' + NL
+        + '                                 "修正 SQL 使其可依規格的資料表定義在 MS SQL 上執行。"))' + NL
+        + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
+        + '                "conditions": plan["conditions"],' + NL
+        + '                "coverage_gaps": coverage_gaps + _unrun_gaps(plan, ex["case_results"]),',
+        '"執行錯誤(語法/欄位):{ex[\'sql_error\']}",' + NL
+        + '                                 "修正 SQL 使其可依規格的資料表定義在 MS SQL 上執行。"))' + NL
+        + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
+        + '                "conditions": plan["conditions"],' + NL
+        + '                "coverage_gaps": coverage_gaps,'),
+    "執行中止:測資建不起來時沒跑到的案例不算缺口": (S,
+        'f"{ex[\'testdata_error\']}。需人工執行驗證。"))' + NL
+        + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
+        + '                "conditions": plan["conditions"],' + NL
+        + '                "coverage_gaps": coverage_gaps + _unrun_gaps(plan, ex["case_results"]),',
+        'f"{ex[\'testdata_error\']}。需人工執行驗證。"))' + NL
+        + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
+        + '                "conditions": plan["conditions"],' + NL
+        + '                "coverage_gaps": coverage_gaps,'),
 })
 
 

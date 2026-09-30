@@ -280,3 +280,64 @@ def test_仲裁結果可以從_dropped_cases_看出來(monkeypatch):
 
     r = _stub_spec_exec(monkeypatch, {"who_is_wrong": "sql", "reason": "x"})
     assert [d["by"] for d in r["dropped_cases"]] == []
+
+
+# ─────────────────── 執行中止後,沒跑到的案例也是覆蓋缺口 ───────────────────
+
+def _plan_n(n_conditions: int):
+    conds = [f"C{i}" for i in range(1, n_conditions + 1)]
+    cases = []
+    for c in conds:
+        cases.append(_case(f"{c}-T", c, "true"))
+        cases.append(_case(f"{c}-F", c, "false", False))
+    return _plan(cases, conditions=tuple(conds))
+
+
+def _stub_abort(monkeypatch, plan, ran: int, error_key: str):
+    """模擬:跑到第 ran+1 個案例時中止(現行行為是直接放棄剩下全部)。"""
+    async def fake_generate(cfg, code, text, profile_name=None, max_attempts=3):
+        return plan, [], []
+
+    def fake_execute(sql, plan_):
+        results = [{"case_id": c["case_id"], "condition_id": c["condition_id"],
+                    "direction": c["direction"], "note": "", "expect_flagged": True,
+                    "actual_flagged": True, "actual_rows": [], "ok": True}
+                   for c in plan_["cases"][:ran]]
+        out = {"engine": "stub", "sandbox_error": None, "testdata_error": None,
+               "sql_error": None, "case_results": results, "mismatches": []}
+        out[error_key] = "模擬的中止原因"
+        return out
+
+    monkeypatch.setattr(spec_exec, "generate_cases", fake_generate)
+    monkeypatch.setattr(spec_exec, "execute_cases", fake_execute)
+    mr = {"files": [{"path": "sql/rules/r201.sql", "full_content": "SELECT 1;"}]}
+    return asyncio.run(run_spec_exec(None, None, mr, "R-201", "規格內容"))
+
+
+@pytest.mark.parametrize("error_key", ["sql_error", "testdata_error"])
+def test_執行中止時沒跑到的案例要列入覆蓋缺口(monkeypatch, error_key):
+    """`execute_cases` 的 per-case 迴圈遇到測資建不起來或 SQL 跑不起來會直接
+    `return out`,放棄剩下的案例。**中止本身是合理的**(SQL 真的壞掉時跑完只會
+    得到一堆相同錯誤),不合理的是報告沒交代這件事。
+
+    仲裁剔除案例時已經有對應處理(「被剔除 = 該向未驗證 → 列入覆蓋缺口」),
+    這裡是同一個道理的另一半:**沒跑到 = 沒驗到**。少了它,報告會顯示
+    「跑了 3 個案例、零缺口」,讀起來像全覆蓋,實際上多數案例根本沒執行——
+    而 coverage_gaps 正是人用來判斷「這次到底驗了多少」的欄位。
+    """
+    plan = _plan_n(10)                      # 10 條件 → 20 案例
+    r = _stub_abort(monkeypatch, plan, ran=3, error_key=error_key)
+
+    assert r["passed"] is False
+    assert len(r["case_results"]) == 3, "中止後只有前 3 個案例有結果"
+    unrun = [g for g in r["coverage_gaps"] if "因執行中止而未驗證" in g]
+    assert len(unrun) == 17, f"17 個沒跑到的案例都要列成缺口,實得 {len(unrun)}"
+    assert any("C10-F" in g for g in unrun), "最後一個案例也要在列"
+    assert not any("C1-T" in g for g in unrun), "已經跑過的案例不該被列成未驗證"
+
+
+def test_全部跑完時不會冒出未驗證的缺口(monkeypatch):
+    """反向:正常跑完不該因為這個修改多出任何缺口(否則每份報告都會被汙染)。"""
+    plan = _plan_n(3)
+    r = _stub_abort(monkeypatch, plan, ran=len(plan["cases"]), error_key="sql_error")
+    assert [g for g in r["coverage_gaps"] if "因執行中止而未驗證" in g] == []
