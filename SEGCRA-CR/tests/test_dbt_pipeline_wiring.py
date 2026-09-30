@@ -12,7 +12,8 @@ import pathlib
 
 import pytest
 
-from orchestrator.config import Config, _load_dbt_section, load_config
+import orchestrator.pipeline as _pipeline_mod
+from orchestrator.config import DBT_DATABASE_PLACEHOLDER, Config, _load_dbt_section, load_config
 from orchestrator.dbt_render import _RELATION_NOTICE
 from orchestrator.pipeline import (_DBT_NOTICE_TITLE, _dry_run_report, apply_policy,
                                    enforce_dbt_notice, enforce_hints, prescan)
@@ -197,7 +198,7 @@ def test_path_traversal_produces_no_candidates(specs_dir, malicious_path):
 # 「SQL 無法在測資上執行、請修正 SQL」——錯誤地指控開發者的程式壞了)。
 
 class _Cfg:
-    dbt = {"enabled": True, "database": "SAMPLE_DW"}
+    dbt = {"enabled": True, "database": "DBT_PLACEHOLDER"}
 
 
 @pytest.fixture
@@ -276,7 +277,7 @@ def _files(path, content):
 
 
 # ---------------------------------------------- 關閉時(預設)行為完全不變
-def test_prescan_dbt_cfg_none_leaves_dbt_file_unrendered():
+def test_prescan_dbt_cfg_none_leaves_dbt_file_unrendered(render_must_not_run):
     """dbt_cfg 完全不給(呼叫端沒傳,例如舊程式碼)——必須是安全的預設,
     不能因為忘記傳這個參數就意外展開。"""
     hub = _FakePrescanHub()
@@ -284,29 +285,36 @@ def test_prescan_dbt_cfg_none_leaves_dbt_file_unrendered():
     assert hub.rules_calls == [DBT_MODEL]   # 原樣送進規則層,樣板沒被展開
 
 
-def test_prescan_dbt_cfg_disabled_leaves_dbt_file_unrendered():
+# 下面三條「應維持關閉」的測試,資料庫名刻意給**正確的**約定假名:否則就算開關
+# 判斷壞了,也會被後面的資料庫名檢查擋下、照樣看起來「沒展開」,測試就驗不到開關
+# 本身(突變測試實際抓到過這個遮蔽)。所以除了結果,也斷言根本沒有嘗試展開。
+def test_prescan_dbt_cfg_disabled_leaves_dbt_file_unrendered(render_must_not_run):
     hub = _FakePrescanHub()
-    _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
-                {"enabled": False, "database": "SAMPLE_DW"}))
+    entries = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
+                           {"enabled": False, "database": DBT_DATABASE_PLACEHOLDER}))
     assert hub.rules_calls == [DBT_MODEL]
+    assert "dbt_render_error" not in entries[0]
 
 
-def test_prescan_dbt_cfg_missing_enabled_key_defaults_off():
+def test_prescan_dbt_cfg_missing_enabled_key_defaults_off(render_must_not_run):
     """dbt_cfg 給了字典,但沒有 enabled 這個鍵——一樣視為關閉,不是預設開啟。"""
     hub = _FakePrescanHub()
-    _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL), {"database": "SAMPLE_DW"}))
+    entries = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
+                           {"database": DBT_DATABASE_PLACEHOLDER}))
     assert hub.rules_calls == [DBT_MODEL]
+    assert "dbt_render_error" not in entries[0]
 
 
-def test_prescan_dbt_cfg_truthy_but_not_bool_true_does_not_enable():
+def test_prescan_dbt_cfg_truthy_but_not_bool_true_does_not_enable(render_must_not_run):
     """enabled 是非布林的真值(例如字串)時**不能**被當成開啟。config.py 的
     _load_dbt_section() 會在設定檔載入時就擋掉這種值,但 prescan() 自己也要有
     這道防線——它是這個模組唯一真正決定「要不要展開」的地方,不能只依賴
     上游有做過檢查。"""
     hub = _FakePrescanHub()
-    _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
-                {"enabled": "true", "database": "SAMPLE_DW"}))
+    entries = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
+                           {"enabled": "true", "database": DBT_DATABASE_PLACEHOLDER}))
     assert hub.rules_calls == [DBT_MODEL]
+    assert "dbt_render_error" not in entries[0]
 
 
 def test_prescan_plain_sql_never_touched_even_when_enabled():
@@ -314,7 +322,7 @@ def test_prescan_plain_sql_never_touched_even_when_enabled():
     is_dbt_template() 為 False,直接跳過,省一次子行程開銷)。"""
     hub = _FakePrescanHub()
     _run(prescan(hub, _files("sql/rules/r201.sql", PLAIN_SQL),
-                {"enabled": True, "database": "SAMPLE_DW"}))
+                {"enabled": True, "database": "DBT_PLACEHOLDER"}))
     assert hub.rules_calls == [PLAIN_SQL]
 
 
@@ -323,8 +331,8 @@ def test_prescan_enabled_expands_dbt_template():
     """核心行為:開啟後,dbt 樣板展開成純 SQL 才送進規則層。"""
     hub = _FakePrescanHub()
     entries = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
-                           {"enabled": True, "database": "SAMPLE_DW"}))
-    assert hub.rules_calls == ['SELECT * FROM "SAMPLE_DW"."dbo"."txn_log" WHERE amount > 1000']
+                           {"enabled": True, "database": "DBT_PLACEHOLDER"}))
+    assert hub.rules_calls == ['SELECT * FROM "DBT_PLACEHOLDER"."dbo"."txn_log" WHERE amount > 1000']
     assert "dbt_render_error" not in entries[0]
 
 
@@ -333,7 +341,7 @@ def test_prescan_surfaces_relation_notice_when_ref_used():
     審查者看得到,不能只是展開「成功」就沒事——DBT_MODEL 用了 ref(),提醒要出現。"""
     hub = _FakePrescanHub()
     entries = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
-                           {"enabled": True, "database": "SAMPLE_DW"}))
+                           {"enabled": True, "database": "DBT_PLACEHOLDER"}))
     assert "ref()" in entries[0]["dbt_render_notice"]
 
 
@@ -342,7 +350,7 @@ def test_prescan_no_relation_notice_when_ref_not_used():
     hub = _FakePrescanHub()
     src = "SELECT {{ var('threshold', 1000) }} AS threshold"
     entries = _run(prescan(hub, _files("models/mrt_x.sql", src),
-                           {"enabled": True, "database": "SAMPLE_DW"}))
+                           {"enabled": True, "database": "DBT_PLACEHOLDER"}))
     assert "dbt_render_notice" not in entries[0]
 
 
@@ -361,7 +369,7 @@ def test_prescan_lint_stays_on_original_text_not_rendered_sql():
     展開後的 SQL。這條測試把這個決定鎖住,不讓未來的重構不小心把兩者對齊。"""
     hub = _FakePrescanHub()
     _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
-                {"enabled": True, "database": "SAMPLE_DW"}))
+                {"enabled": True, "database": "DBT_PLACEHOLDER"}))
     assert hub.lint_calls == [DBT_MODEL]                      # 原始 Jinja 文字
     assert hub.rules_calls != hub.lint_calls                   # 規則層吃的是展開後的
 
@@ -386,7 +394,7 @@ def test_prescan_enabled_macro_not_available_fails_closed():
     hub = _FakePrescanHub()
     src = "SELECT * FROM t WHERE {{ is_large_amount('t') }}"
     entries = _run(prescan(hub, _files("models/mrt_x.sql", src),
-                           {"enabled": True, "database": "SAMPLE_DW"}))
+                           {"enabled": True, "database": "DBT_PLACEHOLDER"}))
     assert hub.rules_calls == [src]
     assert entries[0]["dbt_render_error"]
 
@@ -408,9 +416,9 @@ def test_prescan_multiple_files_only_dbt_ones_expanded():
     hub = _FakePrescanHub()
     files = [{"path": "models/mrt_x.sql", "full_content": DBT_MODEL},
             {"path": "sql/rules/r201.sql", "full_content": PLAIN_SQL}]
-    _run(prescan(hub, files, {"enabled": True, "database": "SAMPLE_DW"}))
+    _run(prescan(hub, files, {"enabled": True, "database": "DBT_PLACEHOLDER"}))
     assert hub.rules_calls == [
-        'SELECT * FROM "SAMPLE_DW"."dbo"."txn_log" WHERE amount > 1000',
+        'SELECT * FROM "DBT_PLACEHOLDER"."dbo"."txn_log" WHERE amount > 1000',
         PLAIN_SQL,
     ]
 
@@ -423,7 +431,7 @@ def test_prescan_model_path_with_traversal_does_not_touch_filesystem():
     hub = _FakePrescanHub()
     src = "SELECT {{ 1 + 1 }} AS two"
     entries = _run(prescan(hub, _files("../../../../etc/passwd", src),
-                           {"enabled": True, "database": "SAMPLE_DW"}))
+                           {"enabled": True, "database": "DBT_PLACEHOLDER"}))
     assert hub.rules_calls == ["SELECT 2 AS two"]
     assert "dbt_render_error" not in entries[0]
 
@@ -436,7 +444,7 @@ def test_prescan_undefined_var_fails_closed_cleanly():
     hub = _FakePrescanHub()
     src = "SELECT {{ var('undeclared_var') }}"
     entries = _run(prescan(hub, _files("models/mrt_x.sql", src),
-                           {"enabled": True, "database": "SAMPLE_DW"}))
+                           {"enabled": True, "database": "DBT_PLACEHOLDER"}))
     assert hub.rules_calls == [src]
     assert entries[0]["dbt_render_error"]
 
@@ -447,8 +455,8 @@ def test_load_dbt_section_defaults_to_disabled_when_key_missing(no_db_env):
 
 
 def test_load_dbt_section_accepts_explicit_values(no_db_env):
-    raw = {"dbt": {"enabled": True, "database": "SAMPLE_DW"}}
-    assert _load_dbt_section(raw) == {"enabled": True, "database": "SAMPLE_DW"}
+    raw = {"dbt": {"enabled": True, "database": "DBT_PLACEHOLDER"}}
+    assert _load_dbt_section(raw) == {"enabled": True, "database": "DBT_PLACEHOLDER"}
 
 
 @pytest.mark.parametrize("bad_enabled", ["true", "false", "1", "0", 1, 0, None, [], {}])
@@ -470,10 +478,10 @@ def no_db_env(monkeypatch):
 
 
 def test_database_from_env_var_overrides_file(monkeypatch):
-    """正式資料庫名只放在部署機的環境變數:repo 是公開的,不可寫進進版控的設定檔。"""
-    monkeypatch.setenv("SEGCRA_DBT_DATABASE", "PROD_DW")
+    """資料庫名由環境變數提供,設定檔裡的值只當後備(repo 是公開的,不寫進版控)。"""
+    monkeypatch.setenv("SEGCRA_DBT_DATABASE", "DBT_PLACEHOLDER")
     raw = {"dbt": {"enabled": True, "database": "IGNORED"}}
-    assert _load_dbt_section(raw)["database"] == "PROD_DW"
+    assert _load_dbt_section(raw)["database"] == "DBT_PLACEHOLDER"
 
 
 def test_database_falls_back_to_file_without_env(no_db_env):
@@ -630,7 +638,7 @@ def test_notice_end_to_end_from_real_render_and_does_not_change_decision():
     info 不影響決策:其他條件都乾淨時,有沒有提醒結果都一樣。"""
     hub = _FakePrescanHub()
     pre = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
-                       {"enabled": True, "database": "SAMPLE_DW"}))
+                       {"enabled": True, "database": "DBT_PLACEHOLDER"}))
     policy = {"auto_approve": {"max_diff_lines": 30, "min_score": 95,
                                "allowed_severities": ["info"],
                                "forbid_pending_hints": True},
@@ -673,3 +681,71 @@ def test_placeholder_database_passes_loader_and_renders(monkeypatch):
 def test_tracked_config_still_has_no_database_value(no_db_env):
     """假名走環境變數,設定檔的 database 仍是空字串(維持「不寫進版控」的做法)。"""
     assert load_config().dbt["database"] == ""
+
+
+# ---------------------------- 資料庫名必須是約定的假名(#14 合併前 review 最後一點)
+# 漏設或拼錯時展開不會報錯,只會產出錯的表名,報告看起來卻完全正常。兩道檢查:
+# 載入設定時擋(不讓審查帶著錯的設定啟動),展開前再擋(dbt_cfg 可能不經 load_config)。
+_WRONG_DATABASES = ["DBT_PLACEHOLDR",      # 拼錯
+                    "dbt_placeholder",     # 大小寫不同也不算
+                    "DBT_PLACEHOLDER_",    # 多一個字元
+                    "PROD_DW"]             # 有人照舊習慣填了真名
+
+
+def test_placeholder_constant_matches_documented_value():
+    """程式裡的約定值要與設定檔註解、docs/09 寫的是同一個(那兩處另有測試互相比對)。"""
+    assert DBT_DATABASE_PLACEHOLDER == _PLACEHOLDER_SETTING.split("=", 1)[1]
+
+
+@pytest.mark.parametrize("wrong", _WRONG_DATABASES)
+def test_load_rejects_wrong_database_when_enabled(monkeypatch, wrong):
+    monkeypatch.setenv("SEGCRA_DBT_DATABASE", wrong)
+    with pytest.raises(ValueError) as exc:
+        _load_dbt_section({"dbt": {"enabled": True}})
+    msg = str(exc.value)
+    assert DBT_DATABASE_PLACEHOLDER in msg and "SEGCRA_DBT_DATABASE" in msg
+    assert wrong not in msg.replace(DBT_DATABASE_PLACEHOLDER, "")   # 不回顯實際的值
+
+
+def test_load_rejects_missing_database_when_enabled(no_db_env):
+    """開啟卻漏設環境變數:以前會等到每個檔各自展開失敗,現在載入時就擋下。"""
+    with pytest.raises(ValueError, match="SEGCRA_DBT_DATABASE"):
+        _load_dbt_section({"dbt": {"enabled": True}})
+
+
+@pytest.mark.parametrize("database", ["", "SAMPLE_DW", "DBT_PLACEHOLDER"])
+def test_disabled_does_not_require_placeholder(no_db_env, database):
+    """關閉時不用展開,也就不檢查——不能因為這道檢查讓預設關閉的設定載入失敗。"""
+    raw = {"dbt": {"enabled": False, "database": database}}
+    assert _load_dbt_section(raw) == {"enabled": False, "database": database}
+
+
+@pytest.fixture
+def render_must_not_run(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("資料庫名不符時不可展開")
+    monkeypatch.setattr(_pipeline_mod, "render_model_isolated", _boom)
+
+
+@pytest.mark.parametrize("wrong", _WRONG_DATABASES + ["", None])
+def test_prescan_refuses_to_render_with_wrong_database(render_must_not_run, wrong):
+    """不經 load_config 直接傳入 dbt_cfg 時,展開前也要擋:不展開、退回原文,
+    讓既有的 parse_error → enforce_parse 交人工;原因要留痕,且不回顯實際的值。"""
+    hub = _FakePrescanHub()
+    entries = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
+                           {"enabled": True, "database": wrong}))
+    assert hub.rules_calls == [DBT_MODEL]
+    err = entries[0]["dbt_render_error"]
+    assert DBT_DATABASE_PLACEHOLDER in err
+    if wrong:
+        assert wrong not in err.replace(DBT_DATABASE_PLACEHOLDER, "")
+    assert "dbt_render_notice" not in entries[0]
+
+
+def test_prescan_wrong_database_does_not_touch_plain_sql(render_must_not_run):
+    """純 SQL 本來就不展開,資料庫名不符也不影響它的規則檢查。"""
+    hub = _FakePrescanHub()
+    entries = _run(prescan(hub, _files("sql/rules/r201.sql", PLAIN_SQL),
+                           {"enabled": True, "database": "PROD_DW"}))
+    assert hub.rules_calls == [PLAIN_SQL]
+    assert "dbt_render_error" not in entries[0]

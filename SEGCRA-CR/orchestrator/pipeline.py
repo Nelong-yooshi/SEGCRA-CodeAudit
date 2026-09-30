@@ -10,7 +10,7 @@ import re
 from pathlib import Path
 
 from .agent import extract_json, run_agent
-from .config import PKG_ROOT, Config, estimate_tokens
+from .config import DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, estimate_tokens
 from .dbt_render import is_dbt_template, render_model_isolated
 from .security import scan_mr
 from .skills_loader import always_skills, load_skills, skills_index
@@ -159,6 +159,11 @@ def _sql_from_diff(diff: str) -> str:
     return "\n".join(lines)
 
 
+_DBT_DATABASE_MISMATCH = (
+    f"dbt 資料庫名稱未設定或不是約定的假名 {DBT_DATABASE_PLACEHOLDER},為避免產出錯的表名,"
+    "不展開此檔(請檢查環境變數 SEGCRA_DBT_DATABASE)")
+
+
 def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, str | None, str | None]:
     """dbt 樣板先展開成純 SQL 再交給規則層(#7)。
     回傳 (交給規則層的 sql, 展開失敗原因或 None, ref()/source() 精確度提醒或 None)。
@@ -176,8 +181,12 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, st
     存在、不讀 sources.yml、不套用 alias——見 dbt_render 模組文件),不影響
     規則層判斷,但要讓審查者看得到,不能只寫在程式註解裡沒人會翻。
     """
+    if dbt_cfg.get("database") != DBT_DATABASE_PLACEHOLDER:
+        # 設定載入時已擋過,這裡再擋一次:dbt_cfg 也可能不經 load_config() 直接傳入。
+        # 不符就不展開(fail closed),走既有 parse_error → enforce_parse 交人工。
+        return sql, _DBT_DATABASE_MISMATCH, None
     rendered = render_model_isolated(path or "model.sql", source=sql,
-                                     database=dbt_cfg.get("database") or None)
+                                     database=dbt_cfg["database"])
     if rendered.ok:
         return rendered.sql, None, rendered.relation_notice
     return sql, rendered.error, None
