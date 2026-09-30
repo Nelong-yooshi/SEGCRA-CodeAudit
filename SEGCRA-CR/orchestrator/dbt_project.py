@@ -3,7 +3,8 @@
 流程(任何一步失敗 = ok=False,**絕不當成「專案沒有 macro」**,#15 條件 7):
 
   1. 以 commit 編號打包下載 dbt 專案所在的目錄——只呼叫一次 GitLab
-  2. 從這一包先解出 dbt_project.yml,讀出 model-paths / macro-paths
+  2. 從這一包先解出專案根目錄的 dbt_project.yml(讀出 model-paths / macro-paths)
+     與 packages.yml / dependencies.yml(有沒有用 dbt 套件)
   3. 從**同一包**再解出這些目錄的 .sql / .yml(不另外用讀檔 API:那預設讀 main,
      讀到的就不是被審的那一版)
   4. 成功的結果放進記憶體快取(以 commit 編號為鍵,#15 條件 9);失敗不快取,
@@ -31,6 +32,9 @@ MAX_PATHS = 20                          # 單一設定項最多幾個目錄
 CACHE_MAX_ENTRIES = 8
 CACHE_MAX_BYTES = 100 * 1024 * 1024     # 快取內所有檔案內容合計(字元數,近似位元組)
 MAX_ERROR_CHARS = 300
+# 專案根目錄要取回的設定檔。packages.yml / dependencies.yml 決定專案有沒有用 dbt 套件:
+# 套件的 model / source 不在 repo 裡,有用套件時 ref() / source() 找不到不代表不存在
+ROOT_FILES = ("dbt_project.yml", "packages.yml", "dependencies.yml")
 
 _SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
@@ -43,6 +47,10 @@ class DbtProject:
     model_paths: tuple[str, ...] = ()
     macro_paths: tuple[str, ...] = ()
     error: str | None = None
+    # 專案根目錄的設定檔(ROOT_FILES 中存在的那些)→ 內容。ok=True 時一定含 dbt_project.yml;
+    # 其餘不在這裡就是**確實不存在**(已從同一包檢查過),呼叫端可據此傳
+    # dbt_relations.project_info_from_files(root_files_checked=True)
+    root_files: dict[str, str] = field(default_factory=dict)
 
 
 class DbtProjectError(Exception):
@@ -82,10 +90,13 @@ def load_dbt_project(sha: str, project_dir: str = "", *, download=None) -> DbtPr
 # ------------------------------------------------------------------ 解析
 def _parse(data: bytes, prefix: str) -> DbtProject:
     base = f"{prefix}/" if prefix else ""
-    cfg = archive.extract_archive(data, (f"{base}dbt_project.yml",))
+    cfg = archive.extract_archive(data, tuple(f"{base}{name}" for name in ROOT_FILES))
     if not cfg.ok:
         raise DbtProjectError(f"解不開打包下載的內容({cfg.error})")
-    text = cfg.files.get(f"{base}dbt_project.yml")
+    # 只收剛好是這些檔名的檔案;同名的目錄(例如 packages.yml/x.yml)不算
+    root_files = {name: cfg.files[f"{base}{name}"] for name in ROOT_FILES
+                  if f"{base}{name}" in cfg.files}
+    text = root_files.get("dbt_project.yml")
     if text is None:
         raise DbtProjectError("專案目錄裡沒有 dbt_project.yml(請檢查設定檔的 dbt.project_dir)")
     model_paths, macro_paths = _read_paths(text)
@@ -94,7 +105,8 @@ def _parse(data: bytes, prefix: str) -> DbtProject:
     if not got.ok:
         raise DbtProjectError(f"解不開打包下載的內容({got.error})")
     files = {rel[len(base):]: content for rel, content in got.files.items()}
-    return DbtProject(ok=True, files=files, model_paths=model_paths, macro_paths=macro_paths)
+    return DbtProject(ok=True, files=files, model_paths=model_paths, macro_paths=macro_paths,
+                      root_files=root_files)
 
 
 def _read_paths(text: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -149,14 +161,14 @@ def _check_relative(path: str, what: str) -> str:
 
 # ------------------------------------------------------------------ 快取
 def _size(project: DbtProject) -> int:
-    return sum(len(k) + len(v) for k, v in project.files.items())
+    return sum(len(k) + len(v) for d in (project.files, project.root_files) for k, v in d.items())
 
 
 def _copy(project: DbtProject) -> DbtProject:
-    """快取進出都複製 files:呼叫端改了拿到的字典,不能影響下一次審查拿到的內容。"""
+    """快取進出都複製 files / root_files:呼叫端改了拿到的字典,不能影響下一次審查拿到的內容。"""
     return DbtProject(ok=project.ok, files=dict(project.files),
                       model_paths=project.model_paths, macro_paths=project.macro_paths,
-                      error=project.error)
+                      error=project.error, root_files=dict(project.root_files))
 
 
 def _remember(key, project: DbtProject) -> None:

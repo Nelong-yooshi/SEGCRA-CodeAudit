@@ -237,7 +237,7 @@ python tests/dbt_impact_reference/random_projects.py --dbt <dbt 執行檔>
 |---|---|---|
 | `toolbox/gitlab.py` 的 `download_archive()` | 下載 tar.gz | 只用唯讀的 `GITLAB_READ_TOKEN`(不退回、不可與 `GITLAB_TOKEN` 相同);只接受完整 commit 編號;本機以外必須 https;不讀代理設定;不跟隨轉址;不做傳輸層解壓;大小與時間上限;**不在模型可呼叫的工具清單內** |
 | `orchestrator/archive.py` 的 `extract_archive()` | 解開成 {路徑: 內容} | 邊解壓邊計數(壓縮炸彈);逐一檢查成員(路徑穿越、連結與特殊檔、重複含大小寫與 Unicode 正規化、控制字元、Windows 保留名稱);只收 `.sql` / `.yml`;`filter="data"`;權限 700 的暫存目錄、讀完即刪 |
-| `orchestrator/dbt_project.py` 的 `load_dbt_project()` | 讀 `dbt_project.yml` 的目錄設定,取回 models / macros | 同一包讀設定與檔案(不另外用讀檔 API,那預設讀 main);目錄設定當不可信內容檢查;記憶體快取(以 commit 為鍵、有筆數與總量上限、只收成功結果、進出都複製) |
+| `orchestrator/dbt_project.py` 的 `load_dbt_project()` | 讀 `dbt_project.yml` 的目錄設定,取回 models / macros,以及專案根目錄的 `packages.yml` / `dependencies.yml`(`root_files`,判斷有沒有用 dbt 套件) | 同一包讀設定與檔案(不另外用讀檔 API,那預設讀 main);目錄設定當不可信內容檢查;記憶體快取(以 commit 為鍵、有筆數與總量上限、只收成功結果、進出都複製) |
 
 任何一步失敗都是整包失敗(`ok=False`),**不會當成「專案沒有 macro」**。
 

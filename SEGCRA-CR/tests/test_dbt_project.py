@@ -67,7 +67,7 @@ BASIC = {
 
 
 def _fails(result, *, not_in_error=(MARK,)):
-    assert result.ok is False and result.files == {} and result.error
+    assert result.ok is False and result.files == {} and result.root_files == {} and result.error
     for s in not_in_error:
         assert s not in result.error, result.error
     return result.error
@@ -81,7 +81,53 @@ def test_default_paths_from_repo_root():
     assert p.files == {"models/a.sql": "select 1", "models/schema.yml": "version: 2",
                        "macros/m.sql": "{% macro m() %}1{% endmacro %}"}
     assert p.model_paths == ("models",) and p.macro_paths == ("macros",)
+    assert p.root_files == {"dbt_project.yml": BASIC["dbt_project.yml"]}   # 沒有套件檔
     assert dl.calls == [(SHA, "", archive.MAX_COMPRESSED_BYTES)]      # 只下載一次
+
+
+@pytest.mark.parametrize("names", [("packages.yml",), ("dependencies.yml",),
+                                   ("packages.yml", "dependencies.yml")])
+def test_root_package_files_are_returned_separately(names):
+    """packages.yml / dependencies.yml 決定專案有沒有用 dbt 套件,從同一包取回;
+    放在 root_files,不混進 model / macro 的 files(macro 反查只看那些目錄)。"""
+    extra = {n: f"packages:\n  - package: {n}\n" for n in names}
+    dl = _Download(_gz(BASIC | extra))
+    p = load_dbt_project(SHA, download=dl)
+    assert p.ok, p.error
+    assert p.root_files == {"dbt_project.yml": BASIC["dbt_project.yml"]} | extra
+    assert not set(p.root_files) & set(p.files)
+    assert len(dl.calls) == 1
+
+
+def test_root_files_come_from_the_project_dir_not_the_repo_root():
+    """dbt 讀的是專案根目錄的 packages.yml;repo 根目錄或更深層的同名檔都不算。"""
+    files = ({f"dbt/{k}": v for k, v in BASIC.items()}
+             | {"packages.yml": "repo-root", "dbt/models/packages.yml": "nested"})
+    p = load_dbt_project(SHA, "dbt", download=_Download(_gz(files)))
+    assert p.ok, p.error
+    assert set(p.root_files) == {"dbt_project.yml"}
+    assert p.files["models/packages.yml"] == "nested"           # 在 models 裡是普通屬性檔
+
+
+def test_directory_named_like_a_root_file_is_not_that_file():
+    p = load_dbt_project(SHA, download=_Download(_gz(BASIC | {"packages.yml/x.yml": "x"})))
+    assert p.ok, p.error
+    assert set(p.root_files) == {"dbt_project.yml"}
+
+
+def test_symlinked_package_file_fails_whole_project():
+    """packages.yml 是符號連結:看不到真正內容,不可當成「沒用套件」——整包失敗。"""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        for name, data in (("dbt_project.yml", b"name: x\n"), ("models/a.sql", b"1")):
+            ti = tarfile.TarInfo(f"{TOP}/{name}")
+            ti.size = len(data)
+            tar.addfile(ti, io.BytesIO(data))
+        link = tarfile.TarInfo(f"{TOP}/packages.yml")
+        link.type, link.linkname = tarfile.SYMTYPE, "/etc/passwd"
+        tar.addfile(link)
+    err = _fails(load_dbt_project(SHA, download=_Download(gzip.compress(buf.getvalue()))))
+    assert "符號連結" in err
 
 
 def test_project_in_subdirectory():
@@ -242,12 +288,16 @@ def test_returned_files_can_not_poison_the_cache():
     first = load_dbt_project(SHA, download=dl)
     first.files["macros/m.sql"] = "{% macro m() %}DROP TABLE x{% endmacro %}"
     first.files["macros/evil.sql"] = "x"
+    first.root_files["packages.yml"] = "packages: []"          # 假裝有用套件
     again = load_dbt_project(SHA, download=dl)                  # 這次來自快取
     assert again.files["macros/m.sql"] == "{% macro m() %}1{% endmacro %}"
     assert "macros/evil.sql" not in again.files
+    assert "packages.yml" not in again.root_files
+    again.root_files["dependencies.yml"] = "x"                  # 改快取給的那一份
     again.files["macros/m.sql"] = "tampered"                    # 改快取給的那一份
     third = load_dbt_project(SHA, download=dl)
     assert third.files["macros/m.sql"] == "{% macro m() %}1{% endmacro %}"
+    assert set(third.root_files) == {"dbt_project.yml"}
     assert len(dl.calls) == 1
 
 
@@ -262,8 +312,7 @@ def test_cache_entry_limit_evicts_least_recently_used(monkeypatch):
 
 
 def test_cache_byte_limit(monkeypatch):
-    size = sum(len(k) + len(v) for k, v in load_dbt_project(
-        SHA, download=_Download(_gz(BASIC))).files.items())
+    size = dbt_project._size(load_dbt_project(SHA, download=_Download(_gz(BASIC))))
     dbt_project.clear_cache()
     monkeypatch.setattr(dbt_project, "CACHE_MAX_BYTES", size * 2 - 1)   # 只放得下一筆
     dl = _Download(_gz(BASIC))
@@ -284,6 +333,15 @@ def test_project_larger_than_cache_is_not_cached_and_does_not_flush_others(monke
     assert len(big.calls) == 2
     assert load_dbt_project("a" * 40, download=small).ok        # 小的還在快取裡
     assert len(small.calls) == 1
+
+
+def test_cache_size_counts_root_files(monkeypatch):
+    """快取總量要連 root_files 一起算:否則一個很大的 packages.yml 可以繞過上限。"""
+    big = _Download(_gz(BASIC | {"packages.yml": "x" * 5000}))
+    monkeypatch.setattr(dbt_project, "CACHE_MAX_BYTES", 3000)
+    assert load_dbt_project(SHA, download=big).ok
+    assert load_dbt_project(SHA, download=big).ok
+    assert len(big.calls) == 2                                  # 太大,沒進快取
 
 
 def test_default_download_is_the_gitlab_tool(monkeypatch):
