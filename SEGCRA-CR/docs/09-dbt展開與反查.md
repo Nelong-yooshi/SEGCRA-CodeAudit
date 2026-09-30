@@ -228,10 +228,32 @@ python tests/dbt_impact_reference/generate.py --dbt <dbt 執行檔>
 python tests/dbt_impact_reference/random_projects.py --dbt <dbt 執行檔>
 ```
 
+## 取回 dbt 專案(#15,已實作、尚未接進管線)
+
+審查機要能展開呼叫自訂 macro 的 model、做 macro 反查,必須拿到整個專案的 models / macros。
+以 GitLab `/repository/archive` 依 MR 的 commit 一次取回,分三個模組:
+
+| 模組 | 做什麼 | 主要防線 |
+|---|---|---|
+| `toolbox/gitlab.py` 的 `download_archive()` | 下載 tar.gz | 只用唯讀的 `GITLAB_READ_TOKEN`(不退回、不可與 `GITLAB_TOKEN` 相同);只接受完整 commit 編號;本機以外必須 https;不讀代理設定;不跟隨轉址;不做傳輸層解壓;大小與時間上限;**不在模型可呼叫的工具清單內** |
+| `orchestrator/archive.py` 的 `extract_archive()` | 解開成 {路徑: 內容} | 邊解壓邊計數(壓縮炸彈);逐一檢查成員(路徑穿越、連結與特殊檔、重複含大小寫與 Unicode 正規化、控制字元、Windows 保留名稱);只收 `.sql` / `.yml`;`filter="data"`;權限 700 的暫存目錄、讀完即刪 |
+| `orchestrator/dbt_project.py` 的 `load_dbt_project()` | 讀 `dbt_project.yml` 的目錄設定,取回 models / macros | 同一包讀設定與檔案(不另外用讀檔 API,那預設讀 main);目錄設定當不可信內容檢查;記憶體快取(以 commit 為鍵、有筆數與總量上限、只收成功結果、進出都複製) |
+
+任何一步失敗都是整包失敗(`ok=False`),**不會當成「專案沒有 macro」**。
+
+已知限制(接線與實測時要處理或確認):
+
+- **dbt 套件的 macro 拿不到**:`packages.yml` 宣告的套件(例如 `dbt_utils`)由 `dbt deps`
+  下載到 `dbt_packages/`,不在 repo 裡。呼叫套件 macro 的 model 仍會展開失敗(以展開失敗
+  揭露,不會靜默放行)
+- 只收 `.sql` / `.yml`(#15 條件 6);專案若用 `.yaml` 副檔名的屬性檔,需要調整
+- `path` 參數下 GitLab 打包的目錄結構(是否保留 `path` 那一層)、以及 `read_repository`
+  是否足以呼叫這個 API,要在真實 GitLab 上實測確認
+- 解壓與讀 `dbt_project.yml` 在審查行程內執行(不在子行程),由各項大小上限約束記憶體
+
 ## 後續
 
-- **macro 反查接進管線**:需要列 GitLab 目錄(或以 `/repository/archive` 依 commit
-  一次取回 `models/`、`macros/`)的工具,並先定好下載量上限
+- **macro 反查接進管線**:下載與解壓已實作(見上一節),尚待接線與實測
 - **展開結果尚未在 MS SQL 沙盒實際執行過**(目前只驗證了展開字串與 `dbt compile`
   逐字一致)。要支援樣板的執行驗證,需把 `ref()`/`source()` 對應到沙盒每次建立的
   資料庫,且 model 引用的上游表與規格建立的測資表名稱不同,需要處理

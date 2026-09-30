@@ -75,6 +75,31 @@ class ArchiveDownloadError(Exception):
     """打包下載失敗。訊息是固定文字,不含 token、URL、回應內容。"""
 
 
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _check_archive_url(url: str) -> None:
+    """本機以外一律要 https;網址裡不可夾帶帳密。訊息不回顯網址。
+
+    README §8 的測試 GitLab 綁在本機 127.0.0.1(或經 SSH tunnel 的 localhost),
+    用 http 沒有經過網路;其餘位址的 http 會讓唯讀 token 以明文傳輸。"""
+    import urllib.parse
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        raise ArchiveDownloadError("GITLAB_URL 不是合法的網址") from None
+    if parts.username is not None or parts.password is not None:
+        raise ArchiveDownloadError("GITLAB_URL 不可夾帶帳號密碼")
+    if not host:
+        raise ArchiveDownloadError("GITLAB_URL 不是合法的網址")
+    if parts.scheme == "https":
+        return
+    if parts.scheme == "http" and host in _LOOPBACK_HOSTS:
+        return
+    raise ArchiveDownloadError("GITLAB_URL 必須是 https(本機 localhost / 127.0.0.1 除外)")
+
+
 def download_archive(sha: str, path: str = "", *, max_bytes: int) -> bytes:
     """以 GitLab `/repository/archive.tar.gz` 取回某個 commit 的程式碼(tar.gz 原始位元組)。
 
@@ -82,17 +107,23 @@ def download_archive(sha: str, path: str = "", *, max_bytes: int) -> bytes:
     模型能自己決定下載哪個 commit 的哪個目錄,等於讓 MR 內容操控審查機去抓任意程式碼。
 
     sha        MR 的 head commit(完整編號,不接受分支名)
-    path       只取這個子目錄;空字串 = 整個 repo(舊版 GitLab 不支援 path 參數時)
+    path       只取這個子目錄;空字串 = 整個 repo(dbt 專案就在 repo 根目錄時)
     max_bytes  壓縮檔大小上限,超過就中止(呼叫端傳 archive.MAX_COMPRESSED_BYTES)
 
     權限:只用 GITLAB_READ_TOKEN(唯讀),**不退回用 GITLAB_TOKEN**——那把有寫入權,
-    #15 條件 1 要求兩者分開。缺了就失敗,由呼叫端交人工。
+    #15 條件 1 要求兩者分開。缺了、或兩把設成同一把,就失敗,由呼叫端交人工。
+    連線:本機以外一律要 https(token 不以明文過網路);不讀 HTTP_PROXY 等環境變數
+    (token 不送往代理);不跟隨轉址。
     回傳內容仍是不可信的,必須交給 orchestrator/archive.py 的 extract_archive() 解。
     任何失敗都丟 ArchiveDownloadError,訊息不含 token、URL 或回應內容。
     """
     if not (GITLAB_URL and GITLAB_PROJECT and GITLAB_READ_TOKEN):
         raise ArchiveDownloadError(
             "未設定 GITLAB_URL、GITLAB_PROJECT 或 GITLAB_READ_TOKEN,無法打包下載")
+    if GITLAB_READ_TOKEN == GITLAB_TOKEN:
+        raise ArchiveDownloadError(
+            "GITLAB_READ_TOKEN 與 GITLAB_TOKEN 是同一把;打包下載必須用另一把唯讀 token")
+    _check_archive_url(GITLAB_URL)
     if not isinstance(sha, str) or not _SHA.fullmatch(sha):
         raise ArchiveDownloadError("sha 必須是完整的 commit 編號(40 或 64 位小寫十六進位)")
     if not isinstance(path, str) or (path and (
@@ -113,7 +144,9 @@ def download_archive(sha: str, path: str = "", *, max_bytes: int) -> bytes:
                 # 計算大小之前就在記憶體裡膨脹(下面也只讀原始位元組)
                 headers={"PRIVATE-TOKEN": GITLAB_READ_TOKEN, "Accept-Encoding": "identity"},
                 # 不跟隨轉址:自訂的 PRIVATE-TOKEN 標頭可能被帶到別的主機
-                follow_redirects=False, timeout=30) as r:
+                follow_redirects=False,
+                # 不讀 HTTP_PROXY / HTTPS_PROXY / .netrc 等環境設定:token 不送往代理
+                trust_env=False, timeout=30) as r:
             if r.status_code != 200:
                 raise ArchiveDownloadError(f"GitLab 回應 HTTP {r.status_code}")
             if r.headers.get("Content-Encoding", "identity").lower() != "identity":

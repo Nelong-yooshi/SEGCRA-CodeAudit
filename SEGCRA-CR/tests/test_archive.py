@@ -231,6 +231,34 @@ def test_structure_violations_fail_whole_archive(entries, reason):
     _fails(extract_archive(_gz(entries), DIRS), reason)
 
 
+WINDOWS = "Windows 保留名稱"
+
+
+@pytest.mark.parametrize("name", [
+    f"{TOP}/models/{MARK}.sql.",           # Windows 會去掉結尾的點 → 變成另一個檔名
+    f"{TOP}/models/{MARK}.sql ",           # 結尾空白同理
+    f"{TOP}/models/{MARK}./a.sql",         # 目錄段落也一樣
+    f"{TOP}/models/con.sql",               # 裝置名稱(不分大小寫、帶副檔名也算)
+    f"{TOP}/models/NUL.yml",
+    f"{TOP}/models/Aux/x.sql",
+    f"{TOP}/models/com1.sql",
+    f"{TOP}/models/lpt9.sql",
+], ids=["trailing-dot", "trailing-space", "dir-trailing-dot", "con", "nul", "aux-dir",
+        "com1", "lpt9"])
+def test_windows_problem_names_fail(name):
+    """正式環境是 Linux,但開發與審查者的電腦可能是 Windows:結尾的點或空白會被去掉,
+    可用來繞過重複檢查覆蓋另一個檔案;裝置名稱會寫到裝置上。"""
+    _fails(extract_archive(_gz(_project([(name, b"x")])), DIRS), WINDOWS)
+
+
+def test_windows_like_but_legal_names_are_fine():
+    """只擋完全等於裝置名稱的段落;console、config、com10 這類正常名稱不受影響。"""
+    r = extract_archive(_gz(_project([(f"{TOP}/models/console.sql", b"1"),
+                                      (f"{TOP}/models/config/con_x.sql", b"2"),
+                                      (f"{TOP}/models/com10.sql", b"3")])), DIRS)
+    assert r.ok, r.error
+
+
 def test_duplicate_can_not_smuggle_content_past_review():
     """tar 允許同名項目、後者覆蓋前者:第一個看起來無害、第二個才是真內容。"""
     entries = [(f"{TOP}/",), (f"{TOP}/macros/m.sql", b"-- harmless"),

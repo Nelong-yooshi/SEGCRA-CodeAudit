@@ -48,6 +48,9 @@ ALLOWED_SUFFIXES = (".sql", ".yml")
 
 _CHUNK = 64 * 1024
 _REGULAR_TYPES = (tarfile.REGTYPE, tarfile.AREGTYPE)
+_WINDOWS_RESERVED = frozenset({"con", "prn", "aux", "nul",
+                               *(f"com{i}" for i in range(10)),
+                               *(f"lpt{i}" for i in range(10))})
 
 
 class ArchiveError(Exception):
@@ -138,6 +141,12 @@ def _split_relative(name: str) -> list[str]:
     parts = name.split("/")
     if any(p in ("", ".", "..") for p in parts):
         raise ArchiveError("路徑含 ..、. 或空段落")
+    for p in parts:
+        # Windows 會默默去掉結尾的點與空白(`a.sql.` 變成 `a.sql`),可用來繞過重複檢查
+        # 覆蓋另一個檔案;CON、NUL 等是裝置名稱。正式環境是 Linux,但開發與審查者的
+        # 電腦可能是 Windows,而正常的 dbt 專案不會有這種名稱,一律拒絕
+        if p.endswith((".", " ")) or p.split(".")[0].lower() in _WINDOWS_RESERVED:
+            raise ArchiveError("路徑含 Windows 保留名稱,或段落結尾是點或空白")
     return parts
 
 

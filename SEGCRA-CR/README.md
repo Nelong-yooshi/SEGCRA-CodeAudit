@@ -181,9 +181,14 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
    三個都設齊即切到 real 模式;缺任一則走 mock(fixtures/)。
 
    **dbt macro 的打包下載另外需要一把唯讀 token**(#15):專案 → *Settings* → *Access tokens*
-   建一把 **project access token**,角色 *Reporter*、scope 只勾 `read_repository`,設成
-   `GITLAB_READ_TOKEN`。它與上面有寫入權的 `GITLAB_TOKEN` 刻意分開,打包下載**不會**退回
-   用 `GITLAB_TOKEN`;沒設時打包下載一律失敗、交人工。
+   建一把 **project access token**,角色 *Reporter*、scope 只勾 `read_repository`、設定到期日,
+   設成 `GITLAB_READ_TOKEN`。它與上面有寫入權的 `GITLAB_TOKEN` 刻意分開:打包下載**不會**
+   退回用 `GITLAB_TOKEN`,兩把設成同一把也會拒絕;沒設時打包下載一律失敗、交人工。
+   打包下載只接受 https 的 `GITLAB_URL`(本機 localhost / 127.0.0.1 除外),且不經過
+   `HTTP_PROXY` 等代理設定。
+
+   > 待實測確認:`read_repository` 是否足以呼叫 `/repository/archive`(官方文件明寫它可用於
+   > git 與讀檔 API)。若回 HTTP 403,最小的替代是 `read_api`(仍是唯讀,但範圍較大)。
 3. **手動審一條真 MR**:
 
    ```bash

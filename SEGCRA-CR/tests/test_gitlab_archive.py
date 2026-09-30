@@ -59,7 +59,7 @@ class _Recorder:
 
 @pytest.fixture
 def real_env(monkeypatch):
-    monkeypatch.setattr(gitlab, "GITLAB_URL", "http://gitlab.test")
+    monkeypatch.setattr(gitlab, "GITLAB_URL", "https://gitlab.test")
     monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "42")
     monkeypatch.setattr(gitlab, "GITLAB_TOKEN", WRITE_TOKEN)
     monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", READ_TOKEN)
@@ -87,12 +87,13 @@ def test_downloads_with_read_token_only(real_env, fake_http):
     assert gitlab.download_archive(SHA, "dbt", max_bytes=100) == b"abcd"
     [call] = rec.calls
     assert call["method"] == "GET"
-    assert call["url"] == "http://gitlab.test/api/v4/projects/42/repository/archive.tar.gz"
+    assert call["url"] == "https://gitlab.test/api/v4/projects/42/repository/archive.tar.gz"
     assert call["params"] == {"sha": SHA, "path": "dbt"}
     assert call["headers"]["PRIVATE-TOKEN"] == READ_TOKEN        # 唯讀那把
     assert WRITE_TOKEN not in str(call)                            # 有寫入權的那把不能出現
     assert call["headers"]["Accept-Encoding"] == "identity"
     assert call["follow_redirects"] is False
+    assert call["trust_env"] is False                  # 不讀 HTTP_PROXY 等:token 不送往代理
     assert call["timeout"]
 
 
@@ -124,6 +125,47 @@ def test_never_falls_back_to_write_token(real_env, fake_http, monkeypatch):
     monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", "")
     with pytest.raises(gitlab.ArchiveDownloadError):
         gitlab.download_archive(SHA, max_bytes=100)
+    assert rec.calls == []
+
+
+def test_read_token_identical_to_write_token_is_refused(real_env, fake_http, monkeypatch):
+    """兩把設成同一把,「分開」就形同虛設:不下載。"""
+    rec = fake_http()
+    monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", WRITE_TOKEN)
+    with pytest.raises(gitlab.ArchiveDownloadError, match="同一把") as e:
+        gitlab.download_archive(SHA, max_bytes=100)
+    _err(e)
+    assert rec.calls == []
+
+
+@pytest.mark.parametrize("url", [
+    "https://gitlab.test", "https://gitlab.test:8443/", "http://localhost:8929",
+    "http://127.0.0.1:8929", "http://[::1]:8929", "HTTP://LOCALHOST:8929",
+])
+def test_https_or_loopback_is_accepted(real_env, fake_http, monkeypatch, url):
+    fake_http()
+    monkeypatch.setattr(gitlab, "GITLAB_URL", url)
+    assert gitlab.download_archive(SHA, max_bytes=100) == b"data"
+
+
+@pytest.mark.parametrize("url", [
+    "http://gitlab.test",                    # 明文、不在本機:token 會以明文過網路
+    "http://192.0.2.10:8929",                # 內網位址也一樣(RFC 5737 文件專用位址)
+    "http://localhost.gitlab.test",          # 看起來像 localhost 的其他主機
+    "ftp://gitlab.test",
+    "https://user:pass@gitlab.test",         # 網址夾帶帳密
+    "gitlab.test",                           # 沒有 scheme
+    "https://",
+    "http://[::1",                           # 解析失敗
+], ids=["http-remote", "http-lan", "fake-localhost", "ftp", "userinfo", "no-scheme",
+        "no-host", "broken"])
+def test_insecure_or_bad_url_refused_without_request(real_env, fake_http, monkeypatch, url):
+    rec = fake_http()
+    monkeypatch.setattr(gitlab, "GITLAB_URL", url)
+    with pytest.raises(gitlab.ArchiveDownloadError, match="GITLAB_URL") as e:
+        gitlab.download_archive(SHA, max_bytes=100)
+    msg = _err(e)
+    assert "pass" not in msg and url not in msg
     assert rec.calls == []
 
 
