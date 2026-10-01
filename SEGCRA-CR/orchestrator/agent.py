@@ -64,7 +64,11 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
     但 `extract_json` 照樣解析成功,只是案例從 46 個掉到 9 個。
 
     回傳型別刻意不改(5 個呼叫點全不受影響),沿用本檔既有的 `trace`
-    那種「傳容器進來收集額外資訊」的慣例。"""
+    那種「傳容器進來收集額外資訊」的慣例。
+
+    已對真實端點驗證過兩個方向(不只單元測試的 mock):`max_tokens=16` 時
+    回 `finish_reason='length'`、`completion_tokens=16`;`max_tokens=512`
+    的短回覆回 `'stop'`、`completion_tokens=67`。"""
     client = AsyncOpenAI(base_url=cfg.endpoint, api_key=cfg.api_key,
                          timeout=REQUEST_TIMEOUT, max_retries=0)
     messages = [{"role": "system", "content": system},
