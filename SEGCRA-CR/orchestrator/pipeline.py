@@ -444,6 +444,29 @@ _HINT_KEYWORDS = {
 
 
 _VALID_SEV = {"blocker", "major", "minor", "info"}
+_SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
+
+
+def _put_program_finding(report: dict, finding: dict) -> None:
+    """程式專用標題的 finding 只能由程式產生(#16 review):先移除同檔同標題的那條,
+    再放程式自己的。
+
+    以前用「同檔同標題已存在」去重,不看那條是誰產生的、嚴重度是什麼:模型只要先輸出
+    一條同標題的 info,程式就不補 major——等於讓模型自己關掉確定性防線(與 #10 修掉的
+    enforce_injection 同一類問題;repo 公開,標題字串查得到,MR 內容可以指示模型照抄)。
+
+    被移除的那條若比程式的嚴重,採較嚴重的等級:後處理只能讓決策更保守,不能更寬鬆。
+    只動同一個檔案的:其他檔案上的同標題 finding 沒有程式的版本可以取代,移掉只會更寬鬆。
+    """
+    key = (finding["file"], finding["title"])
+    kept, worst = [], finding["severity"]
+    for f in report.get("findings", []):
+        if (f.get("file"), f.get("title")) != key:
+            kept.append(f)
+        elif _SEVERITY_RANK.get(f.get("severity"), -1) > _SEVERITY_RANK[worst]:
+            worst = f["severity"]
+    kept.append({**finding, "severity": worst})
+    report["findings"] = kept
 
 
 def _title_grams(s: str):
@@ -517,13 +540,13 @@ def _parse_fail_finding(entry: dict) -> dict:
 def enforce_parse(report: dict, pre: list[dict]) -> dict:
     """預掃解析失敗的強制揭露。解析失敗時 AST 規則整組沒跑,若不補一條 finding,
     這個缺口不會出現在報告任何地方,MR 還可能因「沒有命中」而被自動放行。
-    dbt 展開失敗的檔案改由 enforce_dbt_render_failure 報(同一個檔案只留一條)。"""
-    have = {(f.get("file"), f.get("title")) for f in report.get("findings", [])}
+    dbt 展開失敗的檔案改由 enforce_dbt_render_failure 報(同一個檔案只留一條)。
+    標題只能由程式產生,模型同標題的輸出會被取代(見 _put_program_finding)。"""
     for entry in pre:
         if entry.get("dbt_render_error"):
             continue
-        if entry.get("parse_error") and (entry["path"], _PARSE_FAIL_TITLE) not in have:
-            report.setdefault("findings", []).append(_parse_fail_finding(entry))
+        if entry.get("parse_error"):
+            _put_program_finding(report, _parse_fail_finding(entry))
     return report
 
 
@@ -555,13 +578,13 @@ def enforce_dbt_render_failure(report: dict, pre: list[dict]) -> dict:
     不做「標記只在註解/字串裡就不報」的豁免:macro 的輸出可以帶換行結束行註解、
     帶 `*/` 結束區塊註解、帶引號結束字串或引號識別字,之後就是任意 SQL(四種位置
     都實測過能變成 R001 blocker)。展開失敗 = 不知道輸出是什麼,無法證明它跳不出去。
+
+    標題只能由程式產生:模型先輸出同標題的 info 也不能讓這條 major 消失
+    (見 _put_program_finding)。
     """
-    have = {(f.get("file"), f.get("title")) for f in report.get("findings", [])}
     for entry in pre:
-        if not entry.get("dbt_render_error") or (entry["path"], _RENDER_FAIL_TITLE) in have:
-            continue
-        report.setdefault("findings", []).append(_render_fail_finding(entry))
-        have.add((entry["path"], _RENDER_FAIL_TITLE))
+        if entry.get("dbt_render_error"):
+            _put_program_finding(report, _render_fail_finding(entry))
     return report
 
 
@@ -575,34 +598,57 @@ def enforce_dbt_notice(report: dict, pre: list[dict]) -> dict:
     審查者看到的表名卻從未被驗證過(見 dbt_render._RELATION_NOTICE)。這句提醒若只
     放在 prescan 裡交給模型,報告有沒有它取決於模型願不願意轉述。
     info 不影響決策(policy 允許 info 自動放行),但一定會出現在報告裡。
-    內容全是固定文字(dbt_render 的常數),不回顯 MR 內容。"""
-    have = {(f.get("file"), f.get("title")) for f in report.get("findings", [])}
+    內容全是固定文字(dbt_render 的常數),不回顯 MR 內容。
+    標題只能由程式產生:模型同標題的輸出(例如內文寫「已確認表名正確」)會被取代
+    (見 _put_program_finding)。"""
     for entry in pre:
         notice = entry.get("dbt_render_notice")
-        if not notice or (entry["path"], _DBT_NOTICE_TITLE) in have:
+        if not notice:
             continue
-        report.setdefault("findings", []).append({
+        _put_program_finding(report, {
             "file": entry["path"], "line": 0, "severity": "info",
             "title": _DBT_NOTICE_TITLE,
             "detail": notice,
             "suggestion": "確認 ref()/source() 指向的表名與實際專案一致後,再採信這段 SQL 的表名。",
             "citations": []})
-        have.add((entry["path"], _DBT_NOTICE_TITLE))
     return report
+
+
+def _reported_at_least(findings: list[dict], keywords: list[str], severity: str) -> bool:
+    """有沒有一條嚴重度不低於 severity 的 finding 提到任一關鍵詞。
+    只看 findings 的標題、內文與建議(summary、檔名等欄位不算:檔名 `r001_purge.sql`
+    含關鍵詞 purge,不代表講的是 R001)。不認得的嚴重度一律當成最嚴重
+    (只有 blocker 才算報過),寧可多補也不漏補。"""
+    need = _SEVERITY_RANK.get(severity, _SEVERITY_RANK["blocker"])
+    for f in findings:
+        if _SEVERITY_RANK.get(f.get("severity"), -1) < need:
+            continue
+        text = " ".join(str(f.get(k) or "") for k in ("title", "detail", "suggestion"))
+        if any(k in text for k in keywords):
+            return True
+    return False
 
 
 def enforce_rules(report: dict, pre: list[dict]) -> dict:
     """rule-base 命中的強制執行:預掃的 R 規則命中(blocker/major/minor)若模型
     未在報告中涵蓋,管線確定性補進 findings。
     起因:大型多問題 SQL 中,模型會挑語意問題報而漏掉機械性規則命中,
-    導致確定性 blocker(如 DELETE 無 WHERE)靜默消失——不能只靠模型 echo。"""
-    text = json.dumps(report, ensure_ascii=False)
+    導致確定性 blocker(如 DELETE 無 WHERE)靜默消失——不能只靠模型 echo。
+
+    「模型已經報過」只算**嚴重度不低於該命中**的 finding。以前比對報告全文的關鍵詞、
+    不看嚴重度:模型輸出一條 info「已確認 WHERE 條件無誤」,R001 的 blocker 就不補,
+    執行驗證通過時 DELETE 無 WHERE 會被自動放行(#16 review 同一類問題,已重現)。
+    跳過時報告裡一定已有同等或更嚴重的 finding,決策不會因此變寬鬆。
+    只比對進來時就有的 findings:本函式自己補的(標題含 WHERE 等關鍵詞)不能讓其他檔案的
+    同一條命中被當成「已經報過」。"""
+    before = list(report.get("findings", []))
     for entry in pre:
         for h in entry.get("rules", []):
             code = h.get("rule", "")
             if not code.startswith("R"):   # hint(H 系列)由 enforce_hints 處理
                 continue
-            if any(k in text for k in _RULE_KEYWORDS.get(code, [code])):
+            if _reported_at_least(before, _RULE_KEYWORDS.get(code, [code]),
+                                  h.get("severity", "major")):
                 continue
             report.setdefault("findings", []).append({
                 "file": entry["path"], "line": 0, "severity": h.get("severity", "major"),

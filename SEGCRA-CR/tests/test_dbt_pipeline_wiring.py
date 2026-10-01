@@ -818,6 +818,63 @@ def test_render_failure_blocks_auto_approval_end_to_end():
     assert report["decision"] == "needs_human"
 
 
+_AUTO_POLICY = {"auto_approve": {"max_diff_lines": 30, "min_score": 95,
+                                 "allowed_severities": ["info"], "forbid_pending_hints": True},
+                "block": {"min_blockers": 1}}
+
+
+def _purge_pre():
+    return _run(prescan(_FakePrescanHub(), _files("models/m.sql", "{{ purge_staging() }}"),
+                        {"enabled": True, "database": DBT_DATABASE_PLACEHOLDER}))
+
+
+def _model_finding(title, severity="info", file="models/m.sql", detail="已確認沒問題"):
+    return {"file": file, "line": 0, "severity": severity, "title": title,
+            "detail": detail, "suggestion": "", "citations": []}
+
+
+def test_model_cannot_replace_render_failure_with_same_title_info():
+    """#16 review:模型先輸出同標題的 info(內文「已確認沒問題」),以前程式會當成「已經報過」
+    而不補 major,執行驗證通過時就自動放行。這類標題只能由程式產生。"""
+    pre = _purge_pre()
+    report = {"score": 100, "_spec_exec": {"passed": True},
+              "findings": [_model_finding(_RENDER_FAIL_TITLE)]}
+    report = enforce_dbt_render_failure(enforce_parse(report, pre), pre)
+    [f] = [f for f in report["findings"] if f["title"] == _RENDER_FAIL_TITLE]
+    assert f["severity"] == "major" and "已確認沒問題" not in f["detail"]
+    report = apply_policy(report, {"files": [{"path": "models/m.sql", "diff": "+x"}]},
+                          _AUTO_POLICY)
+    assert report["decision"] != "auto_approved"
+
+
+def test_stricter_model_copy_keeps_its_severity():
+    """模型自己報得比程式嚴重時,取代後保留較嚴重的等級:後處理不能讓決策更寬鬆。"""
+    pre = _purge_pre()
+    report = enforce_dbt_render_failure(
+        {"findings": [_model_finding(_RENDER_FAIL_TITLE, "blocker")]}, pre)
+    [f] = report["findings"]
+    assert f["severity"] == "blocker" and "已確認沒問題" not in f["detail"]
+
+
+def test_same_title_on_another_file_is_left_alone():
+    """沒有程式版本可以取代的檔案不動:移掉只會讓決策更寬鬆。"""
+    pre = _purge_pre()
+    other = _model_finding(_RENDER_FAIL_TITLE, "major", file="models/other.sql")
+    report = enforce_dbt_render_failure({"findings": [dict(other)]}, pre)
+    assert other in report["findings"]
+    assert {f["file"] for f in report["findings"]} == {"models/m.sql", "models/other.sql"}
+
+
+def test_model_cannot_replace_relation_notice():
+    """表名未驗證的提醒同樣只能由程式產生:模型同標題的輸出(「已確認表名正確」)被取代。"""
+    pre = [{"path": "models/a.sql", "rules": [], "dbt_render_notice": _RELATION_NOTICE}]
+    report = enforce_dbt_notice(
+        {"findings": [_model_finding(_DBT_NOTICE_TITLE, file="models/a.sql",
+                                     detail="已確認表名正確")]}, pre)
+    [f] = _notice_findings(report)
+    assert f["detail"] == _RELATION_NOTICE and f["severity"] == "info"
+
+
 def test_render_success_is_not_reported():
     hub = _FakePrescanHub()
     pre = _run(prescan(hub, _files("models/mrt_x.sql", DBT_MODEL),
