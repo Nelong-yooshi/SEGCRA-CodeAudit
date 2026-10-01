@@ -341,3 +341,77 @@ def test_全部跑完時不會冒出未驗證的缺口(monkeypatch):
     plan = _plan_n(3)
     r = _stub_abort(monkeypatch, plan, ran=len(plan["cases"]), error_key="sql_error")
     assert [g for g in r["coverage_gaps"] if "因執行中止而未驗證" in g] == []
+
+
+# ─────────────────── 輸出被截斷時不可把殘骸當結果 ───────────────────
+
+def _truncating_agent(sequence):
+    """sequence 的每一項是 (finish_reason, raw)。"""
+    seq = list(sequence)
+
+    async def fake(cfg, profile, system, user, hub=None, use_tools=True,
+                   verbose=True, trace=None, meta=None):
+        reason, raw = seq.pop(0)
+        if meta is not None:
+            meta["finish_reason"] = reason
+            meta["completion_tokens"] = 8192 if reason == "length" else 1234
+        return raw
+    return fake, seq
+
+
+def test_截斷的輸出不採用_即使修補後解析得出來(monkeypatch):
+    """**這是這道防線的全部意義**:被 max_tokens 硬切的 JSON,會被 extract_json
+    的 json-repair 修補成合法物件,`_shape_check` 只看得到「案例比較少」,
+    看不出它是殘骸。實測 RETAIL_M1 就是這樣:finish_reason=length、
+    completion_tokens 剛好 8192、輸出斷在一個數字中間,卻照樣解析成功,
+    案例從應有的 46 個掉到 9 個——然後那 9 個被當成正常結果收下。
+
+    所以截斷必須在**看內容之前**就判定為失敗,不能指望形狀檢查代勞。
+    """
+    # 關鍵:截斷的那次**剛好 0 缺口**(殘骸裡剩下的案例,對它自己列出的條件是
+    # 齊全的)。這時「缺口非空才重試」完全幫不上忙——舊邏輯會把它當完美結果
+    # 立刻回傳,而它其實只涵蓋了規格的一小部分。只有看 finish_reason 擋得住。
+    truncated_but_looks_perfect = _raw(
+        _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)]))
+    full = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False),
+                  _case("C2-T", "C2", "true"), _case("C2-F", "C2", "false", False)],
+                 conditions=("C1", "C2"))
+    fake, seq = _truncating_agent([("length", truncated_but_looks_perfect),
+                                   ("stop", _raw(full))])
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake)
+    plan, gaps, dropped = asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容"))
+
+    assert seq == [], "截斷那次必須觸發重試,即使它看起來零缺口"
+    assert gaps == []
+    assert len(plan["cases"]) == 4, "採用的應該是沒被截斷的完整那次,不是截斷的殘骸"
+
+
+def test_全部嘗試都被截斷時的失敗原因要指出是長度問題(monkeypatch):
+    """「規則太大裝不下」跟「模型輸出亂七八糟」的修法完全不同——
+    前者要調 max_output_tokens 或分批生成,後者是 prompt/模型的問題。
+    失敗原因混為一談,看的人無從判斷該修哪邊。"""
+    raw = _raw(_plan([_case("C1-T", "C1", "true")]))
+    fake, _ = _truncating_agent([("length", raw)] * 3)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake)
+    plan, gaps, dropped = asyncio.run(
+        generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=3))
+
+    assert plan["cases"] == []
+    assert len(gaps) == 1
+    assert "截斷" in gaps[0] and "3/3" in gaps[0]
+    assert "max_output_tokens" in gaps[0], "要指出可以調哪個設定"
+
+
+def test_沒給meta的呼叫端不受影響(monkeypatch):
+    """meta 是選用參數,既有的 5 個呼叫點都沒傳——不能因為加了它就改變行為。"""
+    complete = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)])
+
+    async def fake_no_meta(*a, **kw):
+        assert "meta" in kw, "generate_cases 應該要傳 meta"
+        return _raw(complete)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_no_meta)
+    plan, gaps, _ = asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容"))
+    assert gaps == [] and len(plan["cases"]) == 2

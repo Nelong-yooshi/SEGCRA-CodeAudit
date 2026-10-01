@@ -729,6 +729,11 @@ MUTANTS.update({
         + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
         + '                "conditions": plan["conditions"],' + NL
         + '                "coverage_gaps": coverage_gaps,'),
+    # 截斷偵測:被 max_tokens 硬切的 JSON 會被 json-repair 修補成合法物件,
+    # 形狀檢查只看得到「案例比較少」。拿掉這一關,殘骸會被當成正常結果收下。
+    "測資:不理會輸出被截斷(殘骸當結果收下)": (S,
+        '        if meta.get("finish_reason") == "length":',
+        "        if False:"),
     "執行中止:測資建不起來時沒跑到的案例不算缺口": (S,
         'f"{ex[\'testdata_error\']}。需人工執行驗證。"))' + NL
         + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL

@@ -203,13 +203,28 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
     user = f"規則 {spec_code} 的核定規格如下,請產出測資計畫 JSON:\n\n{spec_text}"
     profile = cfg.role_profile("testgen") if profile_name is None else cfg.profile(profile_name)
     llm_error = None
+    truncated = 0
     best: tuple[dict, list[str], list[dict]] | None = None
     for attempt in range(max_attempts):
+        meta: dict = {}
         try:
             raw = await run_agent(cfg, profile, system, user, hub=None,
-                                  use_tools=False, verbose=False)
+                                  use_tools=False, verbose=False, meta=meta)
         except Exception as e:   # LLM 傳輸層失敗(連線/逾時)→ 降級為「測資生成失敗」,不炸管線
             llm_error = f"{type(e).__name__}: {e}"
+            continue
+        # 被 max_tokens 截斷 → 這次結果一律不可信,連看都不看就重試。
+        # **這一關不能靠 _shape_check 代勞**:截斷的 JSON 會被 extract_json 的
+        # json-repair 修補成合法物件,形狀檢查只會看到「案例比較少」,看不出
+        # 它其實是被硬切的殘骸。實測 RETAIL_M1:finish_reason=length、
+        # completion_tokens 剛好 8192、輸出斷在一個數字中間,但照樣解析成功,
+        # 案例從應有的 46 個掉到 9 個——而那 9 個會被當成正常結果收下。
+        if meta.get("finish_reason") == "length":
+            truncated += 1
+            user = (f"上一次的輸出超過長度上限被截斷了。請**大幅精簡**:"
+                    f"`note` 一律留空字串,每個案例只放最少必要的資料列,"
+                    f"但**條件的 true/false 兩向都不可省略**。\n\n"
+                    f"規則 {spec_code} 規格:\n{spec_text}")
             continue
         plan = extract_json(raw)
         if plan:
@@ -224,8 +239,17 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
                 f"規則 {spec_code} 規格:\n{spec_text}")
     if best is not None:
         return best
-    reason = (f"測資生成失敗(LLM 呼叫失敗:{llm_error})" if llm_error
-              else f"測資生成失敗({max_attempts} 次嘗試皆無合法輸出)")
+    if truncated:
+        # 這條失敗原因要講得夠具體才有用:「規則太大、輸出裝不下」跟「模型輸出
+        # 亂七八糟」的修法完全不同——前者要調 max_output_tokens 或分批生成,
+        # 後者是 prompt 或模型的問題。混在同一句話裡,看的人無從判斷。
+        reason = (f"測資生成失敗({truncated}/{max_attempts} 次因超過輸出長度上限被截斷)。"
+                  f"這條規則的測資計畫裝不進目前的 max_output_tokens;"
+                  f"需調高 roles.testgen 所用 profile 的上限,或改成分批生成。")
+    elif llm_error:
+        reason = f"測資生成失敗(LLM 呼叫失敗:{llm_error})"
+    else:
+        reason = f"測資生成失敗({max_attempts} 次嘗試皆無合法輸出)"
     return {"schema_ddl": [], "conditions": [], "cases": []}, [reason], []
 
 
