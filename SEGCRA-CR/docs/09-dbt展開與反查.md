@@ -41,7 +41,8 @@
 (`tests/dbt_reference/` → `tests/fixtures/dbt_compiled/`),不拿自己寫的預期值比。
 
 1. **`build_env()`**:建立含 dbt 樁的 `SandboxedEnvironment`。
-   - `ref()` / `source()` 展開成 `"<資料庫>"."dbo"."<表>"`(資料庫名由呼叫端傳入,不猜)
+   - `ref()` / `source()` 展開成 `"<資料庫>"."<綱要>"."<表>"`(資料庫名由呼叫端傳入,不猜);
+     沒有專案資訊時綱要固定為 `dbo`,有專案資訊時見下方「`ref()` / `source()` 的精確度」
    - `config()` 回傳空字串、`var()` 取呼叫端給的值、`execute` 為 True、
      `is_incremental()` 為 False(比照 compile 期)
    - `this`、`env_var` **刻意不定義**:給錯值會靜靜產出錯的 SQL,或把審查機的環境變數
@@ -65,6 +66,31 @@
    空白控制),改把左修剪拆成一個只輸出標記的 `{{- '標記' }}`,後面接去掉 `-` 的原
    標記:輸出只多了標記,這行(例如 `{{- 巨集() }}` 展開出的多行)仍有自己的行號。
    空白控制把幾行接成一個輸出行時,這行歸給內容開頭所在的原始行。
+4. **`ref()` / `source()` 的精確度(`dbt_relations`)**:呼叫端從專案檔案整理出
+   `DbtProjectInfo`(`project_info_from_files()`),交給 `render_model(project=...)`。
+
+   | 情況 | 沒給專案資訊 | 有給專案資訊 |
+   |---|---|---|
+   | 找得到的 `ref()` | 以 model 名稱為表名,帶提醒 | 照 dbt 規則展開,不帶提醒 |
+   | 找得到的 `source()` | 綱要固定 `dbo`,帶提醒 | 用 `sources.yml` 的 schema / identifier(schema 預設 = 來源名),不帶提醒 |
+   | 確定不存在 | 照常展開,帶提醒 | 展開失敗(dbt compile 一樣會失敗) |
+   | 無法確定 | — | 以慣例展開,帶「表名無法確定」提醒 |
+
+   - **「確定不存在」的條件**(缺一就只提醒、不判失敗,寧可保留提醒也不冤枉開發者):
+     沒用 dbt 套件(套件的 model / source 不在 repo 裡)、呼叫端提供了 seed / snapshot
+     名單(打包只收 `.sql` / `.yml`,拿不到 seed 的 `.csv`)、所有屬性檔都解析得了、呼叫端
+     以 `root_files_checked=True` 明確確認已檢查專案根目錄的 `packages.yml` /
+     `dependencies.yml`(沒傳進來不等於沒有)
+   - **只偵測、不模擬**:alias、自訂 schema、`generate_*_name`、樣板值、model 版本。
+     有這類設定就保留提醒;規則層檢查語法結構、不看表名,模擬的成本高、價值低
+   - **資料庫名一律用呼叫端給的約定假名**,不採用 `sources.yml` 宣告的 database:
+     展開結果會出現在審查報告裡,不放正式資料庫名;規則也不看資料庫名
+   - **macro 檔最外層的 `ref()` 不判定**:dbt 不會執行那段程式碼,在那裡失敗會冤枉開發者
+   - 專案檔案來自待審的 commit:YAML 一律 `safe_load`;輸入形狀不對就回傳「全部無法確定」;
+     `sources.yml` 宣告的名稱拼進 SQL 前過識別字白名單;YAML 別名可以把「來源 × 表」放大成
+     平方級,所有屬性檔合計最多處理 `MAX_PROPERTY_ENTRIES`(50,000)筆,超過即無法確定
+
+   以 `tests/dbt_reference` 驗證:有專案資訊時,與 `dbt compile` 逐字一致且不帶提醒。
 
 ### 二、反查與規格對應(dbt_impact)
 
@@ -237,11 +263,9 @@ python tests/dbt_impact_reference/random_projects.py --dbt <dbt 執行檔>
   資料庫,且 model 引用的上游表與規格建立的測資表名稱不同,需要處理
 - `{% if is_incremental() %}` 內的 SQL 不會被掃到(比照 compile 固定為 False),接線時
   需另以 True 再展開一次
-- `ref()` / `source()` 的精確度:`dbt_relations.project_info_from_files()` 已實作(給專案
-  檔案就能驗證 model / source 是否存在、套用 sources.yml),**尚待接線**——需要取回的專案
-  檔案、seed / snapshot 名單,以及專案根目錄的 `packages.yml` / `dependencies.yml`。
-  alias / 自訂 schema / generate_*_name / 樣板值只偵測、不模擬(保留提醒);資料庫名一律
-  用約定假名。以 `tests/dbt_reference` 驗證:有專案資訊時與 `dbt compile` 逐字一致、不帶提醒
+- `ref()` / `source()` 的精確度(見「一、展開」第 4 點)已實作,**尚待接線**:需要取回的
+  專案檔案、seed / snapshot 名單,以及專案根目錄的 `packages.yml` / `dependencies.yml`
 - 反查以檔案為單位;不分析第三方套件內的 macro;目錄由呼叫端指定
-- `invocation_id` 為固定值,樣板若輸出它,結果會與 dbt compile 不同- 待確認:規格檔名慣例(目前只去除 `mrt_` 前綴);earlyjob model 應歸屬主規則的規格,
+- `invocation_id` 為固定值,樣板若輸出它,結果會與 dbt compile 不同
+- 待確認:規格檔名慣例(目前只去除 `mrt_` 前綴);earlyjob model 應歸屬主規則的規格,
   確認前會交人工
