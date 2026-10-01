@@ -242,15 +242,25 @@ python tests/dbt_impact_reference/random_projects.py --dbt <dbt 執行檔>
 
 任何一步失敗都是整包失敗(`ok=False`),**不會當成「專案沒有 macro」**。
 
-已知限制(接線與實測時要處理或確認):
+**真實 GitLab 實測**(2026-10-01,測試用 GitLab、只含假資料的專案;project access token,
+角色 Reporter、只勾 `read_api`):
+
+| 項目 | 結果 |
+|---|---|
+| 依 commit 打包下載整個 repo | 成功;單一頂層目錄 `<專案>-<sha>-<sha>/` |
+| 指定 `path=dbt_sub` | 成功;頂層目錄變成 `<專案>-<sha>-<sha>-dbt_sub/`,**底下保留 `dbt_sub/` 這一層** |
+| `load_dbt_project()`,專案在 repo 根目錄 | 成功;只取回 models / macros 的 `.sql` / `.yml`(`README.md`、`seeds/*.csv` 排除) |
+| `load_dbt_project()`,專案在 `dbt_sub/` | 成功;路徑換算成相對專案根目錄 |
+| 不存在的 commit | HTTP 404,乾淨失敗並附處理提示 |
+| 同一個 token 只勾 `read_repository`(先前實測) | 讀單檔 200,打包與列目錄 403 |
+
+已知限制(接線時要處理):
 
 - **dbt 套件的 macro 拿不到**:`packages.yml` 宣告的套件(例如 `dbt_utils`)由 `dbt deps`
   下載到 `dbt_packages/`,不在 repo 裡。呼叫套件 macro 的 model 仍會展開失敗(以展開失敗
   揭露,不會靜默放行)
 - 只收 `.sql` / `.yml`(#15 條件 6);專案若用 `.yaml` 副檔名的屬性檔,需要調整
-- 權限:實測 `read_repository` 呼叫打包回 403(只能讀單檔),唯讀 token 改用 `read_api`
-  (仍然只能讀;見 README)。`read_api` 的打包實測、以及 `path` 參數下打包的目錄結構
-  (是否保留 `path` 那一層),待在真實 GitLab 上確認
+- 權限:唯讀 token 需要 `read_api`(仍然只能讀;見 README),`read_repository` 不夠(見上表)
 - 解壓與讀 `dbt_project.yml` 在審查行程內執行(不在子行程),由各項大小上限約束記憶體
 
 ## 後續

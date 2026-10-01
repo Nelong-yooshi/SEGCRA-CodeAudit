@@ -21,16 +21,18 @@ TOP = "proj-0123abc-0123abc"
 MARK = "SECRETCONTENT"
 
 
-def _gz(files: dict[str, bytes | str]) -> bytes:
-    """files:相對 repo 根的路徑 → 內容;全部放在 GitLab 打包的單一頂層目錄下。"""
+def _gz(files: dict[str, bytes | str], top_name: str = TOP, dirs: tuple[str, ...] = ()) -> bytes:
+    """files:相對 repo 根的路徑 → 內容;全部放在 GitLab 打包的單一頂層目錄下。
+    dirs:要另外放進去的目錄成員(真實 GitLab 的打包每一層目錄都有自己的成員)。"""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
-        top = tarfile.TarInfo(TOP)
-        top.type = tarfile.DIRTYPE
-        tar.addfile(top)
+        for name in (top_name, *(f"{top_name}/{d}" for d in dirs)):
+            entry = tarfile.TarInfo(name)
+            entry.type = tarfile.DIRTYPE
+            tar.addfile(entry)
         for name, content in files.items():
             data = content.encode("utf-8") if isinstance(content, str) else content
-            ti = tarfile.TarInfo(f"{TOP}/{name}")
+            ti = tarfile.TarInfo(f"{top_name}/{name}")
             ti.size = len(data)
             tar.addfile(ti, io.BytesIO(data))
     return gzip.compress(buf.getvalue())
@@ -138,6 +140,21 @@ def test_project_in_subdirectory():
     assert p.ok, p.error
     assert set(p.files) == {"models/a.sql", "models/schema.yml", "macros/m.sql"}
     assert dl.calls[0][1] == "dbt"
+
+
+def test_subdirectory_archive_shaped_like_real_gitlab():
+    """真實 GitLab 實測(docs/09)的形狀:指定 path=dbt_sub 時,頂層目錄多一個 `-dbt_sub`
+    後綴,底下**保留 dbt_sub/ 這一層**,每層目錄都有自己的成員。"""
+    sha = "ce555752b104a16c105873f5351e4fe666a277ba"
+    top = f"sample-project-{sha}-{sha}-dbt_sub"
+    files = {"dbt_sub/dbt_project.yml": "name: sub\n",
+             "dbt_sub/macros/sub_macro.sql": "{% macro m() %}1{% endmacro %}",
+             "dbt_sub/models/sub_model.sql": "select 1"}
+    data = _gz(files, top_name=top, dirs=("dbt_sub", "dbt_sub/macros", "dbt_sub/models"))
+    p = load_dbt_project(sha, "dbt_sub", download=_Download(data))
+    assert p.ok, p.error
+    assert set(p.files) == {"macros/sub_macro.sql", "models/sub_model.sql"}
+    assert p.root_files == {"dbt_project.yml": "name: sub\n"}
 
 
 def test_trailing_slash_in_project_dir_is_accepted():
