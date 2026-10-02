@@ -70,15 +70,18 @@
     `{% if is_incremental() %}` 裡的 SQL 不會出現在輸出中。要審查該分支需另外以
     True 再展開一次(且需支援 `{{ this }}`)。
   * 記憶體上限依賴作業系統(Linux 的 RLIMIT_AS);Windows 上只有逾時與上述上限。
-  * `source()` 依正式環境慣例展開(沿用 profile 的 database 與 dbo),未讀取
-    sources.yml;若某來源另外指定 schema / database / identifier,結果會與 dbt 不同。
-  * `ref()` 以 model 名稱為表名,不驗證被引用的 model 是否存在(沒有 manifest 可查),
-    未讀取被引用 model 的 alias,也未套用專案自訂的 `generate_schema_name` /
-    `generate_alias_name`;有自訂或指到不存在的 model 時,結果會與 dbt 不同。
+  * `ref()` / `source()` 的精確度取決於呼叫端有沒有給 `project`(DbtProjectInfo,
+    由 dbt_relations.project_info_from_files() 從專案檔案整理):
+      - **沒給**:不驗證被引用的 model 是否存在,source() 固定套用正式環境慣例
+        (database 與 dbo),不讀 sources.yml;用到就帶 `relation_notice`
+      - **有給**:找得到的照 dbt 的規則展開(source 讀 sources.yml 的 schema /
+        identifier);找不到而且能確定不存在就展開失敗(dbt compile 一樣會失敗);
+        專案用了套件、缺 seed / snapshot 名單、有 alias / 自訂 schema /
+        generate_*_name / 樣板值等**只偵測、不模擬**,這些情況才帶 `relation_notice`
+    資料庫名一律用呼叫端給的 database(約定的假名),不採用 sources.yml 宣告的資料庫。
     專案以 macro 覆寫 `ref` / `source`(dbt 允許)時,這裡會拒絕展開。
-    以上三項不影響規則層判斷(規則檢查的是語法結構,不檢查表名/表是否存在),
-    但用到 `ref()`/`source()` 時 `RenderResult.relation_notice` 會帶上提醒,
-    呼叫端應呈現給審查者,不要讓表名看起來像是已經過完整驗證。
+    表名落差不影響規則層判斷(規則檢查的是語法結構,不檢查表名),但呼叫端應呈現
+    `relation_notice`,不要讓表名看起來像是已經過完整驗證。
   * `adapter` 只提供 `dispatch`(依 `adapter` 參數先找 `<轉接器>__x`,再退回
     `default__x`);不讀 `dbt_project.yml` 的 dispatch 搜尋順序設定,也不分辨套件。
     `{{ this }}`、`run_query`、`modules`、`fromjson` 等其餘 dbt 內建未支援,
@@ -154,8 +157,8 @@ _DEFAULT_VARS: dict = {}
 _MISSING = object()
 _PLAIN_SCALARS = (str, int, float, bool, type(None))
 
-# ref()/source() 展開出的表名有三個已知落差,PR review 要求接線時要讓審查者看得到,
-# 不能只寫在模組文件裡沒人會翻:
+# 沒有專案資訊(DbtProjectInfo)時,ref()/source() 展開出的表名有三個已知落差,
+# PR review 要求接線時要讓審查者看得到,不能只寫在模組文件裡沒人會翻:
 #   1. 不驗證被引用的 model 是否真的存在(沒有 manifest 可查)
 #   2. source() 不讀 sources.yml,固定套用正式環境慣例(profile 的 database、dbo)
 #   3. ref() 不套用被引用 model 的 alias,也不套用專案自訂的 generate_schema_name
@@ -166,6 +169,43 @@ _RELATION_NOTICE = (
     "(不驗證被引用的 model 是否存在、不讀取 sources.yml、不套用 alias 與"
     "自訂 generate_schema_name)。若專案有用到這些進階寫法,表名可能有落差,"
     "建議人工核對。")
+# 有專案資訊(DbtProjectInfo)時,只有真的無法確定才帶這句——落差已經逐項處理掉,
+# 剩下的是:專案用了 dbt 套件、沒有 seed/snapshot 名單、屬性檔解析不了、
+# 或有會改變表名的設定(alias、自訂 schema、generate_*_name、樣板值)。
+_RELATION_UNCERTAIN_NOTICE = (
+    "此檔引用的 ref()/source() 有無法確定的部分(專案用了 dbt 套件、缺少 seed/snapshot "
+    "名單、屬性檔無法解析,或有 alias / 自訂 schema / 樣板值等會改變表名的設定),"
+    "展開出的表名可能與 dbt compile 不同,建議人工核對。")
+
+
+@dataclass(frozen=True)
+class DbtProjectInfo:
+    """專案層級的資訊(由 dbt_relations.project_info_from_files() 從專案檔案整理)。
+
+    給了它,ref() / source() 才能確認被引用的對象存在,並套用 sources.yml 的
+    schema / identifier;沒給就維持舊行為(不驗證、固定慣例、帶 _RELATION_NOTICE)。
+    資料庫名**一律用呼叫端給的 database**(約定的假名),不採用 sources.yml 宣告的
+    資料庫——展開後的 SQL 會出現在審查結果裡,不放正式資料庫名;規則也不看資料庫名。
+
+    project_name       dbt_project.yml 的 name(ref('本專案', 'x') 的第一個參數)
+    ref_names          ref() 找得到的名稱:model 檔名,加上呼叫端提供的 seed / snapshot
+    sources            {(來源名, 表名): (schema 或 None, identifier 或 None)};None = 沒宣告
+    uncertain_models   被引用時表名無法確定的 model / seed / snapshot(alias / schema / database、
+                       ephemeral、停用、同名、版本、Python model 等;見 dbt_relations)
+    uncertain_sources  schema / identifier 是樣板值、無法確定的來源表
+    global_uncertain   整個專案層級的不確定(自訂 generate_*_name、dbt_project.yml 的
+                       +schema / +alias 等);非 None 時所有 ref() 都視為無法確定
+    refs_complete      ref() 找不到就一定不存在(已知 seed/snapshot、沒用套件、屬性檔都解析得了)
+    sources_complete   source() 找不到就一定沒宣告(沒用套件、屬性檔都解析得了)
+    """
+    project_name: str | None = None
+    ref_names: frozenset = frozenset()
+    sources: dict = field(default_factory=dict)
+    uncertain_models: frozenset = frozenset()
+    uncertain_sources: frozenset = frozenset()
+    global_uncertain: str | None = None
+    refs_complete: bool = False
+    sources_complete: bool = False
 
 
 class DbtRenderError(Exception):
@@ -362,20 +402,49 @@ def _check_ident(kind: str, value) -> str:
     return value
 
 
-def _make_relations(database: str | None, schema: str, usage: dict):
+def _make_relations(database: str | None, schema: str, usage: dict,
+                    project: "DbtProjectInfo | None" = None):
     """dbt 的 ref() / source(),比照正式環境展開成 "<database>"."<schema>"."<表>"。
 
-    usage 是呼叫端給的共用字典,呼叫到 ref()/source() 就記一筆,讓呼叫端知道
-    這份 model 是否用了這兩個「不保證與 dbt 逐字相同」的展開(見 _RELATION_NOTICE)。
+    usage 是呼叫端給的共用字典:呼叫到 ref()/source() 記 used;有專案資訊但這次
+    引用無法確定時記 uncertain。呼叫端據此決定要不要帶提醒(見 _RELATION_NOTICE)。
+
+    有專案資訊時:
+      * 找得到的 ref() / source() 照 dbt 的規則展開(source 的 schema 預設是來源名、
+        表名預設是 table 名,sources.yml 有宣告就用宣告的)
+      * 找不到、而且能確定真的不存在(refs_complete / sources_complete)時展開失敗——
+        dbt compile 一樣會失敗,這種 MR 合進去會讓排程壞掉
+      * 找不到但無法確定(專案用了套件等),或有會改變表名的設定 → 記 uncertain,
+        仍以慣例展開(規則層不看表名,不影響判斷)
     """
 
-    def relation(name) -> str:
+    def relation(name, rel_schema=schema) -> str:
         usage["used"] = True
         if database is None:
             raise DbtRenderError(
                 "未設定 database,無法展開 ref()/source()。dbt 由 profile 決定資料庫名稱,"
                 "這裡同樣不猜值——請由呼叫端傳入 database。")
-        return f'"{database}"."{schema}"."{_check_ident("表", name)}"'
+        return f'"{database}"."{_check_ident("綱要", rel_schema)}"."{_check_ident("表", name)}"'
+
+    def missing(complete: bool, message: str) -> None:
+        """找不到被引用的對象:能確定不存在就失敗,否則記為無法確定。
+        載入 macro 檔時不判定:dbt 根本不執行 macro 檔最外層的程式碼,在那裡失敗
+        會冤枉開發者(那一階段的紀錄載入完也會歸零,見 build_env)。"""
+        if complete and not usage.get("loading_macros"):
+            raise DbtRenderError(message)
+        usage["uncertain"] = True
+
+    def check_ref(package, name) -> None:
+        if package is not None and package != project.project_name:
+            # 其他套件的 model:套件不在 repo 裡,看不到
+            missing(project.refs_complete,
+                    f"ref() 指向不存在的套件 {package}(dbt 會編譯失敗)")
+        elif name in project.ref_names:
+            if project.global_uncertain or name in project.uncertain_models:
+                usage["uncertain"] = True
+        else:
+            missing(project.refs_complete,
+                    f"ref() 指向專案裡不存在的 model / seed / snapshot:{name}(dbt 會編譯失敗)")
 
     def ref(*args, **kwargs):
         # ref('model') 或 ref('package', 'model')
@@ -389,11 +458,26 @@ def _make_relations(database: str | None, schema: str, usage: dict):
                 f"ref() 的關鍵字參數({names})會改變指向的關聯,本模組無法解析,拒絕展開。")
         for a in args[:-1]:
             _check_ident("套件", a)
-        return relation(args[-1])
+        name = _check_ident("表", args[-1])      # 先過白名單,錯誤訊息才可以帶名稱
+        if project is not None:
+            check_ref(args[0] if len(args) == 2 else None, name)
+        return relation(name)
 
     def source(source_name, table_name):
         _check_ident("來源", source_name)
-        return relation(table_name)
+        _check_ident("表", table_name)
+        if project is None:
+            return relation(table_name)
+        key = (source_name, table_name)
+        if key not in project.sources:
+            missing(project.sources_complete,
+                    f"source() 未在 sources.yml 宣告:{source_name}.{table_name}(dbt 會編譯失敗)")
+            return relation(table_name, source_name)
+        if key in project.uncertain_sources:
+            usage["uncertain"] = True
+        declared_schema, identifier = project.sources[key]
+        # dbt 的預設:schema = 來源名、表名 = table 名;宣告了才用宣告的
+        return relation(identifier or table_name, declared_schema or source_name)
 
     return ref, source
 
@@ -504,11 +588,13 @@ def _render_capped(template, limit: int) -> str:
 # ------------------------------------------------------- Jinja 環境與 dbt 樁
 def build_env(code_root=None, variables: dict | None = None,
               database: str | None = None, schema: str = DEFAULT_SCHEMA,
-              macro_dirs=DEFAULT_MACRO_DIRS, adapter: str = DEFAULT_ADAPTER):
+              macro_dirs=DEFAULT_MACRO_DIRS, adapter: str = DEFAULT_ADAPTER,
+              project: DbtProjectInfo | None = None):
     """建好含 dbt 樁與 macro 的 Environment。code_root 為 None 時不載入任何 macro。
 
     macro_dirs  專案的 macro 目錄(dbt 的 macro-paths;預設 macros/)
     adapter     dbt 轉接器名稱,決定 adapter.dispatch 先找哪個前綴的實作
+    project     專案層級資訊;給了才驗證 ref()/source() 的對象、套用 sources.yml
 
     回傳 (env, macro 名稱清單, 同名衝突清單)。
     """
@@ -531,8 +617,10 @@ def build_env(code_root=None, variables: dict | None = None,
     # 是否用到 ref()/source() 記在這裡,render_model() 展開成功後讀出來決定
     # relation_notice 要不要帶上。掛在 env 上是既有作法(見 segcra_macro_phase),
     # 不改 build_env() 的回傳簽章,呼叫端(含既有測試)不受影響。
-    env.segcra_relation_usage = {"used": False}
-    ref, source = _make_relations(database, schema, env.segcra_relation_usage)
+    if project is not None and not isinstance(project, DbtProjectInfo):
+        raise DbtRenderError("project 必須是 DbtProjectInfo")
+    env.segcra_relation_usage = {"used": False, "uncertain": False}
+    ref, source = _make_relations(database, schema, env.segcra_relation_usage, project)
     env.globals["ref"] = ref
     env.globals["source"] = source
     env.globals["config"] = _Config()
@@ -588,6 +676,7 @@ def build_env(code_root=None, variables: dict | None = None,
     shared: dict = dict(env.globals)
     # dbt 專用的區塊標籤只在這個階段解析得掉(理由見 _DbtBlocks)
     env.segcra_macro_phase = True
+    env.segcra_relation_usage["loading_macros"] = True
     for f in files:
         rel = f.relative_to(root).as_posix()
         try:
@@ -632,6 +721,8 @@ def build_env(code_root=None, variables: dict | None = None,
     # ref()/source();那是 macro 檔的事,不代表 model 本身用了——歸零,之後只記
     # model 展開(含它呼叫到的 macro)時真的用到的。
     env.segcra_relation_usage["used"] = False
+    env.segcra_relation_usage["uncertain"] = False
+    env.segcra_relation_usage["loading_macros"] = False
     env.segcra_macro_phase = False
     return env, sorted(macros), conflicts, problems
 
@@ -793,7 +884,8 @@ def _clamp(line_map: dict[int, int], n_src: int, n_out: int) -> dict[int, int]:
 def render_model(model_path, code_root=None, variables: dict | None = None,
                  source: str | None = None, database: str | None = None,
                  schema: str = DEFAULT_SCHEMA, macro_dirs=DEFAULT_MACRO_DIRS,
-                 adapter: str = DEFAULT_ADAPTER) -> RenderResult:
+                 adapter: str = DEFAULT_ADAPTER,
+                 project: DbtProjectInfo | None = None) -> RenderResult:
     """在同一行程內展開一份 dbt model。**待審的 MR 內容請改用 render_model_isolated()。**
 
     model_path  model 檔路徑(相對 code_root 或絕對路徑皆可)
@@ -805,6 +897,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
     schema      ref()/source() 展開用的綱要名,預設 dbo
     macro_dirs  macro 目錄(dbt 的 macro-paths;專案有自訂時由呼叫端傳入)
     adapter     dbt 轉接器名稱,決定 adapter.dispatch 先找哪個前綴的實作
+    project     專案層級資訊(DbtProjectInfo);給了才驗證 ref()/source() 的對象是否存在、
+                套用 sources.yml,且只在真的無法確定時才帶 relation_notice
 
     任何失敗都收斂成 ok=False 而不丟例外。
     """
@@ -822,7 +916,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
         if len(source) > MAX_SOURCE_CHARS:
             raise DbtRenderError(f"原始碼超過 {MAX_SOURCE_CHARS} 字元上限")
         env, macros, conflicts, problems = build_env(root, variables, database, schema,
-                                                     macro_dirs, adapter)
+                                                     macro_dirs, adapter, project)
         # dbt 讀檔時會去掉頭尾空白再渲染(開頭空行不會出現在編譯結果裡)
         body = source.strip()
         clean = _render_capped(env.from_string(body), MAX_OUTPUT_CHARS)
@@ -861,8 +955,16 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
         macro_problems=problems,
         source_lines=n_src,
         rendered_lines=n_out,
-        relation_notice=(_RELATION_NOTICE if env.segcra_relation_usage["used"] else None),
+        relation_notice=_relation_notice(env.segcra_relation_usage, project),
     )
+
+
+def _relation_notice(usage: dict, project: DbtProjectInfo | None) -> str | None:
+    """沒有專案資訊:用到 ref()/source() 就提醒(落差都沒處理)。
+    有專案資訊:只有真的無法確定才提醒——能確定的已經照 dbt 的規則展開。"""
+    if project is None:
+        return _RELATION_NOTICE if usage["used"] else None
+    return _RELATION_UNCERTAIN_NOTICE if usage["uncertain"] else None
 
 
 # ------------------------------------------------------------------ 隔離展開
