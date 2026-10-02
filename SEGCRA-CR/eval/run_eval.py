@@ -54,7 +54,7 @@ os.environ.setdefault("LLM_SEED", "42")
 
 sys.path.insert(0, str(PKG_ROOT))
 
-from orchestrator.config import load_config  # noqa: E402
+from orchestrator.config import DBT_DATABASE_PLACEHOLDER, load_config  # noqa: E402
 from orchestrator.pipeline import review_mr  # noqa: E402
 
 # Windows 主控台預設 cp950,中文輸出會炸;能改就改成 UTF-8。
@@ -167,12 +167,6 @@ def spec_desc(spec: dict) -> str:
     return "/".join(bits) or "(任意)"
 
 
-# dbt 接線開啟時的約定資料庫假名。正式環境由環境變數 SEGCRA_DBT_DATABASE 提供;
-# 這裡的後備值只給 golden set 用(評測不連任何資料庫,這個名字只會被拼進展開後的
-# 表名字串)。#16 會把這個約定值收成程式裡的共用常數,屆時改成 import。
-_DBT_PLACEHOLDER_DB = "DBT_PLACEHOLDER"
-
-
 def case_config(cfg, golden: dict):
     """`_golden.dbt_enabled` 的 case 用「開啟 dbt 接線」的設定跑,其餘 case 原樣。
 
@@ -185,9 +179,10 @@ def case_config(cfg, golden: dict):
     """
     if not golden.get("dbt_enabled"):
         return cfg
-    return replace(cfg, dbt={"enabled": True,
-                             "database": os.environ.get("SEGCRA_DBT_DATABASE")
-                             or _DBT_PLACEHOLDER_DB})
+    # 資料庫名一律用約定假名,不讀 SEGCRA_DBT_DATABASE:評測不連任何資料庫,這個名字
+    # 只會被拼進展開後的表名字串;讀環境變數的話,開發機設了別的值就會被 #16 的
+    # 「必須等於約定假名」檢查擋下,或拼出不同的表名,兩份 baseline 就不可比。
+    return replace(cfg, dbt={"enabled": True, "database": DBT_DATABASE_PLACEHOLDER})
 
 
 def read_signal(report: dict, key: str):

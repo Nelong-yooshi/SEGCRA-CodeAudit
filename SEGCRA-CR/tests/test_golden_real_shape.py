@@ -92,6 +92,15 @@ def test_case_config只對標記過的case開啟dbt接線(case):
     assert base.dbt["enabled"] is False, "不得就地改到傳進來的設定(其他 case 還要用)"
 
 
+def test_case_config一律用約定假名_不讀環境變數(case, monkeypatch):
+    """評測不連資料庫,資料庫名只會被拼進表名字串。讀環境變數的話,開發機設了別的值
+    就會被 #16 的「必須等於約定假名」擋下,或拼出不同的表名,兩份 baseline 不可比。"""
+    from orchestrator.config import DBT_DATABASE_PLACEHOLDER
+    monkeypatch.setenv("SEGCRA_DBT_DATABASE", "SOME_REAL_DB")
+    opened = case_config(_cfg(), case["_golden"])
+    assert opened.dbt["database"] == DBT_DATABASE_PLACEHOLDER
+
+
 def test_已編譯的SQL不會被當成dbt樣板(case):
     """被判成樣板的話,spec_exec 會直接回報「尚未支援樣板的執行驗證」而不執行——
     那就測不到任何東西了。"""
