@@ -151,6 +151,12 @@ TESTGEN_SYSTEM = """你是測試資料工程師。給你一份異常交易規則
    T-SQL 的 NVARCHAR 不寫長度等於長度 1。"""
 
 
+def testgen_system() -> str:
+    """實際送出的測資生成 system prompt(代入時間窗)。eval 的凍結檔以它的雜湊
+    判斷「這份測資是不是用現在的 prompt 生的」,所以兩邊必須拿同一份字串。"""
+    return TESTGEN_SYSTEM.replace("{win_start}", WIN_START).replace("{win_end}", WIN_END)
+
+
 def _shape_check(plan: dict) -> tuple[dict, list[str], list[dict]]:
     """確定性檢查測資計畫:JSON 形狀 + 逐條件 true/false 覆蓋。
     回傳 (清洗後 plan, coverage_gaps, dropped_malformed)。"""
@@ -199,7 +205,7 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
     0 缺口時,回傳嘗試過的最佳結果(而不是最後一次、也不是直接判定失敗)——
     覆蓋不完整要如實反映在 coverage_gaps 裡,由後續判斷是否需要人工確認,
     不能因為「retry 用完了」就悄悄退化成沒案例。"""
-    system = TESTGEN_SYSTEM.replace("{win_start}", WIN_START).replace("{win_end}", WIN_END)
+    system = testgen_system()
     user = f"規則 {spec_code} 的核定規格如下,請產出測資計畫 JSON:\n\n{spec_text}"
     profile = cfg.role_profile("testgen") if profile_name is None else cfg.profile(profile_name)
     llm_error = None

@@ -64,12 +64,15 @@ async def main() -> int:
         testdata_cache.save(
             args.spec_code, spec_text, plan, gaps,
             profile=(args.profile or cfg.roles.get("testgen") or cfg.default_profile),
+            model=testdata_cache.testgen_model(cfg, args.profile),
             force=args.force)
     except ValueError as e:
         print(f"\n{e}")
         return 1
 
     print(f"\n已凍結到 eval/testdata_cache/{args.spec_code}.json")
+    print("0 缺口不代表每個條件都驗到了:commit 前請逐條看過反向案例,"
+          "確認每個都「只有該條件不成立」。")
     return 0
 
 
