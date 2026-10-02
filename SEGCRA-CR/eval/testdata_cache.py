@@ -9,6 +9,7 @@
 
 用法:
   1. python eval/freeze_testdata.py R-140       # 生成、驗證 0 缺口才存檔
+     python eval/check_frozen_testdata.py R-140 # 沙盒上確認寫錯的 SQL 都抓得到,再 commit
   2. python eval/run_eval.py --frozen-testdata  # 有凍結檔的規格一律吃凍結版,
                                                  # 不呼叫測資生成的 LLM;沒凍結的規格照常呼叫
 

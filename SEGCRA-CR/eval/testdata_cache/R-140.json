@@ -1,10 +1,12 @@
 {
   "spec_code": "R-140",
   "spec_sha256": "af1bcc2871ac",
-  "generated_at": "2026-09-30T15:42:48+0800",
+  "prompt_sha256": "58e729c7b99f",
+  "generated_at": "2026-10-02T17:26:27+0800",
   "profile": "review",
+  "model": "gemma4:31b",
   "coverage_gaps": [],
-  "case_count": 21,
+  "case_count": 19,
   "plan": {
     "schema_ddl": [
       "CREATE TABLE txn_log(account_id INT, tx_time DATETIME2, op_code NVARCHAR(10), amount DECIMAL(14,2), cash_flag NVARCHAR(10), rev_flag NVARCHAR(10), channel_name NVARCHAR(50));"
@@ -57,7 +59,7 @@
           ]
         ],
         "expect_flagged": true,
-        "note": "Valid op_code OP01 should be counted"
+        "note": "入帳 op_code 應命中"
       },
       {
         "case_id": "C1-F",
@@ -76,7 +78,7 @@
           ]
         ],
         "expect_flagged": false,
-        "note": "Invalid op_code OP21 should be ignored"
+        "note": "出帳 op_code 不應命中"
       },
       {
         "case_id": "C2-T",
@@ -95,7 +97,7 @@
           ]
         ],
         "expect_flagged": true,
-        "note": "cash_flag='Y' should be counted"
+        "note": "現金入帳應命中"
       },
       {
         "case_id": "C2-F",
@@ -114,10 +116,10 @@
           ]
         ],
         "expect_flagged": false,
-        "note": "cash_flag='N' should be ignored"
+        "note": "非現金入帳不應命中"
       },
       {
-        "case_id": "C3-T-Val",
+        "case_id": "C3-T",
         "condition_id": "C3",
         "direction": "true",
         "rows": [
@@ -133,10 +135,10 @@
           ]
         ],
         "expect_flagged": true,
-        "note": "rev_flag='N' is not a reversal"
+        "note": "非沖銷交易應命中"
       },
       {
-        "case_id": "C3-T-Null",
+        "case_id": "C3-TN",
         "condition_id": "C3",
         "direction": "true",
         "rows": [
@@ -152,7 +154,7 @@
           ]
         ],
         "expect_flagged": true,
-        "note": "rev_flag=NULL should be treated as not a reversal"
+        "note": "rev_flag 為 NULL 視為非沖銷應命中"
       },
       {
         "case_id": "C3-F",
@@ -171,7 +173,7 @@
           ]
         ],
         "expect_flagged": false,
-        "note": "rev_flag='Y' must be excluded"
+        "note": "沖銷交易應排除"
       },
       {
         "case_id": "C4-T",
@@ -190,10 +192,10 @@
           ]
         ],
         "expect_flagged": true,
-        "note": "Amount > 1000 should be counted"
+        "note": "金額 > 1000 應列計"
       },
       {
-        "case_id": "C4-F-Bound",
+        "case_id": "C4-F",
         "condition_id": "C4",
         "direction": "false",
         "rows": [
@@ -201,6 +203,45 @@
             "txn_log",
             1,
             "2026-06-01 10:00:00",
+            "OP01",
+            500000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            1,
+            "2026-06-01 11:00:00",
+            "OP01",
+            1000.0,
+            "Y",
+            "N",
+            "ATM"
+          ]
+        ],
+        "expect_flagged": true,
+        "note": "恰 1000 元不列計，總額仍為 500k"
+      },
+      {
+        "case_id": "C4-B",
+        "condition_id": "C4",
+        "direction": "false",
+        "rows": [
+          [
+            "txn_log",
+            1,
+            "2026-06-01 10:00:00",
+            "OP01",
+            499500.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            1,
+            "2026-06-01 11:00:00",
             "OP01",
             1000.0,
             "Y",
@@ -209,29 +250,10 @@
           ]
         ],
         "expect_flagged": false,
-        "note": "Amount exactly 1000 should be excluded"
+        "note": "邊界測試：恰 1000 不列計，導致總額 499500 < 500k"
       },
       {
-        "case_id": "C4-F-Below",
-        "condition_id": "C4",
-        "direction": "false",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP01",
-            999.99,
-            "Y",
-            "N",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": false,
-        "note": "Amount < 1000 should be excluded"
-      },
-      {
-        "case_id": "C5-T-Val",
+        "case_id": "C5-T",
         "condition_id": "C5",
         "direction": "true",
         "rows": [
@@ -247,10 +269,10 @@
           ]
         ],
         "expect_flagged": true,
-        "note": "channel_name='ATM' is not PROMO"
+        "note": "一般通路應命中"
       },
       {
-        "case_id": "C5-T-Null",
+        "case_id": "C5-TN",
         "condition_id": "C5",
         "direction": "true",
         "rows": [
@@ -266,7 +288,7 @@
           ]
         ],
         "expect_flagged": true,
-        "note": "channel_name=NULL should be treated as not PROMO"
+        "note": "channel_name 為 NULL 視為非行銷撥入應命中"
       },
       {
         "case_id": "C5-F",
@@ -285,7 +307,7 @@
           ]
         ],
         "expect_flagged": false,
-        "note": "channel_name='PROMO' must be excluded"
+        "note": "行銷活動撥入應排除"
       },
       {
         "case_id": "C6-T",
@@ -304,10 +326,10 @@
           ]
         ],
         "expect_flagged": true,
-        "note": "Transaction within window (June 1st)"
+        "note": "交易日在窗內應命中"
       },
       {
-        "case_id": "C6-F-Before",
+        "case_id": "C6-F1",
         "condition_id": "C6",
         "direction": "false",
         "rows": [
@@ -323,10 +345,10 @@
           ]
         ],
         "expect_flagged": false,
-        "note": "Transaction before window start"
+        "note": "交易日在窗前不應命中"
       },
       {
-        "case_id": "C6-F-After",
+        "case_id": "C6-F2",
         "condition_id": "C6",
         "direction": "false",
         "rows": [
@@ -342,10 +364,10 @@
           ]
         ],
         "expect_flagged": false,
-        "note": "Transaction at window end (half-open interval)"
+        "note": "交易日在窗後(半開區間)不應命中"
       },
       {
-        "case_id": "C7-T-Bound",
+        "case_id": "C7-T",
         "condition_id": "C7",
         "direction": "true",
         "rows": [
@@ -361,29 +383,10 @@
           ]
         ],
         "expect_flagged": true,
-        "note": "Sum exactly 500,000 should be flagged"
+        "note": "累計金額恰 500,000 應命中"
       },
       {
-        "case_id": "C7-T-Above",
-        "condition_id": "C7",
-        "direction": "true",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP01",
-            500000.01,
-            "Y",
-            "N",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": true,
-        "note": "Sum > 500,000 should be flagged"
-      },
-      {
-        "case_id": "C7-F-Below",
+        "case_id": "C7-F",
         "condition_id": "C7",
         "direction": "false",
         "rows": [
@@ -399,10 +402,10 @@
           ]
         ],
         "expect_flagged": false,
-        "note": "Sum < 500,000 should not be flagged"
+        "note": "累計金額小於 500,000 不應命中"
       },
       {
-        "case_id": "C8-T-Agg",
+        "case_id": "C7-T2",
         "condition_id": "C7",
         "direction": "true",
         "rows": [
@@ -411,53 +414,14 @@
             1,
             "2026-06-01 10:00:00",
             "OP01",
-            300000.0,
-            "Y",
-            "N",
-            "ATM"
-          ],
-          [
-            "txn_log",
-            1,
-            "2026-06-01 11:00:00",
-            "OP01",
-            200000.0,
+            500000.01,
             "Y",
             "N",
             "ATM"
           ]
         ],
         "expect_flagged": true,
-        "note": "Aggregation of multiple rows reaching threshold"
-      },
-      {
-        "case_id": "C8-F-Agg",
-        "condition_id": "C7",
-        "direction": "false",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP01",
-            300000.0,
-            "Y",
-            "N",
-            "ATM"
-          ],
-          [
-            "txn_log",
-            1,
-            "2026-06-01 11:00:00",
-            "OP01",
-            199999.99,
-            "Y",
-            "N",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": false,
-        "note": "Aggregation of multiple rows below threshold"
+        "note": "累計金額大於 500,000 應命中"
       }
     ]
   }

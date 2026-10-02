@@ -15,6 +15,7 @@
 
 只想跳過測資生成那次 LLM 呼叫、主審查仍即時跑,見 eval/testdata_cache.py:
   python eval/freeze_testdata.py R-140        # 先凍結一次(0 缺口才會存檔)
+  python eval/check_frozen_testdata.py R-140  # 確認凍結的案例抓得到寫錯的 SQL
   python eval/run_eval.py --frozen-testdata   # 有凍結檔的規格直接用,沒凍結的照常生成
 
 golden case = mock MR fixture + 兩段標準答案:

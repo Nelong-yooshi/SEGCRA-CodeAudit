@@ -6,6 +6,9 @@
   python eval/freeze_testdata.py R-140 --profile fast    # 換模型
   python eval/freeze_testdata.py R-140 --force           # 有缺口也要存(不建議,見下)
 
+存檔後、commit 前再跑 `python eval/check_frozen_testdata.py R-140`:0 缺口只代表每個
+條件都有兩向案例,不代表反向案例真的只讓那一個條件不成立。
+
 只做這一件事:呼叫真的 `generate_cases()`(不經任何快取),印出結果,
 再決定要不要存檔。凍結是人主動觸發的動作,不是自動發生的——不然凍住的
 可能是一次不完整的取樣,而且不會有人注意到 golden set 從此少測了幾個條件。
@@ -72,7 +75,7 @@ async def main() -> int:
 
     print(f"\n已凍結到 eval/testdata_cache/{args.spec_code}.json")
     print("0 缺口不代表每個條件都驗到了:commit 前請逐條看過反向案例,"
-          "確認每個都「只有該條件不成立」。")
+          "並跑 eval/check_frozen_testdata.py 確認寫錯的 SQL 都抓得到。")
     return 0
 
 
