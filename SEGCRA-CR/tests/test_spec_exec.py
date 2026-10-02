@@ -138,9 +138,9 @@ def test_第一次覆蓋不完整_補齊後就採用補齊的那版(monkeypatch)
     assert calls == [], "第一次不完整,必須觸發第二次呼叫"
 
 
-def test_多次都沒抽到完整覆蓋時保留缺口最少的一版(monkeypatch):
+def test_多次都沒抽到完整覆蓋時保留覆蓋最多的一版(monkeypatch):
     """三次都沒抽到 0 缺口——不能因為「試完了」就退化成空案例,也不能只認最後一次
-    (最後一次剛好抽差也要收較好的那次),要保留看過的裡面缺口最少的。"""
+    (最後一次剛好抽差也要收較好的那次),要保留看過的裡面覆蓋最多的。"""
     worse = _plan([_case("C1-T", "C1", "true")], conditions=("C1", "C2"))       # 3 個缺口
     better = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False),
                     _case("C2-T", "C2", "true")], conditions=("C1", "C2"))       # 1 個缺口
@@ -184,6 +184,92 @@ def test_LLM_呼叫失敗後仍能在下次成功時採用完整結果(monkeypat
     plan, gaps, dropped = asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容"))
     assert gaps == []
     assert len(plan["cases"]) == 2
+
+
+def _all_dirs(conditions):
+    """每個條件兩向都有案例(0 缺口)。"""
+    return [_case(f"{c}-{d[0].upper()}", c, d, d == "true")
+            for c in conditions for d in ("true", "false")]
+
+
+def test_挑最佳版本看覆蓋數_不被拆得少的0缺口版本騙走(monkeypatch):
+    """review 第 4 點:缺口是對照模型**自己拆出的**條件算的。拆得少、全覆蓋的
+    那次是 0 缺口,但實際驗到的「條件 × 方向」比拆得齊、只缺一點的那次少。
+
+      第 1 次:拆 4 個條件、覆蓋 7/8(1 缺口)
+      第 2 次:只拆 1 個條件、覆蓋 2/2(0 缺口)← 不能因為 0 缺口就提前收下
+      第 3 次:拆 4 個條件、覆蓋 4/8(4 缺口)
+    應收第 1 次,而且第 2 次的 0 缺口不能讓它提前結束(第 3 次要被呼叫到)。"""
+    four = ("C1", "C2", "C3", "C4")
+    first = _plan(_all_dirs(four)[:-1], conditions=four)
+    second = _plan(_all_dirs(("C1",)), conditions=("C1",))
+    third = _plan(_all_dirs(four)[::2], conditions=four)
+    calls = [_raw(first), _raw(second), _raw(third)]
+
+    async def fake_run_agent(*a, **kw):
+        return calls.pop(0)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    plan, gaps, _ = asyncio.run(
+        generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=3))
+    assert calls == [], "第 2 次拆得比第 1 次少,0 缺口也不能提前結束"
+    assert len(plan["conditions"]) == 4 and len(plan["cases"]) == 7, \
+        "應收覆蓋 7 個「條件 × 方向」的第 1 次,不是 0 缺口但只覆蓋 2 個的第 2 次"
+    assert gaps == ["條件 C4 缺 false 向案例"]
+
+
+def test_0缺口且條件數不少於之前的最大值才提前結束(monkeypatch):
+    """第 1 次拆 2 個條件有缺口,第 2 次拆齊 2 個且 0 缺口 → 收第 2 次,不再試。"""
+    two = ("C1", "C2")
+    calls = [_raw(_plan(_all_dirs(two)[:3], conditions=two)),
+             _raw(_plan(_all_dirs(two), conditions=two)),
+             "不該被呼叫到"]
+
+    async def fake_run_agent(*a, **kw):
+        return calls.pop(0)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    plan, gaps, _ = asyncio.run(
+        generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=3))
+    assert gaps == [] and len(plan["cases"]) == 4
+    assert calls == ["不該被呼叫到"]
+
+
+def test_重試的prompt帶上一次的缺口_每次都不同(monkeypatch):
+    """review 第 4 點:評測固定 temperature 0 + seed 42,同一個 prompt 會得到逐位元組
+    相同的輸出。重試不帶這次的缺口,第 2、3 次送的是同一個 prompt,第 3 次等於白跑。"""
+    two = ("C1", "C2")
+    calls = [_raw(_plan(_all_dirs(two)[:3], conditions=two)),       # 缺 C2 false
+             _raw(_plan(_all_dirs(two)[:2], conditions=two)),       # 缺 C2 兩向
+             _raw(_plan(_all_dirs(two)[:3], conditions=two))]
+    users = []
+
+    async def fake_run_agent(cfg, profile, system, user, **kw):
+        users.append(user)
+        return calls.pop(0)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=3))
+    assert len(users) == 3
+    assert "條件 C2 缺 false 向案例" in users[1]
+    assert "條件 C2 缺 true 向案例" in users[2]
+    assert len(set(users)) == 3, "三次嘗試的 prompt 必須互不相同"
+
+
+def test_重試的prompt指出條件拆得比之前少(monkeypatch):
+    four = ("C1", "C2", "C3", "C4")
+    calls = [_raw(_plan(_all_dirs(four)[:-1], conditions=four)),
+             _raw(_plan(_all_dirs(("C1",)), conditions=("C1",))),
+             _raw(_plan(_all_dirs(four)[:-1], conditions=four))]
+    users = []
+
+    async def fake_run_agent(cfg, profile, system, user, **kw):
+        users.append(user)
+        return calls.pop(0)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=3))
+    assert "只拆出 1 個原子條件" in users[2] and "4 個" in users[2]
 
 
 # ─────────────────── 規則碼抽取 ───────────────────

@@ -704,14 +704,23 @@ def _mutate_all(args, src: pathlib.Path) -> int:
 S = "spec_exec.py"
 MUTANTS.update({
     "測資:有缺口也直接收下(回到舊行為)": (S,
-        "                if not gaps:\n"
-        "                    return cleaned, gaps, dropped   # 這次抽到完整覆蓋,不用再試",
-        "                if True:\n"
-        "                    return cleaned, gaps, dropped"),
-    "測資:不留缺口最少的一版(只認最後一次)": (S,
-        "                if best is None or len(gaps) < len(best[1]):\n"
+        "                if not gaps and n_conds >= max_conds:",
+        "                if True:"),
+    "測資:不留覆蓋最多的一版(只認最後一次)": (S,
+        "                if best is None or _covered(cleaned) > _covered(best[0]):\n"
         "                    best = (cleaned, gaps, dropped)",
         "                best = (cleaned, gaps, dropped)"),
+    # review 第 4 點:缺口是對照模型自己拆的條件算的,拆得少的 0 缺口版本不能
+    # 勝過拆得齊、只缺一點的版本;重試 prompt 不帶缺口,固定 seed 下等於白跑。
+    "測資:0 缺口就提前結束,不看條件數有沒有變少": (S,
+        "                if not gaps and n_conds >= max_conds:",
+        "                if not gaps:"),
+    "測資:最佳版本改回比缺口數": (S,
+        "                if best is None or _covered(cleaned) > _covered(best[0]):",
+        "                if best is None or len(gaps) < len(best[1]):"),
+    "測資:重試 prompt 不帶上一次的缺口": (S,
+        "        issues.append(\"上一次的測資計畫覆蓋不完整,缺:\\n\" + \"\\n\".join(f\"- {g}\" for g in gaps))",
+        "        issues.append(\"上一次的測資計畫覆蓋不完整。\")"),
     "測資:重試用完就判失敗(丟掉已抽到的最佳版)": (S,
         "    if best is not None:\n        return best",
         "    if False:\n        return best"),

@@ -190,6 +190,28 @@ def _shape_check(plan: dict) -> tuple[dict, list[str], list[dict]]:
     return {"schema_ddl": ddl, "conditions": conds, "cases": cases}, gaps, dropped
 
 
+def _covered(plan: dict) -> int:
+    """已覆蓋的「條件 × 方向」數。plan 須已經過 _shape_check(案例都指向存在的條件)。"""
+    return len({(c["condition_id"], c["direction"]) for c in plan["cases"]})
+
+
+def _retry_prompt(spec_code: str, spec_text: str, gaps: list[str],
+                  n_conds: int, max_conds: int) -> str:
+    """有合法案例但不夠好時的重試提示:講清楚上一次差在哪,讓每次重試的 prompt
+    都不同(固定 seed 下同一個 prompt 只會得到同一份輸出)。仍要求輸出**完整**
+    計畫,不是只補缺的部分——這裡收的是整份計畫,不做合併。"""
+    issues = []
+    if gaps:
+        issues.append("上一次的測資計畫覆蓋不完整,缺:\n" + "\n".join(f"- {g}" for g in gaps))
+    if n_conds < max_conds:
+        issues.append(f"上一次只拆出 {n_conds} 個原子條件,先前的嘗試拆出過 {max_conds} 個;"
+                      f"請依規格完整拆解,不要合併或省略條件。")
+    return ("\n\n".join(issues)
+            + "\n\n請重新輸出**完整的**測資計畫 JSON(包含已經有的案例),"
+              "每個條件的 true/false 兩向都要有案例。\n\n"
+            + f"規則 {spec_code} 規格:\n{spec_text}")
+
+
 async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
                          profile_name: str | None = None,
                          max_attempts: int = 3) -> tuple[dict, list[str], list[dict]]:
@@ -200,17 +222,28 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
     可能拆出不同數量的條件與案例)。只在「解析失敗/零案例」才重試,等於把
     這次取樣抽到的覆蓋度直接當結果收下,抽到不完整的就是不完整的結果。
 
-    所以現在 coverage_gaps 非空也算「這次不夠好」,一樣觸發重試;多次嘗試中
-    留**覆蓋缺口最少**的一版當候選,直到抽到 0 缺口才提前結束。仍然抽不到
-    0 缺口時,回傳嘗試過的最佳結果(而不是最後一次、也不是直接判定失敗)——
-    覆蓋不完整要如實反映在 coverage_gaps 裡,由後續判斷是否需要人工確認,
-    不能因為「retry 用完了」就悄悄退化成沒案例。"""
+    所以現在 coverage_gaps 非空也算「這次不夠好」,一樣觸發重試,而且重試的
+    prompt 會列出上一次缺了哪些條件、哪個方向。固定 temperature/seed 時,同一個
+    prompt 會得到逐位元組相同的輸出,不帶缺口的重試等於白跑。
+
+    「最佳」看的是**已覆蓋的「條件 × 方向」數**,不是缺口數:缺口是對照模型
+    自己拆出的條件算的,拆 12 個條件全覆蓋的那次是 0 缺口,會勝過拆齊 23 個、
+    只缺幾個案例的那次。同理,0 缺口也要條件數不少於之前各次嘗試的最大值
+    才提前結束,否則繼續試、最後仍收覆蓋數最多的一版。
+
+    已知限制:第一次就抽到「拆得少、0 缺口」時沒有東西可比,仍會直接收下。
+    要擋這個得拿規格本身的條件數比對,不是靠多次嘗試互比。
+
+    仍然抽不到 0 缺口時,回傳嘗試過的最佳結果(而不是最後一次、也不是直接判定
+    失敗)——覆蓋不完整要如實反映在 coverage_gaps 裡,由後續判斷是否需要人工
+    確認,不能因為「retry 用完了」就悄悄退化成沒案例。"""
     system = testgen_system()
     user = f"規則 {spec_code} 的核定規格如下,請產出測資計畫 JSON:\n\n{spec_text}"
     profile = cfg.role_profile("testgen") if profile_name is None else cfg.profile(profile_name)
     llm_error = None
     truncated = 0
     best: tuple[dict, list[str], list[dict]] | None = None
+    max_conds = 0
     for attempt in range(max_attempts):
         meta: dict = {}
         try:
@@ -236,11 +269,15 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
         if plan:
             cleaned, gaps, dropped = _shape_check(plan)
             if cleaned["cases"]:
-                if not gaps:
-                    return cleaned, gaps, dropped   # 這次抽到完整覆蓋,不用再試
-                if best is None or len(gaps) < len(best[1]):
+                n_conds = len(cleaned["conditions"])
+                max_conds = max(max_conds, n_conds)
+                if not gaps and n_conds >= max_conds:
+                    return cleaned, gaps, dropped   # 完整覆蓋且沒有拆得比之前少,不用再試
+                if best is None or _covered(cleaned) > _covered(best[0]):
                     best = (cleaned, gaps, dropped)
-        user = (f"上一次輸出無法解析、沒有任何合法案例,或覆蓋不完整,"
+                user = _retry_prompt(spec_code, spec_text, gaps, n_conds, max_conds)
+                continue
+        user = (f"上一次輸出無法解析或沒有任何合法案例,"
                 f"請重新輸出**完整覆蓋每個條件 true/false 兩向**的 JSON。\n\n"
                 f"規則 {spec_code} 規格:\n{spec_text}")
     if best is not None:
