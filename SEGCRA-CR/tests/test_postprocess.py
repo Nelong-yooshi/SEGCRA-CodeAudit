@@ -126,6 +126,65 @@ def test_模型已經報過就不重複補():
     assert len(report["findings"]) == 1, "模型已經報過了,不該重複補"
 
 
+_POLICY = {"auto_approve": {"max_diff_lines": 30, "min_score": 95,
+                            "allowed_severities": ["info"], "forbid_pending_hints": True},
+           "block": {"min_blockers": 1}}
+_R001 = {"rule": "R001", "severity": "blocker", "message": "DELETE 沒有 WHERE,將刪除整張表"}
+
+
+def test_模型用較低嚴重度提到關鍵詞_不能關掉確定性_blocker():
+    """#16 review 同一類問題(已重現):以前比對報告全文、不看嚴重度,模型輸出一條 info
+    「已確認 WHERE 條件無誤」,R001 的 blocker 就不補,執行驗證通過時 DELETE 無 WHERE
+    會被自動放行。"""
+    from orchestrator.pipeline import apply_policy
+
+    report = enforce_rules(
+        {"score": 100, "_spec_exec": {"passed": True},
+         "findings": [{"severity": "info", "file": FILE, "title": "已確認 WHERE 條件無誤"}]},
+        _pre([_R001]))
+    assert [f["severity"] for f in report["findings"]] == ["info", "blocker"]
+    mr = {"files": [{"path": "sql/maintenance/x.sql", "diff": "@@\n+DELETE FROM t;"}]}
+    assert apply_policy(report, mr, _POLICY)["decision"] == "blocked"
+
+
+@pytest.mark.parametrize("severity, added", [
+    ("info", True), ("minor", True), ("major", True), ("blocker", False)])
+def test_只有同等或更嚴重的_finding_才算報過(severity, added):
+    report = enforce_rules(
+        {"findings": [{"severity": severity, "file": FILE, "title": "DELETE 沒有 WHERE"}]},
+        _pre([_R001]))
+    assert (len(report["findings"]) == 2) is added
+
+
+@pytest.mark.parametrize("findings", [
+    [],
+    # 夠嚴重,但講的是別的事;FILE 是 r001_purge.sql,檔名含關鍵詞 purge 也不算
+    [{"severity": "blocker", "file": FILE, "title": "硬編碼密碼"}],
+], ids=["no-findings", "unrelated-blocker"])
+def test_summary_提到關鍵詞不算報過(findings):
+    """只看 finding 的標題、內文與建議:summary 或檔名提到關鍵詞,都不算報過。"""
+    report = enforce_rules({"summary": "WHERE 條件都檢查過了", "findings": list(findings)},
+                           _pre([_R001]))
+    assert any("R001" in f["title"] for f in report["findings"])
+
+
+def test_自己補的_finding_不能讓其他檔案的同一條命中被跳過():
+    """補出來的標題含關鍵詞(「DELETE 沒有 WHERE」);若拿來比對,第二個檔案的 R001 就會
+    被當成已經報過而從報告消失。只比對模型原本的 findings。"""
+    pre = _pre([_R001]) + _pre([_R001], path="sql/rules/r002_other.sql")
+    report = enforce_rules({"findings": []}, pre)
+    assert sorted(f["file"] for f in report["findings"]) == sorted(
+        [FILE, "sql/rules/r002_other.sql"])
+
+
+def test_不認得的規則嚴重度只有_blocker_才算報過():
+    pre = _pre([{"rule": "R009", "severity": "critical", "message": "R009 新規則"}])
+    major = {"severity": "major", "file": FILE, "title": "R009 已處理"}
+    assert len(enforce_rules({"findings": [dict(major)]}, pre)["findings"]) == 2
+    blocker = {"severity": "blocker", "file": FILE, "title": "R009 已處理"}
+    assert len(enforce_rules({"findings": [dict(blocker)]}, pre)["findings"]) == 1
+
+
 def test_hint_系列不由_enforce_rules_處理():
     """H 系列是檢核點,走 enforce_hints;enforce_rules 只管 R 系列。"""
     pre = _pre([{"rule": "H001", "severity": "hint", "message": "沖正/退匯是否已處理"}])
@@ -195,6 +254,16 @@ def test_同檔解析失敗不重複補():
     report = enforce_parse({"findings": []}, pre)
     report = enforce_parse(report, pre)      # 再跑一次
     assert len(report["findings"]) == 1
+
+
+def test_模型同標題的_info_不能取代解析失敗的_major():
+    """#16 review:這類標題只能由程式產生,先移除模型同標題的輸出再補程式自己的。"""
+    from orchestrator.pipeline import _PARSE_FAIL_TITLE
+
+    model = {"severity": "info", "file": FILE, "title": _PARSE_FAIL_TITLE, "detail": "沒問題"}
+    report = enforce_parse({"findings": [model]}, _pre(parse_error="boom"))
+    [f] = report["findings"]
+    assert f["severity"] == "major" and f["detail"] != "沒問題"
 
 
 def test_沒有解析錯誤就不補():
