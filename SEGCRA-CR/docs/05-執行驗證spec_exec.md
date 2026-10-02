@@ -56,6 +56,18 @@
 >
 > **審查時間會變長**:決策行為不變,但真實規模的規則每次嘗試都會生成到輸出上限(被截斷後重試),最多 3 次——測資生成這段的耗時最多約為原本的 3 倍。
 
+**截斷偵測**:`generate_cases` 在解析輸出**之前**先看 `run_agent` 回填的 `meta["finish_reason"]`,是 `length`(碰到 `max_output_tokens` 被硬切)就整次不收、帶「大幅精簡、兩向不可省略」的提示重試;全部嘗試都被截斷時,失敗原因明說是長度問題(調上限或改分批生成)。這一關不能靠 `_shape_check` 代勞:截斷的 JSON 會被 `extract_json` 的 json-repair 修補成合法物件,形狀檢查只看得到「案例比較少」,甚至可能剛好 0 缺口。
+
+這道防線**整個依賴端點回報 `finish_reason`**,單元測試的 `run_agent` 是假的、證明不了這件事。2026-10-02 對 `gemma4:31b`(Ollama OpenAI 相容端點)實測:
+
+| 檢查 | 結果 |
+|---|---|
+| 輸出上限 64、要求長輸出 | `meta` = `finish_reason: length`、`completion_tokens: 64` |
+| 正常短回答 | `finish_reason: stop` |
+| `generate_cases` 整條路徑,上限 256 | 0 案例,失敗原因「2/2 次因超過輸出長度上限被截斷…」,沒有把殘骸當結果 |
+
+換端點或模型時(例如部署到客戶環境)端點可能不回報這個欄位,防線就會**靜默失效**。所以 `eval/preflight.py` 的「輸出截斷回報」探針會在每次跑批前重驗一次(走真正的 `run_agent`):碰到上限卻沒回 `length` 就中止跑批。
+
 ### 第 2 步:角色二 沙盒執行(確定性程式,非 LLM;`prepare_sql` / `execute_cases`)
 
 **為什麼沙盒必須是 MS SQL**:規則程式跑在 MS SQL 上。不同引擎在整數除法(`7/2` 在 SQL Server 是 3,在 DuckDB 是 3.5)、`DATETIME` 精度、型別轉換、日期函式上的語意不同,同一段 SQL 在別的引擎上「通過」,不代表在正式環境通過。所以沙盒是 `scripts/sandbox.sh` 起的 SQL Server 容器(Developer 版,只綁 127.0.0.1),**SQL 本體原樣執行、不做方言轉譯**。

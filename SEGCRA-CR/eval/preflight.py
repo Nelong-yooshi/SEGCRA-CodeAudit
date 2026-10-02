@@ -22,7 +22,8 @@
 
   --offline   只做確定性檢查(git 狀態、套件版本)。不連網路,秒級,可掛 CI
   --quick     加上端點身分、模型 digest、沙盒往返。仍不呼叫模型,約數秒
-  (預設)     加上三個模型探針(seed 是否生效 / context 是否被截 / 延遲中位數),
+  (預設)     加上四個模型探針(seed 是否生效 / context 是否被截 / 輸出截斷是否回報 /
+              延遲中位數),
               會真的呼叫模型,約一到三分鐘
 
 輸出一份**環境指紋**(`--out fingerprint.yaml`),`run_baseline.py` 會把它收進
@@ -462,6 +463,56 @@ async def check_num_ctx(client, model: str, budget_tokens: int) -> Check:
                  f"({budget_tokens})之內沒有被截斷", data)
 
 
+TRUNC_PROBE_TOKENS = 64
+
+
+async def check_truncation_signal(cfg) -> Check:
+    """實測「輸出被 max_tokens 截斷時,端點有沒有說出來」——而且走真正的 `run_agent`。
+
+    測資生成的截斷偵測(`generate_cases` 看 `finish_reason == "length"` 就不收這次的
+    結果)**整個依賴端點回報這個欄位**:截斷的 JSON 會被 `extract_json` 的 json-repair
+    修補成合法物件,除了這個欄位之外沒有任何線索。單元測試的 `run_agent` 是假的、
+    欄位是自己填的,只證明「看到 length 會正確處理」,證明不了「真實端點會給」。
+    換了端點或模型(例如部署到客戶環境),端點不回這個欄位的話,這道防線會**靜默
+    失效**——套件照樣全綠,截斷的殘骸照樣被當成完整結果收下。
+
+    探針:用測資生成的 profile、把輸出上限壓到 64,要求一段長輸出,看 `run_agent`
+    回填的 `meta`。2026-10-02 對 gemma4:31b(Ollama)實測:`finish_reason=length`、
+    `completion_tokens=64`。
+    """
+    from dataclasses import replace
+
+    from orchestrator.agent import run_agent
+
+    prof = replace(cfg.role_profile("testgen"), max_output_tokens=TRUNC_PROBE_TOKENS)
+    meta: dict = {}
+    try:
+        await run_agent(cfg, prof, "你是助理。",
+                        "請把 1 到 500 的每個數字寫成中文大寫,用逗號分隔,不要省略。",
+                        hub=None, use_tools=False, verbose=False, meta=meta)
+    except Exception as e:
+        return Check("輸出截斷回報", "fail",
+                     f"探針呼叫失敗:{type(e).__name__}: {str(e)[:150]}", {})
+    reason, used = meta.get("finish_reason"), meta.get("completion_tokens")
+    data = {"model": prof.model, "max_tokens": TRUNC_PROBE_TOKENS,
+            "finish_reason": reason, "completion_tokens": used,
+            "reported": reason == "length"}
+    if reason == "length":
+        return Check("輸出截斷回報", "ok",
+                     f"上限 {TRUNC_PROBE_TOKENS} 時回報 finish_reason=length"
+                     f"(completion_tokens={used})→ 測資生成的截斷偵測在這個端點上有效", data)
+    if reason == "stop" and isinstance(used, int) and used < TRUNC_PROBE_TOKENS:
+        data["reported"] = None
+        return Check("輸出截斷回報", "warn",
+                     f"模型只用了 {used} tokens 就自己停了,沒碰到上限 → 這次量不出"
+                     "端點會不會回報截斷", data)
+    return Check("輸出截斷回報", "fail",
+                 f"❗輸出碰到上限,端點卻回 finish_reason={reason!r}"
+                 f"(completion_tokens={used})→ **測資生成的截斷偵測在這個端點上靜默失效**:"
+                 "被截斷的測資計畫會被 json-repair 修補後當成完整結果收下。"
+                 "換端點/模型後請先確認它如何回報截斷,再調整 orchestrator/agent.py 的 meta 回填", data)
+
+
 async def check_latency(client, model: str, n: int = 3) -> Check:
     """量短呼叫的耗時中位數,只為了一個目的:**判斷計時數據能不能跨輪比較**。
 
@@ -529,6 +580,8 @@ def build_fingerprint(checks: list[Check], cfg, profiles: list[str]) -> dict:
             # 跑批是可重現的。所以兩個都記,而且 seed_configured 也列入不可比欄位。
             "seed_effective": seed_chk.get("effective", "未測"),
             "seed_configured": {p: getattr(prof_obj[p], "seed", "不支援") for p in prof},
+            # 測資生成的截斷偵測只靠端點回報 finish_reason=length;記下這輪實測的結果
+            "truncation_reported": d("輸出截斷回報").get("reported", "未測"),
         },
         "sandbox": d("執行驗證沙盒"),
         "timing": d("推論延遲"),
@@ -593,6 +646,7 @@ async def run(args) -> int:
         model = cfg.profile(cfg.default_profile).model
         checks.append(await check_seed(client, model))
         checks.append(await check_num_ctx(client, model, cfg.budget["diff"]))
+        checks.append(await check_truncation_signal(cfg))
         checks.append(await check_latency(client, model))
 
     print("起飛前檢查" + ("(--offline:只做確定性檢查)" if args.offline
