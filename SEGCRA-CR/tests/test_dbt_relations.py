@@ -204,6 +204,218 @@ def test_config_without_name_settings_is_certain():
     assert "stg_txn" not in info.uncertain_models
 
 
+@pytest.mark.parametrize("src", [
+    "{{ config({'alias': 'renamed'}) }} select 1",                    # 字典寫法(#19 review)
+    "{{ config(**{'alias': 'renamed'}) }} select 1",                  # ** 展開(#19 review)
+    "{{ config(materialized='ephemeral') }} select 1",                # ephemeral(#19 review)
+    "{{ config(materialized=\"EPHEMERAL\") }} select 1",
+    "{% set c = {'alias': 'x'} %}{{ config(**c) }} select 1",         # 名稱寫在別處
+    "{{ config(c) }} select 1",                                       # 位置參數是變數
+    "{{ config(materialized=var('m')) }} select 1",                   # 執行期才知道
+    "{{ config(post_hook=')', **var('c')) }} select 1",               # 字串裡的括號
+    "{{ config(materialized='view', alias='x') }} select 1",          # 第二個參數才改名
+    "{{ config(materialized='view',\n  schema='x') }} select 1",
+    "{{ config(materialized='view' ~ 'x') }} select 1",               # 樣板運算
+    "{{ config(materialized='view'",                                  # 沒有右括號
+], ids=["dict", "double-star", "ephemeral", "ephemeral-upper", "set-then-star", "positional-var",
+        "var-materialized", "paren-in-string", "second-arg", "multiline-second-arg", "concat",
+        "unclosed"])
+def test_config_forms_that_may_rename_are_uncertain(src):
+    """#19 review:被引用時表名可能不是 model 名稱的寫法,一律判成無法確定(只是保留提醒)。
+    做法是白名單:每個參數都要是「名稱 = 常值」,看不懂的一律算可能改名。"""
+    assert "stg_txn" in _info(BASE | {"models/stg/stg_txn.sql": src}).uncertain_models
+
+
+@pytest.mark.parametrize("src", [
+    "{{ config(materialized='view', tags=['a', 'b'], enabled=true) }} select 1",
+    "{{ config(materialized=\"table\", unique_key='id', batch_size=100) }} select 1",
+    "{{ config(post_hook='select (1)', materialized='view') }} select 1",   # 字串裡成對的括號
+    "{{ config() }} select 1",
+    "{{ config.get('x') }} select 1",                                       # 讀設定不是設定
+    "select alias, schema_name from t",                                     # 沒有 config()
+], ids=["literals", "double-quote", "paren-pair-in-string", "empty", "config-get", "no-config"])
+def test_plain_config_stays_certain(src):
+    """正常寫法不能誤判:否則每個 model 都帶提醒,審查者會開始忽略它。"""
+    assert "stg_txn" not in _info(BASE | {"models/stg/stg_txn.sql": src}).uncertain_models
+
+
+@pytest.mark.parametrize("yml, uncertain", [
+    ("models:\n  - name: stg_txn\n    config: {materialized: ephemeral}\n", True),
+    ("models:\n  - name: stg_txn\n    config:\n      materialized: \"{{ var('m') }}\"\n", True),
+    ("models:\n  - name: stg_txn\n    config: {materialized: [ephemeral]}\n", True),
+    ("models:\n  - name: stg_txn\n    config: {materialized: table}\n", False),
+], ids=["ephemeral", "templated", "not-a-string", "table"])
+def test_properties_materialization(yml, uncertain):
+    info = _info(BASE | {"models/p.yml": yml})
+    assert ("stg_txn" in info.uncertain_models) is uncertain
+
+
+@pytest.mark.parametrize("yml, uncertain", [
+    ("models:\n  shop:\n    marts:\n      +materialized: ephemeral\n", True),
+    ("models:\n  shop:\n    +materialized: \"{{ var('m') }}\"\n", True),
+    ("models:\n  shop:\n    +materialized: view\n", False),
+    ("models:\n  shop:\n    materialized:\n      +materialized: view\n", False),  # 目錄剛好叫 materialized
+], ids=["ephemeral", "templated", "view", "folder-named-materialized"])
+def test_dbt_project_materialization(yml, uncertain):
+    info = _info(BASE | {"dbt_project.yml": "name: shop\n" + yml})
+    assert bool(info.global_uncertain) is uncertain
+
+
+@pytest.mark.parametrize("content", [None, "def model(dbt, session): ...", b"\x00"],
+                         ids=["no-content", "text", "bytes"])
+def test_python_model_names_count_without_reading_content(content):
+    """#19 review:引用 Python model 在 dbt 是正常的;只取檔名,內容不讀(打包也不收 .py)。"""
+    info = _info(BASE | {"models/py/scores.py": content})
+    assert "scores" in info.ref_names
+    assert info.refs_complete and info.sources_complete      # .py 不算看不懂的檔案
+    r = _render("select * from {{ ref('scores') }}", info)
+    assert r.ok, r.error
+
+
+@pytest.mark.parametrize("src", [
+    "{{ config(" + ",".join(f"k{i}=1" for i in range(200_000)) + ") }}",      # 參數極多
+    "{{ config(" * 200_000,                                                   # 沒有右括號
+    "{{ config(" + "(" * 100_000 + ")" * 100_000 + ") }}",                     # 極深的巢狀
+], ids=["many-args", "unclosed", "deep"])
+def test_config_scan_is_linear(src):
+    """model 檔來自待審的 commit:config() 的掃描不能被刻意構造的內容拖成平方時間
+    (自檢時實測:逐次切片的寫法,20 萬個參數要 62 秒)。"""
+    start = time.monotonic()
+    _info(BASE | {"models/stg/stg_txn.sql": src})
+    assert time.monotonic() - start < 5
+
+
+def test_python_model_is_uncertain_because_content_is_not_read():
+    """.py 的內容不讀,裡面的 dbt.config() 可能改名或停用:找得到,但表名無法確定。"""
+    info = _info(BASE | {"models/py/scores.py": None})
+    assert "scores" in info.uncertain_models
+    assert _render("select * from {{ ref('scores') }}", info).relation_notice
+
+
+@pytest.mark.parametrize("files", [
+    {"models/a/dup.sql": "select 1", "models/b/dup.sql": "select 2"},
+    {"models/a/dup.sql": "select 1", "models/b/dup.py": "x"},
+], ids=["two-sql", "sql-and-py"])
+def test_duplicate_model_names_are_uncertain(files):
+    """同名的 model dbt 會編譯失敗,不能當成「確定存在、照名稱展開」。"""
+    assert "dup" in _info(BASE | files).uncertain_models
+
+
+@pytest.mark.parametrize("macro, uncertain", [
+    ("{% macro setup() %}{{ config(alias='x') }}{% endmacro %}", True),
+    ("{% macro setup() %}{{ config(**kwargs) }}{% endmacro %}", True),
+    ("{% macro setup() %}{{ config(materialized='view') }}{% endmacro %}", False),
+    ("{% macro m() %}{{ config.get('x') }}{% endmacro %}", False),
+], ids=["alias", "kwargs", "plain", "config-get"])
+def test_config_called_inside_a_macro(macro, uncertain):
+    """model 呼叫 macro 時,macro 裡的 config() 一樣作用在那個 model 上;看不出是哪些 model
+    呼叫,所以整個專案都無法確定。只讀設定(config.get)不算。"""
+    assert bool(_info(BASE | {"macros/setup.sql": macro}).global_uncertain) is uncertain
+
+
+@pytest.mark.parametrize("src, uncertain", [
+    ("{{ config(enabled=false) }} select 1", True),
+    ("{{ config(enabled=False) }} select 1", True),
+    ("{{ config(enabled=var('on')) }} select 1", True),
+    ("{{ config(enabled=true) }} select 1", False),
+], ids=["false", "False", "var", "true"])
+def test_disabled_model_in_config(src, uncertain):
+    """停用的 model 被 ref() 時 dbt 會編譯失敗:只有明確的 true 才算確定。"""
+    assert ("stg_txn" in _info(BASE | {"models/stg/stg_txn.sql": src}).uncertain_models) is uncertain
+
+
+@pytest.mark.parametrize("yml, uncertain", [
+    ("models:\n  - name: stg_txn\n    config: {enabled: false}\n", True),
+    ("models:\n  - name: stg_txn\n    config: {enabled: \"{{ var('on') }}\"}\n", True),
+    ("models:\n  - name: stg_txn\n    config: {enabled: true}\n", False),
+], ids=["false", "templated", "true"])
+def test_disabled_model_in_properties(yml, uncertain):
+    assert ("stg_txn" in _info(BASE | {"models/p.yml": yml}).uncertain_models) is uncertain
+
+
+@pytest.mark.parametrize("yml, uncertain", [
+    ("models:\n  shop:\n    legacy:\n      +enabled: false\n", True),
+    ("models:\n  shop:\n    +enabled: true\n", False),
+], ids=["false", "true"])
+def test_disabled_folder_in_dbt_project(yml, uncertain):
+    assert bool(_info(BASE | {"dbt_project.yml": "name: shop\n" + yml}).global_uncertain) is uncertain
+
+
+@pytest.mark.parametrize("section", ["seeds", "snapshots"])
+def test_seed_and_snapshot_properties_are_read(section):
+    """屬性檔的 seeds: / snapshots: 一樣可以設 alias,被 ref() 時受影響。"""
+    yml = f"{section}:\n  - name: country_codes\n    config: {{alias: cc}}\n"
+    info = _info(BASE | {"models/p.yml": yml}, other=("country_codes",))
+    assert "country_codes" in info.uncertain_models
+    assert _render("select * from {{ ref('country_codes') }}", info).relation_notice
+
+
+@pytest.mark.parametrize("yml", [
+    "sources:\n  - name: raw\n    config: {enabled: false}\n    tables:\n      - name: T_TXN\n",
+    "sources:\n  - name: raw\n    tables:\n      - name: T_TXN\n        config: {enabled: false}\n",
+    "sources:\n  - name: raw\n    tables:\n      - name: T_TXN\n        config: {enabled: \"{{ var('on') }}\"}\n",
+], ids=["source-disabled", "table-disabled", "table-templated"])
+def test_disabled_source_is_uncertain(yml):
+    """停用的 source 被引用時 dbt 會編譯失敗:找得到也不能當成確定。"""
+    info = _info({"dbt_project.yml": "name: shop\n", "models/s.yml": yml})
+    assert ("raw", "T_TXN") in info.uncertain_sources
+    assert _render("select * from {{ source('raw', 'T_TXN') }}", info).relation_notice
+
+
+def test_enabled_source_stays_certain():
+    yml = "sources:\n  - name: raw\n    config: {enabled: true}\n    tables:\n      - name: T_TXN\n"
+    info = _info({"dbt_project.yml": "name: shop\n", "models/s.yml": yml})
+    assert not info.uncertain_sources
+
+
+@pytest.mark.parametrize("project", [
+    "name: shop\nsources:\n  shop:\n    raw:\n      +enabled: false\n",   # sources 區塊停用
+    "name: shop\nsources: [1\n",                                         # 看不懂(括號沒閉合)
+    None,                                                                # 沒有 dbt_project.yml
+], ids=["sources-block-disabled", "unreadable", "missing"])
+def test_project_level_source_settings_make_every_source_uncertain(project):
+    """dbt_project.yml 的 sources 區塊作用在 source() 上;看不懂或沒有時也看不到這些設定。"""
+    files = {k: v for k, v in BASE.items() if k != "dbt_project.yml"}
+    if project is not None:
+        files["dbt_project.yml"] = project
+    info = _info(files)
+    assert info.uncertain_sources == set(info.sources) and info.sources
+
+
+def test_python_model_outside_model_paths_is_ignored():
+    assert "scores" not in _info(BASE | {"analyses/scores.py": "x"}).ref_names
+
+
+@pytest.mark.parametrize("model_src", [
+    "{{ config({'alias': 'renamed'}) }} select 1",
+    "{{ config(**{'alias': 'renamed'}) }} select 1",
+    "{{ config(materialized='ephemeral') }} select 1",
+], ids=["dict", "double-star", "ephemeral"])
+def test_review_table_reference_gets_notice(model_src):
+    """#19 review 的表格:專案資訊完整時,引用這些 model 必須帶「表名無法確定」的提醒。"""
+    info = _info(BASE | {"models/stg/stg_txn.sql": model_src})
+    r = _render("select * from {{ ref('stg_txn') }}", info)
+    assert r.ok and r.relation_notice
+
+
+def test_c_yaml_loader_is_used_when_available(monkeypatch):
+    """純 Python 的 safe_load 對大檔很慢(#19 review:1.7 MB 約 2 秒);有 libyaml 時用 C 版的
+    安全載入器(行為相同)。"""
+    import yaml
+    if not getattr(yaml, "__with_libyaml__", False):
+        pytest.skip("此環境沒有 libyaml")
+    seen = []
+    real = yaml.load
+    monkeypatch.setattr(yaml, "load", lambda text, Loader: seen.append(Loader) or real(text, Loader=Loader))
+    _info()
+    assert seen and all(loader is yaml.CSafeLoader for loader in seen)
+
+
+def test_c_yaml_loader_still_refuses_python_tags():
+    info = _info(BASE | {"models/evil.yml": "x: !!python/object/apply:os.system ['echo hi']\n"})
+    assert not info.sources_complete
+
+
 def test_yaml_alias_bomb_is_linear():
     """YAML 別名可以讓同一段內容被引用極多次;走訪要記住走過的節點,不能指數爆炸。"""
     lines = ["name: shop", "models:", "  l0: &l0 {a: {+materialized: view}}"]

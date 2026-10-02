@@ -190,7 +190,8 @@ class DbtProjectInfo:
     project_name       dbt_project.yml 的 name(ref('本專案', 'x') 的第一個參數)
     ref_names          ref() 找得到的名稱:model 檔名,加上呼叫端提供的 seed / snapshot
     sources            {(來源名, 表名): (schema 或 None, identifier 或 None)};None = 沒宣告
-    uncertain_models   表名可能被改掉的 model(屬性檔或檔內 config 設了 alias/schema/database)
+    uncertain_models   被引用時表名無法確定的 model / seed / snapshot(alias / schema / database、
+                       ephemeral、停用、同名、版本、Python model 等;見 dbt_relations)
     uncertain_sources  schema / identifier 是樣板值、無法確定的來源表
     global_uncertain   整個專案層級的不確定(自訂 generate_*_name、dbt_project.yml 的
                        +schema / +alias 等);非 None 時所有 ref() 都視為無法確定

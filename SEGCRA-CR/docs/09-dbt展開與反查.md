@@ -77,18 +77,31 @@
    | 無法確定 | — | 以慣例展開,帶「表名無法確定」提醒 |
 
    - **「確定不存在」的條件**(缺一就只提醒、不判失敗,寧可保留提醒也不冤枉開發者):
-     沒用 dbt 套件(套件的 model / source 不在 repo 裡)、呼叫端提供了 seed / snapshot
-     名單(打包只收 `.sql` / `.yml`,拿不到 seed 的 `.csv`)、所有屬性檔都解析得了、呼叫端
+     沒用 dbt 套件(套件的 model / source 不在 repo 裡)、呼叫端提供了 seed / snapshot /
+     Python model 的名單(打包只收 `.sql` / `.yml` 的內容,看不到 `.csv` 與 `.py`;名單要從
+     檔名清單取得,snapshot 的名稱寫在 `{% snapshot %}` 區塊上)、所有屬性檔都解析得了、呼叫端
      以 `root_files_checked=True` 明確確認已檢查專案根目錄的 `packages.yml` /
      `dependencies.yml`(沒傳進來不等於沒有)
-   - **只偵測、不模擬**:alias、自訂 schema、`generate_*_name`、樣板值、model 版本。
-     有這類設定就保留提醒;規則層檢查語法結構、不看表名,模擬的成本高、價值低
+   - **只偵測、不模擬**:alias、自訂 schema、`generate_*_name`、樣板值、ephemeral
+     (被引用時展開成 CTE,不是表名)、停用(`enabled` 不是 true,被引用時 dbt 編譯失敗)、
+     model 版本、同名的 model(dbt 編譯失敗)、Python model(內容不讀)、macro 裡呼叫的
+     `config()`(作用在呼叫它的 model 上,看不出是哪些,整個專案都無法確定);屬性檔的
+     `seeds:` / `snapshots:` 區段同樣檢查。有這類設定就保留提醒;規則層檢查語法結構、
+     不看表名,模擬的成本高、價值低
+   - **model 檔內 `config()` 的偵測用白名單**:每個參數都必須是「名稱 = 常值」(字串、數字、
+     布林、字串清單),名稱不是 alias / schema / database,`materialized` 也不是 ephemeral,
+     才算確定。字典寫法、`**` 展開、變數、`var()`、樣板運算、沒有右括號,一律算可能改名——
+     看不懂的寫法會自動往「無法確定」靠,不會漏判。屬性檔與 `dbt_project.yml` 的
+     `materialized` 為 ephemeral 或樣板值時同樣無法確定
    - **資料庫名一律用呼叫端給的約定假名**,不採用 `sources.yml` 宣告的 database:
      展開結果會出現在審查報告裡,不放正式資料庫名;規則也不看資料庫名
    - **macro 檔最外層的 `ref()` 不判定**:dbt 不會執行那段程式碼,在那裡失敗會冤枉開發者
-   - 專案檔案來自待審的 commit:YAML 一律 `safe_load`;輸入形狀不對就回傳「全部無法確定」;
-     `sources.yml` 宣告的名稱拼進 SQL 前過識別字白名單;YAML 別名可以把「來源 × 表」放大成
-     平方級,所有屬性檔合計最多處理 `MAX_PROPERTY_ENTRIES`(50,000)筆,超過即無法確定
+   - 專案檔案來自待審的 commit:YAML 一律用安全的載入器(有 libyaml 時用 C 版,行為相同、
+     約快 4 倍);輸入形狀不對就回傳「全部無法確定」;`sources.yml` 宣告的名稱拼進 SQL 前過
+     識別字白名單;YAML 別名可以把「來源 × 表」放大成平方級,所有屬性檔合計最多處理
+     `MAX_PROPERTY_ENTRIES`(50,000)筆,超過即無法確定;`config()` 的掃描是線性時間
+   - 接線時:屬性檔的解析放進子行程並設逾時(純 Python 解析 50 MB 最壞約一分鐘),
+     屬性檔設單檔大小上限
 
    以 `tests/dbt_reference` 驗證:有專案資訊時,與 `dbt compile` 逐字一致且不帶提醒。
 
