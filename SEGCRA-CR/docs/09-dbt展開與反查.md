@@ -236,9 +236,9 @@ python tests/dbt_impact_reference/random_projects.py --dbt <dbt 執行檔>
 | 模組 | 做什麼 | 主要防線 |
 |---|---|---|
 | `toolbox/gitlab.py` 的 `download_archive()` | 下載 tar.gz | 只用唯讀的 `GITLAB_READ_TOKEN`(不退回、不可與 `GITLAB_TOKEN` 相同);只接受完整 commit 編號;本機以外必須 https;不讀代理設定;不跟隨轉址;不做傳輸層解壓;大小與時間上限;**不在模型可呼叫的工具清單內** |
-| `orchestrator/archive.py` 的 `extract_archive()` | 解開成 {路徑: 內容} | 邊解壓邊計數(壓縮炸彈);逐一檢查成員(路徑穿越、連結與特殊檔、重複含大小寫與 Unicode 正規化、控制字元、Windows 保留名稱);只收 `.sql` / `.yml`;`filter="data"`;權限 700 的暫存目錄、讀完即刪 |
-| `orchestrator/dbt_project.py` 的 `load_dbt_project()` | 讀 `dbt_project.yml` 的目錄設定,取回 models / macros,以及專案根目錄的 `packages.yml` / `dependencies.yml`(`root_files`,判斷有沒有用 dbt 套件) | 同一包讀設定與檔案(不另外用讀檔 API,那預設讀 main);目錄設定當不可信內容檢查;記憶體快取(以 commit 為鍵、有筆數與總量上限、只收成功結果、進出都複製) |
-| `orchestrator/dbt_mr_impact.py` 的 `analyze_mr_macro_impact()` | 把 MR(變更清單 + head / base commit)轉成 macro 反查的輸入並執行 | 路徑換成相對專案根目錄;新增檔以 head / base 兩個專案比對判斷(不依賴 GitLab 的旗標),改名與刪除的舊路徑一併列入;變更清單被截斷、路徑看不懂、取回失敗 → 全部 model 可能受影響;改到專案設定檔或兩邊目錄設定不同 → 全部 model 可能受影響;反查一律在子行程 |
+| `orchestrator/archive.py` 的 `extract_archive()` | 解開成 {路徑: 內容};另可只列指定目錄的檔名(不解出) | 邊解壓邊計數(壓縮炸彈);**所有成員**檢查單一頂層目錄、絕對路徑、`..`、`.` 或空段落、重複(要收內容的目錄內另含大小寫與 Unicode 正規化),指定目錄的上層不能是連結或檔案(否則目錄看起來是空的);**要收內容的目錄內**不能有連結或特殊檔;**會解出的檔案**另外檢查控制字元、反斜線、冒號、Windows 保留名稱——不解出的成員(目錄外,或 `.md`、`.csv`、`.py` 等)不讓整包失敗;只收 `.sql` / `.yml` / `.yaml`;`filter="data"`;權限 700 的暫存目錄、讀完即刪 |
+| `orchestrator/dbt_project.py` 的 `load_dbt_project()` | 讀 `dbt_project.yml` 的目錄設定(model / macro / seed / snapshot),取回這些目錄的內容、model / seed / snapshot 目錄的檔名清單,以及專案根目錄的 `packages.yml` / `dependencies.yml`(`root_files`,判斷有沒有用 dbt 套件);`extra_ref_names()` 從同一包算出 seed / Python model / snapshot 的名稱(看不懂就回 `None`) | 同一包讀設定與檔案(不另外用讀檔 API,那預設讀 main);目錄設定當不可信內容檢查;記憶體快取(以 commit 為鍵、有筆數與總量上限、只收成功結果、進出都複製) |
+| `orchestrator/dbt_mr_impact.py` 的 `analyze_mr_macro_impact()` | 把 MR(變更清單 + head / base commit)轉成 macro 反查的輸入並執行 | 路徑換成相對專案根目錄;新增檔以 head / base 兩個專案比對判斷(不依賴 GitLab 的旗標),改名與刪除的舊路徑一併列入;反查看得到 `dbt_project.yml` 的 hook;變更清單被截斷、路徑看不懂、取回失敗 → 全部 model 可能受影響;改到專案設定檔或兩邊目錄設定不同 → 全部 model 可能受影響;反查只追 model,有 macro 變更而專案有 snapshot 時交人工;反查一律在子行程 |
 
 任何一步失敗都是整包失敗(`ok=False`),**不會當成「專案沒有 macro」**。
 
@@ -254,12 +254,22 @@ python tests/dbt_impact_reference/random_projects.py --dbt <dbt 執行檔>
 | 不存在的 commit | HTTP 404,乾淨失敗並附處理提示 |
 | 同一個 token 只勾 `read_repository`(先前實測) | 讀單檔 200,打包與列目錄 403 |
 
+正式環境的條件(#15 review 回覆):正式的 dbt 專案**沒有用 dbt 套件**(共用邏輯都是自己寫的
+macro);正式環境的主機**不連外網**,審查流程裡不能有任何執行時才從網路下載的步驟(包括
+`dbt deps`);正式環境用 dbt-sqlserver,預設 schema 是 `dbo`。含 dbt 樣板的 MR 這一階段**不需要
+自動放行**:接線完成就是終點,最後由人決定(dbt 的執行驗證另排,前提是測資生成在真實規模下
+穩定、測試資料的持久化方式定案)。
+
 已知限制(接線時要處理):
 
 - **dbt 套件的 macro 拿不到**:`packages.yml` 宣告的套件(例如 `dbt_utils`)由 `dbt deps`
   下載到 `dbt_packages/`,不在 repo 裡。呼叫套件 macro 的 model 仍會展開失敗(以展開失敗
-  揭露,不會靜默放行)
-- 只收 `.sql` / `.yml`(#15 條件 6);專案若用 `.yaml` 副檔名的屬性檔,需要調整
+  揭露,不會靜默放行)。正式專案沒有用套件(見上)
+- 反查只追 model,不追 snapshot:有 macro 變更、而專案有 snapshot 時一律交人工
+- `ref()` / `source()` 的專案資訊(#19)目前只讀 model 目錄的屬性檔;seed / snapshot 目錄的
+  屬性檔(可能設 alias)已一併取回,接線時要一起交給它。`extra_ref_names()` 在呼叫它的
+  行程裡解析 snapshot 的 yml(合計 1 MB 上限,超過就視為名單不完整);接線時與 #19 的屬性檔
+  解析一起放進有逾時的子行程
 - 權限:唯讀 token 需要 `read_api`(仍然只能讀;見 README),`read_repository` 不夠(見上表)
 - 解壓與讀 `dbt_project.yml` 在審查行程內執行(不在子行程),由各項大小上限約束記憶體
 
@@ -267,6 +277,9 @@ python tests/dbt_impact_reference/random_projects.py --dbt <dbt 執行檔>
 
 - **macro 反查接進管線**:下載、解壓與轉接層已實作(見上一節),尚待接進 pipeline
   (需要 MR 的 base commit,也就是 GitLab 的 `diff_refs.base_sha`)與實測
+- **真實 GitLab 模式只拿得到 diff 新增的行**:預掃與執行驗證目前用的是 diff 還原出的新增行,
+  只改了幾行的檔案送去檢查的是殘缺片段。接線後,dbt 專案內被改到的檔案改用取回的 head
+  版本全文;dbt 專案以外的 SQL 檔用 Files API 依 head sha 取全文
 - **展開結果尚未在 MS SQL 沙盒實際執行過**(目前只驗證了展開字串與 `dbt compile`
   逐字一致)。要支援樣板的執行驗證,需把 `ref()`/`source()` 對應到沙盒每次建立的
   資料庫,且 model 引用的上游表與規格建立的測資表名稱不同,需要處理

@@ -28,9 +28,10 @@ BASE_FILES = {
 ROOT = {"dbt_project.yml": "name: shop\n"}
 
 
-def _project(files, model_paths=("models",), macro_paths=("macros",), root=None):
+def _project(files, model_paths=("models",), macro_paths=("macros",), root=None, names=()):
     return DbtProject(ok=True, files=dict(files), model_paths=model_paths,
-                      macro_paths=macro_paths, root_files=dict(root or ROOT))
+                      macro_paths=macro_paths, root_files=dict(root or ROOT),
+                      seed_paths=("seeds",), snapshot_paths=("snapshots",), names=tuple(names))
 
 
 class _Load:
@@ -92,8 +93,9 @@ def test_inputs_given_to_the_analysis():
     _, load, analyze = _run(_diff("macros/fmt.sql"), head=head)
     assert load.calls == [(HEAD, ""), (BASE, "")]
     (call,) = analyze.calls
-    assert call["files"] == head.files and call["changed"] == ["macros/fmt.sql"]
-    assert call["base_files"] == BASE_FILES and call["added_paths"] == []
+    # 反查也要看 dbt_project.yml(hook 可能呼叫被改的 macro)
+    assert call["files"] == head.files | ROOT and call["changed"] == ["macros/fmt.sql"]
+    assert call["base_files"] == BASE_FILES | ROOT and call["added_paths"] == []
     assert call["model_dirs"] == ("models",) and call["macro_dirs"] == ("macros",)
 
 
@@ -229,7 +231,9 @@ def test_unexpected_exception_is_not_echoed():
 
 
 def test_non_report_from_analysis_fails_closed():
-    _fails_closed(_run(_diff("macros/fmt.sql"), analyze=_Analyze(result={"ok": True}))[0])
+    # 要由型別檢查擋下(訊息固定),不是靠後面取屬性失敗才落到「非預期錯誤」
+    _fails_closed(_run(_diff("macros/fmt.sql"), analyze=_Analyze(result={"ok": True}))[0],
+                  "非預期的資料")
 
 
 def test_reasons_are_single_line_and_bounded():
@@ -247,6 +251,77 @@ def test_default_analysis_is_the_isolated_one():
     sig = inspect.signature(analyze_mr_macro_impact)
     assert sig.parameters["analyze"].default is dbt_impact.analyze_macro_impact_isolated
     assert sig.parameters["load"].default is dbt_project.load_dbt_project
+
+
+# ------------------------------------------------------------------ #20 review 對齊
+SNAPSHOT = "{% snapshot snap_txn %}select {{ fmt('c') }} from t{% endsnapshot %}"
+
+
+@pytest.mark.parametrize("path, new", [
+    ("seeds/codes.csv", None),                                              # 只有名稱、沒有內容
+    ("snapshots/s.sql", "{% snapshot snap_txn %}select 2{% endsnapshot %}"),
+    ("seeds/props.yml", "version: 2\nseeds:\n  - name: codes\n"),
+    ("models/schema.yaml", "version: 2\nmodels:\n  - name: a\n    description: x\n"),
+], ids=["seed-csv", "snapshot-sql", "seed-props", "model-props-yaml"])
+def test_seed_snapshot_and_yaml_changes_are_never_reported_as_no_impact(path, new):
+    """#20 review 確認過的行為:seed、snapshot、.yaml 的變更標成不確定(交人工)。
+    snapshot / seed 的內容不交給反查之後,這點仍要成立(走真正的反查)。"""
+    files = BASE_FILES | {"snapshots/s.sql": SNAPSHOT, "seeds/props.yml": "version: 2\n",
+                          "models/schema.yaml": "version: 2\n"}
+    head_files = dict(files) if new is None else files | {path: new}
+    names = ("seeds/codes.csv", "snapshots/s.sql")
+    report, _, _ = _run(_diff(path), head=_project(head_files, names=names),
+                        base=_project(files, names=names), analyze=analyze_macro_impact)
+    assert report.needs_human and report.uncertain
+
+
+def test_typical_dbt_project_yml_keeps_the_result_precise():
+    """一般的 dbt_project.yml(設定、env_var、var、呼叫別的 macro 的 hook)交給反查,
+    不會讓每個 macro 變更都變成「全部 model 受影響」。"""
+    root = {"dbt_project.yml": (
+        "name: shop\nversion: '1.0'\nprofile: shop\nvars:\n  start: '2024-01-01'\n"
+        "models:\n  shop:\n    +materialized: view\n"
+        "    +schema: \"{{ env_var('DBT_SCHEMA', 'dbo') }}\"\n"
+        "on-run-end:\n  - \"{{ log_run() }}\"\n")}
+    head = _project(BASE_FILES | {"macros/fmt.sql": MACRO_V2}, root=root)
+    base = _project(BASE_FILES, root=root)
+    report, _, _ = _run(_diff("macros/fmt.sql"), head=head, base=base, analyze=analyze_macro_impact)
+    assert not report.all_models_possibly_affected and not report.needs_human
+    assert [m.path for m in report.affected_models] == ["models/a.sql"]
+
+
+def test_hook_in_dbt_project_yml_calling_changed_macro_affects_every_model():
+    """反查要看 dbt_project.yml 的 hook:它呼叫被改的 macro 時全部 model 都受影響。
+    (以前轉接層只給 model / macro 目錄的檔案,hook 看不到,會回報「只影響 a.sql」。)"""
+    root = {"dbt_project.yml": "name: shop\non-run-start:\n  - \"{{ fmt('x') }}\"\n"}
+    head = _project(BASE_FILES | {"macros/fmt.sql": MACRO_V2}, root=root)
+    base = _project(BASE_FILES, root=root)
+    report, _, _ = _run(_diff("macros/fmt.sql"), head=head, base=base, analyze=analyze_macro_impact)
+    assert report.all_models_possibly_affected and report.needs_human
+
+
+def test_snapshot_and_seed_contents_are_not_given_to_the_analysis():
+    """反查只追 model:snapshot / seed 目錄的內容不交給它(否則會被當成目錄外的 .sql)。"""
+    files = BASE_FILES | {"snapshots/s.sql": SNAPSHOT, "seeds/props.yml": "version: 2\n"}
+    _, _, analyze = _run(_diff("models/b.sql"), head=_project(files), base=_project(files))
+    assert set(analyze.calls[0]["files"]) == set(BASE_FILES) | {"dbt_project.yml"}
+
+
+@pytest.mark.parametrize("names, change, uncertain", [
+    (("snapshots/s.sql",), "macros/fmt.sql", True),    # 有 snapshot、改 macro → 交人工
+    (("snapshots/s.sql",), "models/b.sql", False),     # 只改 model → 不受影響
+    ((), "macros/fmt.sql", False),                     # 沒有 snapshot → 照常
+], ids=["snapshot-macro", "snapshot-model-only", "no-snapshot"])
+def test_snapshot_impact_is_not_reported_as_none(names, change, uncertain):
+    """#20:反查不追 snapshot。有 macro 變更、而專案有 snapshot 時,不能說「沒有影響」。
+    但不標「全部 model 可能受影響」:受影響的可能是 snapshot,不是 model。"""
+    head_files = BASE_FILES | {"macros/fmt.sql": MACRO_V2, "models/b.sql": "select 2"}
+    report, _, _ = _run(_diff(change), head=_project(head_files, names=names),
+                        base=_project(BASE_FILES, names=names), analyze=analyze_macro_impact)
+    snapshot_reason = any("snapshot" in r for r in report.uncertain)
+    assert snapshot_reason is uncertain
+    if uncertain:
+        assert report.needs_human and not report.all_models_possibly_affected
 
 
 # ------------------------------------------------------------------ 模組能力

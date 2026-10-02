@@ -32,7 +32,8 @@ MARK = "SECRETNAME"          # 惡意成員名稱裡的記號:錯誤訊息不可
 
 # 各層失敗理由的固定字樣(與 archive.py 的訊息對應)
 LINK = "符號連結、硬連結或特殊檔案"
-DOTS = "路徑含 ..、. 或空段落"
+DOTS = "路徑含 ..、. 或空段落"      # 要收內容的目錄內(嚴格檢查)
+DOTDOT = "路徑含 .."                # 所有成員都檢查;兩種訊息都含這幾個字
 ABS = "絕對路徑"
 SEP = "反斜線或冒號"
 CTRL = "控制字元"
@@ -203,20 +204,50 @@ def test_symlink_replacing_wanted_dir_itself_fails():
 
 @pytest.mark.parametrize("name, reason", [
     (f"/{MARK}/models/a.sql", ABS),
-    (f"../{MARK}/models/a.sql", DOTS),
-    (f"{TOP}/../{MARK}.sql", DOTS),
-    (f"{TOP}/models/../../{MARK}.sql", DOTS),
+    (f"../{MARK}/models/a.sql", DOTDOT),
+    (f"{TOP}/../{MARK}.sql", DOTDOT),
+    (f"{TOP}/models/../../{MARK}.sql", DOTDOT),
     (f"{TOP}/models/./{MARK}.sql", DOTS),
     (f"{TOP}/models//{MARK}.sql", DOTS),
-    (f"{TOP}/models\\..\\..\\{MARK}.sql", SEP),     # Windows 分隔符
+    (f"{TOP}/models/a\\{MARK}.sql", SEP),           # Windows 分隔符
     (f"{TOP}/models/C:{MARK}.sql", SEP),            # 磁碟代號 / 替代資料流
     (f"{TOP}/models/{MARK}\n.sql", CTRL),           # 控制字元(日誌注入)
     (f"{TOP}/models/{MARK}\x1b[31m.sql", CTRL),
-    (f"{TOP}/docs/../../{MARK}.sql", DOTS),         # 指定目錄外也要檢查名稱
+    (f"{TOP}/docs/../../{MARK}.sql", DOTDOT),       # 指定目錄外:.. 仍然要擋
+    (f"/{TOP}/docs/x.md", ABS),                     # 指定目錄外:絕對路徑仍然要擋
+    (f"{TOP}/docs//x.md", DOTS),                    # 指定目錄外:空段落仍然要擋
+    (f"{TOP}/./models/{MARK}.sql", DOTS),           # 解出來在 models/ 底下,字面上卻不是:
+    (f"{TOP}//models/{MARK}.sql", DOTS),            # 會被當成目錄外略過、憑空消失
 ], ids=["abs", "dotdot-top", "dotdot-after-top", "dotdot-deep", "dot", "empty-seg",
-        "backslash", "colon", "newline", "escape", "dotdot-outside"])
+        "backslash", "colon", "newline", "escape", "dotdot-outside", "abs-outside",
+        "empty-seg-outside", "dot-alias", "empty-seg-alias"])
 def test_suspicious_names_fail_whole_archive(name, reason):
     _fails(extract_archive(_gz(_project([(name, b"x")])), DIRS), reason)
+
+
+@pytest.mark.parametrize("name", [
+    f"{TOP}/docs/aux.md",                  # review 實測
+    f"{TOP}/notes/con.txt",                # review 實測
+    f"{TOP}/docs/a:b.md",
+    f"{TOP}/docs/x\\y.md",
+    f"{TOP}/docs/trailing.",
+    f"{TOP}/docs/esc\x1b[31m.md",
+    f"{TOP}/models\\..\\..\\{MARK}.sql",   # 在 Linux 上是根目錄的一個檔名,不在 models/ 裡
+    f"{TOP}/models/aux.md",                # 指定目錄內、但不解出的副檔名(doc 區塊常放 .md)
+    f"{TOP}/models/con/notes.md",
+    f"{TOP}/models/a:b.py",
+    f"{TOP}/models/{MARK}.sql.",           # 結尾的點:副檔名不是 .sql,不解出(不會跟 a.sql 撞名)
+    f"{TOP}/models/{MARK}.sql ",           # 結尾空白同理
+], ids=["aux", "con", "colon", "backslash", "trailing-dot", "control", "backslash-dotdot",
+        "inside-not-extracted-aux", "inside-not-extracted-con-dir", "inside-not-extracted-colon",
+        "inside-trailing-dot", "inside-trailing-space"])
+def test_odd_names_that_are_not_extracted_do_not_fail_the_archive(name):
+    """#20 review:不解出的成員(指定目錄外,或指定目錄內不需要的副檔名)不讀內容、名稱
+    不落地,只做安全必要的檢查(絕對路徑、..、. 與空段落、重複)。repo 裡一個無關的檔名
+    不能讓每個 MR 的整包都失敗。"""
+    r = extract_archive(_gz(_project([(name, b"x")])), DIRS)
+    assert r.ok, r.error
+    assert set(r.files) == {"models/a.sql", "models/schema.yml", "macros/m.sql"}
 
 
 @pytest.mark.parametrize("entries, reason", [
@@ -231,23 +262,35 @@ def test_structure_violations_fail_whole_archive(entries, reason):
     _fails(extract_archive(_gz(entries), DIRS), reason)
 
 
+def test_case_variants_outside_wanted_dirs_are_fine():
+    """目錄外不解出:README.md 與 readme.md 在 Linux 的 repo 裡可以並存,不讓整包失敗
+    (完全相同的重複仍然擋,見上面的 dup-outside)。"""
+    r = extract_archive(_gz(_project([(f"{TOP}/docs/README.md", b"1"),
+                                      (f"{TOP}/docs/readme.md", b"2"),
+                                      (f"{TOP}/docs/café.md", b"3"),       # NFC
+                                      (f"{TOP}/docs/café.md", b"4")])), DIRS)  # NFD
+    assert r.ok, r.error
+    assert set(r.files) == {"models/a.sql", "models/schema.yml", "macros/m.sql"}
+
+
 WINDOWS = "Windows 保留名稱"
 
 
 @pytest.mark.parametrize("name", [
-    f"{TOP}/models/{MARK}.sql.",           # Windows 會去掉結尾的點 → 變成另一個檔名
-    f"{TOP}/models/{MARK}.sql ",           # 結尾空白同理
-    f"{TOP}/models/{MARK}./a.sql",         # 目錄段落也一樣
+    f"{TOP}/models/{MARK}./a.sql",         # Windows 會去掉結尾的點 → 變成另一個路徑
+    f"{TOP}/models/{MARK} /a.sql",         # 結尾空白同理
     f"{TOP}/models/con.sql",               # 裝置名稱(不分大小寫、帶副檔名也算)
     f"{TOP}/models/NUL.yml",
+    f"{TOP}/models/prn.yaml",
     f"{TOP}/models/Aux/x.sql",
     f"{TOP}/models/com1.sql",
     f"{TOP}/models/lpt9.sql",
-], ids=["trailing-dot", "trailing-space", "dir-trailing-dot", "con", "nul", "aux-dir",
+], ids=["dir-trailing-dot", "dir-trailing-space", "con", "nul", "prn-yaml", "aux-dir",
         "com1", "lpt9"])
 def test_windows_problem_names_fail(name):
     """正式環境是 Linux,但開發與審查者的電腦可能是 Windows:結尾的點或空白會被去掉,
-    可用來繞過重複檢查覆蓋另一個檔案;裝置名稱會寫到裝置上。"""
+    可用來繞過重複檢查覆蓋另一個檔案;裝置名稱會寫到裝置上。只針對**會解出**的檔案
+    (整條路徑);不解出的名稱見 test_odd_names_that_are_not_extracted_do_not_fail_the_archive。"""
     _fails(extract_archive(_gz(_project([(name, b"x")])), DIRS), WINDOWS)
 
 
@@ -324,13 +367,123 @@ def test_prefix_trailing_slash_is_accepted():
 
 
 # ------------------------------------------------------------------ 上限
+@pytest.mark.parametrize("top", ["con", "x.", "a:b"], ids=["reserved", "trailing-dot", "colon"])
+def test_top_level_dir_is_still_strictly_checked(top):
+    """頂層目錄是每個成員路徑的一部分(包括要收的),仍然做嚴格檢查。"""
+    entries = [(f"{top}/",), (f"{top}/models/a.sql", b"1")]
+    _fails(extract_archive(_gz(entries), DIRS))
+
+
+def test_yaml_properties_are_collected():
+    """#20 review:dbt 的屬性檔用 .yml 或 .yaml 都可以;沒收 .yaml 會讓宣告的 source 看不到。"""
+    r = extract_archive(_gz(_project([(f"{TOP}/models/sources.yaml", b"version: 2\n"),
+                                      (f"{TOP}/models/Other.YAML", b"x: 1\n")])), DIRS)
+    assert r.ok, r.error
+    assert {"models/sources.yaml", "models/Other.YAML"} <= set(r.files)
+
+
+# ------------------------------------------------------------------ 只列檔名
+def _listing_project(extra=()):
+    return _project([(f"{TOP}/seeds/",), (f"{TOP}/seeds/codes.csv", b"a,b\n"),
+                     (f"{TOP}/seeds/con.csv", b"x\n"),                       # 只列名稱:不查 Windows 名稱
+                     (f"{TOP}/models/py/", ), (f"{TOP}/models/py/score.py", b"def model(): ..."),
+                     (f"{TOP}/docs/readme.md", b"x"), *extra])
+
+
+def test_listing_names_every_file_without_reading_it():
+    """#19 需要 seed / Python model 的名稱:只列名稱(任何副檔名),不解出內容。"""
+    r = extract_archive(_gz(_listing_project()), ("models", "macros"),
+                        list_prefixes=("models", "seeds"))
+    assert r.ok, r.error
+    assert r.names == ("models/a.sql", "models/py/score.py", "models/schema.yml",
+                       "seeds/codes.csv", "seeds/con.csv")
+    assert "seeds/codes.csv" not in r.files and "models/py/score.py" not in r.files
+
+
+def test_listing_is_off_by_default():
+    r = extract_archive(_gz(_listing_project()), ("models", "macros"))
+    assert r.ok and r.names == ()
+
+
+def test_listed_names_skip_windows_name_checks():
+    """只列名稱、不解出:Windows 保留名稱不讓整包失敗。seeds 同時要收內容也一樣(.csv
+    不解出);只有會解出的檔案(例如 seeds 裡的 con.yml)才會被嚴格檢查擋下。"""
+    r = extract_archive(_gz(_listing_project()), ("models", "macros"), list_prefixes=("seeds",))
+    assert r.ok, r.error
+    both = extract_archive(_gz(_listing_project()), ("models", "macros", "seeds"),
+                           list_prefixes=("seeds",))
+    assert both.ok, both.error
+    assert "seeds/con.csv" in both.names and "seeds/con.csv" not in both.files
+    extracted = extract_archive(_gz(_listing_project([(f"{TOP}/seeds/con.yml", b"x: 1\n")])),
+                                ("models", "macros", "seeds"))
+    _fails(extracted, WINDOWS)
+
+
+@pytest.mark.parametrize("extra", [
+    [(f"{TOP}/seeds/link.csv", tarfile.SYMTYPE, "/etc/passwd")],      # 連到別處的檔案
+    [(f"{TOP}/seeds/more", tarfile.SYMTYPE, "../shared_seeds")],       # 連到別處的目錄
+    [(f"{TOP}/seeds/hard.csv", tarfile.LNKTYPE, f"{TOP}/docs/readme.md")],
+], ids=["symlink-file", "symlink-dir", "hardlink"])
+def test_links_in_listed_dirs_fail_because_the_list_would_be_incomplete(extra):
+    """檔名清單要拿來判斷名單完整:連結指到的內容不在包裡,看不出底下還有哪些檔案。"""
+    _fails(extract_archive(_gz(_listing_project(extra)), ("models", "macros"),
+                           list_prefixes=("seeds",)), "列檔名的目錄")
+
+
+@pytest.mark.parametrize("member", [(f"{TOP}/seeds", tarfile.SYMTYPE, "../elsewhere"),
+                                    (f"{TOP}/seeds", b"not a dir")], ids=["link", "file"])
+def test_listed_dir_itself_not_being_a_dir_fails(member):
+    """列檔名的目錄本身不是目錄(連結或一般檔案):底下有哪些檔案看不出來 → 整包失敗。"""
+    entries = [(f"{TOP}/",), (f"{TOP}/models/a.sql", b"1"), member]
+    _fails(extract_archive(_gz(entries), ("models",), list_prefixes=("seeds",)), "列檔名的目錄")
+
+
+@pytest.mark.parametrize("prefixes, list_prefixes, member", [
+    (("sub/models",), (), (f"{TOP}/sub", tarfile.SYMTYPE, "../elsewhere")),
+    (("models",), ("data/seeds",), (f"{TOP}/data", tarfile.SYMTYPE, "../elsewhere")),
+    (("models",), ("data/seeds",), (f"{TOP}/data", tarfile.LNKTYPE, f"{TOP}/models/a.sql")),
+    (("models",), ("data/seeds",), (f"{TOP}/data", b"not a dir")),
+    (("a/b/models",), (), (f"{TOP}/a", tarfile.SYMTYPE, "../elsewhere")),
+], ids=["content-dir-parent-link", "listed-dir-parent-link", "parent-hardlink", "parent-file",
+        "grandparent-link"])
+def test_parent_of_wanted_dir_not_being_a_dir_fails(prefixes, list_prefixes, member):
+    """指定目錄的上層是連結或檔案:底下的內容不在包裡。略過的話目錄會「看起來是空的」,
+    名單被當成完整(例如 seed-paths 是 data/seeds、data 是連結)→ 整包失敗。"""
+    entries = [(f"{TOP}/",), (f"{TOP}/models/a.sql", b"1"), member]
+    _fails(extract_archive(_gz(entries), prefixes, list_prefixes=list_prefixes), "上層")
+
+
+def test_link_whose_name_only_shares_a_prefix_with_wanted_dir_is_ignored():
+    """上層是一般目錄(真實打包每層都有目錄成員)沒問題;`dat`、`database` 只是名稱開頭
+    相同,不是上層,不影響(在指定目錄外,丟棄)。"""
+    entries = [(f"{TOP}/",), (f"{TOP}/data/",), (f"{TOP}/data/seeds/",),
+               (f"{TOP}/data/seeds/codes.csv", b"a\n"),
+               (f"{TOP}/dat", tarfile.SYMTYPE, "../x"), (f"{TOP}/database", tarfile.SYMTYPE, "../x")]
+    r = extract_archive(_gz(entries), ("data/seeds",), list_prefixes=("data/seeds",))
+    assert r.ok, r.error
+    assert r.names == ("data/seeds/codes.csv",)
+
+
+@pytest.mark.parametrize("list_prefixes", [("../x",), ("/abs",), ("",), "seeds", [("seeds")]],
+                         ids=["dotdot", "abs", "empty", "str", "list"])
+def test_bad_list_prefixes_fail(list_prefixes):
+    _fails(extract_archive(_gz(_listing_project()), DIRS, list_prefixes=list_prefixes))
+
+
+def test_failure_has_no_names():
+    r = extract_archive(_gz(_listing_project([(f"{TOP}/models/b.sql", tarfile.SYMTYPE, "x")])),
+                        DIRS, list_prefixes=("seeds",))
+    _fails(r, LINK)
+    assert r.names == ()
+
+
 def test_limits_match_issue_15():
     """#15 條件 3 的數值(壓縮檔 10 MB、合計 50 MB、2,000 檔),改動要有意識。"""
     assert archive.MAX_COMPRESSED_BYTES == 10 * 1024 * 1024
     assert archive.MAX_TOTAL_BYTES == 50 * 1024 * 1024
     assert archive.MAX_FILES == 2_000
     assert archive.MAX_FILE_BYTES <= archive.MAX_TOTAL_BYTES <= archive.MAX_TAR_BYTES
-    assert archive.ALLOWED_SUFFIXES == (".sql", ".yml")
+    assert archive.ALLOWED_SUFFIXES == (".sql", ".yml", ".yaml")
 
 
 def test_compressed_size_limit(monkeypatch):

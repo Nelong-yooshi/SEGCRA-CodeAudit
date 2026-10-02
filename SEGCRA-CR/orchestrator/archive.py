@@ -1,4 +1,4 @@
-"""archive — 安全解開 GitLab 打包下載的 tar.gz,取回 dbt 專案的 .sql / .yml(#15)。
+"""archive — 安全解開 GitLab 打包下載的 tar.gz,取回 dbt 專案的 .sql / .yml / .yaml(#15)。
 
 GitLab `/repository/archive` 回的是待審 MR 那個 commit 的程式碼,**是不可信內容**:
 MR 的作者可以在裡面放任何東西——壓縮炸彈、`../` 路徑、符號連結、成千上萬個小檔。
@@ -10,15 +10,19 @@ MR 的作者可以在裡面放任何東西——壓縮炸彈、`../` 路徑、�
   2. 邊解壓邊計數,解出的 tar 一超過上限就中止。
      tar.gz 的檔案清單藏在壓縮資料裡,不解壓就讀不到——所以「先看宣告大小、不先
      全部解壓」必須搭配這一步,否則壓縮炸彈會在「讀清單」時就發作
-  3. 讀 tar 清單(只讀標頭),逐一檢查每個成員的名稱、路徑、類型、宣告大小
-  4. 只挑出指定目錄下、副檔名在白名單內的檔案,檢查檔數、合計大小、逐檔大小
+  3. 讀 tar 清單(只讀標頭)。每個成員:單一頂層目錄、不是絕對路徑、沒有 `..`、`.` 或空
+     段落、沒有重複;指定目錄的上層不能是連結或檔案;要收內容的目錄內不能有連結或特殊檔;
+     會解出的檔案另外檢查名稱(控制字元、反斜線、冒號、Windows 保留名稱)
+  4. 只挑出指定目錄下、副檔名在白名單內的檔案,檢查檔數、合計大小、逐檔大小;
+     另可只列出指定目錄下的檔名(不解出、不讀內容)
   5. 用 tarfile 內建的 filter="data" 解到權限 700 的暫存目錄(與上面自己寫的檢查
      互為備援——#15 的條件:不要只靠自己寫的檢查)
   6. 讀回內容(嚴格 UTF-8)並核對大小,隨即刪除暫存目錄
 
 為什麼指定目錄內的符號連結要讓**整包**失敗,而不是略過:略過會讓某個 macro 憑空
 消失,反查就會回報「沒有影響」——這正是 #15 要求避免的「抓不到就當作沒有」。
-指定目錄外的成員一律丟棄、不解壓,所以只做名稱檢查(路徑穿越、控制字元等)。
+不解出的成員(指定目錄外,或不需要的副檔名)只做安全必要的檢查(絕對路徑、`..`、
+重複……):repo 裡無關的檔名(例如 `docs/aux.md`)不能讓整包失敗(#20 review)。
 
 錯誤訊息可能被貼進 MR 留言或寫進日誌:不含成員名稱、不含檔案內容,長度有上限。
 
@@ -43,8 +47,8 @@ MAX_TOTAL_BYTES = 50 * 1024 * 1024        # 收下的檔案合計
 MAX_FILE_BYTES = 1_000_000                # 單檔(與 dbt_render.MAX_SOURCE_CHARS 同級)
 MAX_ERROR_CHARS = 300
 
-# 只收需要的副檔名(#15 條件 6),其餘一律丟棄
-ALLOWED_SUFFIXES = (".sql", ".yml")
+# 只收需要的副檔名(#15 條件 6),其餘一律丟棄。dbt 的屬性檔 .yml / .yaml 都可以
+ALLOWED_SUFFIXES = (".sql", ".yml", ".yaml")
 
 _CHUNK = 64 * 1024
 _REGULAR_TYPES = (tarfile.REGTYPE, tarfile.AREGTYPE)
@@ -63,12 +67,18 @@ class ArchiveResult:
     # 去掉頂層目錄後的相對路徑(以 / 分隔)→ 文字內容。ok=False 時一定是空的。
     files: dict[str, str] = field(default_factory=dict)
     error: str | None = None
+    # list_prefixes 底下所有非目錄成員的相對路徑(任何副檔名,只有名稱、沒有內容),已排序。
+    # 名稱只過安全必要的檢查(可能含控制字元等):不可直接寫進日誌或留言
+    names: tuple[str, ...] = ()
 
 
-def extract_archive(data: bytes, prefixes: tuple[str, ...]) -> ArchiveResult:
-    """解開 GitLab 打包下載的 tar.gz,只取 prefixes 目錄下的 .sql / .yml。
+def extract_archive(data: bytes, prefixes: tuple[str, ...], *,
+                    list_prefixes: tuple[str, ...] = ()) -> ArchiveResult:
+    """解開 GitLab 打包下載的 tar.gz,只取 prefixes 目錄下的 .sql / .yml / .yaml。
 
-    prefixes  要收的目錄(相對專案根,例如 ("models", "macros"));目錄外的成員一律丟棄
+    prefixes       要收內容的目錄(相對專案根,例如 ("models", "macros"));目錄外的成員一律丟棄
+    list_prefixes  只列檔名的目錄:底下所有非目錄成員(任何副檔名、含符號連結)的名稱放進
+                   names;不解出、不讀內容。預設不列
     任何失敗都收斂成 ok=False,不丟例外。
     """
     try:
@@ -76,10 +86,11 @@ def extract_archive(data: bytes, prefixes: tuple[str, ...]) -> ArchiveResult:
             # filter="data" 是 #15 的明確要求;沒有它就不解壓,不退回無過濾的解法
             raise ArchiveError("此 Python 版本的 tarfile 沒有 data filter,拒絕解壓")
         wanted_dirs = _check_prefixes(prefixes)
+        list_dirs = _check_prefixes(list_prefixes) if list_prefixes != () else ()
         with tarfile.open(fileobj=_gunzip_capped(data), mode="r:") as tar:
-            wanted = _select_members(tar, wanted_dirs)
+            wanted, names = _select_members(tar, wanted_dirs, list_dirs)
             files = _extract_and_read(tar, wanted)
-        return ArchiveResult(ok=True, files=files)
+        return ArchiveResult(ok=True, files=files, names=tuple(sorted(names)))
     except Exception as e:                  # noqa: BLE001 — 一律收斂成失敗結果
         return ArchiveResult(ok=False, error=_safe_error(e))
 
@@ -150,26 +161,56 @@ def _split_relative(name: str) -> list[str]:
     return parts
 
 
+def _split_loose(name: str) -> list[str]:
+    """**所有**成員都要過的安全必要檢查:不是空的、沒有 NUL、不是絕對路徑、沒有 `..`、
+    `.` 或空段落。
+
+    不解出的成員(指定目錄外,或指定目錄內不需要的副檔名)不讀內容、名稱也不進錯誤訊息,
+    唯一的用途是判斷「在不在指定目錄內」「有沒有重複」與列檔名——所以不套 Windows 保留
+    名稱、冒號這類檢查。否則 repo 裡任何一個無關的檔案(例如 `docs/aux.md`)就會讓每個
+    MR 的整包都失敗(#20 review)。
+
+    `.` 與空段落仍然擋:`x/./models/a.sql`、`x//models/a.sql` 解出來就是 `models/a.sql`,
+    但字面上不在 `models/` 底下,會被當成目錄外略過、讓檔案憑空消失;GitLab 依 git 的
+    樹狀結構打包,正常不會出現這兩種寫法。"""
+    if not name or "\x00" in name:
+        raise ArchiveError("路徑是空的,或含 NUL")
+    if name.startswith("/"):
+        raise ArchiveError("路徑是絕對路徑")
+    parts = name.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        raise ArchiveError("路徑含 ..、. 或空段落")
+    return parts
+
+
 def _under(rel: str, dirs: tuple[str, ...]) -> bool:
     return any(rel == d or rel.startswith(d + "/") for d in dirs)
 
 
-def _select_members(tar: tarfile.TarFile, dirs: tuple[str, ...]) -> list[tuple[tarfile.TarInfo, str]]:
-    """逐一檢查成員(只讀標頭),回傳要收的 (成員, 去掉頂層目錄的相對路徑)。
+def _select_members(tar: tarfile.TarFile, dirs: tuple[str, ...], list_dirs: tuple[str, ...] = ()
+                    ) -> tuple[list[tuple[tarfile.TarInfo, str]], list[str]]:
+    """逐一檢查成員(只讀標頭),回傳 (要收的 (成員, 去掉頂層目錄的相對路徑), 只列的檔名)。
 
     GitLab 的打包一律把所有內容放在單一頂層目錄(<專案>-<sha>-<sha>/)底下;
     不是這個形狀就不是我們預期的東西,整包失敗。
+
+    所有成員:單一頂層目錄、_split_loose、重複檢查、不是指定目錄的上層(連結或檔案)。
+    要收內容的目錄內:所有非目錄成員做型別檢查(連結、特殊檔 → 整包失敗);**會解出的**
+    檔案(副檔名在白名單內)另外過 _split_relative 的嚴格檢查(控制字元、反斜線、冒號、
+    Windows 保留名稱……)——只有它們的名稱會落地、會成為 files 的鍵、會出現在報告裡。
     """
     top = None
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
     wanted: list[tuple[tarfile.TarInfo, str]] = []
+    names: list[str] = []
     count = n_files = total = 0
     for m in tar:
         count += 1
         if count > MAX_MEMBERS:
             raise ArchiveError(f"壓縮檔成員超過 {MAX_MEMBERS} 個上限")
-        parts = _split_relative(m.name.rstrip("/") if m.isdir() else m.name)
+        parts = _split_loose(m.name.rstrip("/") if m.isdir() else m.name)
         if top is None:
+            _split_relative(parts[0])       # 頂層目錄是每個路徑的一部分:嚴格檢查
             top = parts[0]
         elif parts[0] != top:
             raise ArchiveError("壓縮檔不是單一頂層目錄的結構")
@@ -178,21 +219,34 @@ def _select_members(tar: tarfile.TarFile, dirs: tuple[str, ...]) -> list[tuple[t
                 raise ArchiveError("壓縮檔頂層不是目錄")
             continue
         rel = "/".join(parts[1:])
-        # 重複的成員:tar 允許同名項目,後面的會蓋掉前面的,可用來夾帶內容。
-        # 大小寫不同、Unicode 正規化不同也算重複(在不分大小寫的檔案系統上會互相覆蓋)
-        key = unicodedata.normalize("NFC", rel).casefold()
+        # 重複的成員:tar 允許同名項目,後面的會蓋掉前面的,可用來夾帶內容——所有成員都擋。
+        # 要收內容的目錄內,大小寫不同、Unicode 正規化不同也算重複(解到不分大小寫的檔案
+        # 系統上會互相覆蓋);目錄外不解出,README.md 與 readme.md 並存不影響(#20 review)
+        if _under(rel, dirs):
+            key = ("收", unicodedata.normalize("NFC", rel).casefold())
+        else:
+            key = ("外", rel)
         if key in seen:
             raise ArchiveError("壓縮檔含重複的成員")
         seen.add(key)
-        if not _under(rel, dirs):
-            continue                        # 指定目錄外:丟棄,不解壓
-        if m.isdir():
-            continue
+        if not m.isdir() and any(d.startswith(rel + "/") for d in dirs + list_dirs):
+            # 指定目錄的上層是連結或檔案(例如 seed-paths 是 data/seeds,而 data 是連結):
+            # 底下的內容不在包裡,會變成「目錄是空的」被當成完整——整包失敗
+            raise ArchiveError("指定目錄的上層是符號連結、硬連結或檔案")
+        if not m.isdir() and _under(rel, list_dirs):
+            # 檔名清單要拿來判斷「名單完整」:目錄本身或底下的成員是連結時,連到的內容
+            # 不在包裡,名單就不完整——不能略過,整包失敗(與要收內容的目錄同一個理由)
+            if rel in list_dirs or m.type not in _REGULAR_TYPES:
+                raise ArchiveError("列檔名的目錄內含符號連結、硬連結或特殊檔案")
+            names.append(rel)               # 只列名稱:不解出、不讀內容
+        if not _under(rel, dirs) or m.isdir():
+            continue                        # 指定目錄外:丟棄,不解壓;目錄由解出的檔案帶出
         if m.type not in _REGULAR_TYPES:
             # 符號連結、硬連結、裝置檔、FIFO、稀疏檔……一律整包失敗(理由見模組說明)
             raise ArchiveError("指定目錄內含符號連結、硬連結或特殊檔案")
         if not rel.lower().endswith(ALLOWED_SUFFIXES):
-            continue                        # 不需要的副檔名:丟棄
+            continue                        # 不需要的副檔名:丟棄(例如 .md、.csv、.py)
+        _split_relative(rel)                # 會解出的檔案:整條路徑嚴格檢查
         if m.size > MAX_FILE_BYTES:
             raise ArchiveError(f"單一檔案超過 {MAX_FILE_BYTES} 位元組上限")
         n_files += 1
@@ -204,7 +258,7 @@ def _select_members(tar: tarfile.TarFile, dirs: tuple[str, ...]) -> list[tuple[t
         wanted.append((m, rel))
     if top is None:
         raise ArchiveError("壓縮檔是空的")
-    return wanted
+    return wanted, names
 
 
 # ------------------------------------------------------------- 5–6. 解出與讀回
