@@ -172,7 +172,7 @@ def test_全部嘗試都沒有合法案例才真的失敗(monkeypatch):
 def test_LLM_呼叫失敗後仍能在下次成功時採用完整結果(monkeypatch):
     """第一次連線失敗、第二次才拿到完整覆蓋——不能因為中途掛過一次就整體判失敗。"""
     complete = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)])
-    calls = [ConnectionError("gate 連不到上游"), _raw(complete)]
+    calls = [ConnectionError("端點連不到"), _raw(complete)]
 
     async def fake_run_agent(*a, **kw):
         nxt = calls.pop(0)
