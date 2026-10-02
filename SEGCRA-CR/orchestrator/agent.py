@@ -50,8 +50,21 @@ def _dump(profile_model: str, messages: list, iteration: int) -> None:
 
 async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
                     hub: ToolHub, verbose: bool = True, use_tools: bool = True,
-                    trace: list | None = None) -> str:
-    """trace 給定時,把每次工具呼叫記錄下來(供產生逐字對話 transcript)。"""
+                    trace: list | None = None, meta: dict | None = None) -> str:
+    """trace 給定時,把每次工具呼叫記錄下來(供產生逐字對話 transcript)。
+
+    meta 給定時,填入最後一次回應的 `finish_reason` 與 `completion_tokens`。
+
+    **為什麼需要這個**:回應被 `max_tokens` 截斷時,端點回的是
+    `finish_reason="length"`,但呼叫端只拿得到字串,看不到這件事——而
+    `extract_json()` 的 json-repair 退路會把截斷的 JSON **修補成合法物件**,
+    於是上層收到一份「看起來正常、只是比較短」的結果,完全無從察覺截斷。
+    實測過:`RETAIL_M1` 的測資生成 `finish_reason=length`、
+    `completion_tokens` 剛好等於上限 8192、輸出斷在一個數字中間,
+    但 `extract_json` 照樣解析成功,只是案例從 46 個掉到 9 個。
+
+    回傳型別刻意不改(5 個呼叫點全不受影響),沿用本檔既有的 `trace`
+    那種「傳容器進來收集額外資訊」的慣例。"""
     client = AsyncOpenAI(base_url=cfg.endpoint, api_key=cfg.api_key,
                          timeout=REQUEST_TIMEOUT, max_retries=0)
     messages = [{"role": "system", "content": system},
@@ -84,6 +97,11 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
                 print(f"[agent] 警告:估計送出 prompt ≈{sent_estimate} tokens,"
                       f"但端點回報只讀到 {prompt_tokens} tokens——context 可能被靜默截斷,"
                       f"這次生成結果可能不可信。")
+        if meta is not None:
+            # 每一輪都覆寫:呼叫端關心的是**最後一次**回應有沒有被截斷,
+            # 中間輪次的工具呼叫回合即使碰到上限也會繼續跑下去。
+            meta["finish_reason"] = resp.choices[0].finish_reason
+            meta["completion_tokens"] = getattr(usage, "completion_tokens", None) if usage else None
         messages.append(msg.model_dump(exclude_none=True))
 
         if not msg.tool_calls:

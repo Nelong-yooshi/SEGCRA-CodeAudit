@@ -210,7 +210,7 @@ def test_仲裁_LLM_呼叫失敗時保守倒向_SQL_錯(monkeypatch):
     策略是寧可誤差也不要錯放,所以環境掛掉時必須倒向前者。
     """
     async def boom(*a, **kw):
-        raise ConnectionError("gate 連不到上游")
+        raise ConnectionError("端點連不到")
 
     monkeypatch.setattr(spec_exec, "run_agent", boom)
     verdict = asyncio.run(arbitrate(_FakeCfg(), "規格", "SELECT 1;", _MISMATCH))

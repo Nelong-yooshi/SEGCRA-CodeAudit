@@ -1,0 +1,49 @@
+{
+  "title": "RETAIL_M1 條件 1 門檻微調",
+  "description": "例行維護:條件 1 的當日結餘門檻寫法統一。邏輯不變。(規格見 specs/RETAIL_M1_EVAL.md)",
+  "sha": "b2b2000000000000000000000000000000000702",
+  "files": [
+    {
+      "path": "models/mrt_RETAIL_M1_EVAL.sql",
+      "diff": "@@ -155,7 +155,7 @@\n             AND inbound_amt BETWEEN 80000 AND 100000\n             AND inbound_cnt = 2\n             AND io_ratio BETWEEN 0.60 AND 1.20\n-            AND eod_balance <= 1000\n+            AND eod_balance < 1000\n         )\n         OR\n         -- Condition B",
+      "full_content": "/*\nSample / synthetic example — 合成範例,非任何實際業務規則。\nCreated: 2026-03-18\nDescription: 零售交易監控 — 特定條件異常帳戶清單產出 (含小額/行銷撥入排除與 A/B/C 三種情境篩選)\nChange Log:\n- 2026-05-22 [REFACT] Refactor with the clear-logical select and macros, remove cancellation logic\n- 2026-05-08 [REFACT] Refactor with the clear-logical select\n- 2026-03-18 [REFACT] Refactor from python script, Optimized with Conditional Aggregation\n*/\n\n-- dbt config\n\n\n-- ======================================================================\n-- 日期變數設定 (使用 dbt var 以支援排程器動態傳入)\n-- ======================================================================\n\n\n\n-- 1. T_TXN_BASE: 把所有表需要用到的欄位先 select 進來\nWITH T_TXN_BASE AS (\n    SELECT\n        table_date\n        , posted_date\n        , txn_time\n        , account_id\n        , op_code\n        , direction_flag\n        , CAST(amount AS BIGINT)        AS amount\n        , CAST(balance_after AS BIGINT) AS balance_after\n    FROM txn_log_net\n    WHERE NULLIF(LTRIM(RTRIM(account_id)), '') IS NOT NULL\n    AND TABLE_DATE = @start_date\n)\n\n\n-- 2. T_TXN_FULL: 算出所有特徵工程\n, T_TXN_AGG1 AS (\n    SELECT\n        table_date\n        , account_id\n        , op_code\n        , direction_flag\n        , amount\n        , balance_after\n        , posted_date\n        , txn_time\n        -- 利用 ROW_NUMBER 標記出當天最後一筆交易，方便第 4 步直接抓取餘額\n        , ROW_NUMBER()\n            OVER(\n                PARTITION BY account_id, table_date\n                ORDER BY posted_date DESC, txn_time DESC\n            )\n          AS RN_LAST\n    FROM T_TXN_BASE\n)\n\n, T_TXN_AGG2 AS (\n    SELECT\n        table_date\n        , account_id\n        -- [eod_balance] 當日結餘：利用剛剛的 RN_LAST = 1 來抓取最後一筆餘額\n        , MAX(CASE WHEN RN_LAST = 1 THEN balance_after ELSE 0 END) AS eod_balance\n\n        -- [inbound_cnt] & [inbound_amt] 指定入帳次數/總額(排除小額)\n        , SUM(CASE WHEN \n    \n\n    (\n        direction_flag = '0'\n        AND amount > 1000\n        AND op_code IN ('OP01','OP02','OP03')\n    )\n THEN 1 ELSE 0 END) AS inbound_cnt\n        , ISNULL(\n            SUM(CASE WHEN \n    \n\n    (\n        direction_flag = '0'\n        AND amount > 1000\n        AND op_code IN ('OP01','OP02','OP03')\n    )\n THEN amount ELSE 0 END)\n            , 0)\n          AS inbound_amt\n\n        -- [kiosk_outbound_cnt] & [kiosk_outbound_amt] 自助設備出帳次數/總額\n        , SUM(CASE WHEN \n    \n\n    (\n        direction_flag = '1'\n        AND op_code IN ('OP11','OP12')\n    )\n THEN 1 ELSE 0 END) AS kiosk_outbound_cnt\n        , ISNULL(\n            SUM(CASE WHEN \n    \n\n    (\n        direction_flag = '1'\n        AND op_code IN ('OP11','OP12')\n    )\n THEN amount ELSE 0 END)\n            , 0)\n          AS kiosk_outbound_amt\n\n        -- [outbound_amt] 指定出帳總額\n        , ISNULL(\n            SUM(CASE WHEN \n    \n\n    (\n        direction_flag = '1'\n        AND op_code IN ('OP21','OP22','OP23')\n    )\n THEN amount ELSE 0 END)\n            , 0)\n          AS outbound_amt\n    FROM T_TXN_AGG1\n    GROUP BY table_date, account_id\n)\n\n, T_TXN_FULL AS (\n    SELECT\n        *\n        , CASE\n            WHEN inbound_amt = 0 THEN 0\n            ELSE ROUND(CAST(outbound_amt AS FLOAT) / CAST(inbound_amt AS FLOAT), 2)\n          END AS io_ratio\n    FROM T_TXN_AGG2\n)\n\n-- 3. T_TXN_FINAL: 篩選組合清楚的 OR，並計算總額比\n, T_TXN_FINAL AS (\n    SELECT\n        table_date\n        , account_id\n        , eod_balance\n        , inbound_cnt\n        , inbound_amt\n        , kiosk_outbound_cnt\n        , kiosk_outbound_amt\n        , outbound_amt\n        , io_ratio\n        , '' AS remark\n    FROM T_TXN_FULL\n    WHERE\n        -- Condition A\n        (\n            kiosk_outbound_cnt BETWEEN 2 AND 3\n            AND kiosk_outbound_amt BETWEEN 50000 AND 100000\n            AND outbound_amt BETWEEN 90000 AND 110000\n            AND inbound_amt BETWEEN 80000 AND 100000\n            AND inbound_cnt = 2\n            AND io_ratio BETWEEN 0.60 AND 1.20\n            AND eod_balance < 1000\n        )\n        OR\n        -- Condition B\n        (\n            kiosk_outbound_cnt BETWEEN 3 AND 4\n            AND kiosk_outbound_amt BETWEEN 50000 AND 100000\n            AND outbound_amt BETWEEN 90000 AND 110000\n            AND inbound_amt BETWEEN 80000 AND 120000\n            AND inbound_cnt BETWEEN 3 AND 8\n            AND io_ratio BETWEEN 0.60 AND 1.20\n            AND eod_balance <= 1000\n        )\n        OR\n        -- Condition C\n        (\n            kiosk_outbound_cnt BETWEEN 4 AND 10\n            AND kiosk_outbound_amt BETWEEN 90000 AND 100000\n            AND inbound_amt BETWEEN 80000 AND 100000\n            AND inbound_cnt BETWEEN 2 AND 3\n            AND io_ratio BETWEEN 1.00 AND 1.50\n            AND eod_balance <= 1000\n        )\n)\n\n-- ==================== 4. 最終輸出 ====================\nSELECT\n    f.table_date\n    , f.account_id\n    , f.eod_balance\n    , f.inbound_cnt\n    , f.inbound_amt\n    , f.kiosk_outbound_cnt\n    , f.kiosk_outbound_amt\n    , f.outbound_amt\n    , f.io_ratio\n    , f.remark\nFROM T_TXN_FINAL f\nWHERE NOT EXISTS (\n    SELECT 1\n    FROM retail_m1_earlyjob e\n    WHERE e.account_id = f.account_id\n    AND e.TABLE_DATE = DATEADD(DAY, -1, @start_date)\n)"
+    }
+  ],
+  "expected": [
+    {
+      "severity": "major",
+      "title_contains_any": [
+        "規格",
+        "不符",
+        "邊界",
+        "結餘",
+        "eod_balance"
+      ],
+      "file": "models/mrt_RETAIL_M1_EVAL.sql"
+    }
+  ],
+  "_golden": {
+    "layer": "real-shape",
+    "needs_llm": true,
+    "intent": "埋雷(真實程式形狀):條件 1 的 eod_balance <= 1000 被改成 < 1000,規格 1-7 明訂「≤ 1,000」→ 結餘恰好 1,000 的帳戶應通報卻會漏報。**刻意選用小規模已證明抓得到的錯誤類型**(含/不含邊界,同 mr_401),所以這個 case 若漏抓,可以確定是規模造成的,不是這種錯本來就抓不到。難度來自:三組條件的這一行長得一模一樣、只改第一組(其餘兩組維持 <=),而且埋在 200 行、20 項門檻裡。同時也是唯一一個「大檔裡只改幾行」的維護型 diff(issue #8 §3),其餘 case 不是新檔就是小檔全改。與 mr_701 成對:一個不該吵的 + 一個該抓的。",
+    "dbt_enabled": true,
+    "expect_decision": "needs_human",
+    "expect_signals": {
+      "spec_found": true,
+      "spec_exec_passed": false,
+      "spec_exec_sql_fault": true
+    },
+    "expect_findings": [
+      {
+        "severity": "major",
+        "title_contains_any": [
+          "規格",
+          "不符",
+          "執行驗證"
+        ]
+      }
+    ],
+    "known_gap": true,
+    "gap_note": "實測(2026-09-30,gemma4:31b + MS SQL 沙盒):測資生成把規格拆成 **23 個原子條件**(拆解本身是對的),但只產出 0 個合法案例、37 個覆蓋缺口,執行驗證等於沒有生效。對照 R-140(7 個條件)同一套流程是 21 案例、0 缺口。\n\n**根因已直接量測(2026-10-01),結論要分兩半看**:對這份規格直接呼叫端點、讀回應的 `finish_reason`,跑三輪——\n\n| 輪次 | max_tokens | finish_reason | 實際產出 | 條件 | 案例 | 缺口 |\n|---|---|---|---|---|---|---|\n| ① RETAIL_M1 | 8,192 | **length** | 8,192(撞頂) | 23 | 9 | 37 |\n| ② RETAIL_M1 | 32,768 | stop | **10,807**(自己停的) | 23 | **12** | **35** |\n| ③ R-140(對照) | 8,192 | stop | 4,966 | 7 | 17 | **0** |\n\n①**證實了截斷**:`completion_tokens` 剛好等於上限、輸出斷在一個負數中間(`...\"OP21\", \"1\", -`)。是**輸出**容量不足,不是輸入(`prompt_tokens` 只有 2,977)。\n\n但②才是重點:**給了 4 倍空間,模型只用 10,807 就自己停了,案例仍然只有 12 個**(23 個條件需要 46 個)。所以**截斷不是覆蓋不足的主因,調高 `max_output_tokens` 救不回來**——模型就是不會為 23 個條件生出完整案例集。③ 的對照組確認量測本身沒問題。\n\n**下一步是分批生成**(一次只處理幾個條件、多次呼叫再合併),不是調參數。截斷偵測本身仍有價值(不讓殘骸被當成完整結果、失敗原因指對方向),但不改善覆蓋度。\n\n**注意這不是 `generate_cases()` 重試修法能解決的**:重試解決「這次取樣運氣不好」,這裡是每次都裝不下,重試 3 次結果一樣。\n\n**但本案未漏放**:埋的雷(條件 1 的 `eod_balance <= 1000` 改成 `< 1000`)由 LLM 靜態審查抓到(recall 1/1、誤報 0),決策仍為 needs_human。`spec_exec_sql_fault=False` 正確揭露了「是靜態審查接住的,執行驗證沒出力」——這正是該訊號存在的目的。縱深防禦在這個規模上只剩一層,不是零層。"
+  }
+}

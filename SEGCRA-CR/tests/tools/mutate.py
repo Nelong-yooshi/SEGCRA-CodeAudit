@@ -770,5 +770,62 @@ def _mutate_all(args, src: pathlib.Path) -> int:
     return 1 if survived or config_errors else 0
 
 
+# ---- 測資生成的覆蓋度重試(spec_exec)
+# 這道防線的失效是**靜默**的:覆蓋不完整的測資照樣跑得完、報告看起來正常,
+# 只是執行驗證少驗了幾個條件。沒有突變點的話,測試是不是真的守著它無從得知。
+S = "spec_exec.py"
+MUTANTS.update({
+    "測資:有缺口也直接收下(回到舊行為)": (S,
+        "                if not gaps and n_conds >= max_conds:",
+        "                if True:"),
+    "測資:不留覆蓋最多的一版(只認最後一次)": (S,
+        "                if best is None or _covered(cleaned) > _covered(best[0]):\n"
+        "                    best = (cleaned, gaps, dropped)",
+        "                best = (cleaned, gaps, dropped)"),
+    # review 第 4 點:缺口是對照模型自己拆的條件算的,拆得少的 0 缺口版本不能
+    # 勝過拆得齊、只缺一點的版本;重試 prompt 不帶缺口,固定 seed 下等於白跑。
+    "測資:0 缺口就提前結束,不看條件數有沒有變少": (S,
+        "                if not gaps and n_conds >= max_conds:",
+        "                if not gaps:"),
+    "測資:最佳版本改回比缺口數": (S,
+        "                if best is None or _covered(cleaned) > _covered(best[0]):",
+        "                if best is None or len(gaps) < len(best[1]):"),
+    "測資:重試 prompt 不帶上一次的缺口": (S,
+        "        issues.append(\"上一次的測資計畫覆蓋不完整,缺:\\n\" + \"\\n\".join(f\"- {g}\" for g in gaps))",
+        "        issues.append(\"上一次的測資計畫覆蓋不完整。\")"),
+    "測資:重試用完就判失敗(丟掉已抽到的最佳版)": (S,
+        "    if best is not None:\n        return best",
+        "    if False:\n        return best"),
+    # 執行中止後,沒跑到的案例必須列入覆蓋缺口。少了它,報告會顯示「跑了 N 個
+    # 案例、零缺口」,讀起來像全覆蓋,實際上多數案例根本沒執行——而 coverage_gaps
+    # 正是人用來判斷「這次到底驗了多少」的欄位。兩個早退點各一個突變點。
+    "執行中止:SQL 錯時沒跑到的案例不算缺口": (S,
+        '"執行錯誤(語法/欄位):{ex[\'sql_error\']}",' + NL
+        + '                                 "修正 SQL 使其可依規格的資料表定義在 MS SQL 上執行。"))' + NL
+        + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
+        + '                "conditions": plan["conditions"],' + NL
+        + '                "coverage_gaps": coverage_gaps + _unrun_gaps(plan, ex["case_results"]),',
+        '"執行錯誤(語法/欄位):{ex[\'sql_error\']}",' + NL
+        + '                                 "修正 SQL 使其可依規格的資料表定義在 MS SQL 上執行。"))' + NL
+        + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
+        + '                "conditions": plan["conditions"],' + NL
+        + '                "coverage_gaps": coverage_gaps,'),
+    # 截斷偵測:被 max_tokens 硬切的 JSON 會被 json-repair 修補成合法物件,
+    # 形狀檢查只看得到「案例比較少」。拿掉這一關,殘骸會被當成正常結果收下。
+    "測資:不理會輸出被截斷(殘骸當結果收下)": (S,
+        '        if meta.get("finish_reason") == "length":',
+        "        if False:"),
+    "執行中止:測資建不起來時沒跑到的案例不算缺口": (S,
+        'f"{ex[\'testdata_error\']}。需人工執行驗證。"))' + NL
+        + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
+        + '                "conditions": plan["conditions"],' + NL
+        + '                "coverage_gaps": coverage_gaps + _unrun_gaps(plan, ex["case_results"]),',
+        'f"{ex[\'testdata_error\']}。需人工執行驗證。"))' + NL
+        + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
+        + '                "conditions": plan["conditions"],' + NL
+        + '                "coverage_gaps": coverage_gaps,'),
+})
+
+
 if __name__ == "__main__":
     sys.exit(main())
