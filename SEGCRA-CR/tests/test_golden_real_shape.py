@@ -10,8 +10,9 @@
 (「無規格可驗」而不是「檔名對應壞了」)。
 
 驗的東西:
-  1. 規格**依 model 檔名**對應:`mrt_RETAIL_M1.sql` → `specs/RETAIL_M1.md`。
-     真實規則沒有 R 編號,這是它唯一的規格來源。
+  1. 規格**依 model 檔名**對應:`mrt_RETAIL_M1_EVAL.sql` → `specs/RETAIL_M1_EVAL.md`。
+     真實規則沒有 R 編號,這是它唯一的規格來源。評測規格刻意不用正式名稱:
+     真正的 `mrt_RETAIL_M1.sql` 不能對到這份照程式改寫的規格。
   2. 這條路確實由 `dbt.enabled` 控制:關閉時必須對不到(#14 的安全預設)。
   3. `case_config()` 只對標記過的 case 換設定,不影響其他 case。
   4. 已編譯的 SQL 不會被誤判成 dbt 樣板(否則會被擋在沙盒外)。
@@ -63,7 +64,7 @@ def test_真實規則沒有R編號(case):
 
 def test_規格依model檔名對應得到(case):
     code, text = asyncio.run(find_spec(None, case, by_path=True))
-    assert code == "RETAIL_M1"
+    assert code == "RETAIL_M1_EVAL"
     assert text and text.lstrip().startswith("#")
     assert "資料表定義" in text, "執行驗證要靠這段建表,規格少了它測資生成建不起來"
 
@@ -117,7 +118,17 @@ def test_埋雷版只動條件1的那一行(bugged):
 
 def test_埋雷版的規格也對得到(bugged):
     code, text = asyncio.run(find_spec(None, bugged, by_path=True))
-    assert code == "RETAIL_M1" and text
+    assert code == "RETAIL_M1_EVAL" and text
+
+
+def test_正式名稱的model對不到評測專用規格(case):
+    """`specs/RETAIL_M1_EVAL.md` 是照範例程式改寫、讓正向對照乾淨的版本(拿掉了範本
+    規格的兩項排除資料)。若它以正式名稱放在 `specs/`,之後審真正的 `mrt_RETAIL_M1.sql`
+    都會依檔名對到它,範本規格有要求、程式卻沒做的部分就不會再被檢查。"""
+    real = json.loads(json.dumps(case))
+    real["files"][0]["path"] = "models/mrt_RETAIL_M1.sql"
+    code, text = asyncio.run(find_spec(None, real, by_path=True))
+    assert code != "RETAIL_M1_EVAL" and (text is None or "評測專用" not in text)
 
 
 def test_埋雷版是大檔裡只改一行的維護型diff(bugged):

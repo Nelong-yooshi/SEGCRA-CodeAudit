@@ -179,8 +179,8 @@ def case_config(cfg, golden: dict):
     預設,改它等於把正式審查的行為一起改掉,而 golden set 只是想讓某幾個 case
     走到那條路。所以這裡只換一份 Config 複本,影響範圍僅限這個 case。
 
-    目前唯一需要它的是**規格依 model 檔名對應**(`mrt_RETAIL_M1.sql` →
-    `specs/RETAIL_M1.md`):真實規則沒有 R 編號,不開這個開關就一律「無規格可驗」。
+    目前唯一需要它的是**規格依 model 檔名對應**(`mrt_RETAIL_M1_EVAL.sql` →
+    `specs/RETAIL_M1_EVAL.md`):真實規則沒有 R 編號,不開這個開關就一律「無規格可驗」。
     """
     if not golden.get("dbt_enabled"):
         return cfg
