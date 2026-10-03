@@ -343,10 +343,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         if "anomaly-rules" in skills and any(
                 "rules" in f["path"] for f in mr["files"]):
             always_block += "\n\n" + skills["anomaly-rules"].body
-        # 內容觸發:預掃出資安命中(R004/H004)→ 強制載入 secure-sql,不賭模型主動載
-        if "secure-sql" in skills and any(
-                h.get("rule") in ("R004", "H004")
-                for e in pre for h in e.get("rules", [])):
+        # 內容觸發:預掃出資安命中 → 強制載入 secure-sql,不賭模型主動載
+        if "secure-sql" in skills and _needs_secure_sql(pre):
             always_block += "\n\n" + skills["secure-sql"].body
 
         system = SYSTEM_TEMPLATE.format(
@@ -515,12 +513,21 @@ def enforce_hints(report: dict, pre: list[dict]) -> dict:
     return report
 
 
+# 預掃命中這些規則時,secure-sql skill 一律注入 system prompt(不賭模型主動載)
+_SECURE_SQL_RULES = ("R004", "R005", "H004")
+
+
+def _needs_secure_sql(pre: list[dict]) -> bool:
+    return any(h.get("rule") in _SECURE_SQL_RULES for e in pre for h in e.get("rules", []))
+
+
 # rule 命中 → 判定「模型已涵蓋」的關鍵詞(報告全文含任一即視為已報,避免重複)
 _RULE_KEYWORDS = {
     "R001": ["WHERE", "全表", "整表", "整張表", "purge"],
     "R002": ["SELECT *", "明列欄位", "star"],
     "R003": ["NOT IN", "NULL 陷阱", "NOT EXISTS"],
     "R004": ["憑證", "密碼", "金鑰", "硬編碼", "hardcode", "credential", "secret"],
+    "R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys.", "沙盒"],
 }
 
 

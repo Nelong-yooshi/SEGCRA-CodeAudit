@@ -149,6 +149,31 @@ _MASKED_KEY_RE = re.compile(
     r"(?i)(SUBSTRING|SUBSTR|LEFT|RIGHT|MASK|REGEXP_REPLACE|OVERLAY|CONCAT)\s*\("
     r".{0,160}?\b(account_id|acct_id|account_no|acct_no)\b"
     r".{0,160}?\bAS\s+(account_id|acct_id|account_no)\b")
+# R005:讀取執行環境(資料庫名、主機、登入身分、系統表)。規則程式不需要知道自己跑在
+# 哪裡;會讀的話,就能在沙盒裡照規格跑、到正式環境才做別的事(例如
+# `AND DB_NAME() NOT LIKE 'segcra%'`)——執行驗證反而會通過,規則層與沙盒都擋不住。
+# 刻意**不排除註解裡的寫法**:去註解的 regex 會被字串裡的 `--` 騙(`'--' AND DB_NAME()`
+# 會連真正會執行的呼叫一起被當成註解去掉);寫在註解裡的誤報只是多一次人工確認。
+_ENV_FUNC_RE = re.compile(
+    r"(?i)(?<![\w.@\[])(DB_NAME|DB_ID|HOST_NAME|HOST_ID|SUSER_NAME|SUSER_SNAME|SUSER_ID"
+    r"|ORIGINAL_LOGIN|APP_NAME|SERVERPROPERTY|DATABASEPROPERTYEX)\s*\(")
+_ENV_VAR_RE = re.compile(r"(?i)@@(SERVERNAME|SERVICENAME|VERSION|SPID)\b"
+                         r"|(?<![\w.@\[])SYSTEM_USER\b")
+_ENV_CATALOG_RE = re.compile(
+    r"(?i)(?<![\w.])\[?sys\]?\s*\.\s*\[?(databases|objects|tables|schemas|columns|servers"
+    r"|sysdatabases|sysobjects|dm_\w+)\b"
+    r"|(?<![\w.])\[?INFORMATION_SCHEMA\]?\s*\.")
+
+
+def _env_probes(sql: str) -> list[str]:
+    """回傳 SQL 裡讀取執行環境的寫法(去重、保留出現順序)。"""
+    found = []
+    for rx in (_ENV_FUNC_RE, _ENV_VAR_RE, _ENV_CATALOG_RE):
+        for m in rx.finditer(sql):
+            token = " ".join(m.group(0).split()).rstrip("(").strip()
+            if token.upper() not in (t.upper() for t in found):
+                found.append(token)
+    return found
 
 
 def _text_rules(sql: str):
@@ -164,6 +189,12 @@ def _text_rules(sql: str):
     elif _CRED_COL_RE.search(sql):
         hits.append(("H004", "hint",
                      "查詢選取了憑證/密碼/卡號類敏感欄位:請確認此存取的正當性與最小必要"))
+    probes = _env_probes(sql)
+    if probes:
+        hits.append(("R005", "major",
+                     f"規則 SQL 讀取執行環境:{'、'.join(probes[:5])}——規則不需要知道自己跑在"
+                     f"哪個資料庫/主機/身分下;讀取環境的寫法可以讓規則在執行驗證的沙盒裡照規格跑、"
+                     f"到正式環境才做別的事,執行驗證會因此通過。請移除,或說明正當用途"))
     if _MASKED_KEY_RE.search(sql):
         hits.append(("H005", "hint",
                      "輸出的 account_id/主鍵疑似被遮罩:若規格要求明碼輸出(供下游部門"
@@ -193,7 +224,7 @@ def run_rules(sql: str) -> str:
             if msg:
                 hits.append({"rule": code, "severity": severity, "message": msg,
                              "statement": st.sql(dialect=DIALECT)[:200]})
-    # 文字層資安規則(R004 hardcode 憑證、H004 異常查詢)
+    # 文字層資安規則(R004 hardcode 憑證、R005 讀取執行環境、H004 異常查詢)
     for code, severity, msg in _text_rules(sql):
         hits.append({"rule": code, "severity": severity, "message": msg,
                      "statement": ""})

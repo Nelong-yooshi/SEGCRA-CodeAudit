@@ -78,6 +78,8 @@ def run(monkeypatch, tmp_path):
     # 所以兩邊都要設;只設一邊的話 raw 檔會寫到 repo 的 review_output/ 去。
     monkeypatch.setenv("REVIEW_OUTPUT", str(output))
 
+    systems: list[str] = []    # 每次呼叫模型時送出的 system prompt(驗 skill 有沒有注入)
+
     def _run(mr: dict, model_report: dict | None = None, *,
              spec_exec_kind: str = "pass", mr_id: str = "900"):
         (fixtures / f"mr_{mr_id}.json").write_text(
@@ -87,6 +89,7 @@ def run(monkeypatch, tmp_path):
 
         async def fake_run_agent(cfg, profile, system, user, hub,
                                  verbose=True, use_tools=True, trace=None):
+            systems.append(system)
             return report_json
 
         monkeypatch.setattr(pipeline, "run_agent", fake_run_agent)
@@ -126,6 +129,7 @@ def run(monkeypatch, tmp_path):
         report = asyncio.run(pipeline.review_mr(load_config(), mr_id))
         return report, output, mr_id
 
+    _run.systems = systems
     return _run
 
 
@@ -292,3 +296,19 @@ def test_模型輸出無法解析時要明確失敗(run):
     """回不了 JSON 就該炸,不要產出一份空報告讓人以為審過了。"""
     with pytest.raises(RuntimeError, match="無法解析"):
         run(_mr(CLEAN_SQL), "模型今天不想輸出 JSON")
+
+
+# ─────────────────── skill 的內容觸發 ───────────────────
+
+def test_預掃命中R005時secure_sql真的送進模型的system_prompt(run):
+    """`_needs_secure_sql` 判斷對了還不夠:review_mr 有沒有真的依它把 skill 注入
+    system prompt,只有跑整條管線才看得到(#26 第 7 項)。"""
+    from orchestrator.skills_loader import load_skills
+    marker = load_skills()["secure-sql"].body.strip().splitlines()[0]
+
+    run(_mr(CLEAN_SQL.replace("GROUP BY", "  AND DB_NAME() NOT LIKE 'segcra%'\nGROUP BY")))
+    assert marker in run.systems[-1], "命中 R005 卻沒有注入 secure-sql"
+
+    run(_mr(CLEAN_SQL), mr_id="901")
+    assert marker not in run.systems[-1], "沒有資安命中時不該注入(按需載入)"
+

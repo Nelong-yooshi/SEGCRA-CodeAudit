@@ -580,6 +580,16 @@ MUTANTS.update({
      '            "title": _DBT_NOTICE_TITLE,'),
 })
 
+# ---- R005 讀取執行環境(#26 第 7 項):規則層命中後,模型一定看得到 secure-sql 的說明
+MUTANTS.update({
+ "R005:命中時不強制載入 secure-sql": ("pipeline.py",
+     '_SECURE_SQL_RULES = ("R004", "R005", "H004")',
+     '_SECURE_SQL_RULES = ("R004", "H004")'),
+ "R005:強制載入的判斷寫死成不載": ("pipeline.py",
+     "        if \"secure-sql\" in skills and _needs_secure_sql(pre):",
+     "        if False:"),
+})
+
 # ---- 確定性防線不能被模型關掉(#16 review):程式專用標題、規則命中不可被降級
 MUTANTS.update({
  "後處理:不移除模型同標題的輸出": ("pipeline.py",
