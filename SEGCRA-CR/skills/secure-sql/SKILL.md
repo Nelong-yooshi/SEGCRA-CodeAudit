@@ -21,6 +21,11 @@ trigger: on_demand
 - **異常大範圍存取**:無條件讀取整張敏感表(users/credentials/customers 全表 dump)、
   或 `UNION` 拼接非預期資料表(疑似資料外洩/探測);與規則業務目的不符即 major。
 - **權限外操作**:規則腳本卻對權限表、系統表(pg_*, information_schema)寫入或授權。
+- **讀取執行環境**(預掃 R005):`DB_NAME()`、`@@SERVERNAME`、`HOST_NAME()`、`SUSER_NAME()`、
+  `SERVERPROPERTY()`、`sys.databases`/`sys.objects`、`INFORMATION_SCHEMA` 等。規則程式不需要
+  知道自己跑在哪個資料庫、主機或身分下;會讀的話,就能**在執行驗證的沙盒裡照規格跑、
+  到正式環境才做別的事**(例如 `AND DB_NAME() NOT LIKE 'segcra%'`),執行驗證反而會通過。
+  看到這類寫法要追問用途:找不到業務上的理由就是 major,不能因為「執行驗證通過」就放行。
 
 ## 明確「不是」finding(避免誤報)
 - **通報單輸出個資**(account_id、姓名、身分證號)交付調查部門屬**核定用途**,
