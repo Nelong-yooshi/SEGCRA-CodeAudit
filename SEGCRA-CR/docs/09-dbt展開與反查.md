@@ -254,6 +254,17 @@ python tests/dbt_impact_reference/random_projects.py --dbt <dbt 執行檔>
 | 不存在的 commit | HTTP 404,乾淨失敗並附處理提示 |
 | 同一個 token 只勾 `read_repository`(先前實測) | 讀單檔 200,打包與列目錄 403 |
 
+#20 review 修正後重測(2026-10-04,同一個測試專案新增一個 commit;token 條件同上,
+另建新的一把):
+
+| 項目 | 結果 |
+|---|---|
+| repo 裡有 `docs/aux.md`、`notes/con.txt`(review 實測會讓整包失敗的檔名) | 取回根目錄的專案**成功**;兩個檔案在 dbt 目錄外,不解出 |
+| `models/props.yaml` | 有收進來 |
+| seed、Python model、snapshot(`.sql` 區塊與 yml) | snapshot 的 `.sql` 與 yml 收內容;`.csv`、`.py` 只列檔名(清單含 `seeds/sample.csv`、`models/py_score.py`);`extra_ref_names()` 得到 `py_score`、`sample`、`snap_dim`、`snap_sample` |
+| `load_dbt_project()`,專案在 `dbt_sub/` | 成功 |
+| 不存在的 commit | HTTP 404,乾淨失敗 |
+
 正式環境的條件(#15 review 回覆):正式的 dbt 專案**沒有用 dbt 套件**(共用邏輯都是自己寫的
 macro);正式環境的主機**不連外網**,審查流程裡不能有任何執行時才從網路下載的步驟(包括
 `dbt deps`);正式環境用 dbt-sqlserver,預設 schema 是 `dbo`。含 dbt 樣板的 MR 這一階段**不需要
