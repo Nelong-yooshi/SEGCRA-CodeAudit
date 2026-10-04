@@ -3,9 +3,13 @@
 兩種模式(以環境變數切換):
 - mock(預設):MR 從 fixtures/*.json 讀,post_* 寫到 review_output/,離線 demo 用
 - real:設定 GITLAB_URL + GITLAB_TOKEN + GITLAB_PROJECT 後走 GitLab REST API v4
+
+打包下載(download_archive,#15)另外需要 GITLAB_READ_TOKEN(唯讀),見該函式說明。
 """
 import json
 import os
+import re
+import time
 from pathlib import Path
 
 PKG_ROOT = Path(__file__).resolve().parent.parent
@@ -16,6 +20,8 @@ GITLAB_URL = os.environ.get("GITLAB_URL", "")          # e.g. http://localhost:8
 GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "")
 GITLAB_PROJECT = os.environ.get("GITLAB_PROJECT", "")  # project id 或 URL-encoded path
 REAL_MODE = bool(GITLAB_URL and GITLAB_TOKEN and GITLAB_PROJECT)
+# 專案層級的唯讀 token(read_api,角色 Reporter),只給打包下載用(#15 條件 1)
+GITLAB_READ_TOKEN = os.environ.get("GITLAB_READ_TOKEN", "")
 
 
 # --- real mode helpers ---------------------------------------------------
@@ -53,6 +59,122 @@ def _api_pages(path: str, params: dict | None = None) -> tuple[list, bool]:
         nxt = r.headers.get("X-Next-Page", "").strip()
         page = int(nxt) if nxt else 0
     return items, bool(page)
+
+
+# --- 打包下載(#15)------------------------------------------------------
+
+# 完整的 commit 編號(SHA-1 40 位或 SHA-256 64 位,小寫)。不接受分支名:分支在審查
+# 中途可能被推新 commit,抓到的就不是被審的那一版(#15 條件 8)
+_SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+# 打包的子目錄:只接受英數與 _ . -,以 / 分段(不接受 ..、開頭的 /、空白、URL 字元)
+_ARCHIVE_PATH = re.compile(r"[A-Za-z0-9_.\-]+(?:/[A-Za-z0-9_.\-]+)*")
+ARCHIVE_DEADLINE_S = 120          # 整次下載的時間上限(防伺服器慢慢送、把審查卡住)
+# 常見失敗的處理提示(固定文字)。打包與列目錄 API 要 read_api:實測 read_repository
+# 只能讀單檔,打包回 403
+_ARCHIVE_STATUS_HINTS = {
+    401: "GITLAB_READ_TOKEN 無效、已過期或已撤銷",
+    403: "GITLAB_READ_TOKEN 權限不足:需要 read_api,角色至少 Reporter",
+    404: "找不到專案或 commit,或 GITLAB_READ_TOKEN 看不到這個專案",
+}
+
+
+class ArchiveDownloadError(Exception):
+    """打包下載失敗。訊息是固定文字,不含 token、URL、回應內容。"""
+
+
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _check_archive_url(url: str) -> None:
+    """本機以外一律要 https;網址裡不可夾帶帳密。訊息不回顯網址。
+
+    README §8 的測試 GitLab 綁在本機 127.0.0.1(或經 SSH tunnel 的 localhost),
+    用 http 沒有經過網路;其餘位址的 http 會讓唯讀 token 以明文傳輸。"""
+    import urllib.parse
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = (parts.hostname or "").lower()
+    except ValueError:
+        raise ArchiveDownloadError("GITLAB_URL 不是合法的網址") from None
+    if parts.username is not None or parts.password is not None:
+        raise ArchiveDownloadError("GITLAB_URL 不可夾帶帳號密碼")
+    if not host:
+        raise ArchiveDownloadError("GITLAB_URL 不是合法的網址")
+    if parts.scheme == "https":
+        return
+    if parts.scheme == "http" and host in _LOOPBACK_HOSTS:
+        return
+    raise ArchiveDownloadError("GITLAB_URL 必須是 https(本機 localhost / 127.0.0.1 除外)")
+
+
+def download_archive(sha: str, path: str = "", *, max_bytes: int) -> bytes:
+    """以 GitLab `/repository/archive.tar.gz` 取回某個 commit 的程式碼(tar.gz 原始位元組)。
+
+    **這不是給模型用的工具**:刻意不放進 orchestrator/tool_hub.py 的 TOOL_GROUPS。
+    模型能自己決定下載哪個 commit 的哪個目錄,等於讓 MR 內容操控審查機去抓任意程式碼。
+
+    sha        MR 的 head commit(完整編號,不接受分支名)
+    path       只取這個子目錄;空字串 = 整個 repo(dbt 專案就在 repo 根目錄時)
+    max_bytes  壓縮檔大小上限,超過就中止(呼叫端傳 archive.MAX_COMPRESSED_BYTES)
+
+    權限:只用 GITLAB_READ_TOKEN(唯讀),**不退回用 GITLAB_TOKEN**——那把有寫入權,
+    #15 條件 1 要求兩者分開。缺了、或兩把設成同一把,就失敗,由呼叫端交人工。
+    連線:本機以外一律要 https(token 不以明文過網路);不讀 HTTP_PROXY 等環境變數
+    (token 不送往代理);不跟隨轉址。
+    回傳內容仍是不可信的,必須交給 orchestrator/archive.py 的 extract_archive() 解。
+    任何失敗都丟 ArchiveDownloadError,訊息不含 token、URL 或回應內容。
+    """
+    if not (GITLAB_URL and GITLAB_PROJECT and GITLAB_READ_TOKEN):
+        raise ArchiveDownloadError(
+            "未設定 GITLAB_URL、GITLAB_PROJECT 或 GITLAB_READ_TOKEN,無法打包下載")
+    if GITLAB_READ_TOKEN == GITLAB_TOKEN:
+        raise ArchiveDownloadError(
+            "GITLAB_READ_TOKEN 與 GITLAB_TOKEN 是同一把;打包下載必須用另一把唯讀 token")
+    _check_archive_url(GITLAB_URL)
+    if not isinstance(sha, str) or not _SHA.fullmatch(sha):
+        raise ArchiveDownloadError("sha 必須是完整的 commit 編號(40 或 64 位小寫十六進位)")
+    if not isinstance(path, str) or (path and (
+            not _ARCHIVE_PATH.fullmatch(path)
+            or any(p in (".", "..") for p in path.split("/")))):
+        raise ArchiveDownloadError("打包的子目錄名稱不合法")
+    if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
+        raise ArchiveDownloadError("必須指定正整數的下載大小上限")
+    params = {"sha": sha, **({"path": path} if path else {})}
+    import httpx
+    buf = bytearray()
+    deadline = time.monotonic() + ARCHIVE_DEADLINE_S
+    try:
+        with httpx.stream(
+                "GET", f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}/repository/archive.tar.gz",
+                params=params,
+                # 要求不做傳輸層壓縮:否則 httpx 會先自動解開,一個小封包可能在我們
+                # 計算大小之前就在記憶體裡膨脹(下面也只讀原始位元組)
+                headers={"PRIVATE-TOKEN": GITLAB_READ_TOKEN, "Accept-Encoding": "identity"},
+                # 不跟隨轉址:自訂的 PRIVATE-TOKEN 標頭可能被帶到別的主機
+                follow_redirects=False,
+                # 不讀 HTTP_PROXY / HTTPS_PROXY / .netrc 等環境設定:token 不送往代理
+                trust_env=False, timeout=30) as r:
+            if r.status_code != 200:
+                hint = _ARCHIVE_STATUS_HINTS.get(r.status_code)
+                raise ArchiveDownloadError(f"GitLab 回應 HTTP {r.status_code}"
+                                           + (f"({hint})" if hint else ""))
+            if r.headers.get("Content-Encoding", "identity").lower() != "identity":
+                raise ArchiveDownloadError("GitLab 回應使用了傳輸層壓縮,拒絕處理")
+            declared = r.headers.get("Content-Length", "")
+            if declared.isdigit() and int(declared) > max_bytes:
+                raise ArchiveDownloadError(f"壓縮檔超過 {max_bytes} 位元組上限")
+            for chunk in r.iter_raw():
+                buf += chunk
+                if len(buf) > max_bytes:
+                    raise ArchiveDownloadError(f"壓縮檔超過 {max_bytes} 位元組上限")
+                if time.monotonic() > deadline:
+                    raise ArchiveDownloadError(f"下載超過 {ARCHIVE_DEADLINE_S} 秒上限")
+    except ArchiveDownloadError:
+        raise
+    except Exception as e:
+        # httpx 的例外訊息可能帶 URL;只留類型
+        raise ArchiveDownloadError(f"下載失敗({type(e).__name__})") from None
+    return bytes(buf)
 
 
 # --- mock mode helpers ---------------------------------------------------
