@@ -185,6 +185,25 @@ def test_不認得的規則嚴重度只有_blocker_才算報過():
     assert len(enforce_rules({"findings": [dict(blocker)]}, pre)["findings"]) == 1
 
 
+def test_別的檔案報過不算這個檔案報過():
+    """#16 review:兩個檔案都有 R001,模型只在 a.sql 報了 blocker,b.sql 的 R001 仍要補
+    (決策不受影響,但 b.sql 的問題會從報告上消失,作者可能只修 a.sql)。"""
+    other = "sql/rules/r002_other.sql"
+    pre = _pre([_R001]) + _pre([_R001], path=other)
+    report = enforce_rules(
+        {"findings": [{"severity": "blocker", "file": FILE, "title": "DELETE 沒有 WHERE"}]}, pre)
+    assert [f["file"] for f in report["findings"]] == [FILE, other]
+
+
+def test_同檔多個命中都要補():
+    """同一個檔案兩句 DML 都沒有 WHERE:兩條都要出現在報告上(自己先補的那條不能讓
+    第二條被當成「已經報過」——只比對模型原本的 findings)。"""
+    pre = _pre([_R001, {"rule": "R001", "severity": "blocker",
+                        "message": "UPDATE 沒有 WHERE 條件,將影響全表"}])
+    report = enforce_rules({"findings": []}, pre)
+    assert [f["title"][:6] for f in report["findings"]] == ["[R001]", "[R001]"]
+
+
 def test_hint_系列不由_enforce_rules_處理():
     """H 系列是檢核點,走 enforce_hints;enforce_rules 只管 R 系列。"""
     pre = _pre([{"rule": "H001", "severity": "hint", "message": "沖正/退匯是否已處理"}])
@@ -232,6 +251,69 @@ def test_模型回應過的檢核點不補():
         {"findings": [{"severity": "info", "file": FILE,
                        "title": "已確認沖正資料於前置系統淨額"}]}, pre)
     assert len(report["findings"]) == 1
+
+
+_H001 = {"rule": "H001", "severity": "hint", "message": "沖正是否處理"}
+
+
+@pytest.mark.parametrize("field", ["title", "detail", "suggestion"])
+def test_同檔_finding_的標題內文建議都算回應(field):
+    """#16 review:只認同一個檔案的 findings 裡,標題、內文、建議提到的回應。"""
+    finding = {"severity": "info", "file": FILE, "title": "核對結果"}
+    finding[field] = "已確認沖正資料於前置系統處理"
+    report = enforce_hints({"findings": [finding]}, _pre([_H001]))
+    assert len(report["findings"]) == 1
+
+
+@pytest.mark.parametrize("severity", ["info", "minor", "major", "blocker"])
+def test_檢核點的回應不限嚴重度(severity):
+    """檢核點的回應本來就可以是 info(與 enforce_rules 要求同等嚴重度不同)。"""
+    report = enforce_hints(
+        {"findings": [{"severity": severity, "file": FILE, "title": "已確認沖正處理"}]},
+        _pre([_H001]))
+    assert len(report["findings"]) == 1
+
+
+@pytest.mark.parametrize("report", [
+    {"summary": "沖正已確認無誤", "findings": []},
+    {"findings": [{"severity": "info", "file": "sql/rules/other.sql",
+                   "title": "已確認沖正處理"}]},
+    {"findings": [{"severity": "info", "file": FILE, "title": "核對結果",
+                   "citations": [{"source": "沖正"}]}]},
+], ids=["summary", "other-file", "other-field"])
+def test_summary_別的檔案或其他欄位提到不算回應(report):
+    """#16 review:以前比對報告全文,summary 寫一句、別的檔案或其他欄位提到關鍵詞,
+    這個檔案的檢核點就算處理過、不再擋自動放行。"""
+    out = enforce_hints(report, _pre([_H001]))
+    assert any(f["title"].startswith("[H001]") for f in out["findings"])
+
+
+def test_自己補的檢核點不能吞掉同檔的其他檢核點():
+    """用真的預掃訊息:H005 的訊息含「規格」(H003 的關鍵詞),實際命中順序是
+    H002 → H005 → H003。若拿自己補的來比對,H003 會被 H005 補的文字吞掉。"""
+    import json
+
+    from toolbox.sqltools import run_rules
+    sql = ("-- R-201\nSELECT a.x, b.y, SUBSTRING(a.account_id, 1, 4) AS account_id\n"
+           "FROM a JOIN b ON a.id = b.id\nGROUP BY a.x, b.y")
+    hits = json.loads(run_rules(sql))
+    assert [h["rule"] for h in hits] == ["H002", "H005", "H003"]
+    report = enforce_hints({"findings": []}, _pre(hits))
+    assert [f["title"][:6] for f in report["findings"]] == ["[H002]", "[H005]", "[H003]"]
+
+
+def test_後處理鏈上檢核點排在任何程式補報之前():
+    """enforce_rules 補的 R004 內文含「憑證」「密碼」(H004 的關鍵詞);若排在前面,
+    會被當成模型已回應 H004。檢核點只認模型自己的回應。"""
+    import inspect
+
+    from orchestrator import pipeline
+    src = inspect.getsource(pipeline.review_mr)
+    hints = src.index("report = enforce_hints(report, pre)")
+    assert src.index("report = sanitize_findings(report)") < hints
+    for call in ("enforce_rules", "enforce_parse", "enforce_style", "enforce_dbt_notice",
+                 "enforce_dbt_render_failure", "enforce_injection", "enforce_unreviewable"):
+        assert hints < src.index(f"report = {call}("), call
 
 
 # ─────────────────── enforce_parse ───────────────────

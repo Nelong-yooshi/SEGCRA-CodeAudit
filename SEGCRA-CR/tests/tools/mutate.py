@@ -606,12 +606,39 @@ MUTANTS.update({
  "規則補報:檔名也拿來比對關鍵詞": ("pipeline.py",
      '        text = " ".join(str(f.get(k) or "") for k in ("title", "detail", "suggestion"))',
      "        text = json.dumps(f, ensure_ascii=False)"),
- "規則補報:拿自己補的來比對(其他檔案的同條命中被跳過)": ("pipeline.py",
-     "            if _reported_at_least(before, _RULE_KEYWORDS.get(code, [code]),",
-     '            if _reported_at_least(report.get("findings", []), _RULE_KEYWORDS.get(code, [code]),'),
+ "規則補報:拿自己補的來比對(同檔第二個命中被跳過)": ("pipeline.py",
+     '            if _reported_at_least(before, entry["path"], _RULE_KEYWORDS.get(code, [code]),',
+     '            if _reported_at_least(report.get("findings", []), entry["path"],'
+     ' _RULE_KEYWORDS.get(code, [code]),'),
  "規則補報:不認得的嚴重度當成最輕": ("pipeline.py",
      '    need = _SEVERITY_RANK.get(severity, _SEVERITY_RANK["blocker"])',
      "    need = _SEVERITY_RANK.get(severity, 0)"),
+})
+
+# ---- #16 review 後續:補報只認同一個檔案、檢核點只認同檔 finding 的回應
+MUTANTS.update({
+ "同檔:不比對檔案(別的檔案報過就算)": ("pipeline.py",
+     '        if f.get("file") != path:\n            continue\n',
+     ""),
+ "檢核點:比對報告全文(summary 也算回應)": ("pipeline.py",
+     '            if _reported_at_least(before, entry["path"], _HINT_KEYWORDS.get(code, [code]),\n'
+     '                                  "info"):',
+     '            if any(k in json.dumps(report, ensure_ascii=False)\n'
+     '                   for k in _HINT_KEYWORDS.get(code, [code])):'),
+ "檢核點:回應要求同等嚴重(info 不算)": ("pipeline.py",
+     '                                  "info"):',
+     '                                  "minor"):'),
+ "檢核點:拿自己補的來比對(吞掉同檔其他檢核點)": ("pipeline.py",
+     '            if _reported_at_least(before, entry["path"], _HINT_KEYWORDS.get(code, [code]),',
+     '            if _reported_at_least(report.get("findings", []), entry["path"],'
+     ' _HINT_KEYWORDS.get(code, [code]),'),
+ "檢核點:排回程式補報之後(R004 被當成 H004 的回應)": ("pipeline.py",
+     "        report = enforce_hints(report, pre)\n"
+     "        report = enforce_rules(report, pre)    # rule-base 命中不因模型省略而消失\n"
+     "        report = enforce_parse(report, pre)    # 預掃解析失敗 = 確定性規則沒跑,必須看得見\n",
+     "        report = enforce_rules(report, pre)    # rule-base 命中不因模型省略而消失\n"
+     "        report = enforce_parse(report, pre)    # 預掃解析失敗 = 確定性規則沒跑,必須看得見\n"
+     "        report = enforce_hints(report, pre)\n"),
 })
 
 
