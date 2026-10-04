@@ -49,6 +49,14 @@ MODEL_REPORT = {
     "findings": [],
 }
 
+# 模型在檔案上回應了檢核點(CLEAN_SQL 提到 R-201 → H003「與核定規格逐項核對」)。
+# 只寫在 summary 不算回應(#16 review),自動放行要靠這種 info finding
+RESPONDED_REPORT = {**MODEL_REPORT, "findings": [{
+    "file": "sql/maintenance/x.sql", "line": 1, "severity": "info",
+    "title": "已與核定規格 R-201 逐項核對",
+    "detail": "門檻 >= 100000 與規格「達」一致;時間窗與通報粒度相符。",
+    "suggestion": "", "citations": []}]}
+
 
 def _mr(sql: str, *, description: str = "例行維護", path: str = "sql/maintenance/x.sql",
         diff: str | None = None) -> dict:
@@ -230,8 +238,8 @@ def test_三態決策都到得了(run):
     `auto_approved` 走不到的話,整套工具的價值(不擾人)就不成立——
     而這件事只有端到端跑過才知道。
     """
-    # ① auto_approved:小改、非規則檔、spec_exec 通過、無 finding
-    report, _, _ = run(_mr(CLEAN_SQL), spec_exec_kind="pass")
+    # ① auto_approved:小改、非規則檔、spec_exec 通過、只有 info(模型回應檢核點)
+    report, _, _ = run(_mr(CLEAN_SQL), RESPONDED_REPORT, spec_exec_kind="pass")
     assert report["decision"] == "auto_approved", (
         f"自動放行走不到,阻礙訊號:{report.get('_policy_signals')}")
 
@@ -270,10 +278,28 @@ def test_審查結果有寫回去(run):
 
 def test_自動放行時_commit_status_要是_success(run):
     """CE 的 merge 閘門靠 commit status,這個值錯了就等於閘門失效。"""
-    report, output, mr_id = run(_mr(CLEAN_SQL), spec_exec_kind="pass")
+    report, output, mr_id = run(_mr(CLEAN_SQL), RESPONDED_REPORT, spec_exec_kind="pass")
     assert report["decision"] == "auto_approved"
     review = json.loads((output / f"mr_{mr_id}_review.json").read_text(encoding="utf-8"))
     assert review["commit_status"]["state"] == "success"
+
+
+def test_檢核點只在_summary_回應不能自動放行(run):
+    """#16 review:檢核點只認同一個檔案的 finding 的回應。summary 寫「實作與核定規格相符」、
+    沒有任何 finding(以前算回應過)→ 檢核點待人工確認,不得自動放行。"""
+    report, _, _ = run(_mr(CLEAN_SQL), MODEL_REPORT, spec_exec_kind="pass")
+    assert report["_policy_signals"]["pending_hints"] is True
+    assert report["decision"] == "needs_human"
+    assert any(f["title"].startswith("[H003]") for f in report["findings"])
+
+
+def test_程式補的規則命中不能當成模型對檢核點的回應(run):
+    """R004 與 H004 同時命中:程式補的 R004 內文含「憑證」「密碼」(H004 的關鍵詞)。
+    檢核點排在程式補報之前,H004 仍要補上(只認模型自己的回應)。"""
+    report, _, _ = run(_mr("SELECT id FROM users WHERE password = 'abc123';"), MODEL_REPORT)
+    titles = [f["title"] for f in report["findings"]]
+    assert any(t.startswith("[R004]") for t in titles)
+    assert any(t.startswith("[H004]") for t in titles), titles
 
 
 def test_模型原始輸出有存檔(run):
