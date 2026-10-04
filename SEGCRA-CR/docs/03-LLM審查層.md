@@ -27,10 +27,10 @@
 逐步:
 
 1. 建 `AsyncOpenAI` client:`base_url=cfg.endpoint`(`config/models.yaml` 的 `endpoint`,可用環境變數 `OLLAMA_URL` 覆蓋;見 `orchestrator/config.py`:`load_config`)、`timeout=REQUEST_TIMEOUT`、**`max_retries=0`(不自動重試)**。`REQUEST_TIMEOUT` 由環境變數 `LLM_TIMEOUT`(秒)覆蓋,預設 3600——單次請求上限 1 小時。
-2. `messages = [system, user]`;`use_tools` 且有 hub 時帶 `tools=hub.openai_tools, tool_choice="auto"`(baseline 模式 `use_tools=False`,純一問一答)。
+2. `messages = [system, user]`;`use_tools` 且有 hub 時帶 `tools=hub.openai_tools, tool_choice="auto"`(**只含唯讀白名單**,見下方 `MODEL_TOOLS`)(baseline 模式 `use_tools=False`,純一問一答)。
 3. 迴圈至多 `MAX_ITERATIONS = 12` 輪,每輪呼叫 `chat.completions.create`(帶 profile 的 `temperature`、`max_output_tokens`),把回覆 append 進 messages。
 4. **無 tool_calls 時**:若 `content` 非空 → 直接回傳(正常結束);若為空 → append 一則 user 訊息「請直接輸出最終報告 JSON,不要其他文字。」再 continue(**空回應補推**,對付推理型模型偶發的空 content)。
-5. **有 tool_calls 時**:逐個解析 `tc.function.arguments`(JSON 解析失敗退回 `{}`)、呼叫 `hub.call(name, args)`;工具丟例外時不炸迴圈,把 `(工具執行失敗:{e})` 當工具結果餵回模型。結果以 `role="tool"` append。`trace` 參數給定時逐次記錄(工具名/args/結果前 400 字),供產生逐字 transcript。
+5. **有 tool_calls 時**:逐個解析 `tc.function.arguments`(JSON 解析失敗退回 `{}`)、呼叫 `hub.call_from_model(name, args)`(不在白名單的工具**不執行**,回固定的拒絕文字);工具丟例外時不炸迴圈,把 `(工具執行失敗:{e})` 當工具結果餵回模型。結果以 `role="tool"` append。`trace` 參數給定時逐次記錄(工具名/args/結果前 400 字),供產生逐字 transcript。
 6. 12 輪耗盡仍沒有最終文字 → 回傳最後一則訊息的 content,或字串「(達到工具呼叫上限,未產出最終結果)」。
 
 ### 輸出收取與容錯(`orchestrator/agent.py`:`extract_json`、`decode_byte_fallback`)
@@ -47,12 +47,16 @@
 
 行程內工具註冊表:把 `toolbox/` 的**純 Python 函式**轉成 OpenAI tool-calling schema 並分派呼叫,不 spawn 子行程、無協定層。工具名格式 `<group>__<tool>`(OpenAI tool name 不允許點號),與舊 MCP 版命名完全相同(`gitlab__get_mr_diff`、`sqltools__run_rules`…),pipeline/prompt 不需改動。
 
-- **`TOOL_GROUPS`**:group 名 → 函式清單。三組共 16 個工具:
+- **`TOOL_GROUPS`**:group 名 → 函式清單。三組共 16 個工具(註冊的全部;交給模型的只有白名單,見下一項):
   - `gitlab`(7):`get_mr_diff`、`get_file`、`post_inline_comment`、`post_summary`、`set_commit_status`、`create_rule_mr`、`set_label`
   - `sqltools`(3):`parse_ast`、`lint`、`run_rules`
   - `memory`(6):`retrieve_knowledge`、`get_conventions`、`check_style`、`learn_style_from_examples`、`lookup_similar_reviews`、`record_feedback`
+- **`MODEL_TOOLS`(#17)**:審查模型拿得到的工具,全部唯讀,共 10 個:`gitlab__get_mr_diff`、`gitlab__get_file`、`sqltools__parse_ast`、`sqltools__lint`、`sqltools__run_rules`、`memory__retrieve_knowledge`、`memory__get_conventions`、`memory__check_style`、`memory__lookup_similar_reviews`、`load_skill`。MR 的標題、描述、SQL 註解都是作者寫的,可以夾帶給模型的指令;寫判例、學風格、開 MR、留言、設 label、設 commit status 只由管線自己用 `call()` 執行。以名稱逐一列出(不是「排除寫入類」):新增的工具預設**不**開放給模型。
+  - `openai_tools`:只回傳白名單內、且已註冊的工具
+  - `call_from_model(name, args)`:模型要求的工具一律走這裡;不在白名單就不執行、回 `MODEL_REFUSAL`。被拒絕的**已註冊**工具名稱記進 `refused_calls`(不記參數),管線據此補 major(`pipeline.enforce_tool_refusals`,見 04 篇);模型自己編的名稱只回拒絕、不記錄
+  - 白名單內的工具也要擋得住模型給的參數:`get_mr_diff` / `get_file` 的 `mr_id` 會被接進 GitLab API 路徑與 fixture 檔名,只接受 1–10 位 ASCII 數字(`toolbox/gitlab.py:_check_mr_id`),`1/../../issues/5`、`x/../../config/x` 這類值直接報錯、不發請求、不讀檔
 - **schema 自動生成**(`function_schema` + `_annotation_schema`):由函式簽名 + docstring 生成——docstring 就是給 LLM 看的工具描述;參數型別註記對映 `str/int/bool/float → string/integer/boolean/number`,`list/set/tuple → array`(含 items),`dict → object`,未知型別退回 `string`;**有預設值的參數為非必填**(`required` 只收無預設值者)。所以「加工具」= 在 toolbox 寫一個帶型別註記與 docstring 的函式,掛進 `TOOL_GROUPS`,schema 自己長出來。
-- **`register_local(name, fn, description, parameters)`**:註冊 orchestrator 本地工具(目前只有 `load_skill`),schema 手寫,與 toolbox 工具同列於 `openai_tools`。
+- **`register_local(name, fn, description, parameters)`**:註冊 orchestrator 本地工具(目前只有 `load_skill`),schema 手寫,與 toolbox 工具同列;要交給模型的也必須列進 `MODEL_TOOLS`。
 - **`call(full_name, args, truncate=True)`** 分派順序:local_tools → toolbox 函式(例外不炸管線,回 `Error executing tool …: {e}` 字串,與舊 MCP server 端吞錯行為一致)→ 未知 group/工具回中文錯誤字串。結果 `str()` 後,**`truncate=True` 且超過 `max_chars`(`config/models.yaml` 的 `budget.tool_result_max_chars`,現值 6000)時截斷**,尾附「…(截斷,原長 N 字元)」。截斷**只用於餵給 LLM 的工具結果**。
 - **`call_json(full_name, args)`**:orchestrator 自用(預掃、抓 MR、檢索知識),`truncate=False` 直接解析 JSON,失敗回 `None`——不可截斷,否則大型 MR 的 JSON 會被腰斬成解析失敗。
 - `__aenter__/__aexit__` 為介面相容保留(舊版要起子行程),行程內版無事可做,但 `async with ToolHub(...)` 用法一行不改。
@@ -115,11 +119,11 @@
 1. **不需 LLM 的元件驗證**:
 
    ```bash
-   # ToolHub:16 個工具、schema 自動生成
+   # ToolHub:註冊 16 個工具、交給模型的只有唯讀的 9 個(load_skill 由 pipeline 另外註冊)
    python -c "from orchestrator.tool_hub import ToolHub; h=ToolHub(); \
-     print(len(h.openai_tools)); \
+     print(len(h.tools), len(h.openai_tools)); \
      print(h.tools['sqltools__run_rules']['function']['description'])"
-   # 預期:16;description = run_rules 的 docstring
+   # 預期:16 9;description = run_rules 的 docstring
 
    # skills:六個 skill、索引只列 on-demand 四個
    python -c "from orchestrator.skills_loader import load_skills, skills_index; \
@@ -150,7 +154,7 @@
 
 - **換模型/調參**:只改 `config/models.yaml` 的 `profiles`(model/num_ctx/temperature/max_output_tokens);orchestrator 不綁模型。角色化(testgen/arbiter)在 `roles` 段。
 - **調 timeout**:環境變數 `LLM_TIMEOUT`(秒);迭代上限改 `orchestrator/agent.py` 的 `MAX_ITERATIONS`。
-- **加工具**:toolbox 寫純函式(型別註記 + docstring)→ 掛 `orchestrator/tool_hub.py` 的 `TOOL_GROUPS`;orchestrator 本地工具用 `register_local`。
+- **加工具**:toolbox 寫純函式(型別註記 + docstring)→ 掛 `orchestrator/tool_hub.py` 的 `TOOL_GROUPS`;orchestrator 本地工具用 `register_local`。**要讓審查模型呼叫,另外加進 `MODEL_TOOLS`,而且必須確認它不會寫入**(`tests/test_model_tool_allowlist.py` 會要求每個工具都被歸類)。
 - **加 skill**:新增 `skills/<name>/SKILL.md`(front-matter 必填 `name`;`trigger: always` 慎用——會吃每次審查的 context)。要強制注入的觸發條件,加在 `pipeline.review_mr` 的 always_block 組裝段。
 - **調 context 預算**:`config/models.yaml` 的 `budget`(diff/spec/memory/tool_result_max_chars)。
 - 已知限制:

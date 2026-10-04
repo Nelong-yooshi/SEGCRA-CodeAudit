@@ -483,6 +483,51 @@ MUTANTS.update({
      "    env.segcra_macro_phase = False"),
 })
 
+# ---- 審查模型只拿得到唯讀工具(#17):清單、執行入口、被拒絕時的揭露
+MUTANTS.update({
+ "工具:寫判例開放給模型": ("tool_hub.py",
+     '    "memory__lookup_similar_reviews",\n    "load_skill",\n})',
+     '    "memory__lookup_similar_reviews", "memory__record_feedback",\n    "load_skill",\n})'),
+ "工具:清單不過濾(全部交給模型)": ("tool_hub.py",
+     "        return [schema for name, schema in self.tools.items() if name in MODEL_TOOLS]",
+     "        return list(self.tools.values())"),
+ "工具:執行入口不擋": ("tool_hub.py",
+     "        if full_name not in MODEL_TOOLS:\n            if full_name in self._functions",
+     "        if False:\n            if full_name in self._functions"),
+ "工具:被拒絕不記錄": ("tool_hub.py",
+     "                self.refused_calls.append(full_name)",
+     "                pass"),
+ "工具:編造的名稱也記錄(雜訊 finding)": ("tool_hub.py",
+     "            if full_name in self._functions or full_name in self.local_tools:\n"
+     "                self.refused_calls.append(full_name)",
+     "            if True:\n"
+     "                self.refused_calls.append(full_name)"),
+ "工具:審查迴圈直接呼叫(繞過白名單)": ("agent.py",
+     "                result = await hub.call_from_model(tc.function.name, args)",
+     "                result = await hub.call(tc.function.name, args)"),
+ "工具:被拒絕不補 finding": ("pipeline.py",
+     "        report = enforce_tool_refusals(report, hub.refused_calls)  # 模型要求了寫入工具\n",
+     ""),
+ "工具:被拒絕只補 info(可自動放行)": ("pipeline.py",
+     '    finding = {"file": "(MR 內容)", "line": 0, "severity": "major",',
+     '    finding = {"file": "(MR 內容)", "line": 0, "severity": "info",'),
+ "工具:改回直接附加(模型同標題的 info 可取代)": ("pipeline.py",
+     "    _put_program_finding(report, finding)\n    return report",
+     '    report.setdefault("findings", []).insert(0, finding)\n    return report'),
+ "工具:MR 編號不檢查(get_mr_diff 可打別的端點)": ("../toolbox/gitlab.py",
+     "    mr_id = _check_mr_id(mr_id)\n    if REAL_MODE:",
+     "    if REAL_MODE:"),
+ "工具:mock 讀 fixture 不檢查 MR 編號(路徑穿越)": ("../toolbox/gitlab.py",
+     '    f = FIXTURES_DIR / f"mr_{_check_mr_id(mr_id)}.json"',
+     '    f = FIXTURES_DIR / f"mr_{mr_id}.json"'),
+ "工具:MR 編號接受 Unicode 數字": ("../toolbox/gitlab.py",
+     "    if not (mr_id.isascii() and mr_id.isdigit() and len(mr_id) <= 10):",
+     "    if not (mr_id.isdigit() and len(mr_id) <= 10):"),
+ "工具:MR 編號長度不限": ("../toolbox/gitlab.py",
+     "    if not (mr_id.isascii() and mr_id.isdigit() and len(mr_id) <= 10):",
+     "    if not (mr_id.isascii() and mr_id.isdigit()):"),
+})
+
 # ---- 接進審查管線(#7 管線端):開關、檔名對應、樣板不進沙盒、資料庫名
 MUTANTS.update({
  "接線:預掃開關接受任何真值": ("pipeline.py",
