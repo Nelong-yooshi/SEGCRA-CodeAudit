@@ -18,6 +18,7 @@
   5. `plan_runs`:自適應取樣,含「沒有分級記錄就當不穩」的保守退路
   6. `compare_fingerprint`:哪些環境差異讓兩份 baseline 不可比,而 **code.sha 不算**
 """
+import asyncio
 import json
 import sys
 import types
@@ -780,3 +781,47 @@ def test_凍結目錄不存在時不炸():
     preflight 是跑批的前置檢查,不能因為一個選用功能沒用就中止整輪。"""
     h, n = preflight._dir_digest(Path("/nonexistent/testdata_cache"), "*.json")
     assert n == 0 and h, "目錄不存在應回 (空目錄雜湊, 0),不是丟例外"
+
+
+# ─────────────────── preflight:輸出截斷回報探針 ───────────────────
+
+class _TruncCfg:
+    def role_profile(self, role):
+        from orchestrator.config import ModelProfile
+        return ModelProfile(model="fake", num_ctx=1024, temperature=0, max_output_tokens=8192)
+
+
+def _fake_endpoint(monkeypatch, reason, used):
+    from orchestrator import agent
+    seen = {}
+
+    async def fake_run_agent(cfg, profile, system, user, **kw):
+        seen["max_tokens"] = profile.max_output_tokens
+        if kw.get("meta") is not None:
+            if reason is not None:
+                kw["meta"]["finish_reason"] = reason
+            kw["meta"]["completion_tokens"] = used
+        return "壹,貳,參"
+    monkeypatch.setattr(agent, "run_agent", fake_run_agent)
+    return seen
+
+
+def test_截斷探針_端點回報length就通過(monkeypatch):
+    seen = _fake_endpoint(monkeypatch, "length", preflight.TRUNC_PROBE_TOKENS)
+    c = asyncio.run(preflight.check_truncation_signal(_TruncCfg()))
+    assert c.level == "ok" and c.data["reported"] is True
+    assert seen["max_tokens"] == preflight.TRUNC_PROBE_TOKENS, "探針必須真的把上限壓小"
+
+
+@pytest.mark.parametrize("reason", ["stop", None, "eos"])
+def test_截斷探針_碰到上限卻沒回報length就中止(monkeypatch, reason):
+    """端點不回報截斷時,測資生成的截斷偵測會靜默失效——這正是要在跑批前擋下的。"""
+    _fake_endpoint(monkeypatch, reason, preflight.TRUNC_PROBE_TOKENS)
+    c = asyncio.run(preflight.check_truncation_signal(_TruncCfg()))
+    assert c.level == "fail" and c.data["reported"] is False
+
+
+def test_截斷探針_模型自己提早停了算無法判定(monkeypatch):
+    _fake_endpoint(monkeypatch, "stop", 10)
+    c = asyncio.run(preflight.check_truncation_signal(_TruncCfg()))
+    assert c.level == "warn" and c.data["reported"] is None

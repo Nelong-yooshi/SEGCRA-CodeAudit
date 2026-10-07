@@ -6,6 +6,11 @@ import yaml
 
 PKG_ROOT = Path(__file__).resolve().parent.parent
 
+# dbt 展開用的資料庫名稱:約定的固定假名(#14 review)。只用來把 ref()/source() 拼成
+# 完整表名給規則層掃描,不連線;固定不變,golden set 的標準答案才不會跟著飄。
+# 改名時要同步更新 config/models.yaml 的註解與 docs/09(有測試確保三處一致)。
+DBT_DATABASE_PLACEHOLDER = "DBT_PLACEHOLDER"
+
 
 @dataclass
 class ModelProfile:
@@ -123,6 +128,13 @@ def _load_dbt_section(raw: dict) -> dict:
             raise ValueError(
                 "dbt 的資料庫名稱只接受英數與底線(會被拼進 SQL 識別字);"
                 "請檢查環境變數 SEGCRA_DBT_DATABASE。")
+    if enabled and database != DBT_DATABASE_PLACEHOLDER:
+        # 漏設或拼錯時展開不會報錯,只會產出錯的表名,報告看起來卻完全正常(#14
+        # review)——開啟時就擋下,不讓審查帶著錯的設定啟動。訊息不回顯實際的值:
+        # 填進來的可能正是不該外流的正式資料庫名。
+        raise ValueError(
+            f"dbt.enabled 開啟時,環境變數 SEGCRA_DBT_DATABASE 必須設為約定的假名 "
+            f"{DBT_DATABASE_PLACEHOLDER}(見 docs/09-dbt展開與反查.md);目前未設定或不符。")
     return {"enabled": enabled, "database": database}
 
 
