@@ -282,8 +282,24 @@ def test_落檔會寫出實際送出的每一段(tmp_path, monkeypatch):
     assert ":" not in files[0].name
 
 
-def test_落檔失敗不可以弄垮跑批(monkeypatch):
-    """診斷功能寫不出去就算了,不該讓一輪十幾小時的跑批中途爆掉。"""
+def test_落檔失敗不可以弄垮跑批(monkeypatch, tmp_path):
+    """診斷功能寫不出去就算了,不該讓一輪十幾小時的跑批中途爆掉。
+
+    製造「寫不出去」的方法:先放一個**檔案**,再把它當成目錄的上一層——
+    檔案底下建不了目錄,`mkdir` 一定失敗,Windows 與 Linux 皆然。
+
+    > **不要改回用 `/proc/...` 這類路徑。** 那個寫法在 Linux 上可行
+    > (procfs 建不了目錄),但 Windows 會把 `/proc` 當成目前磁碟的根目錄,
+    > 於是目錄真的被建出來、檔案也真的寫成功——**測試照樣綠燈,卻完全沒有
+    > 走到要測的那條路**,而且每跑一次就在磁碟上留下一個檔案
+    > (同事回報累積了 37 個)。這是 PR #12 review 抓到的。
+
+    最後那行斷言就是為了釘住這件事:確認真的走到失敗路徑,
+    而不是像先前那樣不小心寫檔成功。
+    """
     import orchestrator.agent as agent
-    monkeypatch.setattr(agent, "DUMP_PROMPTS", "/proc/不可能建得起來/x")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("")                 # 是檔案,不是目錄 → 底下建不了目錄
+    monkeypatch.setattr(agent, "DUMP_PROMPTS", str(blocker / "x"))
     agent._dump("m", [{"role": "user", "content": "x"}], 0)   # 不得丟例外
+    assert blocker.is_file() and not (blocker / "x").exists()
