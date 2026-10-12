@@ -157,6 +157,30 @@ def testgen_system() -> str:
     return TESTGEN_SYSTEM.replace("{win_start}", WIN_START).replace("{win_end}", WIN_END)
 
 
+# 條件的判斷式(#23 第 3 點)。模型產生的 SQL 要進沙盒,所以收得比 _DDL_OK 更緊:
+# 只接受單一 SELECT、不得有分號與註解、不得出現任何會改變狀態的關鍵字。
+#
+# 這**不是**完整的 SQL 剖析,擋不住所有壞東西;它的作用是讓「判斷式」維持在
+# 判斷式的形狀,而不是變成另一個可以執行任意語句的入口。沙盒本身的權限收斂
+# (目前用 sa、容器可對外連線)是 #26 第 2 點的工作,兩者互補。
+_CHECK_SQL_MAX = 600
+_CHECK_SQL_FORBIDDEN = re.compile(
+    r"(?is)\b(insert|update|delete|drop|create|alter|truncate|merge|grant|revoke|"
+    r"exec|execute|xp_|sp_|backup|restore|shutdown|openrowset|opendatasource|bulk)\b")
+
+
+def _check_sql_ok(text) -> bool:
+    """判斷式必須長得像判斷式:單一 SELECT、沒有分號、沒有註解、沒有狀態變更。"""
+    if not isinstance(text, str) or not (0 < len(text) <= _CHECK_SQL_MAX):
+        return False
+    t = text.strip()
+    if ";" in t or "--" in t or "/*" in t:
+        return False
+    if not re.match(r"(?i)^select\s", t):
+        return False
+    return not _CHECK_SQL_FORBIDDEN.search(t)
+
+
 def _shape_check(plan: dict) -> tuple[dict, list[str], list[dict]]:
     """確定性檢查測資計畫:JSON 形狀 + 逐條件 true/false 覆蓋。
     回傳 (清洗後 plan, coverage_gaps, dropped_malformed)。"""
@@ -164,8 +188,18 @@ def _shape_check(plan: dict) -> tuple[dict, list[str], list[dict]]:
     if not isinstance(plan, dict):
         return {"schema_ddl": [], "conditions": [], "cases": []}, ["整份計畫非 JSON 物件"], []
     ddl = [d for d in plan.get("schema_ddl", []) if isinstance(d, str) and _DDL_OK.match(d)]
-    conds = [c for c in plan.get("conditions", [])
-             if isinstance(c, dict) and c.get("id") and c.get("desc")]
+    conds = []
+    for c in plan.get("conditions", []):
+        if not (isinstance(c, dict) and c.get("id") and c.get("desc")):
+            continue
+        # check_sql 是**可選**的(#23 第 3 點):沒給就不做標籤一致性檢查,行為同以往。
+        # 給了但形狀不合法 → 丟掉那個欄位而不是丟掉整個條件:條件本身是好的,
+        # 只是附帶的判斷式不能用,不該因此讓這個條件的案例全部消失。
+        if "check_sql" in c and not _check_sql_ok(c.get("check_sql")):
+            c = {k: v for k, v in c.items() if k != "check_sql"}
+            dropped.append({"case": {"condition_id": c["id"]},
+                            "reason": "條件的 check_sql 形狀不合法(非單一 SELECT、含分號/註解/狀態變更),已忽略"})
+        conds.append(c)
     cond_ids = {c["id"] for c in conds}
     cases = []
     for c in plan.get("cases", []):
@@ -525,6 +559,41 @@ def _drop_stale_sandbox_dbs(admin) -> None:
         pass
 
 
+def _label_expectation(conds: list[dict], case: dict) -> dict[str, bool]:
+    """這個案例**照它自己的標籤**,每個條件應該是真還是假。
+
+    direction="true"  → 全部條件成立(規則應該命中)
+    direction="false" → **只有**被標的那一條不成立,其餘全部成立
+
+    後者是契約的重點:反向案例要能把失敗歸因到某一條。同時讓兩條不成立的案例,
+    就算行為符合預期也證明不了是哪一條造成的。
+    """
+    target, direction = case["condition_id"], case["direction"]
+    return {c["id"]: (direction == "true" or c["id"] != target) for c in conds}
+
+
+def _eval_conditions(cursor, conds: list[dict]) -> dict[str, bool] | None:
+    """在目前的交易裡逐條算出判斷式的真假;任何一條算不出來就整個放棄(回 None)。
+
+    放棄而不是部分回報:少算一條就可能把「兩條同時不成立」看成「只有一條不成立」,
+    那正是這道檢查要抓的東西,半套的結果比沒有更危險。
+    """
+    out = {}
+    for c in conds:
+        q = c.get("check_sql")
+        if not q:
+            return None
+        try:
+            cursor.execute(q)
+            row = cursor.fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        out[c["id"]] = bool(row[0])
+    return out
+
+
 def execute_cases(sql: str, plan: dict) -> dict:
     """角色二:確定性執行(非 LLM)。
 
@@ -579,6 +648,11 @@ def execute_cases(sql: str, plan: dict) -> dict:
                 except Exception as e:   # SQL 本身跑不起來(語法/欄位/方言)→ SQL 側的錯
                     out["sql_error"] = str(e)[:300]
                     return out
+                # 標籤一致性(#23 第 3 點):在**同一個交易、同一份資料**上逐條算出
+                # 每個條件的真假,確認這個案例真的在測它自己宣稱的那一條。
+                # 覆蓋檢查原本完全相信模型貼的標籤,所以「標籤對、資料卻沒測到」
+                # (反向案例同時讓兩條不成立)看起來跟正確的案例一模一樣。
+                actual_conds = _eval_conditions(c, plan["conditions"])
             finally:
                 try:
                     con.rollback()
@@ -590,6 +664,14 @@ def execute_cases(sql: str, plan: dict) -> dict:
                  "expect_flagged": case["expect_flagged"], "actual_flagged": actual,
                  "actual_rows": [[str(v) for v in row] for row in rows[:5]],
                  "ok": actual == case["expect_flagged"]}
+            if actual_conds is not None:
+                want = _label_expectation(plan["conditions"], case)
+                wrong = sorted(k for k, v in want.items() if actual_conds.get(k) is not v)
+                r["label_ok"] = not wrong
+                if wrong:
+                    # 不改 ok(那是「行為符不符合預期」),另外記一欄:
+                    # 這個案例也許行為正確,但它沒有隔離出它宣稱要測的那一條。
+                    r["label_mismatch"] = wrong
             results.append(r)
             if not r["ok"]:
                 mismatches.append({**r, "rows": case["rows"]})
@@ -658,6 +740,26 @@ async def arbitrate(cfg: Config, spec_text: str, sql: str, mismatch: dict,
 def _finding(path: str, severity: str, title: str, detail: str, suggestion: str = "") -> dict:
     return {"file": path, "line": 0, "severity": severity, "title": title,
             "detail": detail, "suggestion": suggestion, "citations": []}
+
+
+def _label_gaps(case_results: list[dict]) -> list[str]:
+    """標籤與資料對不上的案例 = 該條件該向**沒有真的被驗到**(#23 第 3 點)。
+
+    覆蓋檢查原本完全相信模型自己貼的條件編號與方向,所以「標籤對、資料卻沒測到」
+    看起來跟正確的案例一模一樣。典型的壞法是反向案例同時讓兩條不成立——它的行為
+    (不命中)完全符合預期,`ok` 是 True,但它證明不了是哪一條造成的。
+
+    所以這裡**不動 `ok`**(那是「行為符不符合預期」),另外列入覆蓋缺口:
+    那一向沒有被有效驗證,不可據以自動放行。與仲裁剔除、執行中止是同一個原則。
+    """
+    gaps = []
+    for r in case_results:
+        if r.get("label_ok") is False:
+            gaps.append(
+                f"案例 {r['case_id']}(條件 {r['condition_id']} {r['direction']} 向)"
+                f"的資料與標籤不符:{'、'.join(r.get('label_mismatch') or [])} 的真假"
+                f"與這個標籤應有的不同,該向未經有效驗證")
+    return gaps
 
 
 def _unrun_gaps(plan: dict, case_results: list[dict]) -> list[str]:
@@ -775,6 +877,10 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                 "coverage_gaps": coverage_gaps + _unrun_gaps(plan, ex["case_results"]),
                 "case_results": ex["case_results"], "dropped_cases": dropped_cases,
                 "findings": findings}
+
+    # 標籤一致性的缺口要在仲裁之前就併進去:它講的是「這個案例有沒有驗到它宣稱的
+    # 那一條」,跟仲裁要判的「測資錯還是 SQL 錯」是不同的問題,兩者可以同時成立。
+    coverage_gaps = coverage_gaps + _label_gaps(ex["case_results"])
 
     # 角色三:仲裁(只對 mismatch 逐案出動)
     sql_faults = []

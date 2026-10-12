@@ -661,3 +661,106 @@ def test_補生成的_schema_一律沿用先前的(monkeypatch):
                       [_raw(first), json.dumps(other_ddl, ensure_ascii=False)] * 2)
     assert plan["schema_ddl"] == _shape_check(first)[0]["schema_ddl"], \
         "補生成換掉了 schema,先前的案例會跑不起來"
+
+
+# ─────────────────── 標籤與資料要一致(#23 第 3 點) ───────────────────
+
+@pytest.mark.parametrize("sql,ok", [
+    ("SELECT CASE WHEN EXISTS(SELECT 1 FROM t WHERE a > 0) THEN 1 ELSE 0 END", True),
+    ("select 1", True),
+    ("SELECT 1; DROP TABLE t", False),          # 分號 = 可以接第二個語句
+    ("SELECT 1 -- 註解", False),
+    ("SELECT 1 /* 註解 */", False),
+    ("DELETE FROM t", False),                   # 不是 SELECT
+    ("EXEC xp_cmdshell 'dir'", False),
+    ("SELECT * FROM t WHERE x = (SELECT TOP 1 a FROM u)", True),
+    ("", False),
+    ("SELECT " + "x" * 700, False),             # 超長
+])
+def test_判斷式必須長得像判斷式(sql, ok):
+    """check_sql 是模型產生的、會進沙盒執行的 SQL,所以收得比 _DDL_OK 更緊。
+
+    這**不是**完整的 SQL 剖析,擋不住所有壞東西;它的作用是讓判斷式維持在判斷式
+    的形狀,而不是變成另一個可以執行任意語句的入口。沙盒本身的權限收斂是 #26 第 2 點。
+    """
+    assert spec_exec._check_sql_ok(sql) is ok
+
+
+def test_判斷式形狀不合法時只丟掉那個欄位_不丟掉條件():
+    """條件本身是好的,只是附帶的判斷式不能用——不該因此讓這個條件的案例全部消失。"""
+    plan = _plan(_all_dirs(("C1",)), conditions=("C1",))
+    plan["conditions"][0]["check_sql"] = "SELECT 1; DROP TABLE t"
+    cleaned, gaps, dropped = _shape_check(plan)
+    assert len(cleaned["conditions"]) == 1, "整個條件被丟掉了"
+    assert "check_sql" not in cleaned["conditions"][0], "不合法的判斷式還留著"
+    assert len(cleaned["cases"]) == 2, "條件的案例跟著消失了"
+    assert any("check_sql" in str(d.get("reason")) for d in dropped), "沒有記錄原因"
+
+
+def test_沒給判斷式時行為完全不變():
+    """check_sql 是可選的:既有的測資計畫(含已經凍結的)不帶這個欄位,
+    不該因為這次改動而有任何行為差異。"""
+    plan = _plan(_all_dirs(("C1",)), conditions=("C1",))
+    cleaned, gaps, dropped = _shape_check(plan)
+    assert not gaps and not dropped
+    assert all("check_sql" not in c for c in cleaned["conditions"])
+
+
+# ── 標籤應有的真假向量 ──
+
+def test_正向案例應該全部條件成立():
+    conds = [{"id": "C1", "desc": "x"}, {"id": "C2", "desc": "y"}]
+    want = spec_exec._label_expectation(conds, {"condition_id": "C1", "direction": "true"})
+    assert want == {"C1": True, "C2": True}
+
+
+def test_反向案例應該只有被標的那一條不成立():
+    """這是契約的重點:反向案例要能把失敗歸因到某一條。
+
+    同時讓兩條不成立的案例,就算行為符合預期(不命中)也證明不了是哪一條造成的
+    ——而那正是 #18 review 第 2 點實際遇到的情況。
+    """
+    conds = [{"id": "C1", "desc": "x"}, {"id": "C2", "desc": "y"}, {"id": "C3", "desc": "z"}]
+    want = spec_exec._label_expectation(conds, {"condition_id": "C2", "direction": "false"})
+    assert want == {"C1": True, "C2": False, "C3": True}
+
+
+# ── 算不出來就整個放棄 ──
+
+class _Cur:
+    def __init__(self, answers): self.answers = list(answers)
+    def execute(self, q): self._next = self.answers.pop(0)
+    def fetchone(self):
+        if isinstance(self._next, Exception): raise self._next
+        return self._next
+
+
+def test_判斷式算不出來時整個放棄而不是部分回報():
+    """少算一條就可能把「兩條同時不成立」看成「只有一條不成立」——
+    那正是這道檢查要抓的東西,半套的結果比沒有更危險。"""
+    conds = [{"id": "C1", "desc": "x", "check_sql": "SELECT 1"},
+             {"id": "C2", "desc": "y", "check_sql": "SELECT 1"}]
+    assert spec_exec._eval_conditions(_Cur([(1,), RuntimeError("boom")]), conds) is None
+    assert spec_exec._eval_conditions(_Cur([(1,), None]), conds) is None, "沒有列也要放棄"
+    # 有條件沒附判斷式 → 整個放棄(不能只驗一半的條件)
+    assert spec_exec._eval_conditions(_Cur([(1,)]),
+                                      [conds[0], {"id": "C2", "desc": "y"}]) is None
+    assert spec_exec._eval_conditions(_Cur([(1,), (0,)]), conds) == {"C1": True, "C2": False}
+
+
+# ── 不符要列入覆蓋缺口 ──
+
+def test_標籤不符要列入覆蓋缺口():
+    """不改 ok(那是「行為符不符合預期」),另外列入缺口:那一向沒有被有效驗證,
+    不可據以自動放行。與仲裁剔除、執行中止是同一個原則。"""
+    results = [{"case_id": "C2-F", "condition_id": "C2", "direction": "false",
+                "ok": True, "label_ok": False, "label_mismatch": ["C7"]}]
+    gaps = spec_exec._label_gaps(results)
+    assert len(gaps) == 1
+    assert "C2-F" in gaps[0] and "C7" in gaps[0] and "未經有效驗證" in gaps[0]
+
+
+def test_標籤相符或沒驗時不產生缺口():
+    """沒給判斷式(label_ok 不存在)時不該憑空生出缺口。"""
+    assert spec_exec._label_gaps([{"case_id": "A", "label_ok": True}]) == []
+    assert spec_exec._label_gaps([{"case_id": "A"}]) == []
