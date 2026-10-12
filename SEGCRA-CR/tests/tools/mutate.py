@@ -807,6 +807,21 @@ MUTANTS.update({
     "測資:修補過的結果不在缺口裡說明(看的人會照著缺口去調 prompt)": (S,
         "            return plan_, [_MALFORMED_GAP, *gaps_], dropped_",
         "            return plan_, gaps_, dropped_"),
+    # #23 第 2 點:大規則一次生不完,每次整份重來等於每次重付已成功那部分的代價。
+    # 合併的三道防線少任何一道,補進來的案例都可能指向不存在的東西,而失敗會出現
+    # 在沙盒執行階段,離真正的原因很遠。
+    "測資:不走補缺模式(每次整份重來)": (S,
+        "        if filling and plan and best is not None and not repaired:",
+        "        if False:"),
+    "測資:補生成可以發明新條件(用假分母灌覆蓋率)": (S,
+        "        if c[\"condition_id\"] not in cond_ids or key in have:",
+        "        if False:"),
+    "測資:補生成的 schema 蓋掉先前的(已有案例跑不起來)": (S,
+        "    return ({**base, \"cases\": [*base[\"cases\"], *added]}, len(added), dropped)",
+        "    return ({**base, **addition, \"cases\": [*base[\"cases\"], *added]}, len(added), dropped)"),
+    "測資:補缺失敗退回時用合併後的條件數(拆得少的提示永遠不出現)": (S,
+        "                attempted, _, _ = _shape_check(plan)",
+        "                attempted = cleaned"),
     "測資:重試用完就判失敗(丟掉已抽到的最佳版)": (S,
         "    if best is not None:\n        if best_repaired:",
         "    if False:\n        if best_repaired:"),

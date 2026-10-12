@@ -237,7 +237,11 @@ def test_0缺口且條件數不少於之前的最大值才提前結束(monkeypat
 
 def test_重試的prompt帶上一次的缺口_每次都不同(monkeypatch):
     """review 第 4 點:評測固定 temperature 0 + seed 42,同一個 prompt 會得到逐位元組
-    相同的輸出。重試不帶這次的缺口,第 2、3 次送的是同一個 prompt,第 3 次等於白跑。"""
+    相同的輸出。重試不帶這次的缺口,第 2、3 次送的是同一個 prompt,第 3 次等於白跑。
+
+    #23 第 2 點之後,已經有可用計畫時走的是**補缺模式**(只問缺的那幾個,不整份
+    重來),措辭跟整份重試不同;但「要指名缺什麼」「每次都要不同」這兩個要求不變,
+    所以這裡斷言的是條件編號與方向有沒有出現,不綁特定句型。"""
     two = ("C1", "C2")
     calls = [_raw(_plan(_all_dirs(two)[:3], conditions=two)),       # 缺 C2 false
              _raw(_plan(_all_dirs(two)[:2], conditions=two)),       # 缺 C2 兩向
@@ -251,8 +255,14 @@ def test_重試的prompt帶上一次的缺口_每次都不同(monkeypatch):
     monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
     asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=3))
     assert len(users) == 3
-    assert "條件 C2 缺 false 向案例" in users[1]
-    assert "條件 C2 缺 true 向案例" in users[2]
+    assert "C2" in users[1] and "false 向" in users[1], f"沒指名缺的那一向:{users[1][:120]}"
+    # 第 2 次模型回的是一份更差的計畫(C2 兩向都沒有)。#23 第 2 點之後**不會**
+    # 因此退步:已經拿到的 C2-true 保留在最佳版裡,所以第 3 次要補的仍然只有
+    # C2-false。先前的行為是拿第 2 次的結果去算缺口,於是又去要一次已經有的
+    # C2-true——把重試次數花在重拿已經成功的東西上。
+    assert "C2" in users[2] and "false 向" in users[2], f"沒指名缺的那一向:{users[2][:120]}"
+    assert "true 向" not in users[2], (
+        "又去要一次已經拿到的 C2-true,表示最佳版沒有被保留")
     assert len(set(users)) == 3, "三次嘗試的 prompt 必須互不相同"
 
 
@@ -269,6 +279,8 @@ def test_重試的prompt指出條件拆得比之前少(monkeypatch):
 
     monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
     asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=3))
+    # 第 2 次回的計畫只拆出 1 個條件(比先前的 4 個少),補缺模式在那種情況下會
+    # 退回整份重試——因為繼續「只補缺的」等於接受那份拆得更少的計畫。
     assert "只拆出 1 個原子條件" in users[2] and "4 個" in users[2]
 
 
@@ -594,3 +606,58 @@ def test_乾淨的結果一律勝過修補過的(monkeypatch):
         f"採用了修補過的那份(條件 {len(plan['conditions'])} 個),"
         "它的覆蓋數不可信,不該勝過乾淨的")
     assert not any("JSON 不合法" in g for g in gaps)
+
+
+# ─────────────────── 只補缺的方向,不整份重來(#23 第 2 點) ───────────────────
+
+def test_補缺的案例會併回先前的計畫(monkeypatch):
+    """大規則一次生不完(實測 RETAIL_M1 要 46 個案例,模型自己停在 14 個;
+    調高上限到 4 倍也只多 3 個)。每次都要求「輸出完整計畫」等於每次都在重付
+    已經成功那部分的代價,而那正是裝不下的原因。
+
+    這裡:第一次給 C1 兩向 + C2 true,第二次只回缺的 C2 false,應該合併成 4 個案例。
+    """
+    first = _plan(_all_dirs(("C1", "C2"))[:3], conditions=("C1", "C2"))
+    only_missing = {"cases": [c for c in _plan(_all_dirs(("C1", "C2")),
+                                               conditions=("C1", "C2"))["cases"]
+                              if c["condition_id"] == "C2" and c["direction"] == "false"]}
+    plan, gaps, _ = _gen(monkeypatch, [_raw(first), json.dumps(only_missing, ensure_ascii=False)])
+    assert len(plan["cases"]) == 4, f"沒有併回去,拿到 {len(plan['cases'])} 個案例"
+    assert not gaps, f"補完了卻還有缺口:{gaps}"
+
+
+def test_補生成不可以發明新的條件(monkeypatch):
+    """模型自己加一個條件,覆蓋率會看起來變好——但那個條件根本不在規格的拆解裡,
+    等於用一個假的分母把覆蓋率灌上去。"""
+    first = _plan(_all_dirs(("C1", "C2"))[:3], conditions=("C1", "C2"))
+    bogus = {"cases": [{"case_id": "X-T", "condition_id": "C_NEW", "direction": "true",
+                        "note": "", "rows": [["t", 1]], "expect_flagged": True}]}
+    plan, _, dropped = _gen(monkeypatch,
+                            [_raw(first), json.dumps(bogus, ensure_ascii=False)] * 2)
+    assert all(c["condition_id"] in ("C1", "C2") for c in plan["cases"]), \
+        "併進了不在原計畫裡的條件"
+    assert dropped, "被拒絕的案例沒有記錄下來"
+
+
+def test_補生成不可以改寫已經有的案例(monkeypatch):
+    """補生成只補缺的,不該動已經驗過的案例——否則每一輪的結果都可能被後面的
+    嘗試悄悄改掉,而那無法從報告看出來。"""
+    first = _plan(_all_dirs(("C1", "C2"))[:3], conditions=("C1", "C2"))
+    original = [c for c in _shape_check(first)[0]["cases"]]
+    overwrite = {"cases": [{**original[0], "rows": [["t", 999]], "note": "改過的"}]}
+    plan, _, _ = _gen(monkeypatch,
+                      [_raw(first), json.dumps(overwrite, ensure_ascii=False)] * 2)
+    same = [c for c in plan["cases"] if c["case_id"] == original[0]["case_id"]]
+    assert same and same[0]["rows"] == original[0]["rows"], "已經有的案例被改寫了"
+
+
+def test_補生成的_schema_一律沿用先前的(monkeypatch):
+    """先前的案例是依原本的 schema 寫的。補生成若回了不同的 DDL 還照收,
+    那些案例就跑不起來了——而失敗會出現在沙盒執行階段,離真正的原因很遠。"""
+    first = _plan(_all_dirs(("C1",)), conditions=("C1",))
+    first["cases"] = first["cases"][:1]            # 留一個缺口,才會進補缺模式
+    other_ddl = {"schema_ddl": ["CREATE TABLE 別的表 (x INT)"], "cases": []}
+    plan, _, _ = _gen(monkeypatch,
+                      [_raw(first), json.dumps(other_ddl, ensure_ascii=False)] * 2)
+    assert plan["schema_ddl"] == _shape_check(first)[0]["schema_ddl"], \
+        "補生成換掉了 schema,先前的案例會跑不起來"

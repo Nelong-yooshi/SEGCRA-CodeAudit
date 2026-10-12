@@ -215,6 +215,71 @@ def _malformed_prompt(spec_code: str, spec_text: str) -> str:
             f"\n\n規則 {spec_code} 規格:\n{spec_text}")
 
 
+# 一次補幾個「條件 × 方向」。太大就回到「一次生不完」的老問題,太小則會把重試
+# 次數用在湊數上。6 是依 RETAIL_M1 實測的輸出量粗估的起點,不是調校過的值。
+_FILL_BATCH = 6
+
+
+def _missing_pairs(plan: dict) -> list[tuple[str, str]]:
+    """還缺哪些「條件 × 方向」。只看 plan 自己列出的條件,與 _shape_check 同一把尺。"""
+    have = {(c["condition_id"], c["direction"]) for c in plan["cases"]}
+    return [(c["id"], d) for c in plan["conditions"] for d in ("true", "false")
+            if (c["id"], d) not in have]
+
+
+def _fill_gaps_prompt(spec_code: str, spec_text: str, plan: dict,
+                      missing: list[tuple[str, str]], batch: int) -> str:
+    """只要缺的那幾個案例,不要整份重來。
+
+    為什麼不整份重來:大規則一次生不完(實測 RETAIL_M1 要 46 個案例,模型自己停在
+    14 個;調高上限到 4 倍也只多 3 個)。每次都要求「輸出完整計畫(包含已經有的
+    案例)」等於每次都在重付一遍已經成功的部分的代價,而那正是裝不下的原因。
+
+    只問缺的那幾個,單次輸出就小得多,也不必跟已經生好的部分搶輸出空間。
+    """
+    by_id = {c["id"]: c["desc"] for c in plan["conditions"]}
+    todo = missing[:batch]
+    lines = [f"- 條件 {cid}({by_id.get(cid, '')}) 的 {d} 向" for cid, d in todo]
+    return (
+        f"先前已經產出部分測資計畫,現在**只要補缺的案例**,不要重新輸出整份。\n\n"
+        f"要補的({len(todo)} 個,共缺 {len(missing)} 個):\n" + "\n".join(lines) + "\n\n"
+        f"請只輸出 JSON 物件 `{{\"cases\": [...]}}`,裡面只放上面列出的那幾個案例。\n"
+        f"**`condition_id` 必須用上面的編號,不要自己改名或新增條件**;\n"
+        f"資料表與欄位沿用先前的 schema(不要重新定義):\n"
+        + "\n".join(plan["schema_ddl"]) + "\n\n"
+        f"規則 {spec_code} 規格:\n{spec_text}")
+
+
+def _merge_cases(base: dict, addition: dict) -> tuple[dict, int, list[dict]]:
+    """把補生成的案例併回 base,回傳 (合併後, 實際併入數, 被拒絕的)。
+
+    **只併,不覆寫。** 拒絕三種:
+      * `condition_id` 不在 base 的條件清單裡 —— 模型自己發明了條件,併進去會讓
+        覆蓋率看起來變好,但那個條件根本不在規格的拆解裡
+      * 形狀不合法 —— 與 _shape_check 同一把尺
+      * 已經有同一個「條件 × 方向」 —— 保留先前那個,補生成不該改寫已經驗過的案例
+
+    schema_ddl 一律沿用 base:補生成的 prompt 已經把 schema 給它了,如果它還是
+    回了不同的 DDL,那是它沒照做,**不能拿新的 DDL 去建表**——先前的案例是依
+    base 的 schema 寫的,換了表結構那些案例就跑不起來了。
+    """
+    cond_ids = {c["id"] for c in base["conditions"]}
+    have = {(c["condition_id"], c["direction"]) for c in base["cases"]}
+    # 借 _shape_check 驗形狀:把補生成的案例掛在 base 的條件上一起檢查
+    probe = {"schema_ddl": base["schema_ddl"], "conditions": base["conditions"],
+             "cases": addition.get("cases", []) if isinstance(addition, dict) else []}
+    cleaned, _, dropped = _shape_check(probe)
+    added = []
+    for c in cleaned["cases"]:
+        key = (c["condition_id"], c["direction"])
+        if c["condition_id"] not in cond_ids or key in have:
+            dropped.append({"case": c, "reason": "補生成:條件不在原計畫裡,或該方向已有案例"})
+            continue
+        have.add(key)
+        added.append(c)
+    return ({**base, "cases": [*base["cases"], *added]}, len(added), dropped)
+
+
 def _retry_prompt(spec_code: str, spec_text: str, gaps: list[str],
                   n_conds: int, max_conds: int) -> str:
     """有合法案例但不夠好時的重試提示:講清楚上一次差在哪,讓每次重試的 prompt
@@ -263,6 +328,8 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
     llm_error = None
     truncated = 0
     malformed = 0
+    filling = False          # 這一輪送出去的是「只補缺的」還是整份重來
+    filled_total = 0         # 靠補生成多拿到幾個案例(寫進失敗原因,供判讀)
     best: tuple[dict, list[str], list[dict]] | None = None
     best_repaired = False
     max_conds = 0
@@ -299,6 +366,31 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
         repaired = bool(parse_meta.get("repaired"))
         if repaired:
             malformed += 1
+        if filling and plan and best is not None and not repaired:
+            # 這一輪問的是「只要缺的那幾個」,收到的是案例片段不是整份計畫,
+            # 所以併回去而不是拿去跑 _shape_check 當新計畫(那會把已經生好的
+            # 部分整個丟掉——正是大規則一直生不完的原因)。
+            merged, n_added, merge_dropped = _merge_cases(best[0], plan)
+            cleaned, gaps, _ = _shape_check(merged)
+            best = (cleaned, gaps, [*best[2], *merge_dropped])
+            filled_total += n_added
+            if not gaps:
+                return best
+            if n_added == 0:
+                # 補不進任何東西(模型改了條件編號、或只回了已有的方向)。
+                # 再問同一批只會得到同樣的結果,換回整份重來。
+                #
+                # 條件數要看**這次模型回的**那份,不是合併後的:合併後一定等於
+                # 先前的最佳值,那樣「你這次拆得比之前少」這個提示永遠不會出現,
+                # 而那正是補缺失敗最常見的原因之一(模型把條件重新合併了)。
+                attempted, _, _ = _shape_check(plan)
+                filling = False
+                user = _retry_prompt(spec_code, spec_text, gaps,
+                                     len(attempted["conditions"]), max_conds)
+                continue
+            user = _fill_gaps_prompt(spec_code, spec_text, cleaned,
+                                     _missing_pairs(cleaned), _FILL_BATCH)
+            continue
         if plan:
             cleaned, gaps, dropped = _shape_check(plan)
             if cleaned["cases"]:
@@ -317,8 +409,17 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
                 if better:
                     best = (cleaned, gaps, dropped)
                     best_repaired = repaired
-                user = (_malformed_prompt(spec_code, spec_text) if repaired
-                        else _retry_prompt(spec_code, spec_text, gaps, n_conds, max_conds))
+                if repaired:
+                    user = _malformed_prompt(spec_code, spec_text)
+                    continue
+                # 有一份可用的計畫了 → 接下來只補缺的,不要整份重來。
+                missing = _missing_pairs(cleaned)
+                if missing and best is not None and cleaned is best[0]:
+                    filling = True
+                    user = _fill_gaps_prompt(spec_code, spec_text, cleaned,
+                                             missing, _FILL_BATCH)
+                else:
+                    user = _retry_prompt(spec_code, spec_text, gaps, n_conds, max_conds)
                 continue
         user = (f"上一次輸出無法解析或沒有任何合法案例,"
                 f"請重新輸出**完整覆蓋每個條件 true/false 兩向**的 JSON。\n\n"
