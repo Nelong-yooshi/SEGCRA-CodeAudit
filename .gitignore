@@ -12,6 +12,9 @@ __pycache__/
 # 執行產物
 review_output/
 **/eval/_output/
+# run_eval 的 --dump-reports 輸出(跑批產物,不是程式碼)。
+# 沒 ignore 的話很容易被 `git add -A` 誤收進 PR——實際發生過一次。
+**/eval/_reports*/
 
 # dbt 對照專案(若直接在該目錄手動執行 dbt 會產生這些)
 **/dbt_reference/target/
