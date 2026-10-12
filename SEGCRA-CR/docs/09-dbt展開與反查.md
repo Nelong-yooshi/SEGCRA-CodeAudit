@@ -422,6 +422,25 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 檢查受影響的 model 時若發生非預期的錯誤,審查不中斷:結果收斂成「全部 model 可能受影響」→ major,
 只留錯誤的類型、不回顯內容。
 
+**真實 GitLab 實測**(2026-10-12,測試用 GitLab、只含假資料的專案)。只讀取:不呼叫模型、不寫回
+GitLab;執行的是 `review_mr` 在呼叫模型之前的部分(取 MR → 取回專案 → 預掃 → 反查 → 檢查受影響的
+model)與確定性補報。讀 MR 與打包下載各用一把 project access token,都是角色 Reporter、只勾
+`read_api`。測試專案的 dbt 專案在 repo 根目錄,有 1 個 macro、3 個 model(含 1 個 Python model)、
+1 個 seed、2 個 snapshot;三個 MR 各改一個檔案,目標分支相同。
+
+| 情況 | 結果 |
+|---|---|
+| MR 改 model(diff 只有一行純 SQL、沒有樣板標記) | 下載 1 次(head)。送去跑規則的是**用完整內容與專案的 macro 展開後**的整句 SQL,不是 diff 的那一行;`ref()` 依專案資訊展開;不反查、沒有補報;交給執行驗證的內容帶上完整檔案 |
+| MR 改 macro(讓呼叫它的 model 多出 `NOT IN` 子查詢) | 下載 2 次(head、base)。macro 檔不當成 model 展開;反查到 1 個確定受影響的 model;變更前後各展開一次,多出 `R003 major`;補一條 major,列出該 model、沒有對應到規格、以及專案有 snapshot 未分析 |
+| MR 改 `dbt_project.yml` | 下載 2 次。反查判定全部 model 可能受影響;不逐一展開;補 major |
+| 沒有設定 `GITLAB_READ_TOKEN` | 取回失敗;被改到的 macro 檔記成展開失敗;反查當成全部 model 可能受影響;兩條 major |
+| `GITLAB_READ_TOKEN` 與 `GITLAB_TOKEN` 是同一把 | 拒絕下載(不退回用另一把);三個 MR 都交人工 |
+
+另外確認:三個 MR 的 `base_sha` 都是目標分支的最新 commit;seed、snapshot、Python model 都列在
+`ref()` 找得到的名稱裡,並標成表名無法確定;專案資訊在子行程裡整理,正常完成;錯誤訊息不含 token
+或網址。實測沒有涵蓋:呼叫模型之後的步驟(模型審查、執行驗證、寫回 GitLab)、dbt 專案在子目錄
+(`dbt.project_dir`;打包下載與取回專案在子目錄的情況已於上一節實測)、超過上限的大量受影響 model。
+
 **已知限制**
 
 - mock 模式沒有專案可以取回:macro 檔仍會被當成 model 展開(接線前的行為),接線的效果要接真實
@@ -444,7 +463,6 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
   再展開一次
 - 真實 GitLab 模式下,dbt 專案以外的 SQL 檔(與專案裡不是樣板的 SQL 檔)仍只有 diff 新增的行,
   完整內容由 #22 以 Files API 依 head sha 取得
-- 真實 GitLab 實測(改 model、改 macro、改專案設定檔各一個 MR)尚未進行
 - 反查以檔案為單位;不分析第三方套件內的 macro;目錄由呼叫端指定
 - `invocation_id` 為固定值,樣板若輸出它,結果會與 dbt compile 不同
 - 待確認:規格檔名慣例(目前只去除 `mrt_` 前綴);earlyjob model 應歸屬主規則的規格,

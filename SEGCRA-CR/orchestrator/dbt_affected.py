@@ -184,7 +184,7 @@ async def _hits(hub, rel, text, dbt_cfg, macro_files, macro_dirs, info, render):
 
 
 # ------------------------------------------------------------------ 整理成一條 finding
-IMPACT_TITLE = "dbt macro 或設定的變更影響其他 model"
+IMPACT_TITLE = "dbt 變更對其他 model 的影響"
 _SEVERITY_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
 _MAX_LISTED = 20
 _MAX_REASON_CHARS = 200
