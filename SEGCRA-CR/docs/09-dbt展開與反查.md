@@ -219,7 +219,7 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 | 依檔名對應規格 | 已接上 | 完全沒有 R 編號時,先查本機 `specs/`、再逐一探測 GitLab 的候選路徑 |
 | `ref()`/`source()` 精確度提醒 | 已接上 | 預掃結果帶 `dbt_render_notice`,後處理由 `enforce_dbt_notice()` 確定性補成 info finding(正式路徑與 dry-run 皆同) |
 | 執行驗證(沙盒) | **不支援** | SQL 是樣板時不送進沙盒,回報「尚未支援」major、交人工——原樣執行只會得到語法錯誤,會錯誤地指控程式有誤。改到 dbt 而執行驗證卻通過時,`enforce_dbt_unexecuted()` 補 major |
-| 專案的 macro 與專案資訊 | 已接上(真實 GitLab 模式) | 依 MR 的 head commit 取回專案;取不回來一律交人工。mock 模式沒有專案,呼叫專案 macro 的 model 展開失敗(見「接進審查管線」) |
+| 專案的 macro 與專案資訊 | 已接上(真實 GitLab 模式) | 依 MR 的 head commit 取回專案;取不回來一律交人工。mock 模式要在 fixture 目錄放專案才有(見「接進審查管線」),沒放時呼叫專案 macro 的 model 展開失敗 |
 | macro 反查 | 已接上(真實 GitLab 模式) | MR 改到 macro、屬性檔或專案設定檔時反查受影響的 model,比較變更前後的規則命中,由 `enforce_dbt_impact()` 補成一條 finding |
 
 **展開失敗一律補 major**(#16 review):展開失敗時規則層掃的是未展開的原文。以前只靠
@@ -256,7 +256,7 @@ golden set 的標準答案才不會跟著變;約定值寫在 `orchestrator/confi
 
 `ref()`/`source()` 精確度提醒由 `enforce_dbt_notice()` 在後處理鏈上**確定性**補成
 一條 info finding(#14 review):不靠模型轉述;info 不影響決策,但一定會出現在報告裡。
-沒有取回專案時(mock 模式、專案外的檔案)沒有 macro 可用,呼叫到專案自訂 macro 的 model 會展開失敗(fail closed)。
+沒有取回專案時(mock 模式而 fixture 沒有放專案、專案外的檔案)沒有 macro 可用,呼叫到專案自訂 macro 的 model 會展開失敗(fail closed)。
 
 呼叫端約定(接線時必須遵守):
 
@@ -346,9 +346,10 @@ macro);正式環境的主機**不連外網**,審查流程裡不能有任何執�
 
 ## 接進審查管線(#15)
 
-`dbt.enabled` 開啟、**真實 GitLab 模式**、MR 改到 dbt 專案目錄(`dbt.project_dir`,預設 repo 根目錄)
-裡的 `.sql` / `.yml` / `.yaml` 時才會動作。沒開 dbt、mock 模式(demo、評測)、或 MR 沒改到專案裡的
-這些檔案,行為與接線前相同,下面的程式一個都不會被呼叫。
+`dbt.enabled` 開啟、MR 改到 dbt 專案目錄(`dbt.project_dir`,預設 repo 根目錄)裡的 `.sql` / `.yml` /
+`.yaml`、而且拿得到專案時才會動作。專案的來源:真實 GitLab 模式是打包下載;mock 模式是 fixture 目錄裡
+放的專案(見下方「開啟前的條件」後的說明),沒有放就不適用。沒開 dbt 時行為與接線前相同;開了 dbt 而
+不適用(mock 模式沒有放專案、MR 沒改到專案裡的這些檔案)時,只有最後一步 `enforce_dbt_unexecuted` 仍會檢查。
 
 ```
 review_mr
@@ -422,6 +423,20 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 檢查受影響的 model 時若發生非預期的錯誤,審查不中斷:結果收斂成「全部 model 可能受影響」→ major,
 只留錯誤的類型、不回顯內容。
 
+**開啟 `dbt.enabled` 之前的條件**(#14 review 列的四項)與目前的狀態:
+
+| 條件 | 狀態 |
+|---|---|
+| `relation_notice` 改成確定性揭露 | 完成(#14):`enforce_dbt_notice` |
+| macro 目錄的取檔方式決定並實作 | 完成:依 commit 打包下載(#20),接進管線(本節) |
+| 進入點有 `if __name__ == "__main__":` 保護 | `demo.py` 與 `scripts/webhook_server.py` 都有,由 `tests/test_entrypoint_guard.py` 鎖住。展開、macro 反查、專案資訊都開子行程(spawn);進入點少了保護時,子行程會把整支程式從頭重跑一次。實際踩到時的結果是專案資訊整理失敗 → 當成取不回專案 → 交人工 |
+| 資料庫假名確定並寫進文件,設錯要擋下 | 完成(#16):固定為 `DBT_PLACEHOLDER`,載入設定與展開前各檢查一次 |
+
+開啟與回復的步驟、以及不接 GitLab 就能跑的範例,見 README「開啟 dbt 接線」與 `examples/dbt_wiring/`。
+mock 模式下,fixture 目錄若放了 MR 那個 commit 的專案(`<FIXTURES_DIR>/dbt_archives/<commit 編號>/`),
+接線會從那裡取得專案——打包成 GitLab 的形狀後交給同一個 `load_dbt_project`,解壓與檢查走同一條路;
+沒有放就不適用。預設的 `fixtures/` 與 golden set 都沒有放,行為不變。
+
 **真實 GitLab 實測**(2026-10-12,測試用 GitLab、只含假資料的專案)。只讀取:不呼叫模型、不寫回
 GitLab;執行的是 `review_mr` 在呼叫模型之前的部分(取 MR → 取回專案 → 預掃 → 反查 → 檢查受影響的
 model)與確定性補報。讀 MR 與打包下載各用一把 project access token,都是角色 Reporter、只勾
@@ -443,8 +458,8 @@ model)與確定性補報。讀 MR 與打包下載各用一把 project access tok
 
 **已知限制**
 
-- mock 模式沒有專案可以取回:macro 檔仍會被當成 model 展開(接線前的行為),接線的效果要接真實
-  GitLab 才看得到
+- mock 模式而 fixture 沒有放專案時(預設的 `fixtures/`、golden set):macro 檔仍會被當成 model 展開
+  (接線前的行為)。要在 mock 模式看到接線的效果,得照 `examples/dbt_wiring/` 的方式放專案
 - 沒被這個 MR 改到的 macro 不另外做注入掃描(已合併的既有程式);這個 MR 改到的檔案都會掃
 - 審查途中 MR 被推了新 commit 偵測不到:取回的是 `sha` 那一版,審查結果也寫在那一版上;新的
   commit 沒有 commit status,要等它自己的審查
