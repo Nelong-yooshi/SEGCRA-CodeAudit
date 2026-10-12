@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .agent import extract_json, run_agent
 from .config import DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, estimate_tokens
+from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_render import is_dbt_template, render_model_isolated
 from .security import scan_mr
 from .skills_loader import always_skills, load_skills, skills_index
@@ -164,7 +165,8 @@ _DBT_DATABASE_MISMATCH = (
     "不展開此檔(請檢查環境變數 SEGCRA_DBT_DATABASE)")
 
 
-def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, str | None, str | None]:
+def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict,
+                            dbt_ctx: DbtContext | None = None) -> tuple[str, str | None, str | None]:
     """dbt 樣板先展開成純 SQL 再交給規則層(#7)。
     回傳 (交給規則層的 sql, 展開失敗原因或 None, ref()/source() 精確度提醒或 None)。
 
@@ -174,9 +176,12 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, st
     macro 呼叫時,原文解析得過、0 條規則命中(#16 review)。待審內容一律走
     render_model_isolated()(子行程隔離 + 逾時 + Linux 上限記憶體)。
 
-    尚無列 GitLab 目錄的工具,所以這裡沒有 macro 目錄可餵(code_root 不給、只給
-    source);呼叫到專案自訂 macro 的 model 會如預期展開失敗,原因見
-    config/models.yaml 的 dbt 區塊註解。
+    dbt_ctx 給定(檔案在取回的 dbt 專案裡,見 dbt_context)時,用專案的 macro 展開,並依
+    專案資訊驗證 ref() / source();沒給(專案外的檔案、mock 模式)時沒有 macro 可用,
+    呼叫到專案自訂 macro 的 model 會如預期展開失敗。
+
+    專案裡有同名的 macro 時算展開失敗:dbt 會直接編譯失敗,而我們只有單一命名空間、
+    擇一展開的結果不一定是 dbt 會用的那個,不能當成正確的 SQL 交給規則層。
 
     用到 ref()/source() 時,展開出的表名有已知的精確度落差(不驗證 model 是否
     存在、不讀 sources.yml、不套用 alias——見 dbt_render 模組文件),不影響
@@ -186,29 +191,88 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, st
         # 設定載入時已擋過,這裡再擋一次:dbt_cfg 也可能不經 load_config() 直接傳入。
         # 不符就不展開(fail closed),由 enforce_dbt_render_failure 補 major 交人工。
         return sql, _DBT_DATABASE_MISMATCH, None
+    project = {}
+    if dbt_ctx is not None and dbt_ctx.project is not None:
+        project = {"macro_files": dbt_ctx.macro_files, "macro_dirs": dbt_ctx.project.macro_paths,
+                   "project": dbt_ctx.info}
     rendered = render_model_isolated(path or "model.sql", source=sql,
-                                     database=dbt_cfg["database"])
+                                     database=dbt_cfg["database"], **project)
+    if rendered.ok and rendered.macro_conflicts:
+        return sql, (f"dbt 專案裡有 {len(rendered.macro_conflicts)} 組同名的 macro"
+                     "(dbt 會編譯失敗),無法確定展開結果"), None
     if rendered.ok:
         return rendered.sql, None, rendered.relation_notice
     return sql, rendered.error, None
 
 
-async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None) -> list[dict]:
+_DBT_FETCH_FAILED = "無法取回 dbt 專案:"
+
+
+def _dbt_head_source(f: dict, sql: str, dbt_ctx: DbtContext | None) -> tuple[str, str | None, bool]:
+    """dbt 專案裡的 .sql:改用 head commit 的完整內容(#15 接線)。
+    回傳 (要檢查的內容, 取回失敗的原因或 None, 檔案是否在 dbt 專案裡)。
+
+    真實 GitLab 模式的 diff 只有新增的行;只改了幾行的 model,拿片段去展開沒有意義,
+    改到的那幾行沒有樣板標記也不代表整個檔案沒有。所以只要 head 的完整內容是 dbt 樣板,
+    就用完整內容。不是樣板的檔案(例如已編譯的純 SQL)維持原本的來源。
+
+    專案取不回來時,專案裡的 .sql(以及其他確定是樣板的檔案)一律回報失敗:不知道它是不是
+    樣板、或沒有 macro 可用,都不可以當成沒事。"""
+    rel = dbt_ctx.relative(f.get("path")) if dbt_ctx is not None else None
+    if rel is None:
+        return sql, None, False
+    if dbt_ctx.error is not None:
+        # .sql 不論內容都算(片段看不出是不是樣板);其他檔案只有確定是樣板的才算——
+        # 沒有專案就沒有 macro,拿去展開等於退回「沒有 macro」
+        if rel.endswith(".sql") or is_dbt_template(sql):
+            return sql, _DBT_FETCH_FAILED + dbt_ctx.error, True
+        return sql, None, True
+    if not rel.endswith(".sql"):
+        return sql, None, True
+    head = dbt_ctx.project.files.get(rel)
+    if head is not None and is_dbt_template(head):
+        return head, None, True
+    return sql, None, True
+
+
+def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None) -> dict:
+    """注入掃描用:把取回的完整內容也列進去掃。
+
+    預掃改用 head 的完整內容後,規則命中帶的 SQL 片段可能來自 diff 以外的行;那些行
+    以前不會進到審查流程,也就沒被掃過。原本的 diff 照舊保留。"""
+    if dbt_ctx is None or dbt_ctx.project is None:
+        return mr
+    extra = [{"path": f.get("path"), "full_content": text} for f in mr.get("files", [])
+             if (text := dbt_ctx.head_text(f.get("path"))) is not None]
+    return {**mr, "files": [*mr["files"], *extra]} if extra else mr
+
+
+async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
+                  dbt_ctx: DbtContext | None = None) -> list[dict]:
     """對每個變更檔跑 rule-base + lint(不經 LLM)。
 
     dbt_cfg 給定且 enabled 時,含 dbt 樣板標記的檔案先展開成純 SQL 再交給規則層
     (見 _dbt_expand_for_prescan)。**預設關閉**:dbt_cfg 為 None、空字典、或
     enabled 不是 True,行為與展開器上線前完全相同——不會因為呼叫端忘記傳
     dbt_cfg 而默默改變審查結果。
+
+    dbt_ctx(prepare_dbt_context 的結果)給定時,dbt 專案裡的 .sql 改用 head commit 的完整
+    內容與專案的 macro 展開;取回失敗則記成展開失敗交人工。沒開 dbt 時不看 dbt_ctx。
     """
     dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True
     results = []
     for f in files:
         sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or f.get("diff", "")
         entry = {"path": f["path"]}
+        dbt_error, in_project = None, False
+        if dbt_enabled:
+            sql, dbt_error, in_project = _dbt_head_source(f, sql, dbt_ctx)
         rule_sql = sql
-        if dbt_enabled and sql and is_dbt_template(sql):
-            rule_sql, dbt_error, dbt_notice = _dbt_expand_for_prescan(f.get("path", ""), sql, dbt_cfg)
+        if dbt_error is not None:
+            entry["dbt_render_error"] = dbt_error
+        elif dbt_enabled and sql and is_dbt_template(sql):
+            rule_sql, dbt_error, dbt_notice = _dbt_expand_for_prescan(
+                f.get("path", ""), sql, dbt_cfg, dbt_ctx if in_project else None)
             if dbt_error is not None:
                 entry["dbt_render_error"] = dbt_error
             if dbt_notice is not None:
@@ -292,11 +356,12 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             report["_mode"] = "baseline"
             return report
 
-        pre = await prescan(hub, mr["files"], cfg.dbt)
+        dbt_ctx = prepare_dbt_context(mr, cfg.dbt)   # 需要時取回 MR 那個 commit 的 dbt 專案
+        pre = await prescan(hub, mr["files"], cfg.dbt, dbt_ctx)
         if capture is not None:
             capture["mr"] = mr
             capture["prescan_raw"] = copy.deepcopy(pre)
-        injection_hits = scan_mr(mr)   # 確定性注入掃描(不經 LLM)
+        injection_hits = scan_mr(_mr_with_head_text(mr, dbt_ctx))   # 確定性注入掃描(不經 LLM)
 
         # 找 spec(確定性;執行驗證與 prompt 的規格段共用)。依檔名對應與展開器
         # 同一個開關:關閉時行為與接線前完全相同。
