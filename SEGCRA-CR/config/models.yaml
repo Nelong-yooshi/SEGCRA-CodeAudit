@@ -65,8 +65,10 @@ policy:
 #      規則看資料庫名,用假名不影響判斷。展開後的 SQL 片段會出現在審查結果裡,所以
 #      不放正式資料庫名。假名要固定不變(golden set 的標準答案才不會跟著變),
 #      改名時要同步更新 docs/09-dbt展開與反查.md。
-#      不要寫在這個檔案裡(維持由環境變數提供);沒設定時,用到 ref()/source() 的
-#      model 一律展開失敗(安全預設,但等於沒用)。下面的 database 只留空字串當後備。
+#      不要寫在這個檔案裡(維持由環境變數提供)。enabled: true 時,資料庫名必須
+#      完全等於約定值(orchestrator/config.py 的 DBT_DATABASE_PLACEHOLDER),未設定
+#      或拼錯都會在載入設定時報錯——拼錯的名稱只會默默產出錯的表名,不會自己報錯。
+#      下面的 database 只留空字串當後備。
 #   2. 目前還沒有列 GitLab 目錄的工具,所以這裡展開時**沒有 macro 目錄**——只有
 #      ref() / source() / var() / config() 會生效,呼叫到專案自訂 macro 的 model
 #      會展開失敗(StrictUndefined,fail closed),跟現在完全沒展開時一樣落到
