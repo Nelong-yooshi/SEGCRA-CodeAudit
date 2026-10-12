@@ -12,8 +12,8 @@ __pycache__/
 # 執行產物
 review_output/
 **/eval/_output/
-# run_eval 的 --dump-reports 輸出(跑批產物,不是程式碼)。
-# 沒 ignore 的話很容易被 `git add -A` 誤收進 PR——實際發生過一次。
+# --dump-reports 的落檔目錄(一律用 _ 開頭命名)。跑批的正式 baseline 是交付物、
+# 要能 commit(見 eval/BASELINE.md),但臨時跑一兩個 case 的存檔不必進版控。
 **/eval/_reports*/
 
 # dbt 對照專案(若直接在該目錄手動執行 dbt 會產生這些)
