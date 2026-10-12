@@ -302,3 +302,21 @@ def test_不給macro_files時行為不變(tmp_path):
     assert render_model("m.sql", code_root=tmp_path, source="{{ a() }}").sql == "1"
     assert not render_model("m.sql", source="{{ a() }}").ok
     assert DEFAULT_ADAPTER
+
+
+def test_macro目錄互相包含_同一個檔只載入一次_兩種來源相同(tmp_path):
+    """macro-paths 寫了 macros 與 macros/shared 時,shared 底下的檔會被列到兩次;
+    載入兩次的話,它定義的 macro 會被記成「與自己同名」。"""
+    files = {"macros/a.sql": _macro("a", "1"), "macros/shared/b.sql": _macro("b", "2")}
+    for dirs in (("macros", "macros/shared"), ("macros/shared", "macros"), ("macros", "macros")):
+        disk, mem = _both(tmp_path, files, "{{ a() }}{{ b() }}", macro_dirs=dirs)
+        _same(disk, mem)
+        assert mem.ok and mem.sql == "12" and mem.macro_conflicts == [], dirs
+        assert mem.macros == ["a", "b"]
+
+
+def test_檔數上限以去掉重複後的數量計算(monkeypatch):
+    monkeypatch.setattr(dbt_render, "MAX_MACRO_FILES", 2)
+    files = {"macros/a.sql": _macro("a", "1"), "macros/b.sql": _macro("b", "2")}
+    assert render_model("m.sql", macro_files=files, source="{{ a() }}",
+                        macro_dirs=("macros", "macros")).ok

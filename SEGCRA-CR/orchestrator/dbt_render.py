@@ -708,6 +708,9 @@ def build_env(code_root=None, variables: dict | None = None,
                 continue
             files += [(f.relative_to(root).as_posix(), f) for f in sorted(macro_dir.rglob("*.sql"))
                       if not f.is_symlink() and f.is_file()]   # 符號連結可能指向任意檔案
+    # macro 目錄互相包含(例如 macros 與 macros/shared)時,同一個檔會被列到兩次;
+    # 只載入一次,否則它定義的每個 macro 都會被記成「與自己同名」
+    files = list(dict(files).items())
     if not files:
         return env, macros, conflicts, problems
     if len(files) > MAX_MACRO_FILES:
