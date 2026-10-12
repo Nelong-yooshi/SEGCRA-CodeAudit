@@ -195,6 +195,26 @@ def _covered(plan: dict) -> int:
     return len({(c["condition_id"], c["direction"]) for c in plan["cases"]})
 
 
+# 靠 json-repair 救回來的計畫,缺口清單要先講真正的原因。放在最前面是因為
+# 看的人通常只看第一條:寫「缺條件 C5 的 false 向」會把人導向「改 prompt 讓模型
+# 多生一個案例」,而真正該做的是讓輸出的 JSON 合法。
+_MALFORMED_GAP = ("測資計畫的 JSON 不合法,靠修補救回——**案例可能已經遺失**,"
+                  "下面列出的缺口不一定是模型沒生,也可能是被修補過程吃掉的。"
+                  "先看輸出格式,不要照缺口清單去調 prompt。")
+
+
+def _malformed_prompt(spec_code: str, spec_text: str) -> str:
+    """JSON 不合法時的重試 prompt。
+
+    刻意**不**列出缺口:這一次的缺口清單是從修補過的物件算出來的,不可信,
+    拿它去要求模型「補某某條件」只會讓它在錯的方向上努力。
+    """
+    return (f"上一次的輸出不是合法的 JSON(少了括號或引號之類的語法錯誤)。"
+            f"請重新輸出一份**語法完全正確**的 JSON,不要有任何說明文字、"
+            f"不要用 ``` 圍欄。內容要求與先前相同:每個條件的 true/false 兩向都要有。"
+            f"\n\n規則 {spec_code} 規格:\n{spec_text}")
+
+
 def _retry_prompt(spec_code: str, spec_text: str, gaps: list[str],
                   n_conds: int, max_conds: int) -> str:
     """有合法案例但不夠好時的重試提示:講清楚上一次差在哪,讓每次重試的 prompt
@@ -242,7 +262,9 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
     profile = cfg.role_profile("testgen") if profile_name is None else cfg.profile(profile_name)
     llm_error = None
     truncated = 0
+    malformed = 0
     best: tuple[dict, list[str], list[dict]] | None = None
+    best_repaired = False
     max_conds = 0
     for attempt in range(max_attempts):
         meta: dict = {}
@@ -265,22 +287,49 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
                     f"但**條件的 true/false 兩向都不可省略**。\n\n"
                     f"規則 {spec_code} 規格:\n{spec_text}")
             continue
-        plan = extract_json(raw)
+        # JSON 不合法、靠 json-repair 救回來的輸出**不可信**,理由跟截斷同一類:
+        # repair 不會失敗,它會把壞掉的 JSON 修補成一個**合法但語意錯誤**的物件。
+        # 實測(#23)R-140 少打一個 `]`:
+        #     "rows": [["txn_log", 1, ..., null], "expect_flagged": true, ...},
+        # repair 把後面所有案例都塞進這一筆的 `rows`,那一筆因為形狀不對被剔除,
+        # 後面的案例跟著消失——而報告上寫的是「條件 C5 缺 false 向案例」。
+        # 一個標點符號的問題被回報成「模型覆蓋不足」,兩者的修法完全不同。
+        parse_meta: dict = {}
+        plan = extract_json(raw, parse_meta)
+        repaired = bool(parse_meta.get("repaired"))
+        if repaired:
+            malformed += 1
         if plan:
             cleaned, gaps, dropped = _shape_check(plan)
             if cleaned["cases"]:
                 n_conds = len(cleaned["conditions"])
                 max_conds = max(max_conds, n_conds)
-                if not gaps and n_conds >= max_conds:
+                # 修補過的結果不走「提前結束」:它的 0 缺口可能是假的
+                # (案例被 repair 吃掉之後,剩下的對它自己列出的條件剛好齊全)。
+                if not repaired and not gaps and n_conds >= max_conds:
                     return cleaned, gaps, dropped   # 完整覆蓋且沒有拆得比之前少,不用再試
-                if best is None or _covered(cleaned) > _covered(best[0]):
+                # 乾淨的結果一律勝過修補過的,即使覆蓋數比較少——
+                # 修補過的「覆蓋數」本身就不可信,拿它跟乾淨的比是比錯東西。
+                better = (best is None
+                          or (best_repaired and not repaired)
+                          or (best_repaired == repaired
+                              and _covered(cleaned) > _covered(best[0])))
+                if better:
                     best = (cleaned, gaps, dropped)
-                user = _retry_prompt(spec_code, spec_text, gaps, n_conds, max_conds)
+                    best_repaired = repaired
+                user = (_malformed_prompt(spec_code, spec_text) if repaired
+                        else _retry_prompt(spec_code, spec_text, gaps, n_conds, max_conds))
                 continue
         user = (f"上一次輸出無法解析或沒有任何合法案例,"
                 f"請重新輸出**完整覆蓋每個條件 true/false 兩向**的 JSON。\n\n"
                 f"規則 {spec_code} 規格:\n{spec_text}")
     if best is not None:
+        if best_repaired:
+            # 這份計畫是靠修補救回來的,它的 coverage_gaps **不能當成真的覆蓋缺口**:
+            # 被 repair 吃掉的案例不會出現在任何地方,看起來就像模型沒生。
+            # 把真正的原因放在最前面,免得看的人照著「缺某個條件」的方向去修 prompt。
+            plan_, gaps_, dropped_ = best
+            return plan_, [_MALFORMED_GAP, *gaps_], dropped_
         return best
     if truncated:
         # 這條失敗原因要講得夠具體才有用:「規則太大、輸出裝不下」跟「模型輸出
@@ -289,6 +338,12 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
         reason = (f"測資生成失敗({truncated}/{max_attempts} 次因超過輸出長度上限被截斷)。"
                   f"這條規則的測資計畫裝不進目前的 max_output_tokens;"
                   f"需調高 roles.testgen 所用 profile 的上限,或改成分批生成。")
+    elif malformed:
+        # 跟截斷分開講:截斷要調上限或分批,格式錯誤要修 prompt 或限制輸出格式,
+        # 修法完全不同,混在同一句話裡看的人無從判斷。
+        reason = (f"測資生成失敗({malformed}/{max_attempts} 次輸出的 JSON 不合法)。"
+                  f"這是輸出格式的問題,不是覆蓋度不足;"
+                  f"考慮改用 response_format 的 json_schema 限制輸出格式。")
     elif llm_error:
         reason = f"測資生成失敗(LLM 呼叫失敗:{llm_error})"
     else:

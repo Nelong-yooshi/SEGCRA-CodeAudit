@@ -501,3 +501,96 @@ def test_沒給meta的呼叫端不受影響(monkeypatch):
     monkeypatch.setattr(spec_exec, "run_agent", fake_no_meta)
     plan, gaps, _ = asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容"))
     assert gaps == [] and len(plan["cases"]) == 2
+
+
+# ─────────────────── 格式錯誤要看得見,不可偽裝成覆蓋缺口(#23 第 1 點) ───────────────────
+
+_CLEAN_PLAN = '''{"schema_ddl": ["CREATE TABLE t (a INT)"],
+ "conditions": [{"id": "C1", "desc": "a > 0"}],
+ "cases": [{"case_id": "C1-T", "condition_id": "C1", "direction": "true",
+            "note": "", "rows": [["t", 1]], "expect_flagged": true},
+           {"case_id": "C1-F", "condition_id": "C1", "direction": "false",
+            "note": "", "rows": [["t", 0]], "expect_flagged": false}]}'''
+
+# 會真的觸發 json-repair 的壞法:結尾多一個逗號。嚴格解析失敗、repair 修得回來,
+# 而且修完案例還在——「修補過但仍可用」。
+#
+# 註:要讓 extract_json 走到 repair 並不容易,它會先掃第一段**括號平衡**的子字串
+# 去試 json.loads,所以很多「看起來壞掉」的輸入其實有一段合法子物件可以解出來。
+# 這也說明了真實世界那次(R-140 少一個 `]`)為什麼難查:壞法要夠特定才會走到 repair,
+# 而走到的時候它不會失敗,只會悄悄給你一個語意錯誤的物件。
+_REPAIRABLE_PLAN = _CLEAN_PLAN.replace('"expect_flagged": false}]}',
+                                       '"expect_flagged": false},]}')
+
+# 修補得回來、但案例全部過不了形狀檢查(缺 condition_id)——修完等於什麼都不剩。
+_REPAIRABLE_BUT_EMPTY = _REPAIRABLE_PLAN.replace('"condition_id": "C1", ', '')
+
+
+def _gen(monkeypatch, outputs: list[str]):
+    """讓 generate_cases 依序拿到指定的模型輸出。"""
+    import asyncio
+
+    from orchestrator import spec_exec as se
+    seq = list(outputs)
+
+    async def fake(cfg, profile, system, user, hub=None, verbose=True,
+                   use_tools=True, trace=None, meta=None):
+        if meta is not None:
+            meta["finish_reason"] = "stop"
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    monkeypatch.setattr(se, "run_agent", fake)
+    return asyncio.run(se.generate_cases(_FakeCfg(), "R-999", "規格內容"))
+
+
+def test_修補過的輸出不可以提前結束(monkeypatch):
+    """修補過的計畫,它的 0 缺口可能是假的——被 repair 吃掉的案例不會出現在任何
+    地方,剩下的對它自己列出的條件剛好齊全。所以不能當成「完整覆蓋」收下。
+
+    第一次給修補過的、第二次給乾淨的:應該要採用第二次。
+    """
+    plan, gaps, _ = _gen(monkeypatch, [_REPAIRABLE_PLAN, _CLEAN_PLAN])
+    assert len(plan["cases"]) == 2
+    assert not any("JSON 不合法" in g for g in gaps), (
+        f"採用的是乾淨的計畫,不該再標格式錯誤:{gaps}")
+
+
+def test_只能拿到修補過的結果時_缺口要先講真正的原因(monkeypatch):
+    """三次都要修補、但修完仍有可用案例時,要回傳最佳版(不能因為 retry 用完就
+    退化成沒案例),但**缺口清單的第一條要講格式問題**。
+
+    放第一條是因為看的人通常只看第一條:寫「缺條件 C5 的 false 向」會把人導向
+    「改 prompt 讓模型多生一個案例」,而真正該做的是讓輸出的 JSON 合法。
+    """
+    plan, gaps, _ = _gen(monkeypatch, [_REPAIRABLE_PLAN] * 3)
+    assert plan["cases"], "重試用完就丟掉已抽到的結果了"
+    assert gaps and "JSON 不合法" in gaps[0], (
+        f"格式問題沒有放在第一條,看的人會照著後面的缺口去調 prompt:{gaps}")
+
+
+def test_修補後什麼都不剩時_失敗原因要指向格式而不是覆蓋度(monkeypatch):
+    """先前這種情況只會說「N 次嘗試皆無合法輸出」,看的人無從判斷是 prompt 問題、
+    模型問題、還是規則太大裝不下——而這三者的修法完全不同。"""
+    plan, gaps, _ = _gen(monkeypatch, [_REPAIRABLE_BUT_EMPTY] * 3)
+    assert plan["cases"] == []
+    assert gaps and "JSON 不合法" in gaps[0], f"失敗原因沒指向格式:{gaps}"
+
+
+def test_乾淨的輸出不會被誤標成格式錯誤(monkeypatch):
+    """反方向同樣重要:誤標會讓人去修一個不存在的格式問題。"""
+    plan, gaps, _ = _gen(monkeypatch, [_CLEAN_PLAN])
+    assert len(plan["cases"]) == 2
+    assert not gaps, f"乾淨的計畫不該有缺口:{gaps}"
+
+
+def test_乾淨的結果一律勝過修補過的(monkeypatch):
+    """即使修補過的那份「覆蓋數」比較多也一樣——它的覆蓋數本身就不可信,
+    拿它跟乾淨的比是比錯東西。"""
+    big_broken = _REPAIRABLE_PLAN.replace(
+        '"conditions": [{"id": "C1", "desc": "a > 0"}]',
+        '"conditions": [{"id": "C1", "desc": "a > 0"}, {"id": "C2", "desc": "a < 9"}]')
+    plan, gaps, _ = _gen(monkeypatch, [big_broken, _CLEAN_PLAN, _CLEAN_PLAN])
+    assert len(plan["conditions"]) == 1, (
+        f"採用了修補過的那份(條件 {len(plan['conditions'])} 個),"
+        "它的覆蓋數不可信,不該勝過乾淨的")
+    assert not any("JSON 不合法" in g for g in gaps)

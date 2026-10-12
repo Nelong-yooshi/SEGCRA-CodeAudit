@@ -776,26 +776,40 @@ def _mutate_all(args, src: pathlib.Path) -> int:
 S = "spec_exec.py"
 MUTANTS.update({
     "測資:有缺口也直接收下(回到舊行為)": (S,
-        "                if not gaps and n_conds >= max_conds:",
+        "                if not repaired and not gaps and n_conds >= max_conds:",
         "                if True:"),
     "測資:不留覆蓋最多的一版(只認最後一次)": (S,
-        "                if best is None or _covered(cleaned) > _covered(best[0]):\n"
-        "                    best = (cleaned, gaps, dropped)",
-        "                best = (cleaned, gaps, dropped)"),
+        "                if better:\n"
+        "                    best = (cleaned, gaps, dropped)\n"
+        "                    best_repaired = repaired",
+        "                best = (cleaned, gaps, dropped)\n"
+        "                best_repaired = repaired"),
     # review 第 4 點:缺口是對照模型自己拆的條件算的,拆得少的 0 缺口版本不能
     # 勝過拆得齊、只缺一點的版本;重試 prompt 不帶缺口,固定 seed 下等於白跑。
     "測資:0 缺口就提前結束,不看條件數有沒有變少": (S,
-        "                if not gaps and n_conds >= max_conds:",
-        "                if not gaps:"),
+        "                if not repaired and not gaps and n_conds >= max_conds:",
+        "                if not repaired and not gaps:"),
     "測資:最佳版本改回比缺口數": (S,
-        "                if best is None or _covered(cleaned) > _covered(best[0]):",
-        "                if best is None or len(gaps) < len(best[1]):"),
+        "                          and _covered(cleaned) > _covered(best[0])))",
+        "                          and len(gaps) < len(best[1])))"),
     "測資:重試 prompt 不帶上一次的缺口": (S,
         "        issues.append(\"上一次的測資計畫覆蓋不完整,缺:\\n\" + \"\\n\".join(f\"- {g}\" for g in gaps))",
         "        issues.append(\"上一次的測資計畫覆蓋不完整。\")"),
+    # #23 第 1 點:json-repair 不會失敗,它把壞掉的 JSON 修補成一個**合法但語意
+    # 錯誤**的物件。少了這三道,格式問題會被回報成「模型覆蓋不足」,而兩者的
+    # 修法完全不同(修 prompt / 限制輸出格式 vs 調 max_tokens、分批生成)。
+    "測資:修補過的輸出當成正常結果": (S,
+        "        repaired = bool(parse_meta.get(\"repaired\"))",
+        "        repaired = False"),
+    "測資:修補過的也能提前結束(假的 0 缺口被收下)": (S,
+        "                if not repaired and not gaps and n_conds >= max_conds:",
+        "                if not gaps and n_conds >= max_conds:"),
+    "測資:修補過的結果不在缺口裡說明(看的人會照著缺口去調 prompt)": (S,
+        "            return plan_, [_MALFORMED_GAP, *gaps_], dropped_",
+        "            return plan_, gaps_, dropped_"),
     "測資:重試用完就判失敗(丟掉已抽到的最佳版)": (S,
-        "    if best is not None:\n        return best",
-        "    if False:\n        return best"),
+        "    if best is not None:\n        if best_repaired:",
+        "    if False:\n        if best_repaired:"),
     # 執行中止後,沒跑到的案例必須列入覆蓋缺口。少了它,報告會顯示「跑了 N 個
     # 案例、零缺口」,讀起來像全覆蓋,實際上多數案例根本沒執行——而 coverage_gaps
     # 正是人用來判斷「這次到底驗了多少」的欄位。兩個早退點各一個突變點。
