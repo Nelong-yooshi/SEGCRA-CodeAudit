@@ -965,6 +965,28 @@ MUTANTS.update({
      "from .dbt_impact import analyze_macro_impact as analyze_macro_impact_isolated"),
 })
 
+# ---- get_mr_diff 帶出 diff_refs 的三個 sha(#15 接線與 #22 共用)
+MUTANTS.update({
+ "diff_refs:real 模式不帶出": ("../toolbox/gitlab.py",
+     '"sha": mr.get("sha", ""), **_diff_refs(mr), "files": files,',
+     '"sha": mr.get("sha", ""), "files": files,'),
+ "diff_refs:mock 模式不帶出": ("../toolbox/gitlab.py",
+     '"sha": mr.get("sha", f"mock-{mr_id}"), **_diff_refs(mr),',
+     '"sha": mr.get("sha", f"mock-{mr_id}"),'),
+ "diff_refs:不是完整 commit 編號也帶出": ("../toolbox/gitlab.py",
+     "isinstance(v := refs.get(k), str) and _SHA.fullmatch(v) else None",
+     "isinstance(v := refs.get(k), str) else None"),
+ "diff_refs:只比對開頭(結尾可夾帶)": ("../toolbox/gitlab.py",
+     "isinstance(v := refs.get(k), str) and _SHA.fullmatch(v) else None",
+     "isinstance(v := refs.get(k), str) and _SHA.match(v) else None"),
+ "diff_refs:不是物件也照用": ("../toolbox/gitlab.py",
+     "    refs = refs if isinstance(refs, dict) else {}",
+     "    refs = refs or {}"),
+ "diff_refs:少帶 start_sha": ("../toolbox/gitlab.py",
+     '_DIFF_REF_KEYS = ("base_sha", "head_sha", "start_sha")',
+     '_DIFF_REF_KEYS = ("base_sha", "head_sha")'),
+})
+
 
 def _run_baseline(src: pathlib.Path, python: str, timeout: int) -> tuple[str | None, float]:
     """複製一份未突變的專案,跑一次測試套件,確認完全乾淨才能開始判斷突變。

@@ -287,7 +287,9 @@ macro);正式環境的主機**不連外網**,審查流程裡不能有任何執�
 ## 後續
 
 - **macro 反查接進管線**:下載、解壓與轉接層已實作(見上一節),尚待接進 pipeline
-  (需要 MR 的 base commit,也就是 GitLab 的 `diff_refs.base_sha`)與實測
+  與實測。MR 的 base / head commit 已由 `get_mr_diff` 帶出(`base_sha` / `head_sha` /
+  `start_sha`,欄位名照 GitLab 的 `diff_refs`);拿不到或不是完整 commit 編號時是 None,
+  接線時遇到 None 不做前後版本比較、交人工
 - **真實 GitLab 模式只拿得到 diff 新增的行**:預掃與執行驗證目前用的是 diff 還原出的新增行,
   只改了幾行的檔案送去檢查的是殘缺片段。接線後,dbt 專案內被改到的檔案改用取回的 head
   版本全文;dbt 專案以外的 SQL 檔用 Files API 依 head sha 取全文

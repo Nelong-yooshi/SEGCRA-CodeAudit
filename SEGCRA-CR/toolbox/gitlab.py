@@ -61,6 +61,22 @@ def _api_pages(path: str, params: dict | None = None) -> tuple[list, bool]:
     return items, bool(page)
 
 
+# GitLab MR 的 diff_refs 三個欄位,名稱照 GitLab API 原樣(post_inline_comment 也用這組)
+_DIFF_REF_KEYS = ("base_sha", "head_sha", "start_sha")
+
+
+def _diff_refs(mr: dict) -> dict:
+    """取出 MR 的 base_sha / head_sha / start_sha;拿不到或不是完整 commit 編號的給 None。
+
+    GitLab 在 MR 還沒有 commit、或 diff 尚未算好時 `diff_refs` 是 null;mock 模式的
+    fixture 通常也沒有。呼叫端一律要處理 None(不能做前後版本比較就交人工),不可以
+    拿別的值代替。"""
+    refs = mr.get("diff_refs")
+    refs = refs if isinstance(refs, dict) else {}
+    return {k: v if isinstance(v := refs.get(k), str) and _SHA.fullmatch(v) else None
+            for k in _DIFF_REF_KEYS}
+
+
 # --- 打包下載(#15)------------------------------------------------------
 
 # 完整的 commit 編號(SHA-1 40 位或 SHA-256 64 位,小寫)。不接受分支名:分支在審查
@@ -209,6 +225,9 @@ def _mock_output(mr_id: str, kind: str, payload: dict):
 def get_mr_diff(mr_id: str) -> str:
     """取得 MR 的標題、描述、head commit sha 與 diff(逐檔)。
 
+    另外帶 GitLab `diff_refs` 的 `base_sha` / `head_sha` / `start_sha`(欄位名照 GitLab
+    原樣),給「依 commit 取回程式碼」的流程用;拿不到時是 None,見 `_diff_refs`。
+
     real 模式的 `files` 每項多帶 `unreviewable`:GitLab 對過大或被摺疊的檔案
     不會回傳 diff 內容(`too_large`/`collapsed`),這種檔案沒有經過任何審查,
     `unreviewable=True` 讓後面的 `enforce_unreviewable` 能攔下來,而不是
@@ -223,12 +242,12 @@ def get_mr_diff(mr_id: str) -> str:
                   "unreviewable": bool(c.get("too_large") or c.get("collapsed"))}
                  for c in changes]
         return json.dumps({"title": mr["title"], "description": mr.get("description", ""),
-                           "sha": mr.get("sha", ""), "files": files,
+                           "sha": mr.get("sha", ""), **_diff_refs(mr), "files": files,
                            "truncated": truncated}, ensure_ascii=False)
     mr = _mock_mr(mr_id)
     return json.dumps({"title": mr["title"], "description": mr.get("description", ""),
-                       "sha": mr.get("sha", f"mock-{mr_id}"), "files": mr["files"]},
-                      ensure_ascii=False)
+                       "sha": mr.get("sha", f"mock-{mr_id}"), **_diff_refs(mr),
+                       "files": mr["files"]}, ensure_ascii=False)
 
 
 def get_file(path: str, ref: str = "main", mr_id: str = "") -> str:
