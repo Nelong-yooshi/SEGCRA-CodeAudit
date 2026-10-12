@@ -1,0 +1,17 @@
+{
+  "title": "調整 is_large 的判斷",
+  "description": "金額不在既有清單裡的也算大額。(合成資料,僅供示範 dbt 接線)",
+  "sha": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+  "diff_refs": {
+    "base_sha": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
+    "head_sha": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+    "start_sha": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+  },
+  "files": [
+    {
+      "path": "macros/is_large.sql",
+      "old_path": "macros/is_large.sql",
+      "diff": "@@ -1 +1 @@\n-{% macro is_large(col) %}{{ col }} > 1000{% endmacro %}\n+{% macro is_large(col) %}{{ col }} > 1000 or {{ col }} not in (select amount from {{ ref('txn_log') }}){% endmacro %}\n"
+    }
+  ]
+}

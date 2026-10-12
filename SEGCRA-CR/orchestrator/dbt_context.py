@@ -17,11 +17,19 @@ MR 的 diff 裡。這裡依 MR 的 head commit 取回專案(dbt_project.load_dbt
 少了一段的 SQL,或讓規則掃到片段卻看起來沒問題。
 
 本模組不渲染樣板、不寫檔;連網只發生在 load(預設 load_dbt_project → download_archive)。
+
+mock 模式(沒有設定 GitLab)沒有地方可以打包下載。若 `<FIXTURES_DIR>/dbt_archives/<commit 編號>/`
+放了那個 commit 的專案,就把它打包成跟 GitLab 一樣的形狀、交給**同一個** load_dbt_project
+(解壓、路徑檢查、大小上限、讀設定都走同一條路);沒有放就維持「不適用」。用途是 demo、測試與評測
+能實際跑到接線——內附的範例在 examples/dbt_wiring/。
 專案的屬性檔(yml)是待審 repo 的內容:整理專案資訊時要解析它們,放在有逾時與記憶體上限的
 子行程裡做(_summarize_isolated),逾時或失敗就當成專案取不回來。
 """
 import dataclasses
+import gzip
+import io
 import re
+import tarfile
 from dataclasses import dataclass, field
 
 from .dbt_impact import ImpactReport, normalize_path, path_kind
@@ -126,7 +134,7 @@ def prepare_dbt_context(mr: dict, dbt_cfg: dict | None, *, real_mode: bool | Non
     """回傳 None = 不需要 / 不適用,預掃的行為與沒有這個模組時完全相同:
 
       * dbt.enabled 不是 True(預設關閉)
-      * 不是真實 GitLab 模式(mock:fixture 已經帶完整內容,也沒有 GitLab 可以取回專案)
+      * mock 模式,而且 fixture 目錄裡沒有放這個 MR 那個 commit 的專案(見模組說明)
       * MR 沒有改到 dbt 專案目錄裡的 .sql / .yml / .yaml
 
     其餘情況一律回傳 DbtContext;取回失敗時 error 有值(見模組說明)。不丟例外。
@@ -140,7 +148,13 @@ def prepare_dbt_context(mr: dict, dbt_cfg: dict | None, *, real_mode: bool | Non
         from toolbox import gitlab
         real_mode = gitlab.REAL_MODE
     if real_mode is not True:
-        return None
+        # mock 模式:fixture 目錄有放這個 commit 的專案才適用;呼叫端自己給了 load 就照它的
+        if not isinstance(mr, dict) or _fixture_project_dir(mr.get("sha")) is None:
+            return None
+        if load is load_dbt_project:
+            load = _load_from_fixtures
+        # fixture 的變更清單一定是完整的(mock 的 get_mr_diff 不帶 truncated 這個欄位)
+        mr = {**mr, "truncated": mr.get("truncated", False)}
     try:
         prefix = check_project_dir(dbt_cfg.get("project_dir", ""))
     except DbtProjectError as e:
@@ -225,3 +239,51 @@ def _summarize_isolated(project: DbtProject) -> tuple[DbtProjectInfo, dict] | No
             and isinstance(result[0], DbtProjectInfo) and isinstance(result[1], dict)):
         return result
     return None
+
+
+# ------------------------------------------------------------------ mock 模式的專案來源
+MAX_FIXTURE_FILES = 2_000
+
+
+def _fixture_project_dir(sha):
+    """<FIXTURES_DIR>/dbt_archives/<sha>/;sha 不是完整的 commit 編號、或目錄不存在回 None。
+
+    sha 會被接進路徑,所以只接受完整的 commit 編號(純十六進位),`..` 之類的值到不了檔案系統。"""
+    if not (isinstance(sha, str) and _SHA.fullmatch(sha)):
+        return None
+    from toolbox import gitlab
+    path = gitlab.FIXTURES_DIR / "dbt_archives" / sha
+    return path if path.is_dir() else None
+
+
+def _fixture_archive(sha, path="", *, max_bytes):
+    """把 fixture 目錄打包成 GitLab `/repository/archive` 的形狀(單一頂層目錄;指定子目錄時
+    保留那一層),給 load_dbt_project 的 download 參數用。簽章與 toolbox.gitlab.download_archive 相同。"""
+    root = _fixture_project_dir(sha)
+    if root is None:
+        raise DbtProjectError("fixture 裡沒有這個 commit 的 dbt 專案")
+    top = f"fixture-{sha}" + (f"-{path}" if path else "")
+    members = sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink())
+    if len(members) > MAX_FIXTURE_FILES:
+        raise DbtProjectError(f"fixture 的 dbt 專案超過 {MAX_FIXTURE_FILES} 個檔案")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tar:
+        entry = tarfile.TarInfo(top)
+        entry.type = tarfile.DIRTYPE
+        tar.addfile(entry)
+        for member in members:
+            rel = member.relative_to(root).as_posix()
+            if path and not rel.startswith(path + "/"):
+                continue
+            data = member.read_bytes()
+            info = tarfile.TarInfo(f"{top}/{rel}")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    data = gzip.compress(buf.getvalue())
+    if len(data) > max_bytes:
+        raise DbtProjectError(f"fixture 的 dbt 專案打包後超過 {max_bytes} 位元組上限")
+    return data
+
+
+def _load_from_fixtures(sha, project_dir: str = "") -> DbtProject:
+    return load_dbt_project(sha, project_dir, download=_fixture_archive)

@@ -723,6 +723,48 @@ MUTANTS.update({
      "    base_summary = (summarize(base) or (DbtProjectInfo(), {})) if isinstance(base, DbtProject) and base.ok else None"),
 })
 
+# ---- mock 模式的 dbt 專案來源(fixture 目錄;#15 接線)
+MUTANTS.update({
+ "範例專案:fixture 有放專案也不用": ("dbt_context.py",
+     "        if not isinstance(mr, dict) or _fixture_project_dir(mr.get(\"sha\")) is None:\n            return None",
+     "        if True:\n            return None"),
+ "範例專案:fixture 沒放專案也往下走(變成取回失敗)": ("dbt_context.py",
+     "        if not isinstance(mr, dict) or _fixture_project_dir(mr.get(\"sha\")) is None:",
+     "        if not isinstance(mr, dict):"),
+ "範例專案:呼叫端給的 load 被換掉": ("dbt_context.py",
+     "        if load is load_dbt_project:\n            load = _load_from_fixtures",
+     "        if True:\n            load = _load_from_fixtures"),
+ "範例專案:不用 fixture 的專案來源(去打真的下載)": ("dbt_context.py",
+     "        if load is load_dbt_project:\n            load = _load_from_fixtures",
+     "        if False:\n            load = _load_from_fixtures"),
+ "範例專案:變更清單沒有標成完整(反查做不了)": ("dbt_context.py",
+     "        mr = {**mr, \"truncated\": mr.get(\"truncated\", False)}",
+     "        mr = dict(mr)"),
+ "範例專案:MR 明講不完整也當成完整": ("dbt_context.py",
+     "        mr = {**mr, \"truncated\": mr.get(\"truncated\", False)}",
+     "        mr = {**mr, \"truncated\": False}"),
+ "範例專案:真實模式也去看 fixture": ("dbt_context.py",
+     "    if real_mode is not True:\n        # mock 模式",
+     "    if True:\n        # mock 模式"),
+ "範例專案:commit 編號不檢查就接進路徑": ("dbt_context.py",
+     "    if not (isinstance(sha, str) and _SHA.fullmatch(sha)):",
+     "    if not isinstance(sha, str):"),
+ "範例專案:不是目錄也算有專案": ("dbt_context.py",
+     "    return path if path.is_dir() else None", "    return path if path.exists() else None"),
+ "範例專案:指定子目錄時整包都打": ("dbt_context.py",
+     "            if path and not rel.startswith(path + \"/\"):\n                continue",
+     "            if False:\n                continue"),
+ "範例專案:子目錄的前綴不含斜線(dbt_sub_other 也打進去)": ("dbt_context.py",
+     "            if path and not rel.startswith(path + \"/\"):",
+     "            if path and not rel.startswith(path):"),
+ "範例專案:打包後的大小不檢查": ("dbt_context.py",
+     "    if len(data) > max_bytes:", "    if False:"),
+ "範例專案:檔案數不檢查": ("dbt_context.py",
+     "    if len(members) > MAX_FIXTURE_FILES:", "    if False:"),
+ "範例專案:頂層目錄不帶子目錄名(與 GitLab 的形狀不同仍要讀得到)": ("dbt_context.py",
+     "            info = tarfile.TarInfo(f\"{top}/{rel}\")", "            info = tarfile.TarInfo(rel)"),
+})
+
 
 MUTANTS.update({
  "hook:config(...) 不檢查": (I, "            refs.dynamic |= _config_call_is_dynamic(call)", "            pass"),
