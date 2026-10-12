@@ -411,6 +411,48 @@ def copy_project(src: pathlib.Path, dst: pathlib.Path) -> None:
             shutil.copyfile(item, dst / item.name)
 
 
+# ---- 展開器從記憶體裡的專案檔案讀 macro(#15 接線:macro_files)
+MUTANTS.update({
+ "字典來源:給了也不用": (
+     "    if code_root is None and macro_files is None:", "    if code_root is None:"),
+ "字典來源:兩種來源同時給不拒絕": (
+     "    if code_root is not None and macro_files is not None:", "    if False:"),
+ "字典來源:不是字典不拒絕": (
+     "    if not isinstance(macro_files, dict):", "    if False:"),
+ "字典來源:路徑與內容的型別不檢查": (
+     "        if not isinstance(path, str) or not isinstance(text, str):", "        if False:"),
+ "字典來源:路徑分段不檢查(.. 與空段)": (
+     "                or any(part in (\"\", \".\", \"..\") for part in path.split(\"/\"))):\n"
+     "            raise DbtRenderError(\"macro_files 含不合法的路徑\")",
+     "                or False):\n"
+     "            raise DbtRenderError(\"macro_files 含不合法的路徑\")"),
+ "字典來源:反斜線路徑不檢查": (
+     "        if (\"\\\\\" in path or \":\" in path or path.startswith(\"/\")",
+     "        if (\":\" in path or path.startswith(\"/\")"),
+ "字典來源:磁碟代號與絕對路徑不檢查": (
+     "        if (\"\\\\\" in path or \":\" in path or path.startswith(\"/\")",
+     "        if (\"\\\\\" in path"),
+ "字典來源:錯誤訊息回顯路徑": (
+     "            raise DbtRenderError(\"macro_files 含不合法的路徑\")",
+     "            raise DbtRenderError(f\"macro_files 含不合法的路徑:{path}\")"),
+ "字典來源:目錄前綴不含斜線(macros_backup 也載入)": (
+     "        prefix = name + \"/\"", "        prefix = name"),
+ "字典來源:不限 .sql": (
+     "                         if p.startswith(prefix) and p.endswith(\".sql\")),",
+     "                         if p.startswith(prefix)),"),
+ "字典來源:整串排序(與磁碟順序不同)": (
+     "                        key=lambda item: item[0].split(\"/\"))",
+     "                        key=lambda item: item[0])"),
+ "字典來源:不排序(依字典的插入順序)": (
+     "                        key=lambda item: item[0].split(\"/\"))",
+     "                        key=lambda item: 0)"),
+ "字典來源:render_model 沒把字典傳下去": (
+     "macro_dirs, adapter, project, macro_files)", "macro_dirs, adapter, project)"),
+ "字典來源:給了字典仍讀 model 旁邊的 macros": (
+     "    elif source is None and macro_files is None:", "    elif source is None:"),
+})
+
+
 MUTANTS.update({
  "hook:config(...) 不檢查": (I, "            refs.dynamic |= _config_call_is_dynamic(call)", "            pass"),
  "hook:config.set 不檢查": (I, "            refs.dynamic |= _config_set_is_dynamic(call)", "            pass"),

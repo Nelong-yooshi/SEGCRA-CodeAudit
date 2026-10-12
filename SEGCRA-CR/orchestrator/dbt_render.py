@@ -586,12 +586,55 @@ def _render_capped(template, limit: int) -> str:
 
 
 # ------------------------------------------------------- Jinja 環境與 dbt 樁
+def _macro_dir_names(macro_dirs) -> list[str]:
+    """檢查 macro 目錄設定,回傳以 / 分段的相對路徑。
+
+    目錄設定由呼叫端給,不接受跳出專案或指向別處的路徑。判斷不依平台:
+    Windows 上 `專案 / "/etc"` 會跳到磁碟根目錄,`is_absolute()` 卻是 False。"""
+    names = []
+    for name in ((macro_dirs,) if isinstance(macro_dirs, str) else macro_dirs):
+        posix = name.replace("\\", "/") if isinstance(name, str) else ""
+        # 空字串 / None 會變成空的路徑段,一併被下面的檢查擋下
+        if (posix.startswith("/") or ":" in posix
+                or any(part in ("", ".", "..") for part in posix.split("/"))):
+            raise DbtRenderError(f"macro 目錄設定不合法:{name!r}")
+        names.append(posix)
+    return names
+
+
+def _macro_files_from_dict(macro_files, dir_names: list[str]) -> list[tuple[str, str]]:
+    """從 {路徑: 內容} 挑出 macro 目錄底下的 .sql,順序與從磁碟讀相同。
+
+    這份資料來自待審的 repo(經 archive 解壓),路徑照樣檢查一次:不是「相對路徑、以 /
+    分段、沒有 . 與 ..」的鍵,或內容不是字串,整份拒絕(不猜、不略過)。錯誤訊息不回顯路徑。
+    順序:依 macro_dirs 的順序,各目錄內依路徑分段排序(與 sorted(rglob) 在 POSIX 上相同),
+    同名 macro 由後載入的勝出,所以順序必須一致。"""
+    if not isinstance(macro_files, dict):
+        raise DbtRenderError("macro_files 必須是 {路徑: 內容} 的字典")
+    for path, text in macro_files.items():
+        if not isinstance(path, str) or not isinstance(text, str):
+            raise DbtRenderError("macro_files 的路徑與內容都必須是字串")
+        if ("\\" in path or ":" in path or path.startswith("/")
+                or any(part in ("", ".", "..") for part in path.split("/"))):
+            raise DbtRenderError("macro_files 含不合法的路徑")
+    files = []
+    for name in dir_names:
+        prefix = name + "/"
+        files += sorted(((p, t) for p, t in macro_files.items()
+                         if p.startswith(prefix) and p.endswith(".sql")),
+                        key=lambda item: item[0].split("/"))
+    return files
+
+
 def build_env(code_root=None, variables: dict | None = None,
               database: str | None = None, schema: str = DEFAULT_SCHEMA,
               macro_dirs=DEFAULT_MACRO_DIRS, adapter: str = DEFAULT_ADAPTER,
-              project: DbtProjectInfo | None = None):
-    """建好含 dbt 樁與 macro 的 Environment。code_root 為 None 時不載入任何 macro。
+              project: DbtProjectInfo | None = None, macro_files: dict | None = None):
+    """建好含 dbt 樁與 macro 的 Environment。code_root 與 macro_files 都沒給時不載入任何 macro。
 
+    macro_files 專案的檔案 {相對專案根的路徑: 內容}(從 GitLab 取回、不在磁碟上的專案用)。
+                只載入 macro 目錄底下的 .sql;與 code_root 只能擇一。兩種來源走同一段
+                載入邏輯(上限、共用命名空間、內建同名檢查、壞檔記錄),結果相同
     macro_dirs  專案的 macro 目錄(dbt 的 macro-paths;預設 macros/)
     adapter     dbt 轉接器名稱,決定 adapter.dispatch 先找哪個前綴的實作
     project     專案層級資訊;給了才驗證 ref()/source() 的對象、套用 sources.yml
@@ -646,25 +689,25 @@ def build_env(code_root=None, variables: dict | None = None,
     macros: list[str] = []
     conflicts: list[str] = []
     problems: list[str] = []
-    if code_root is None:
+    if code_root is None and macro_files is None:
         return env, macros, conflicts, problems
+    if code_root is not None and macro_files is not None:
+        raise DbtRenderError("code_root 與 macro_files 只能擇一")
 
-    root = pathlib.Path(code_root)
     seen: dict[str, str] = {}
-    files = []
-    for name in ((macro_dirs,) if isinstance(macro_dirs, str) else macro_dirs):
-        # 目錄設定由呼叫端給,不接受跳出專案或指向別處的路徑。判斷不依平台:
-        # Windows 上 `專案 / "/etc"` 會跳到磁碟根目錄,`is_absolute()` 卻是 False。
-        posix = name.replace("\\", "/") if isinstance(name, str) else ""
-        # 空字串 / None 會變成空的路徑段,一併被下面的檢查擋下
-        if (posix.startswith("/") or ":" in posix
-                or any(part in ("", ".", "..") for part in posix.split("/"))):
-            raise DbtRenderError(f"macro 目錄設定不合法:{name!r}")
-        macro_dir = root / posix
-        if not macro_dir.is_dir() or macro_dir.is_symlink():
-            continue
-        files += [f for f in sorted(macro_dir.rglob("*.sql"))
-                  if not f.is_symlink() and f.is_file()]   # 符號連結可能指向任意檔案
+    dir_names = _macro_dir_names(macro_dirs)
+    # files 的每一項是 (相對專案根的路徑, 來源);來源是磁碟上的檔案或已在記憶體的內容
+    if macro_files is not None:
+        files = _macro_files_from_dict(macro_files, dir_names)
+    else:
+        root = pathlib.Path(code_root)
+        files = []
+        for posix in dir_names:
+            macro_dir = root / posix
+            if not macro_dir.is_dir() or macro_dir.is_symlink():
+                continue
+            files += [(f.relative_to(root).as_posix(), f) for f in sorted(macro_dir.rglob("*.sql"))
+                      if not f.is_symlink() and f.is_file()]   # 符號連結可能指向任意檔案
     if not files:
         return env, macros, conflicts, problems
     if len(files) > MAX_MACRO_FILES:
@@ -677,10 +720,9 @@ def build_env(code_root=None, variables: dict | None = None,
     # dbt 專用的區塊標籤只在這個階段解析得掉(理由見 _DbtBlocks)
     env.segcra_macro_phase = True
     env.segcra_relation_usage["loading_macros"] = True
-    for f in files:
-        rel = f.relative_to(root).as_posix()
+    for rel, origin in files:
         try:
-            text = f.read_bytes().decode("utf-8")
+            text = origin if isinstance(origin, str) else origin.read_bytes().decode("utf-8")
         except UnicodeDecodeError as e:
             problems.append(f"{rel}:{_safe_error(e)}")
             continue
@@ -885,7 +927,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
                  source: str | None = None, database: str | None = None,
                  schema: str = DEFAULT_SCHEMA, macro_dirs=DEFAULT_MACRO_DIRS,
                  adapter: str = DEFAULT_ADAPTER,
-                 project: DbtProjectInfo | None = None) -> RenderResult:
+                 project: DbtProjectInfo | None = None,
+                 macro_files: dict | None = None) -> RenderResult:
     """在同一行程內展開一份 dbt model。**待審的 MR 內容請改用 render_model_isolated()。**
 
     model_path  model 檔路徑(相對 code_root 或絕對路徑皆可)
@@ -899,13 +942,15 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
     adapter     dbt 轉接器名稱,決定 adapter.dispatch 先找哪個前綴的實作
     project     專案層級資訊(DbtProjectInfo);給了才驗證 ref()/source() 的對象是否存在、
                 套用 sources.yml,且只在真的無法確定時才帶 relation_notice
+    macro_files 專案的檔案 {相對路徑: 內容},macro 從這裡讀而不讀磁碟(見 build_env);
+                與 code_root 只能擇一
 
     任何失敗都收斂成 ok=False 而不丟例外。
     """
     model_path = pathlib.Path(model_path)
     if code_root is not None:
         root = pathlib.Path(code_root)
-    elif source is None:
+    elif source is None and macro_files is None:
         root = model_path.parent
     else:
         root = None
@@ -916,7 +961,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
         if len(source) > MAX_SOURCE_CHARS:
             raise DbtRenderError(f"原始碼超過 {MAX_SOURCE_CHARS} 字元上限")
         env, macros, conflicts, problems = build_env(root, variables, database, schema,
-                                                     macro_dirs, adapter, project)
+                                                     macro_dirs, adapter, project, macro_files)
         # dbt 讀檔時會去掉頭尾空白再渲染(開頭空行不會出現在編譯結果裡)
         body = source.strip()
         clean = _render_capped(env.from_string(body), MAX_OUTPUT_CHARS)
