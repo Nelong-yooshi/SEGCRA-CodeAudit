@@ -17,7 +17,7 @@ import tarfile
 import pytest
 
 import orchestrator.pipeline as pipeline
-from orchestrator import dbt_project
+from orchestrator import dbt_context, dbt_project
 from orchestrator.config import DBT_DATABASE_PLACEHOLDER, _load_dbt_section, load_config
 from orchestrator.dbt_context import DbtContext, prepare_dbt_context
 from orchestrator.dbt_project import DbtProject, load_dbt_project
@@ -77,6 +77,16 @@ class _Loader:
                 raise self.fail
             return _gz(self.files, path)
         return load_dbt_project(sha, prefix, download=download)
+
+
+# 整理專案資訊在正式路徑是開子行程做的(見 dbt_context._summarize_isolated);測試裡每次都開
+# 子行程太慢,預設換成同行程。要驗子行程本身的測試用 _REAL_SUMMARIZE_ISOLATED。
+_REAL_SUMMARIZE_ISOLATED = dbt_context._summarize_isolated
+
+
+@pytest.fixture(autouse=True)
+def _summarize_in_process(monkeypatch):
+    monkeypatch.setattr(dbt_context, "_summarize_isolated", dbt_context._summarize)
 
 
 @pytest.fixture(autouse=True)
@@ -145,9 +155,9 @@ def test_real_mode預設讀gitlab的設定(monkeypatch):
 
 
 @pytest.mark.parametrize("paths", [
-    [], ["models/schema.yml"], ["README.md", "docs/a.md"], ["models/a.SQL.txt"], ["models/a.py"],
-], ids=["沒有檔案", "只有 yml", "文件", "不是 .sql 結尾", "Python model"])
-def test_沒改到專案裡的sql_不取回(paths):
+    [], ["README.md", "docs/a.md"], ["models/a.SQL.txt"], ["models/a.py"], ["models/data.csv"],
+], ids=["沒有檔案", "文件", "不是 .sql 結尾", "Python model", "seed"])
+def test_沒改到專案裡的sql或yml_不取回(paths):
     mr = _mr([_f(p) for p in paths])
     assert prepare_dbt_context(mr, CFG, real_mode=True, load=_never) is None
 
@@ -476,7 +486,10 @@ def test_review_mr_沒開dbt_完全不取回(dry_run):
 
 
 def test_review_mr_mock模式_完全不取回(dry_run):
-    dry_run(_never, real_mode=False)
+    # 取回時丟的例外會被收斂成「取回失敗」,所以要看結果:沒有取回失敗的記錄才算沒取回
+    report, pre = dry_run(_never, real_mode=False)
+    assert not any(str(e.get("dbt_render_error", "")).startswith(_DBT_FETCH_FAILED) for e in pre)
+    assert not any("無法取回 dbt 專案" in f["detail"] for f in report["findings"])
 
 
 # ─────────────────── 8. 設定 ───────────────────
@@ -586,3 +599,79 @@ def test_規則掃得到只出現在macro展開結果裡的問題(dry_run):
     assert any(h["rule"] == "R001" and h["severity"] == "blocker" for h in pre[0]["rules"])
     assert any(f["severity"] == "blocker" and f["file"] == "models/mrt_big.sql"
                for f in report["findings"])
+
+
+# ─────────────────── 11. 專案資訊在子行程裡整理;seed / snapshot 的表名不當成確定 ───────────────────
+
+def test_整理專案資訊_子行程的結果與同行程相同():
+    project = _Loader()(SHA, "")
+    assert project.ok
+    here = dbt_context._summarize(project)
+    isolated = _REAL_SUMMARIZE_ISOLATED(project)
+    assert isolated is not None and isolated == here
+    assert isolated[1] == {"macros/checks.sql": MACRO}
+
+
+def test_預設走子行程():
+    """本檔其他測試為了速度換成同行程;這裡確認沒換的時候用的是子行程那一個。"""
+    assert _REAL_SUMMARIZE_ISOLATED is not dbt_context._summarize
+    calls = []
+
+    def fake_isolated(project):
+        calls.append(project)
+        return dbt_context._summarize(project)
+    import unittest.mock
+    with unittest.mock.patch.object(dbt_context, "_summarize_isolated", fake_isolated):
+        ctx = prepare_dbt_context(_mr([_f("models/mrt_big.sql")]), CFG, real_mode=True, load=_Loader())
+    assert len(calls) == 1 and ctx.error is None
+
+
+def test_整理專案資訊逾時或失敗_當成專案取不回來():
+    ctx = prepare_dbt_context(_mr([_f("models/mrt_big.sql")]), CFG, real_mode=True, load=_Loader(),
+                              summarize=lambda project: None)
+    assert ctx.error == "dbt 專案的屬性檔解析逾時或失敗" and ctx.project is None
+    assert ctx.impact.all_models_possibly_affected
+
+
+@pytest.mark.parametrize("bad", [None, "x", (1, 2), (dbt_context.DbtProjectInfo(),),
+                                 (dbt_context.DbtProjectInfo(), "x"), ("x", {})],
+                         ids=["None", "字串", "型別不對", "少一項", "macro 不是字典", "資訊不是物件"])
+def test_子行程回傳的形狀不對_當成失敗(monkeypatch, bad):
+    monkeypatch.setattr(dbt_context, "run_isolated", lambda *a, **kw: bad)
+    assert _REAL_SUMMARIZE_ISOLATED(_Loader()(SHA, "")) is None
+
+
+def test_子行程失敗時回None(monkeypatch):
+    seen = {}
+
+    def fake_run(fn, args, **kw):
+        seen.update(kw, fn=fn)
+        return kw["on_failure"]("TimeoutError: 逾時")
+    monkeypatch.setattr(dbt_context, "run_isolated", fake_run)
+    assert _REAL_SUMMARIZE_ISOLATED(_Loader()(SHA, "")) is None
+    assert seen["fn"] is dbt_context._summarize and seen["timeout_s"] > 0 and seen["max_memory_mb"] > 0
+
+
+SEEDED = {**PROJECT,
+          "seeds/country.csv": "code,name\n",
+          "snapshots/snap.sql": "{% snapshot snap_dim %}SELECT 1{% endsnapshot %}",
+          "models/py_score.py": "def model(dbt, session): ...\n"}
+
+
+def test_seed與snapshot_知道存在_但表名不當成確定():
+    """snapshot 的 target_schema / alias 寫在區塊的 config 裡、seed 的 alias 寫在 seed 目錄的
+    屬性檔裡,專案資訊都沒有讀;用預設慣例展開可能是錯的表名。"""
+    ctx = _ctx(SEEDED)
+    for name in ("country", "snap_dim", "py_score"):
+        assert name in ctx.info.ref_names and name in ctx.info.uncertain_models, name
+    assert "stg_txn" in ctx.info.ref_names and "stg_txn" not in ctx.info.uncertain_models
+
+
+@pytest.mark.parametrize("name", ["country", "snap_dim"])
+def test_ref到seed或snapshot_帶無法確定的提醒(name):
+    src = "SELECT * FROM {{ ref('" + name + "') }}"
+    pre, hub = _prescan([_f("models/x.sql", full_content=src)], ctx=_ctx(SEEDED))
+    assert "dbt_render_error" not in pre[0] and pre[0].get("dbt_render_notice")
+    certain, _ = _prescan([_f("models/x.sql", full_content="SELECT * FROM {{ ref('stg_txn') }}")],
+                          ctx=_ctx(SEEDED))
+    assert "dbt_render_notice" not in certain[0]

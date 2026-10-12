@@ -665,6 +665,14 @@ def _kind(path: str, model_dirs, macro_dirs) -> str:
     return "other"
 
 
+def path_kind(path: str, model_dirs, macro_dirs) -> str:
+    """專案內的路徑屬於哪一類:macro / model / dbt_config / other。
+
+    給接線(dbt_context)用:它要判斷變更檔是不是 macro、MR 是不是只改到 model,必須跟
+    反查用同一套規則,否則兩邊對同一個檔的看法會不一樣。"""
+    return _kind(path, model_dirs, macro_dirs)
+
+
 def _is_builtin_override(name: str) -> bool:
     if name in BUILTIN_MACROS or name in _CONTEXT_OVERRIDES or name.startswith("materialization_"):
         return True
