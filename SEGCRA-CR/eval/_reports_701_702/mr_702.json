@@ -1,0 +1,201 @@
+{
+  "score": 65,
+  "verdict": "needs_changes",
+  "summary": "本次修改將條件 1 的結餘門檻由「含」改為「不含」，與核定規格不符，會導致邊界案例漏報。",
+  "findings": [
+    {
+      "file": "models/mrt_RETAIL_M1.sql",
+      "line": 158,
+      "severity": "major",
+      "title": "實作與核定規格不符",
+      "detail": "核定規格要求條件 1-7 的 eod_balance 為「≤ 1,000」(含)，但本次修改將運算子由 `<=` 改為 `<` (不含)。這會導致當帳戶結餘正好等於 1,000 時，該帳戶將被排除在異常清單之外，造成漏報。",
+      "suggestion": "請將 `AND eod_balance < 1000` 修改回 `AND eod_balance <= 1000` 以符合規格。",
+      "citations": [
+        {
+          "source": "specs/RETAIL_M1.md",
+          "article": "篩選條件 1-7 eod_balance ≤ 1,000"
+        }
+      ]
+    },
+    {
+      "file": "models/mrt_RETAIL_M1.sql",
+      "line": 1,
+      "severity": "info",
+      "title": "建議統一 SQL 風格與格式",
+      "detail": "預掃結果顯示檔案中存在多處風格問題（如 LT05 行長過長、LT15 過多空白行、CP02 大小寫不一致及前置逗號等）。雖然不影響正確性，但建議在合入前使用團隊統一的 Formatter 進行格式化。",
+      "suggestion": "執行 sqlfluff fix 或使用團隊推薦的 SQL 格式化工具。",
+      "citations": []
+    },
+    {
+      "file": "models/mrt_RETAIL_M1.sql",
+      "line": 0,
+      "severity": "minor",
+      "title": "[R002] SELECT * — 請明列欄位(含視圖/子查詢)",
+      "detail": "SELECT * — 請明列欄位(含視圖/子查詢)",
+      "suggestion": "",
+      "citations": []
+    },
+    {
+      "file": "models/mrt_RETAIL_M1.sql",
+      "line": 0,
+      "severity": "major",
+      "title": "執行驗證無法完成(沙盒不可用)",
+      "detail": "無法連線執行驗證沙盒 127.0.0.1:1433:(20009, b'DB-Lib error message 20009, severity 9:\\nUnable to connect: TDS server is unavailable or does not exist (127.0.0.1)\\nNet-Lib error during Connection r。這是驗證環境的問題,不代表程式有錯;但未經執行驗證,本 MR 不得自動放行。",
+      "suggestion": "啟動沙盒(scripts/sandbox.sh start)後重新觸發審查。",
+      "citations": []
+    }
+  ],
+  "_spec_exec": {
+    "passed": false,
+    "spec_code": "RETAIL_M1",
+    "engine": null,
+    "conditions": [
+      {
+        "id": "C_ACC",
+        "desc": "account_id is not null and not empty after trimming"
+      },
+      {
+        "id": "C_SI_MIN",
+        "desc": "Specified Inbound amount > 1000"
+      },
+      {
+        "id": "C_EJ",
+        "desc": "Account not in retail_m1_earlyjob for table_date - 1 day"
+      },
+      {
+        "id": "C1_1",
+        "desc": "kiosk_outbound_cnt between 2 and 3"
+      },
+      {
+        "id": "C1_2",
+        "desc": "kiosk_outbound_amt between 50,000 and 100,000"
+      },
+      {
+        "id": "C1_3",
+        "desc": "outbound_amt between 90,000 and 110,000"
+      },
+      {
+        "id": "C1_4",
+        "desc": "inbound_amt between 80,000 and 100,000"
+      },
+      {
+        "id": "C1_5",
+        "desc": "inbound_cnt equals 2"
+      },
+      {
+        "id": "C1_6",
+        "desc": "io_ratio between 0.60 and 1.20"
+      },
+      {
+        "id": "C1_7",
+        "desc": "eod_balance <= 1,000"
+      },
+      {
+        "id": "C2_1",
+        "desc": "kiosk_outbound_cnt between 3 and 4"
+      },
+      {
+        "id": "C2_2",
+        "desc": "kiosk_outbound_amt between 50,000 and 100,000"
+      },
+      {
+        "id": "C2_3",
+        "desc": "outbound_amt between 90,000 and 110,000"
+      },
+      {
+        "id": "C2_4",
+        "desc": "inbound_amt between 80,000 and 120,000"
+      },
+      {
+        "id": "C2_5",
+        "desc": "inbound_cnt between 3 and 8"
+      },
+      {
+        "id": "C2_6",
+        "desc": "io_ratio between 0.60 and 1.20"
+      },
+      {
+        "id": "C2_7",
+        "desc": "eod_balance <= 1,000"
+      },
+      {
+        "id": "C3_1",
+        "desc": "kiosk_outbound_cnt between 4 and 10"
+      },
+      {
+        "id": "C3_2",
+        "desc": "kiosk_outbound_amt between 90,000 and 100,000"
+      },
+      {
+        "id": "C3_3",
+        "desc": "inbound_amt between 80,000 and 100,000"
+      },
+      {
+        "id": "C3_4",
+        "desc": "inbound_cnt between 2 and 3"
+      },
+      {
+        "id": "C3_5",
+        "desc": "io_ratio between 1.00 and 1.50"
+      },
+      {
+        "id": "C3_6",
+        "desc": "eod_balance <= 1,000"
+      }
+    ],
+    "coverage_gaps": [
+      "條件 C1_2 缺 false 向案例",
+      "條件 C1_3 缺 true 向案例",
+      "條件 C1_3 缺 false 向案例",
+      "條件 C1_4 缺 true 向案例",
+      "條件 C1_4 缺 false 向案例",
+      "條件 C1_5 缺 true 向案例",
+      "條件 C1_5 缺 false 向案例",
+      "條件 C1_6 缺 true 向案例",
+      "條件 C1_6 缺 false 向案例",
+      "條件 C1_7 缺 true 向案例",
+      "條件 C1_7 缺 false 向案例",
+      "條件 C2_1 缺 true 向案例",
+      "條件 C2_1 缺 false 向案例",
+      "條件 C2_2 缺 true 向案例",
+      "條件 C2_2 缺 false 向案例",
+      "條件 C2_3 缺 true 向案例",
+      "條件 C2_3 缺 false 向案例",
+      "條件 C2_4 缺 true 向案例",
+      "條件 C2_4 缺 false 向案例",
+      "條件 C2_5 缺 true 向案例",
+      "條件 C2_5 缺 false 向案例",
+      "條件 C2_6 缺 true 向案例",
+      "條件 C2_6 缺 false 向案例",
+      "條件 C2_7 缺 true 向案例",
+      "條件 C2_7 缺 false 向案例",
+      "條件 C3_1 缺 true 向案例",
+      "條件 C3_1 缺 false 向案例",
+      "條件 C3_2 缺 true 向案例",
+      "條件 C3_2 缺 false 向案例",
+      "條件 C3_3 缺 true 向案例",
+      "條件 C3_3 缺 false 向案例",
+      "條件 C3_4 缺 true 向案例",
+      "條件 C3_4 缺 false 向案例",
+      "條件 C3_5 缺 true 向案例",
+      "條件 C3_5 缺 false 向案例",
+      "條件 C3_6 缺 true 向案例",
+      "條件 C3_6 缺 false 向案例"
+    ],
+    "case_results": [],
+    "dropped_cases": []
+  },
+  "_model_score": 85,
+  "decision": "needs_human",
+  "_policy_signals": {
+    "change_lines": 1,
+    "new_rule": false,
+    "severities": [
+      "info",
+      "major",
+      "minor"
+    ],
+    "pending_hints": false,
+    "spec_exec_passed": false
+  }
+}

@@ -1,0 +1,133 @@
+{
+  "generated_at": "2026-09-30T16:03:26+0800",
+  "code": {
+    "sha": "e8815f8",
+    "branch": "fix/testgen-coverage-retry",
+    "dirty": true,
+    "dirty_count": 1
+  },
+  "testset": {
+    "golden": "35dd78a5defd",
+    "golden_count": 34,
+    "specs": "c342f6607d55",
+    "specs_count": 7,
+    "frozen": "78e508f422fe",
+    "frozen_count": 1
+  },
+  "deps": {
+    "sqlglot": "30.18.0",
+    "jinja2": "3.1.6",
+    "sqlfluff": "4.3.0",
+    "openai": "3.10.0",
+    "pyyaml": "6.0.3",
+    "json-repair": "0.63.4",
+    "pymssql": "2.4.1"
+  },
+  "endpoint": {
+    "id": "7866d6383042",
+    "api_version": "0.31.1"
+  },
+  "model": {
+    "profiles": {
+      "review": {
+        "model": "gemma4:31b",
+        "num_ctx": 32768,
+        "temperature": 0.1,
+        "max_output_tokens": 8192,
+        "seed": null
+      }
+    },
+    "wanted": [
+      "gemma4:31b"
+    ],
+    "digest": {
+      "gemma4:31b": "6316f0629137b426"
+    },
+    "available": [
+      "gemma4:31b",
+      "gpt-oss:20b"
+    ]
+  },
+  "params": {
+    "temperature": {
+      "review": 0.1
+    },
+    "max_output_tokens": {
+      "review": 8192
+    },
+    "num_ctx_declared": {
+      "review": 32768
+    },
+    "num_ctx_effective": ">= probe",
+    "seed_effective": true,
+    "seed_configured": {
+      "review": null
+    }
+  },
+  "sandbox": {
+    "engine": "SQL Server 16.0.4255.1 (Developer Edition (64-bit))",
+    "seconds": 1.56,
+    "sql_error": null,
+    "testdata_error": null,
+    "sandbox_error": null
+  },
+  "timing": {
+    "seconds": [
+      7.0,
+      6.4,
+      6.4
+    ],
+    "median": 6.4,
+    "spread": 1.1
+  },
+  "preflight": {
+    "verdict": "go-with-caveats",
+    "checks": [
+      {
+        "name": "程式碼版本",
+        "level": "warn",
+        "detail": "fix/testgen-coverage-retry@e8815f8,但有 1 個未 commit 的改動——這輪的結果無法被別人重建,不要當共用基準"
+      },
+      {
+        "name": "測資集",
+        "level": "ok",
+        "detail": "golden set 34 個 case(35dd78a5defd)、規格 7 份(c342f6607d55)、凍結測資 1 份(78e508f422fe)"
+      },
+      {
+        "name": "套件版本",
+        "level": "ok",
+        "detail": "sqlglot 30.18.0 / jinja2 3.1.6"
+      },
+      {
+        "name": "端點身分",
+        "level": "ok",
+        "detail": "模型端點 7866d6383042(API 版本 0.31.1)"
+      },
+      {
+        "name": "模型 digest",
+        "level": "ok",
+        "detail": "gemma4:31b=6316f0629137b426"
+      },
+      {
+        "name": "執行驗證沙盒",
+        "level": "ok",
+        "detail": "SQL Server 16.0.4255.1 (Developer Edition (64-bit)),一正一反皆符合(1.56s)"
+      },
+      {
+        "name": "seed 是否生效",
+        "level": "ok",
+        "detail": "同 seed 逐字一致、無 seed 對照組不同 → seed 真的生效。注意:這只證明**單次呼叫**可重現;整條管線是多輪 agent loop,後一輪的輸入含前一輪的工具結果,仍然可能每輪不同(見 BASELINE.md §1)"
+      },
+      {
+        "name": "context 長度",
+        "level": "ok",
+        "detail": "送出約 8023 tokens 仍記得開頭的驗證碼 → diff 預算(8000)之內沒有被截斷"
+      },
+      {
+        "name": "推論延遲",
+        "level": "ok",
+        "detail": "中位數 6.4s([7.0, 6.4, 6.4])"
+      }
+    ]
+  }
+}

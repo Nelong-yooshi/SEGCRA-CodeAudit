@@ -61,6 +61,7 @@ async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None
       * 只在沒有 R 編號時才試,避免蓋掉「MR 提到了編號、但規格真的不存在」
         這種需要如實回報成「無規格」的情況
     """
+    from toolbox import gitlab   # 延遲匯入:只為了拿 SPEC_REF,不讓無關呼叫端多背相依
     codes = extract_rule_codes(mr)
     for code in codes:
         local = SPECS_DIR / f"{code}.md"
@@ -69,8 +70,12 @@ async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None
     if hub is not None:
         for code in codes:
             try:
+                # ref 明確指定,不吃預設值:#22 把 get_file 的預設改成「正在審的
+                # 那一版」之後,規格如果跟著走,MR 就能在同一次提交裡改掉自己的
+                # 規格讓自己過——執行驗證整道防線等於自己開門。
                 txt = await hub.call("gitlab__get_file",
-                                     {"path": f"specs/{code}.md"}, truncate=False)
+                                     {"path": f"specs/{code}.md",
+                                      "ref": gitlab.SPEC_REF}, truncate=False)
             except Exception:
                 continue
             if txt and txt.lstrip().startswith("#"):
@@ -111,10 +116,13 @@ async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
 
     if hub is None:
         return None
+    from toolbox import gitlab   # 延遲匯入,同 find_spec
     for path in paths:
         for candidate in resolve_spec(path, ()).candidates:   # 只要候選路徑,不比對存在與否
             try:
-                txt = await hub.call("gitlab__get_file", {"path": candidate}, truncate=False)
+                txt = await hub.call("gitlab__get_file",
+                                     {"path": candidate,
+                                      "ref": gitlab.SPEC_REF}, truncate=False)   # 同上:規格不跟 MR 走
             except Exception:
                 continue
             if txt and txt.lstrip().startswith("#"):

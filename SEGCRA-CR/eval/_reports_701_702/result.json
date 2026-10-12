@@ -1,0 +1,223 @@
+{
+  "profile": null,
+  "dry_run": false,
+  "precision": 0.25,
+  "recall": 1.0,
+  "tp": 1,
+  "fp": 3,
+  "fn": 0,
+  "layers": {
+    "real-shape": {
+      "pass": 0,
+      "fail": 2,
+      "gap": 0,
+      "error": 0
+    }
+  },
+  "decisions": {
+    "needs_human": 2
+  },
+  "style_severity": {
+    "info": 2
+  },
+  "auto_approve_blockers": {
+    "diff": 1,
+    "執行驗證未通過": 2,
+    "分數": 2,
+    "severity": 2
+  },
+  "known_gaps": [],
+  "errors": [],
+  "cases": [
+    {
+      "case": "701",
+      "layer": "real-shape",
+      "intent": "正向對照(真實程式形狀):200 行、4 層 CTE、視窗函式取當日最後餘額、OR-of-ANDs 三組條件共 20 項門檻、除零保護與四捨五入,與 specs/RETAIL_M1.md 逐條相符。內容取自 dbt compile 的實際輸出(tests/fixtures/dbt_compiled/sqlserver/mrt_RETAIL_M1.sql),只改兩處以便在沙盒執行:三段式表名改單純表名、寫死日期改 @start_date(原因見 tests/test_golden_real_shape.py 釘住的已知缺口)。量的是「真實形狀的乾淨程式會不會被誤報」——其餘 case 都是 10~20 行的簡化 SQL,量不到這件事。同時也是 spec-by-filename 對應(mrt_RETAIL_M1.sql → specs/RETAIL_M1.md)唯一的端到端 case。",
+      "known_gap": false,
+      "expected": 0,
+      "hit": 0,
+      "noise": 3,
+      "decision": "needs_human",
+      "severities": [
+        "info",
+        "major",
+        "minor"
+      ],
+      "spec_exec": {
+        "passed": false,
+        "spec_code": "RETAIL_M1",
+        "conditions": 23,
+        "cases": 9,
+        "coverage_gaps": 38,
+        "dropped_cases": 1,
+        "gap_detail": [
+          "條件 C1_2 缺 false 向案例",
+          "條件 C1_3 缺 true 向案例",
+          "條件 C1_3 缺 false 向案例",
+          "條件 C1_4 缺 true 向案例",
+          "條件 C1_4 缺 false 向案例",
+          "條件 C1_5 缺 true 向案例",
+          "條件 C1_5 缺 false 向案例",
+          "條件 C1_6 缺 true 向案例",
+          "條件 C1_6 缺 false 向案例",
+          "條件 C1_7 缺 true 向案例",
+          "條件 C1_7 缺 false 向案例",
+          "條件 C2_1 缺 true 向案例",
+          "條件 C2_1 缺 false 向案例",
+          "條件 C2_2 缺 true 向案例",
+          "條件 C2_2 缺 false 向案例",
+          "條件 C2_3 缺 true 向案例",
+          "條件 C2_3 缺 false 向案例",
+          "條件 C2_4 缺 true 向案例",
+          "條件 C2_4 缺 false 向案例",
+          "條件 C2_5 缺 true 向案例",
+          "條件 C2_5 缺 false 向案例",
+          "條件 C2_6 缺 true 向案例",
+          "條件 C2_6 缺 false 向案例",
+          "條件 C2_7 缺 true 向案例",
+          "條件 C2_7 缺 false 向案例",
+          "條件 C3_1 缺 true 向案例",
+          "條件 C3_1 缺 false 向案例",
+          "條件 C3_2 缺 true 向案例",
+          "條件 C3_2 缺 false 向案例",
+          "條件 C3_3 缺 true 向案例",
+          "條件 C3_3 缺 false 向案例",
+          "條件 C3_4 缺 true 向案例",
+          "條件 C3_4 缺 false 向案例",
+          "條件 C3_5 缺 true 向案例",
+          "條件 C3_5 缺 false 向案例",
+          "條件 C3_6 缺 true 向案例",
+          "條件 C3_6 缺 false 向案例",
+          "案例 C_ACC-T(條件 C_ACC true 向)遭仲裁剔除(測資錯),該向未驗證"
+        ]
+      },
+      "policy_signals": {
+        "change_lines": 201,
+        "new_rule": false,
+        "severities": [
+          "info",
+          "major",
+          "minor"
+        ],
+        "pending_hints": false,
+        "spec_exec_passed": false
+      },
+      "auto_approve_blockers": [
+        "diff 行數 201 > 30",
+        "執行驗證未通過",
+        "分數 65 < 95",
+        "severity 白名單(出現 ['major', 'minor'])"
+      ],
+      "style_findings": [
+        {
+          "severity": "info",
+          "title": "SQL 風格不一致"
+        }
+      ],
+      "checks": 4,
+      "failed": 2,
+      "failures": [
+        {
+          "name": "signal:spec_exec_passed",
+          "why": "期望 True,實得 False"
+        },
+        {
+          "name": "forbid_severities",
+          "why": "出現 2 條:major/金額型別轉換導致精度損失 (Precision Loss)"
+        }
+      ]
+    },
+    {
+      "case": "702",
+      "layer": "real-shape",
+      "intent": "埋雷(真實程式形狀):條件 1 的 eod_balance <= 1000 被改成 < 1000,規格 1-7 明訂「≤ 1,000」→ 結餘恰好 1,000 的帳戶應通報卻會漏報。**刻意選用小規模已證明抓得到的錯誤類型**(含/不含邊界,同 mr_401),所以這個 case 若漏抓,可以確定是規模造成的,不是這種錯本來就抓不到。難度來自:三組條件的這一行長得一模一樣、只改第一組(其餘兩組維持 <=),而且埋在 200 行、20 項門檻裡。同時也是唯一一個「大檔裡只改幾行」的維護型 diff(issue #8 §3),其餘 case 不是新檔就是小檔全改。與 mr_701 成對:一個不該吵的 + 一個該抓的。",
+      "known_gap": false,
+      "expected": 1,
+      "hit": 1,
+      "noise": 0,
+      "decision": "needs_human",
+      "severities": [
+        "info",
+        "major",
+        "minor"
+      ],
+      "spec_exec": {
+        "passed": false,
+        "spec_code": "RETAIL_M1",
+        "conditions": 23,
+        "cases": 0,
+        "coverage_gaps": 37,
+        "dropped_cases": 0,
+        "gap_detail": [
+          "條件 C1_2 缺 false 向案例",
+          "條件 C1_3 缺 true 向案例",
+          "條件 C1_3 缺 false 向案例",
+          "條件 C1_4 缺 true 向案例",
+          "條件 C1_4 缺 false 向案例",
+          "條件 C1_5 缺 true 向案例",
+          "條件 C1_5 缺 false 向案例",
+          "條件 C1_6 缺 true 向案例",
+          "條件 C1_6 缺 false 向案例",
+          "條件 C1_7 缺 true 向案例",
+          "條件 C1_7 缺 false 向案例",
+          "條件 C2_1 缺 true 向案例",
+          "條件 C2_1 缺 false 向案例",
+          "條件 C2_2 缺 true 向案例",
+          "條件 C2_2 缺 false 向案例",
+          "條件 C2_3 缺 true 向案例",
+          "條件 C2_3 缺 false 向案例",
+          "條件 C2_4 缺 true 向案例",
+          "條件 C2_4 缺 false 向案例",
+          "條件 C2_5 缺 true 向案例",
+          "條件 C2_5 缺 false 向案例",
+          "條件 C2_6 缺 true 向案例",
+          "條件 C2_6 缺 false 向案例",
+          "條件 C2_7 缺 true 向案例",
+          "條件 C2_7 缺 false 向案例",
+          "條件 C3_1 缺 true 向案例",
+          "條件 C3_1 缺 false 向案例",
+          "條件 C3_2 缺 true 向案例",
+          "條件 C3_2 缺 false 向案例",
+          "條件 C3_3 缺 true 向案例",
+          "條件 C3_3 缺 false 向案例",
+          "條件 C3_4 缺 true 向案例",
+          "條件 C3_4 缺 false 向案例",
+          "條件 C3_5 缺 true 向案例",
+          "條件 C3_5 缺 false 向案例",
+          "條件 C3_6 缺 true 向案例",
+          "條件 C3_6 缺 false 向案例"
+        ]
+      },
+      "policy_signals": {
+        "change_lines": 1,
+        "new_rule": false,
+        "severities": [
+          "info",
+          "major",
+          "minor"
+        ],
+        "pending_hints": false,
+        "spec_exec_passed": false
+      },
+      "auto_approve_blockers": [
+        "執行驗證未通過",
+        "分數 65 < 95",
+        "severity 白名單(出現 ['major', 'minor'])"
+      ],
+      "style_findings": [
+        {
+          "severity": "info",
+          "title": "建議統一 SQL 風格與格式"
+        }
+      ],
+      "checks": 5,
+      "failed": 1,
+      "failures": [
+        {
+          "name": "signal:spec_exec_sql_fault",
+          "why": "期望 True,實得 False"
+        }
+      ]
+    }
+  ]
+}

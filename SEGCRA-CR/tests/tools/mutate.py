@@ -967,8 +967,10 @@ MUTANTS.update({
 
 # ---- get_mr_diff 帶出 diff_refs 的三個 sha(#15 接線與 #22 共用)
 MUTANTS.update({
+ # #22 把 real 模式的 _diff_refs(mr) 先存成 refs(補 full_content 時要用 head_sha),
+ # 所以字面從 **_diff_refs(mr) 變成 **refs;突變本身不變,仍是「不帶出三個 sha」。
  "diff_refs:real 模式不帶出": ("../toolbox/gitlab.py",
-     '"sha": mr.get("sha", ""), **_diff_refs(mr), "files": files,',
+     '"sha": mr.get("sha", ""), **refs, "files": files,',
      '"sha": mr.get("sha", ""), "files": files,'),
  "diff_refs:mock 模式不帶出": ("../toolbox/gitlab.py",
      '"sha": mr.get("sha", f"mock-{mr_id}"), **_diff_refs(mr),',

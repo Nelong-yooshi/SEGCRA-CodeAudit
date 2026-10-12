@@ -23,6 +23,14 @@ REAL_MODE = bool(GITLAB_URL and GITLAB_TOKEN and GITLAB_PROJECT)
 # 專案層級的唯讀 token(read_api,角色 Reporter),只給打包下載用(#15 條件 1)
 GITLAB_READ_TOKEN = os.environ.get("GITLAB_READ_TOKEN", "")
 
+# 規格一律從這個 ref 讀,**不跟著 MR 走**(#22)。
+# 理由是安全性:規格是核定過的真值,如果它跟著 MR 的版本走,一個 MR 就能在同一次
+# 提交裡改掉自己的規格讓自己通過——那等於執行驗證整道防線自己把門打開。
+# 現行行為原本是靠「get_file 的 ref 預設是 main」意外達成的;#22 要把 get_file 的
+# 預設改成跟著 MR,所以這條規則必須改成寫死在呼叫處(見 spec_exec.find_spec),
+# 預設值怎麼變都不會破。
+SPEC_REF = os.environ.get("SPEC_REF", "main")
+
 
 # --- real mode helpers ---------------------------------------------------
 
@@ -63,6 +71,42 @@ def _api_pages(path: str, params: dict | None = None) -> tuple[list, bool]:
 
 # GitLab MR 的 diff_refs 三個欄位,名稱照 GitLab API 原樣(post_inline_comment 也用這組)
 _DIFF_REF_KEYS = ("base_sha", "head_sha", "start_sha")
+
+
+# 這次審查釘住的 commit。get_mr_diff 取到 head_sha 時設定,之後 get_file 沒指定
+# ref 就用它——**模型看到的要是被審的那一版,不是目標分支的現況**。
+# 釘住而不是用分支名,是因為分支在審查中途可能被推新 commit,那會變成「審了 A、
+# 驗了 B」而且完全沒有徵兆(同一個理由讓 _SHA 不接受分支名)。
+_REVIEW_REF: str | None = None
+
+
+def pin_review_ref(sha: str | None) -> None:
+    """把這次審查釘在某個 commit 上;None = 解除(回到 SPEC_REF)。
+
+    由 get_mr_diff 自動呼叫。拿不到 head_sha 時會是 None,那時 get_file 退回
+    目標分支——**那是「看不到被審版本」的降級,不是正常狀況**,呼叫端要知道
+    自己拿到的可能不是 MR 的內容。
+    """
+    global _REVIEW_REF
+    _REVIEW_REF = sha
+
+
+def review_ref() -> str | None:
+    return _REVIEW_REF
+
+
+def _file_at(path: str, ref: str) -> str | None:
+    """取某個 commit 上的檔案完整內容;取不到回 None(不編造、不退回別的版本)。"""
+    import urllib.parse
+    import httpx
+    try:
+        r = httpx.get(
+            f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}/repository/files/"
+            f"{urllib.parse.quote(path, safe='')}/raw",
+            headers={"PRIVATE-TOKEN": GITLAB_TOKEN}, params={"ref": ref}, timeout=30)
+    except Exception:
+        return None
+    return r.text if r.status_code == 200 else None
 
 
 def _diff_refs(mr: dict) -> dict:
@@ -241,8 +285,26 @@ def get_mr_diff(mr_id: str) -> str:
                   "diff": c.get("diff") or "",
                   "unreviewable": bool(c.get("too_large") or c.get("collapsed"))}
                  for c in changes]
+        refs = _diff_refs(mr)
+        # **預掃與執行驗證要的是整份新檔,不是 diff 裡那幾行**(#22)。
+        # 大檔小改的 MR,從 diff 還原出來的 SQL 可能只剩一行,sqlglot 解析不了、
+        # 沙盒也沒東西可跑——而 golden case 都有 full_content,所以這條路在評測裡
+        # 永遠不會被走到,正式環境卻每次都走。
+        pin_review_ref(refs.get("head_sha"))
+        if refs.get("head_sha"):
+            for f in files:
+                if f["unreviewable"]:
+                    continue        # 本來就拿不到內容的,不用多打一次 API
+                content = _file_at(f["path"], refs["head_sha"])
+                if content is not None:
+                    f["full_content"] = content
+                else:
+                    # 取不到就讓它缺著:下游是 `full_content or _sql_from_diff(...)`,
+                    # 會退回只用 diff。**不要塞空字串**——那會讓下游以為
+                    # 「這個檔是空的」而不是「我們沒拿到」。
+                    f["full_content_unavailable"] = True
         return json.dumps({"title": mr["title"], "description": mr.get("description", ""),
-                           "sha": mr.get("sha", ""), **_diff_refs(mr), "files": files,
+                           "sha": mr.get("sha", ""), **refs, "files": files,
                            "truncated": truncated}, ensure_ascii=False)
     mr = _mock_mr(mr_id)
     return json.dumps({"title": mr["title"], "description": mr.get("description", ""),
@@ -250,12 +312,21 @@ def get_mr_diff(mr_id: str) -> str:
                        "files": mr["files"]}, ensure_ascii=False)
 
 
-def get_file(path: str, ref: str = "main", mr_id: str = "") -> str:
-    """取得 repo 內檔案完整內容(如 specs/R-xxx.md;看 diff 不夠時也可用)。
-    mock 模式下 ref 無作用。"""
+def get_file(path: str, ref: str = "", mr_id: str = "") -> str:
+    """取得 repo 內檔案完整內容(看 diff 不夠時用)。mock 模式下 ref 無作用。
+
+    **ref 不指定時抓「正在審的那一版」**(get_mr_diff 釘住的 head sha),不是目標
+    分支的現況(#22)。先前預設是 `main`,所以模型用這個工具去看檔案時拿到的是
+    **改之前**的內容——看起來正常、實際上在審錯的東西。
+
+    讀規格請明確傳 `ref=SPEC_REF`:規格是核定過的真值,不能跟著 MR 走,
+    否則一個 MR 就能在同一次提交裡改掉自己的規格讓自己過(見 SPEC_REF)。
+    """
     if REAL_MODE:
         import urllib.parse
         import httpx
+        # 釘住的版本 → 目標分支。兩者都沒有才用 SPEC_REF 當最後退路。
+        ref = ref or _REVIEW_REF or SPEC_REF
         r = httpx.get(
             f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}/repository/files/"
             f"{urllib.parse.quote(path, safe='')}/raw",
