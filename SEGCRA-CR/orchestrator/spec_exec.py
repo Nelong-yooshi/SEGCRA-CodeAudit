@@ -128,7 +128,8 @@ TESTGEN_SYSTEM = """你是測試資料工程師。給你一份異常交易規則
 
 # 產出(嚴格 JSON,不要 markdown 圍欄、不要多餘文字)
 {"schema_ddl": ["CREATE TABLE ...(照 spec 的資料表定義,T-SQL 語法,一字不差的欄位名/型別)"],
- "conditions": [{"id": "C1", "desc": "<spec 的一個原子條件,如:tx_type='WITHDRAW'>"}],
+ "conditions": [{"id": "C1", "desc": "<spec 的一個原子條件,如:tx_type='WITHDRAW'>",
+                 "check_sql": "<判斷這個條件在本案例資料上成不成立的查詢,見第 8 點>"}],
  "cases": [{"case_id": "C1-T", "condition_id": "C1", "direction": "true",
             "rows": [["<表名>", <值1>, <值2>, ...], ...],
             "expect_flagged": true, "note": "<這個案例在測什麼>"}]}
@@ -146,7 +147,17 @@ TESTGEN_SYSTEM = """你是測試資料工程師。給你一份異常交易規則
 5. 每個案例只放**該案例需要的資料列**(案例之間互相獨立,各自在乾淨資料庫執行;
    expect_flagged=true 表示該案例的資料應使規則輸出至少一列)。
 6. 只用 spec 資料表定義裡存在的表與欄位,不得發明欄位。
-7. 資料庫是 MS SQL(SQL Server),schema_ddl 一律用 T-SQL 型別
+7. check_sql:每個條件附一個**只回一列一欄 0 或 1** 的查詢,用來確認案例的資料
+   真的測到了它宣稱的那一條。寫法:
+     SELECT CASE WHEN EXISTS (SELECT 1 FROM <表> WHERE <這個條件>) THEN 1 ELSE 0 END
+   涉及彙總的條件(如「單日累計 >= 100000」)要把彙總寫進去:
+     SELECT CASE WHEN EXISTS (SELECT 1 FROM t GROUP BY account_id
+                              HAVING SUM(amount) >= 100000) THEN 1 ELSE 0 END
+   限制:**單一 SELECT、不得有分號或註解、不得出現 INSERT/UPDATE/DELETE/DROP/
+   CREATE/ALTER/EXEC 等會改變狀態的字**(不符會被忽略,那個條件就失去這道檢查)。
+   這道檢查會驗:direction="false" 的案例**只有**被標的那一條不成立,其餘都成立
+   ——所以反向案例要精準地只破壞一個條件,不要順手把別的條件也弄成不成立。
+8. 資料庫是 MS SQL(SQL Server),schema_ddl 一律用 T-SQL 型別
    (NVARCHAR(n) / DECIMAL(p,s) / DATETIME2 / DATE / BIT / INT / BIGINT)。字串型別一定要寫長度:
    T-SQL 的 NVARCHAR 不寫長度等於長度 1。"""
 
