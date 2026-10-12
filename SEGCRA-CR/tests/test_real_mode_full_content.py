@@ -181,3 +181,106 @@ def test_規格一律從目標分支讀(monkeypatch):
         assert p.get("ref") == gitlab.SPEC_REF, (
             f"規格讀取沒有明確指定 ref(拿到 {p.get('ref')!r})——"
             "吃預設值的話,get_file 的預設一改,MR 就能改自己的規格")
+
+
+# ─────────────────── 4. 端到端:大檔只改一行(#22 的完成條件) ───────────────────
+
+# 168 行規模的真實形狀:多層 CTE。diff 只有最後那一行。
+# 這正是 issue #22 描述的 mr_702 情境——從 diff 還原出來的 SQL 只剩
+# `AND eod_balance < 1000`,sqlglot 連 SELECT 都看不到。
+_BIG_SQL = """-- R-201: 單日 ATM 現金提領累計達 100000(含)通報
+WITH base AS (
+    SELECT account_id, amount, tx_time, tx_type, channel
+    FROM transactions
+    WHERE tx_time >= @start_date AND tx_time < @end_date
+), filtered AS (
+    SELECT account_id, amount, tx_time
+    FROM base
+    WHERE tx_type = 'WITHDRAW' AND channel = 'ATM'
+), agg AS (
+    SELECT account_id, SUM(amount) AS total_amount, MIN(amount) AS eod_balance
+    FROM filtered
+    GROUP BY account_id
+)
+SELECT account_id, total_amount
+FROM agg
+WHERE total_amount >= 100000
+  AND eod_balance < 1000;"""
+
+_ONE_LINE_DIFF = "@@ -17,2 +17,3 @@\n   WHERE total_amount >= 100000\n+  AND eod_balance < 1000;\n"
+
+
+def _review_real(monkeypatch, tmp_path, *, serve_full: bool):
+    """在 real 模式下跑完整條 review_mr,回傳 (報告, 預掃結果)。
+
+    serve_full=False 模擬「拿不到完整檔」(也就是 #22 修正前的行為),
+    用來證明這個測試真的分得出有沒有修。
+    """
+    import asyncio
+
+    from orchestrator import pipeline, spec_exec
+    from orchestrator.config import load_config
+
+    monkeypatch.setattr(gitlab, "REAL_MODE", True)
+    monkeypatch.setattr(gitlab, "GITLAB_URL", "http://gl")
+    monkeypatch.setattr(gitlab, "GITLAB_TOKEN", "t")
+    monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "1")
+    monkeypatch.setenv("REVIEW_OUTPUT", str(tmp_path))
+    monkeypatch.setattr(gitlab, "OUTPUT_DIR", tmp_path)
+
+    monkeypatch.setattr(gitlab, "_api", lambda *a, **k: {
+        "title": "R-201 例行調整", "description": "加上結餘條件", "sha": SHA,
+        "diff_refs": {"base_sha": "b" * 40, "head_sha": SHA, "start_sha": "c" * 40}})
+    monkeypatch.setattr(gitlab, "_api_pages", lambda p, params=None: (
+        [{"new_path": "sql/rules/r201.sql", "diff": _ONE_LINE_DIFF}], False))
+    monkeypatch.setattr(gitlab, "_file_at",
+                        lambda path, ref: _BIG_SQL if serve_full else None)
+    # 回寫 GitLab 的動作在 real 模式會發 HTTP,這裡不是要驗那個
+    for fn in ("post_inline_comment", "post_summary", "set_commit_status", "set_label"):
+        monkeypatch.setattr(gitlab, fn, lambda *a, **k: "ok")
+
+    async def fake_agent(cfg, profile, system, user, hub, verbose=True,
+                         use_tools=True, trace=None, meta=None):
+        return '{"score": 90, "verdict": "approve", "summary": "相符。", "findings": []}'
+    monkeypatch.setattr(pipeline, "run_agent", fake_agent)
+
+    async def no_cases(*a, **k):
+        return {"schema_ddl": [], "conditions": [], "cases": []}, ["測試中略過"], []
+    monkeypatch.setattr(spec_exec, "generate_cases", no_cases)
+
+    captured: dict = {}
+    report = asyncio.run(review_or_raise(pipeline, load_config(), captured))
+    return report, captured.get("prescan_raw") or []
+
+
+def review_or_raise(pipeline, cfg, captured):
+    return pipeline.review_mr(cfg, "900", capture=captured)
+
+
+def test_大檔只改一行_預掃要拿到整份檔而不是那一行(monkeypatch, tmp_path):
+    """#22 的完成條件:真實模式下預掃解析成功。
+
+    修正前送進預掃的是從 diff 還原的 `AND eod_balance < 1000`——sqlglot 連
+    SELECT 都看不到,解析失敗,AST 規則整組沒跑。而這個缺口 golden set 量不到,
+    因為 golden case 都有 full_content。
+    """
+    _, pre = _review_real(monkeypatch, tmp_path, serve_full=True)
+    assert pre, "沒有拿到預掃結果"
+    entry = pre[0]
+    assert "parse_error" not in entry, (
+        f"預掃解析失敗了:{entry.get('parse_error')}——"
+        "代表送進去的不是整份檔")
+
+
+def test_拿不到完整檔時_預掃解析失敗而且會被揭露(monkeypatch, tmp_path):
+    """反面對照,兩個作用:
+
+    1. 證明上一個測試真的分得出有沒有修(不是恰好都綠)
+    2. 釘住降級時的行為:拿不到完整檔**不可以靜默**——`enforce_parse` 要補一條
+       finding,否則 MR 可能因為「沒有命中任何規則」而被自動放行
+    """
+    report, pre = _review_real(monkeypatch, tmp_path, serve_full=False)
+    assert pre and "parse_error" in pre[0], "拿不到完整檔卻解析成功了?測試設計有問題"
+    titles = [f.get("title") for f in report.get("findings", [])]
+    assert any("預掃無法解析" in str(t) for t in titles), (
+        f"解析失敗沒有被揭露,findings = {titles}")
