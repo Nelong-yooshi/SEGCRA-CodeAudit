@@ -37,7 +37,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 from orchestrator import spec_exec as se   # noqa: E402
 
-BUDGET_TOKENS = 8192     # config/models.yaml 的 max_output_tokens
+# 實測是在 8192 的上限下量的,所以這個值不動——tests/test_sim_calibration.py
+# 靠它對照實測。要掃別的上限用 --budget(設定檔現在給測資生成的是 12288,
+# 因為實測證明 8192 是我們自己寫的限制:模型一次寫得出 11533 tokens)。
+MEASURED_BUDGET = 8192
+BUDGET_TOKENS = MEASURED_BUDGET
 # 下面兩個是**扣掉思考成本之後**的單位成本:實測的 6221 / 7003 都已經含思考,
 # 直接拿去除會把思考算兩次(第一版這樣寫,模擬結果變成連骨架都裝不下,與實測不符)。
 #   每案例 = (6221 - 1500) / 6  ≈ 790    (補缺 6 個成功那次)
@@ -151,14 +155,18 @@ def main():
     ap.add_argument("--rounds", type=int, help="覆寫 _FILL_ROUNDS")
     ap.add_argument("--comply", type=float, default=1.0,
                     help="模型照做的比例(1 = 完全照做,0.5 = 只回一半)")
+    ap.add_argument("--budget", type=int, default=MEASURED_BUDGET,
+                    help="輸出上限(max_output_tokens)。預設 8192 = 實測時的值;"
+                         "設定檔現在給測資生成的是 12288")
     ap.add_argument("--overhead", type=int, default=THINKING_TOKENS,
                     help="思考燒掉的 tokens(預設 1500)。這個值每次呼叫都不同——"
                          "實測同樣要 6 個案例,前兩次成功、第三次被截斷。"
                          "調高它就會看到「沒有安全批量、只能靠被截斷就縮」")
     ap.add_argument("--sweep", action="store_true", help="掃一遍 batch")
     a = ap.parse_args()
-    global _overhead
+    global _overhead, BUDGET_TOKENS
     _overhead = a.overhead
+    BUDGET_TOKENS = a.budget
 
     if a.sweep:
         print(f"條件 {a.conds} 個 → 需要 {a.conds * 2} 個「條件×方向」"
