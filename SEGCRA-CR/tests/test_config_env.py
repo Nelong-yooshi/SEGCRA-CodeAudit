@@ -118,3 +118,58 @@ def test_角色_profile_也吃得到覆蓋與驗證(monkeypatch):
     monkeypatch.setenv("LLM_SEED", "nope")
     with pytest.raises(ValueError):
         cfg.role_profile("testgen")
+
+
+# ─────────────────── reasoning_effort ───────────────────
+
+def test_沒設定時不送這個參數():
+    """預設不送,不是預設關閉思考。
+
+    送了不支援的參數,端點可能把整個請求退回——那比「多花一點 token」嚴重得多。
+    所以 None 的語意是「不送」,讓端點用它自己的預設。
+    """
+    assert _cfg().profile("review").reasoning_effort is None
+
+
+@pytest.mark.parametrize("raw,expect", [
+    ("none", "none"), ("NONE", "none"), ("  high  ", "high"),
+    ("minimal", "minimal"), ("low", "low"), ("medium", "medium"),
+])
+def test_合法檔位會被正規化(monkeypatch, raw, expect):
+    monkeypatch.setenv("LLM_REASONING_EFFORT", raw)
+    assert _cfg().profile("review").reasoning_effort == expect
+
+
+@pytest.mark.parametrize("raw", ["", "   "])
+def test_空字串代表取消覆蓋_不是送_none(monkeypatch, raw):
+    """空字串 → 不送這個參數(端點預設,會思考);送 "none" → 明確要求不思考。
+
+    兩者不同。混淆的話,想「恢復預設」的人會以為自己關掉了思考,
+    量出來的比較就白做了。
+    """
+    monkeypatch.setenv("LLM_REASONING_EFFORT", raw)
+    assert _cfg().profile("review").reasoning_effort is None
+
+
+@pytest.mark.parametrize("bad", ["bogus", "0", "off", "false", "無", "none;high"])
+def test_不認得的檔位要當場擋下(monkeypatch, bad):
+    """端點收到不認得的值可能整個請求退回(還好,看得到錯誤),也可能**默默忽略**。
+
+    後者才是要防的:你以為關掉了思考、實際上沒有,於是「關掉思考有沒有用」
+    這個比較整輪白做,而且不會有任何徵兆。
+    """
+    monkeypatch.setenv("LLM_REASONING_EFFORT", bad)
+    with pytest.raises(ValueError) as e:
+        _cfg().profile("review")
+    assert "LLM_REASONING_EFFORT" in str(e.value)
+    assert "可用" in str(e.value), "訊息要講得出有哪些檔位可以用"
+
+
+def test_角色_profile_也吃得到(monkeypatch):
+    """測資生成走的是 role_profile(\"testgen\"),不是 profile()——漏掉的話這個功能
+    對它完全沒有作用,而它正是最需要省輸出預算的那一個。"""
+    cfg = Config(endpoint="http://x/v1", api_key="k", default_profile="review",
+                 profiles=_PROFILES, roles={"testgen": "review"},
+                 budget={"diff": 8000}, policy={})
+    monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
+    assert cfg.role_profile("testgen").reasoning_effort == "none"

@@ -64,7 +64,8 @@ def _fake_client(monkeypatch, responses):
 class _Hub:
     openai_tools = [{"type": "function", "function": {"name": "t", "parameters": {}}}]
 
-    async def call(self, name, args):
+    # #29 之後模型只能走白名單的 call_from_model(),不是 call()
+    async def call_from_model(self, name, args):
         # 工具結果刻意是一個合法的 JSON 物件:這正是危險的情況——
         # extract_json 會把它當成報告,而且看起來完全正常。
         return json.dumps({"findings": [], "summary": "我是工具結果,不是報告"},
