@@ -26,7 +26,7 @@ MEASURED = [
 ]
 
 
-def _cost(cases, conds, overhead=sim.THINKING_TOKENS):
+def _cost(cases, conds, overhead=sim.THINKING_MIN):
     return cases * sim.TOKENS_PER_CASE + conds * sim.TOKENS_PER_COND + overhead
 
 
@@ -46,13 +46,30 @@ def test_沒被截斷的那幾次_估算要接近實測(name, cases, conds, real
 
 def test_單位成本不含思考成本():
     """實測的 6221 / 7003 都已經含思考,直接拿去除會把思考算兩次——
-    第一版就是這樣,模擬變成連骨架都裝不下,與實測不符。"""
-    assert sim.TOKENS_PER_CASE == pytest.approx((6221 - sim.THINKING_TOKENS) / 6, rel=0.02)
-    assert sim.TOKENS_PER_COND == pytest.approx((7003 - sim.THINKING_TOKENS) / 23, rel=0.02)
+    第一版就是這樣,模擬變成連骨架都裝不下,與實測不符。
+
+    用 THINKING_MIN 推導:這兩次恰好是思考最省的,所以 790/240 是「內容本身」
+    最接近的估計(思考較多的那幾次無法分離兩者)。"""
+    assert sim.TOKENS_PER_CASE == pytest.approx((6221 - sim.THINKING_MIN) / 6, rel=0.02)
+    assert sim.TOKENS_PER_COND == pytest.approx((7003 - sim.THINKING_MIN) / 23, rel=0.02)
+
+
+def test_訂批量要用最壞的思考量():
+    """按中位數訂會固定有一部分呼叫被截斷浪費掉。實測兩次預測失準都是這樣來的:
+    批量 10 / 上限 12288 → 10×790 + 5027 = 12927 > 12288(實測截斷)
+    批量  6 / 上限  8192 →  6×790 + 5027 =  9767 >  8192(實測 3 次中 1 次截斷)
+    """
+    import orchestrator.spec_exec as se
+    budget = 12288            # config/models.yaml 的 testgen profile
+    safe = (budget - sim.THINKING_WORST) // sim.TOKENS_PER_CASE
+    assert se._FILL_BATCH <= safe, (
+        f"批量 {se._FILL_BATCH} 在最壞的思考量({sim.THINKING_WORST})下會截斷"
+        f"(安全值 {safe})")
+    assert sim.THINKING_WORST > sim.THINKING_MEDIAN > sim.THINKING_MIN
 
 
 def test_骨架的餘裕要算得出懸崖在哪():
     """骨架自己被截斷時程式沒有出路(再要一次骨架 → 再截斷 → 0 個案例),
     所以「幾個條件會踩到」是必須看得見的數字。"""
-    fits = (sim.BUDGET_TOKENS - sim.THINKING_TOKENS) // sim.TOKENS_PER_COND
+    fits = (sim.BUDGET_TOKENS - sim.THINKING_MIN) // sim.TOKENS_PER_COND
     assert 25 <= fits <= 29, f"骨架容量算出來是 {fits} 個條件,與實測的 23/86% 不符"
