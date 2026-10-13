@@ -511,20 +511,25 @@ def enforce_hints(report: dict, pre: list[dict]) -> dict:
     就可以是 info。
     只比對進來時就有的 findings:本函式補的內文是檢核點訊息,會含其他檢核點的關鍵詞
     (例如 H005 的訊息有「規格」,是 H003 的關鍵詞),若拿來比對,同一個檔案的其他檢核點
-    會被自己補的文字吞掉。管線上也放在任何程式補報之前。"""
+    會被自己補的文字吞掉。管線上也放在任何程式補報之前。
+    同一個檔案有多處相同的檢核點時逐處對應,一條 finding 最多抵一處(#28 review,見
+    _uncovered_hits):兩處 H001、模型只回應一處,另一處仍是「模型未回應」,照樣擋自動放行。"""
     before = list(report.get("findings", []))
     for entry in pre:
+        by_code: dict[str, list[dict]] = {}
         for h in entry.get("rules", []):
-            if h.get("severity") != "hint":
-                continue
-            code = h.get("rule", "")
-            if _reported_at_least(before, entry["path"], _HINT_KEYWORDS.get(code, [code]),
-                                  "info"):
-                continue
-            report.setdefault("findings", []).append({
-                "file": entry["path"], "line": 0, "severity": "info",
-                "title": f"[{code}] 檢核點待人工確認(模型未回應)",
-                "detail": h.get("message", ""), "suggestion": "", "citations": []})
+            if h.get("severity") == "hint":
+                by_code.setdefault(h.get("rule", ""), []).append(h)
+        for code, hits in by_code.items():
+            # 回應不限嚴重度:比對時把每一處都當成 info
+            missing = _uncovered_hits(before, entry["path"], _HINT_KEYWORDS.get(code, [code]),
+                                      [{**h, "severity": "info"} for h in hits])
+            for n, h in enumerate(missing, 1):
+                report.setdefault("findings", []).append({
+                    "file": entry["path"], "line": 0, "severity": "info",
+                    "title": f"[{code}] 檢核點待人工確認(模型未回應)",
+                    "detail": h.get("message", "") + _count_note(code, len(hits), len(missing), n),
+                    "suggestion": "", "citations": []})
     return report
 
 
@@ -627,11 +632,12 @@ def enforce_dbt_notice(report: dict, pre: list[dict]) -> dict:
     return report
 
 
-def _reported_at_least(findings: list[dict], path: str, keywords: list[str],
-                       severity: str) -> bool:
-    """path 這個檔案有沒有一條嚴重度不低於 severity 的 finding 提到任一關鍵詞
-    (判斷方式見 _uncovered_hits;這裡等於只有一處命中的情況)。"""
-    return not _uncovered_hits(findings, path, keywords, [{"severity": severity}])
+def _count_note(code: str, total: int, missing: int, n: int) -> str:
+    """同一個檔案同一個代碼有多處命中時,附在補的說明後面的數量(只有一處時不加)。"""
+    if total <= 1:
+        return ""
+    return (f"(這個檔案共有 {total} 處命中 {code},模型的 finding 只對應到 {total - missing} 處;"
+            f"這是程式補上的第 {n} 條,共 {missing} 條。請逐一檢查每一處。)")
 
 
 def _flat(text: str) -> str:
@@ -640,7 +646,7 @@ def _flat(text: str) -> str:
 
 def _uncovered_hits(findings: list[dict], path: str, keywords: list[str],
                     hits: list[dict]) -> list[dict]:
-    """同一個檔案、同一條規則的命中(hits)裡,模型的 findings 沒有對應到的那幾處。
+    """同一個檔案、同一個代碼(規則或檢核點)的命中(hits)裡,模型的 findings 沒有對應到的那幾處。
 
     一條 finding 最多對應一處命中(#28 review):一個檔案有兩句 DELETE 都沒有 WHERE、
     模型只報了第一句時,第二句也要出現在報告上——決策不受影響(已經有 blocker),但作者
@@ -710,14 +716,11 @@ def enforce_rules(report: dict, pre: list[dict]) -> dict:
                                       hits)
             for n, h in enumerate(missing, 1):
                 detail = h.get("message", "")
-                if len(hits) > 1:
-                    detail += (f"(這個檔案共有 {len(hits)} 處命中 {code},模型的 finding 只對應到 "
-                               f"{len(hits) - len(missing)} 處;這是程式補上的第 {n} 條,"
-                               f"共 {len(missing)} 條。請逐一檢查每一處。)")
                 report.setdefault("findings", []).append({
                     "file": entry["path"], "line": 0, "severity": h.get("severity", "major"),
                     "title": f"[{code}] {h.get('message', '')[:60]}",
-                    "detail": detail, "suggestion": "", "citations": []})
+                    "detail": detail + _count_note(code, len(hits), len(missing), n),
+                    "suggestion": "", "citations": []})
     return report
 
 

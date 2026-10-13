@@ -174,6 +174,50 @@ def test_執行驗證抓到不符時要變成_major_並擋下自動放行(run):
 
 # ─────────────────── 後處理 enforce 鏈真的在管線裡跑 ───────────────────
 
+TWO_JOINS = """SELECT a.owner_id, b.branch_id, COUNT(*) AS n
+FROM accounts a JOIN branches b ON a.branch_id = b.id GROUP BY a.owner_id, b.branch_id;
+SELECT a.owner_id, c.region_id, COUNT(*) AS n
+FROM accounts a JOIN regions c ON a.region_id = c.id GROUP BY a.owner_id, c.region_id;"""
+
+
+def _h002_reply(text, title="通報粒度"):
+    return {"file": "sql/maintenance/x.sql", "line": 1, "severity": "info",
+            "title": title, "detail": text, "suggestion": "", "citations": []}
+
+
+def _pending_h002(report):
+    return [f for f in report["findings"] if f["title"].startswith("[H002] 檢核點待人工確認")]
+
+
+def test_同檔兩處相同檢核點模型只回應一處時不得自動放行(run):
+    """#28 review 的同一類情況發生在檢核點上,而且會影響決策:兩段 JOIN + GROUP BY 的查詢
+    各有一處 H002(通報粒度),模型只回應一處。用真的預掃結果走整條管線:另一處仍是
+    「模型未回應」,擋下自動放行;兩處都回應時就不再有待確認的 H002。"""
+    assert len(_pending_h002(run(_mr(TWO_JOINS))[0])) == 2       # 對照:都沒回應時兩處都待確認
+
+    one = {**MODEL_REPORT, "findings": [_h002_reply("第一段以分行為粒度,聯名戶不會重複通報。")]}
+    report, _, _ = run(_mr(TWO_JOINS), one)
+    assert len(_pending_h002(report)) == 1, [f["title"] for f in report["findings"]]
+    assert report["_policy_signals"]["pending_hints"] is True
+    assert report["decision"] != "auto_approved"
+
+    both = {**MODEL_REPORT, "findings": [
+        _h002_reply("第一段以分行為粒度,聯名戶不會重複通報。", "分行彙總的處理方式"),
+        _h002_reply("第二段以區域為粒度,同樣不會多筆通報。", "區域查詢沒有一對多的關聯")]}
+    assert _pending_h002(run(_mr(TWO_JOINS), both)[0]) == []
+
+
+def test_兩條回應的標題近似時會先被去重_只算一條(run):
+    """已知的交互作用,寫成測試免得它藏著:sanitize_findings 會把同檔標題近似的 finding
+    去重成一條(排在檢核點比對之前),所以模型對兩處檢核點各寫一條、標題卻一樣時,
+    只算回應了一處,另一處仍待確認、不會自動放行(偏保守)。"""
+    same = {**MODEL_REPORT, "findings": [_h002_reply("第一段以分行為粒度,聯名戶不會重複通報。"),
+                                         _h002_reply("第二段以區域為粒度,同樣不會多筆通報。")]}
+    report, _, _ = run(_mr(TWO_JOINS), same)
+    assert len(_pending_h002(report)) == 1
+    assert report["decision"] != "auto_approved"
+
+
 def test_同檔兩處命中模型只報一處時另一處也在報告上(run):
     """#28 review:一個檔案有兩句 DELETE 都沒有 WHERE,模型只報了第一句。
     用真的預掃結果走整條管線:第二句的 R001 也要出現在報告上。"""

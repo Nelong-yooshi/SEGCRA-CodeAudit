@@ -468,6 +468,94 @@ def test_自己補的檢核點不能吞掉同檔的其他檢核點():
     assert [f["title"][:6] for f in report["findings"]] == ["[H002]", "[H005]", "[H003]"]
 
 
+# ---- 同一個檔案有多處相同的檢核點(#28 review:與規則同一類,而且會影響決策)
+
+def _hint(statement, rule="H001", message="此規則聚合交易金額,但未見沖正/退匯處理"):
+    return {"rule": rule, "severity": "hint", "message": message, "statement": statement}
+
+
+def _reply(text, severity="info", file=FILE):
+    return {"severity": severity, "file": file, "title": "檢核點回應", "detail": text,
+            "suggestion": ""}
+
+
+TWO_HINTS = [_hint("SELECT SUM(amount) FROM transactions WHERE tx_type = 'A'"),
+             _hint("SELECT SUM(amount) FROM transactions WHERE tx_type = 'B'")]
+
+
+def _pending(report):
+    return [f for f in report["findings"] if "檢核點待人工確認" in f.get("title", "")]
+
+
+def test_同檔兩處相同檢核點_模型只回應一處_另一處仍待確認():
+    """以前同檔只要有一條提到關鍵詞,兩處 H001 都算回應過,不再擋自動放行。"""
+    model = [_reply("第一段查詢的資料已是淨額,不需另外處理沖正")]
+    report = enforce_hints({"findings": list(model)}, _pre(list(TWO_HINTS)))
+    pending = _pending(report)
+    assert len(pending) == 1
+    assert pending[0]["severity"] == "info" and pending[0]["file"] == FILE
+    assert pending[0]["title"] == "[H001] 檢核點待人工確認(模型未回應)"
+
+
+@pytest.mark.parametrize("n_hints, n_replies, expected", [
+    (1, 0, 1), (1, 1, 0), (1, 2, 0), (2, 0, 2), (2, 1, 1), (2, 2, 0), (4, 1, 3), (4, 6, 0),
+])
+def test_待確認的數量等於檢核點數減掉回應數(n_hints, n_replies, expected):
+    hints = [_hint(f"SELECT SUM(amount) FROM transactions WHERE k = {i}") for i in range(n_hints)]
+    model = [_reply(f"第 {i} 段:沖正已另外處理") for i in range(n_replies)]
+    report = enforce_hints({"findings": list(model)}, _pre(hints))
+    assert len(_pending(report)) == expected
+
+
+def test_兩條回應講的是同一段查詢_另一段仍待確認():
+    model = [_reply("SELECT SUM(amount) FROM transactions WHERE tx_type = 'A' 已排除沖正"),
+             _reply("select sum(amount) from transactions where tx_type = 'A' 的退匯另有處理")]
+    report = enforce_hints({"findings": list(model)}, _pre(list(TWO_HINTS)))
+    assert len(_pending(report)) == 1
+
+
+def test_檔案提到兩個規格代碼_只回應一次時另一個仍待確認():
+    """H003 是每個規格代碼一處(沒有語句),照數量算。"""
+    hints = [_hint("", rule="H003", message="檔案涉及規則 R-201:必須與核定規格逐項核對"),
+             _hint("", rule="H003", message="檔案涉及規則 R-202:必須與核定規格逐項核對")]
+    one = [_reply("已與核定規格 R-201 逐項核對")]
+    report = enforce_hints({"findings": list(one)}, _pre(hints))
+    assert len(_pending(report)) == 1
+    two = one + [_reply("已與核定規格 R-202 逐項核對")]
+    assert _pending(enforce_hints({"findings": list(two)}, _pre(hints))) == []
+
+
+def test_不同代碼的檢核點分開計算():
+    hints = list(TWO_HINTS) + [_hint("", rule="H003", message="檔案涉及規則 R-201")]
+    model = [_reply("沖正已處理"), _reply("退匯已處理")]
+    report = enforce_hints({"findings": list(model)}, _pre(hints))
+    assert [f["title"][:6] for f in _pending(report)] == ["[H003]"]
+
+
+def test_別的檔案的回應不抵這個檔案的檢核點():
+    model = [_reply("沖正已處理"), _reply("沖正已處理", file="sql/rules/r002_other.sql")]
+    report = enforce_hints({"findings": list(model)}, _pre(list(TWO_HINTS)))
+    assert len(_pending(report)) == 1
+
+
+def test_多處檢核點時說明寫出數量_單一檢核點的說明不變():
+    report = enforce_hints({"findings": [_reply("沖正已處理")]}, _pre(list(TWO_HINTS)))
+    detail = _pending(report)[0]["detail"]
+    assert "共有 2 處命中 H001" in detail and "只對應到 1 處" in detail
+
+    single = enforce_hints({"findings": []}, _pre([TWO_HINTS[0]]))
+    assert _pending(single)[0]["detail"] == "此規則聚合交易金額,但未見沖正/退匯處理"
+
+
+def test_補的檢核點不回顯命中的語句():
+    hints = [_hint("SELECT SUM(amount) FROM transactions WHERE zz_marker = 1"),
+             _hint("SELECT SUM(amount) FROM transactions WHERE zz_marker = 2")]
+    for model in ([], [_reply("沖正已處理")]):
+        report = enforce_hints({"findings": list(model)}, _pre(hints))
+        for f in _pending(report):
+            assert "zz_marker" not in " ".join(str(v) for v in f.values())
+
+
 def test_後處理鏈上檢核點排在任何程式補報之前():
     """enforce_rules 補的 R004 內文含「憑證」「密碼」(H004 的關鍵詞);若排在前面,
     會被當成模型已回應 H004。檢核點只認模型自己的回應。"""
