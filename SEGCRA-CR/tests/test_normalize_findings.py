@@ -348,7 +348,7 @@ def review(monkeypatch, tmp_path):
 
     def _review(model_output: dict):
         async def fake_run_agent(cfg, profile, system, user, hub,
-                                 verbose=True, use_tools=True, trace=None):
+                                 verbose=True, use_tools=True, trace=None, **kw):
             return json.dumps(model_output, ensure_ascii=False)
 
         monkeypatch.setattr(pipeline, "run_agent", fake_run_agent)
