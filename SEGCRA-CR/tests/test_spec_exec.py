@@ -1051,3 +1051,141 @@ def test_補缺的輪數不佔整份生成的次數(monkeypatch):
         ["length", "stop", "stop"])
     assert len(users) > 3, (
         f"只呼叫了 {len(users)} 次——補缺用掉了整份生成的預算")
+
+
+# ─────────────────── 基準＋變體(測資正確率的修法) ───────────────────
+#
+# 舊的覆蓋模型是「每個條件 × true/false 兩向」。對合取規則它**定義不出正確的
+# 預期**:單獨讓一個條件成立不會讓規則命中,所以那種案例的 expect_flagged 必然
+# 是錯的。真端點實測(RETAIL_M1_EVAL,46 個案例 0 缺口):12 個預期是錯的,
+# 其中 10 個就是這個原因。
+#
+# 新的形狀:
+#   基準(kind="base",屬於某個分支)  → 整個分支都成立,規則必然命中
+#   變體(kind="variant",壞掉某一條)→ 從基準只壞一條,規則必然不命中
+# 預期值由構造決定,不問模型(它算錯過)。
+
+def _bv_plan(cases, conds=(("C1", "B1"), ("C2", "B1"), ("C3", "B2"))):
+    return {"schema_ddl": ["CREATE TABLE t (id INT);"],
+            "conditions": [{"id": i, "desc": f"條件 {i}", "branch": b} for i, b in conds],
+            "cases": list(cases)}
+
+
+def _base(cid, branch, flagged=None):
+    c = {"case_id": cid, "kind": "base", "branch": branch,
+         "rows": [["t", 1]], "note": ""}
+    if flagged is not None:
+        c["expect_flagged"] = flagged
+    return c
+
+
+def _variant(cid, cond, flagged=None):
+    c = {"case_id": cid, "kind": "variant", "condition_id": cond,
+         "rows": [["t", 1]], "note": ""}
+    if flagged is not None:
+        c["expect_flagged"] = flagged
+    return c
+
+
+def test_基準的預期是命中_變體的預期是不命中_不問模型():
+    """模型給的 expect_flagged 一律覆寫。實測它在 46 個案例裡錯了 12 個,
+    而預期值錯比沒有案例更糟——正確的實作會被判成不符。"""
+    plan = _bv_plan([_base("B1", "B1", flagged=False),      # 模型給錯的值
+                     _variant("V1", "C1", flagged=True)])   # 也給錯
+    cleaned, _, _ = _shape_check(plan)
+    by = {c["case_id"]: c for c in cleaned["cases"]}
+    assert by["B1"]["expect_flagged"] is True, "基準必然命中"
+    assert by["V1"]["expect_flagged"] is False, "變體必然不命中"
+
+
+def test_覆蓋的定義變成_每個分支要有基準_每個條件要有變體():
+    plan = _bv_plan([_base("B1", "B1"), _variant("V1", "C1")])
+    _, gaps, _ = _shape_check(plan)
+    assert any("分支 B2 缺基準" in g for g in gaps), gaps
+    assert any("條件 C2 缺變體" in g for g in gaps), gaps
+    assert any("條件 C3 缺變體" in g for g in gaps), gaps
+    assert not any("C1 缺變體" in g for g in gaps)
+
+
+def test_齊全時沒有缺口():
+    plan = _bv_plan([_base("b1", "B1"), _base("b2", "B2"),
+                     _variant("v1", "C1"), _variant("v2", "C2"),
+                     _variant("v3", "C3")])
+    _, gaps, _ = _shape_check(plan)
+    assert gaps == [], gaps
+
+
+def test_基準的分支必須是宣告過的():
+    plan = _bv_plan([_base("x", "沒宣告的分支")])
+    cleaned, _, dropped = _shape_check(plan)
+    assert not cleaned["cases"] and dropped and "branch" in dropped[0]["reason"]
+
+
+def test_舊形狀的計畫仍然讀得懂():
+    """現有的凍結檔是「每條件兩向」,換了設計不能讓它們全部失效。"""
+    plan = _plan(_all_dirs(("C1",)), conditions=("C1",))
+    cleaned, gaps, dropped = _shape_check(plan)
+    assert len(cleaned["cases"]) == 2 and not gaps and not dropped
+    assert all("kind" not in c for c in cleaned["cases"])
+
+
+def test_隔離性在分支內可以判定():
+    """原本因為 OR 分支互斥而不得不拔掉的判定,在基準＋變體的形狀下回來了:
+    分支**內**是純 AND,「其他條件都成立」在數學上做得到。"""
+    conds = [{"id": "C1", "desc": "a", "branch": "B1"},
+             {"id": "C2", "desc": "b", "branch": "B1"},
+             {"id": "C3", "desc": "c", "branch": "B2"}]
+    want = spec_exec._label_expectation(conds, {"condition_id": "C1",
+                                                "direction": "false",
+                                                "kind": "variant"})
+    assert want == {"C1": False, "C2": True}, "只管同分支,且只有被壞的那條為假"
+    want_b = spec_exec._label_expectation(conds, {"kind": "base", "branch": "B1",
+                                                  "condition_id": "__base__B1",
+                                                  "direction": "true"})
+    assert want_b == {"C1": True, "C2": True}, "基準:同分支全部成立"
+    assert "C3" not in want and "C3" not in want_b, "別的分支本來就互斥,不可判定"
+
+
+def test_不是資料層面的條件不要求變體():
+    """「每帳戶每日至多一筆」、「輸出欄位」、「待補事項」這類條件造不出
+    「只壞這一條」的變體,要求它會永遠補不完。它們本來該由靜態審查管。"""
+    plan = {"schema_ddl": ["CREATE TABLE t (id INT);"],
+            "conditions": [{"id": "C1", "desc": "金額門檻", "branch": "B1"},
+                           {"id": "C9", "desc": "每帳戶每日至多一筆",
+                            "branch": "B1", "data_level": False}],
+            "cases": [_base("b", "B1"), _variant("v", "C1")]}
+    _, gaps, _ = _shape_check(plan)
+    assert gaps == [], f"不該要求 C9 的變體:{gaps}"
+
+
+def test_補缺會先要基準再要變體():
+    """變體要從基準改出來,沒有基準就沒有東西可以改。"""
+    plan = _shape_check(_bv_plan([]))[0]
+    missing = spec_exec._missing_pairs(plan)
+    kinds = [k for k, _ in missing]
+    assert kinds[:2] == ["base", "base"], missing
+    assert set(kinds[2:]) == {"variant"}
+
+
+def test_要變體時prompt要附上基準的資料列():
+    """不附的話模型只能自己重新發明一組資料,那正是預期值出錯的來源
+    (實測 46 個案例 12 個錯,10 個是「自己發明、只滿足一條」)。"""
+    plan = _shape_check(_bv_plan([_base("b1", "B1")]))[0]
+    plan["cases"][0]["rows"] = [["t", 777]]
+    missing = [("variant", "C1")]
+    text = spec_exec._fill_gaps_prompt("R-1", "規格", plan, missing, 8)
+    assert "777" in text, "基準的資料列沒有附在 prompt 裡"
+    assert "只改一處" in text or "只改要壞的那一處" in text
+
+
+def test_補缺要基準時說明該分支有哪些條件():
+    plan = _shape_check(_bv_plan([]))[0]
+    text = spec_exec._fill_gaps_prompt("R-1", "規格", plan, [("base", "B1")], 8)
+    assert "分支 B1" in text and "C1" in text and "C2" in text
+    assert "同時成立" in text
+
+
+def test_舊形狀的補缺描述不變():
+    plan = _shape_check(_plan([], conditions=("C1",)))[0]
+    text = spec_exec._fill_gaps_prompt("R-1", "規格", plan, [("C1", "true")], 8)
+    assert "條件 C1" in text and "true 向" in text

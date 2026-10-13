@@ -126,40 +126,69 @@ async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
 TESTGEN_SYSTEM = """你是測試資料工程師。給你一份異常交易規則的核定規格(spec),
 你要產出可機器執行的測資計畫。**spec 是唯一真值**,不得自行增減條件。
 
+# 核心做法:基準案例 + 單點變體
+規格的篩選條件通常是「數個分支任一成立」,而每個分支內的各項要**同時**成立。
+所以測資這樣造:
+  * **基準案例(base)**:讓**某一個分支的每一項同時成立** → 規則必然命中。
+  * **變體案例(variant)**:拿該分支的基準,**只改動一處**讓**指定的那一條**
+    不成立,其餘一律照抄 → 該分支不成立 → 規則必然不命中。
+
+**你不需要、也不要判斷「這筆該不該被標記」**:基準必然命中、變體必然不命中,
+由規格的結構決定,我們自己填。你只要把資料造對。
+
+為什麼不逐條造「讓這一條成立」的案例:只讓一條成立並不會讓規則命中(其他項
+還不成立),那種案例的預期無法由規格推出來。
+
 # 產出(嚴格 JSON,不要 markdown 圍欄、不要多餘文字)
-{"schema_ddl": ["CREATE TABLE ...(照 spec 的資料表定義,T-SQL 語法,一字不差的欄位名/型別)"],
- "conditions": [{"id": "C1", "desc": "<spec 的一個原子條件,如:tx_type='WITHDRAW'>",
-                 "check_sql": "<判斷這個條件在本案例資料上成不成立的查詢,見第 8 點>"}],
- "cases": [{"case_id": "C1-T", "condition_id": "C1", "direction": "true",
-            "rows": [["<表名>", <值1>, <值2>, ...], ...],
-            "expect_flagged": true, "note": "<這個案例在測什麼>"}]}
+{"schema_ddl": ["CREATE TABLE ...(照 spec 的資料表定義,T-SQL,欄位名/型別一字不差)"],
+ "conditions": [{"id": "C1-1", "branch": "C1", "data_level": true,
+                 "desc": "<spec 的一個原子條件,如:kiosk_outbound_cnt 介於 2-3>",
+                 "check_sql": "<判斷這條在本案例資料上成不成立,見第 7 點>"}],
+ "cases": [
+   {"case_id": "C1-base", "kind": "base", "branch": "C1",
+    "rows": [["<表名>", <值1>, <值2>, ...], ...],
+    "checks": {"<指標>": "<你算出來的值>(要求 <區間>)"},
+    "note": "<這個基準讓哪個分支成立>"},
+   {"case_id": "C1-1-v", "kind": "variant", "condition_id": "C1-1",
+    "rows": [["<表名>", ...], ...],
+    "broke": "<你改了哪一處,如:最後一列的 balance_after 由 500 改為 5000>",
+    "note": "<只讓 C1-1 不成立>"}]}
 
 # 硬性要求
-1. conditions:把 spec 的需求項目拆成**原子條件**(每個可獨立為真/假的判斷:
-   交易範圍過濾、閾值比較、時段、幣別、豁免、時間窗 各自成條)。
-2. 每個條件都要有 direction="true"(條件成立 → 應命中)與 direction="false"
-   (只有此條件不成立 → 不應命中)**兩向案例**;涉及數值門檻的條件另加**邊界案例**
-   (剛好等於門檻、差最小單位),依 spec 的含/不含決定 expect_flagged。
-3. rows:每列 = [資料表名, 各欄位值...],值的順序與 schema_ddl 欄位順序一致;
+1. conditions:把 spec 的需求拆成**原子條件**(每個可獨立為真/假)。每條要標:
+   * `branch`:屬於哪一個分支(spec 寫「條件 1 / 條件 2 / 條件 3 任一成立」就用
+     "C1"/"C2"/"C3")。全域必要條件(排除空白帳號、時間窗、已出帳排除等)屬於
+     **每一個**分支,放在它們共同的分支裡各寫一條,或標同一個 branch 並在每個
+     基準裡都讓它成立。spec 沒有分支結構(全部 AND)時,一律標 branch="C1"。
+   * `data_level`:這一條是不是**資料層面**可以驗的。「每帳戶每日至多輸出一筆」、
+     「輸出欄位要有哪些」、「待補事項」這類**不是**(標 false,不要為它造變體);
+     只有「某筆/某彙總值符不符合」這種才標 true。
+2. 每個分支一個基準案例;每個 `data_level: true` 的條件一個變體案例。
+   **不要**產生 `direction` 欄位,那是舊格式。
+3. 基準的 `checks`:逐項寫出你算出來的值與要求區間,方便人工複核。
+   注意**比值類門檻是別的指標算出來的**(例如出入帳總額比 = 出帳總額 ÷ 入帳總額),
+   不能各自隨意填——先選定兩個總額,再確認比值落在區間內。
+4. 變體只改一處,其餘照抄基準。`broke` 要寫明改了哪裡。
+   **不要順手破壞別的條件**,也要留意改動後不要讓**另一個分支**反而成立
+   (例如把次數由 2 改成 5 來破壞「介於 2-3」,但 5 落在另一個分支的「介於 4-10」)。
+5. rows:每列 = [資料表名, 各欄位值...],順序與 schema_ddl 欄位順序一致;
    時間值用 "YYYY-MM-DD HH:MM:SS" 字串、日期用 "YYYY-MM-DD"、BIT 欄位用 1 或 0。
-4. 時間窗:SQL 的 @start_date 會代入 '{win_start}'、@end_date 代入 '{win_end}'
-   (半開區間)。「窗內」交易的時間一律落在 {win_start} 當天;測「窗外」時才用其他日期。
-5. 每個案例只放**該案例需要的資料列**(案例之間互相獨立,各自在乾淨資料庫執行;
-   expect_flagged=true 表示該案例的資料應使規則輸出至少一列)。
-6. 只用 spec 資料表定義裡存在的表與欄位,不得發明欄位。
-7. check_sql:每個條件附一個**只回一列一欄 0 或 1** 的查詢,用來確認案例的資料
-   真的測到了它宣稱的那一條。寫法:
+   只用 spec 資料表定義裡存在的表與欄位,不得發明欄位。
+6. 時間窗:SQL 的 @start_date 會代入 '{win_start}'、@end_date 代入 '{win_end}'
+   (半開區間)。資料的日期**一律**落在 {win_start} 當天,除非你要測的就是時間窗
+   那一條。**日期寫錯整份測資都會被過濾掉**,規則不可能命中。
+7. check_sql:每個條件附一個**只回一列一欄 0 或 1** 的查詢:
      SELECT CASE WHEN EXISTS (SELECT 1 FROM <表> WHERE <這個條件>) THEN 1 ELSE 0 END
-   涉及彙總的條件(如「單日累計 >= 100000」)要把彙總寫進去:
+   涉及彙總的條件要把彙總寫進去:
      SELECT CASE WHEN EXISTS (SELECT 1 FROM t GROUP BY account_id
                               HAVING SUM(amount) >= 100000) THEN 1 ELSE 0 END
    限制:**單一 SELECT、不得有分號或註解、不得出現 INSERT/UPDATE/DELETE/DROP/
    CREATE/ALTER/EXEC 等會改變狀態的字**(不符會被忽略,那個條件就失去這道檢查)。
-   這道檢查會驗:direction="false" 的案例**只有**被標的那一條不成立,其餘都成立
-   ——所以反向案例要精準地只破壞一個條件,不要順手把別的條件也弄成不成立。
+   這些查詢會在沙盒上逐條執行,用來驗:基準讓該分支每一條都成立、
+   變體**只有**被指定的那一條不成立。所以變體要精準。
 8. 資料庫是 MS SQL(SQL Server),schema_ddl 一律用 T-SQL 型別
-   (NVARCHAR(n) / DECIMAL(p,s) / DATETIME2 / DATE / BIT / INT / BIGINT)。字串型別一定要寫長度:
-   T-SQL 的 NVARCHAR 不寫長度等於長度 1。"""
+   (NVARCHAR(n) / DECIMAL(p,s) / DATETIME2 / DATE / BIT / INT / BIGINT)。
+   字串型別一定要寫長度:T-SQL 的 NVARCHAR 不寫長度等於長度 1。"""
 
 
 def testgen_system() -> str:
@@ -212,27 +241,128 @@ def _shape_check(plan: dict) -> tuple[dict, list[str], list[dict]]:
                             "reason": "條件的 check_sql 形狀不合法(非單一 SELECT、含分號/註解/狀態變更),已忽略"})
         conds.append(c)
     cond_ids = {c["id"] for c in conds}
+    branches = _branches(conds)
+    # 兩種計畫形狀並存:
+    #   新(基準＋變體):案例有 kind="base"/"variant"。基準讓整個分支成立、
+    #     必然命中;變體從基準只壞一條、必然不命中。
+    #   舊(每條件兩向):案例有 direction="true"/"false"。現有的凍結檔是這種,
+    #     要繼續讀得懂,不能因為換了設計就讓它們全部失效。
+    new_shape = any(isinstance(c, dict) and c.get("kind") in ("base", "variant")
+                    for c in plan.get("cases", []) or [])
     cases = []
     for c in plan.get("cases", []):
-        ok = (isinstance(c, dict) and c.get("case_id")
-              and c.get("condition_id") in cond_ids
-              and c.get("direction") in ("true", "false")
-              and isinstance(c.get("expect_flagged"), bool)
-              and isinstance(c.get("rows"), list) and c["rows"]
-              and all(isinstance(r, list) and len(r) >= 2 and isinstance(r[0], str)
-                      and _IDENT.match(r[0]) for r in c["rows"]))
-        (cases if ok else dropped).append(
-            c if ok else {"case": c, "reason": "形狀不合法(缺欄位/表名非法/方向錯)"})
+        ok, why = _case_ok(c, cond_ids, branches, new_shape)
+        if ok:
+            cases.append(_normalize_case(c, new_shape))
+        else:
+            dropped.append({"case": c, "reason": why})
     if not ddl:
         gaps.append("無合法 schema_ddl")
-    for cid in sorted(cond_ids):
-        dirs = {c["direction"] for c in cases if c["condition_id"] == cid}
-        for d in ("true", "false"):
-            if d not in dirs:
-                gaps.append(f"條件 {cid} 缺 {d} 向案例")
+    if new_shape:
+        # 覆蓋的定義跟著換:每個分支要有基準,每個條件要有變體。
+        # 「每條件 true/false 兩向」對合取規則定義不出正確的預期——單獨成立
+        # 一個條件不會讓規則命中,所以那種案例的 expect_flagged 必然是錯的
+        # (實測 46 個案例 12 個錯,其中 10 個是這個原因)。
+        for b_id in sorted(branches):
+            if not any(c["kind"] == "base" and c.get("branch") == b_id for c in cases):
+                gaps.append(f"分支 {b_id} 缺基準案例(整個分支都成立、規則應命中)")
+        for c0 in conds:
+            cid = c0["id"]
+            if not _data_level(c0):
+                # 「每帳戶每日至多一筆」、「輸出欄位」、「待補事項」這類不是資料層面
+                # 可以驗的條件,造不出「只壞這一條」的變體。要求它會永遠補不完,
+                # 而它本來就該由靜態審查管,不是執行驗證。
+                continue
+            if not any(c["kind"] == "variant" and c["condition_id"] == cid for c in cases):
+                gaps.append(f"條件 {cid} 缺變體案例(從基準只壞這一條、規則應不命中)")
+    else:
+        for cid in sorted(cond_ids):
+            dirs = {c["direction"] for c in cases if c["condition_id"] == cid}
+            for d in ("true", "false"):
+                if d not in dirs:
+                    gaps.append(f"條件 {cid} 缺 {d} 向案例")
     if not conds:
         gaps.append("未拆出任何原子條件")
     return {"schema_ddl": ddl, "conditions": conds, "cases": cases}, gaps, dropped
+
+
+def _data_level(cond: dict) -> bool:
+    """這個條件能不能用資料驗。預設 True:舊的計畫沒有這個欄位,行為要照以往。"""
+    return cond.get("data_level", True) is not False
+
+
+def _is_new_shape(plan: dict) -> bool:
+    """計畫是不是「基準＋變體」的形狀。
+
+    兩個來源都算:案例帶 kind(已經生出案例),或條件帶 branch/data_level
+    (只拿到骨架、還沒有案例時也要能判斷接下來該要什麼)。
+    """
+    if any(isinstance(c, dict) and c.get("kind") in ("base", "variant")
+           for c in plan.get("cases") or []):
+        return True
+    return any(isinstance(c, dict) and ("branch" in c or "data_level" in c)
+               for c in plan.get("conditions") or [])
+
+
+def _branches(conds: list[dict]) -> set[str]:
+    """條件分成哪幾個 OR 分支。
+
+    沒有宣告 branch 的計畫視為單一分支(空字串):純 AND 的規格(例如 R-140)
+    本來就只有一個分支,基準＝全部條件成立,變體＝只壞一條,語意完全成立。
+    """
+    return {str(c.get("branch", "") or "") for c in conds}
+
+
+def _rows_ok(rows) -> bool:
+    return (isinstance(rows, list) and bool(rows)
+            and all(isinstance(r, list) and len(r) >= 2 and isinstance(r[0], str)
+                    and _IDENT.match(r[0]) for r in rows))
+
+
+def _case_ok(c, cond_ids: set, branches: set, new_shape: bool) -> tuple[bool, str]:
+    if not (isinstance(c, dict) and c.get("case_id") and _rows_ok(c.get("rows"))):
+        return False, "形狀不合法(缺 case_id 或資料列,或表名非法)"
+    if not new_shape:
+        if c.get("condition_id") not in cond_ids:
+            return False, "形狀不合法(condition_id 不在條件清單裡)"
+        if c.get("direction") not in ("true", "false"):
+            return False, "形狀不合法(direction 必須是 true/false)"
+        if not isinstance(c.get("expect_flagged"), bool):
+            return False, "形狀不合法(expect_flagged 必須是布林)"
+        return True, ""
+    kind = c.get("kind")
+    if kind == "base":
+        if str(c.get("branch", "") or "") not in branches:
+            return False, "基準案例的 branch 不在條件宣告的分支裡"
+        return True, ""
+    if kind == "variant":
+        if c.get("condition_id") not in cond_ids:
+            return False, "變體案例的 condition_id 不在條件清單裡"
+        return True, ""
+    return False, "形狀不合法(kind 必須是 base 或 variant)"
+
+
+def _normalize_case(c: dict, new_shape: bool) -> dict:
+    """新形狀的 expect_flagged **由我們推導**,不看模型給的值。
+
+    基準:整個分支成立 → 規則必然命中 → True
+    變體:從基準只壞一條 → 該分支不成立 → 規則必然不命中 → False
+
+    為什麼不信模型:今天 46 個案例裡 12 個的 expect_flagged 是錯的,而預期值
+    錯了比沒有案例更糟——它會讓正確的實作被判成不符。基準與變體的預期是
+    由構造決定的,根本不需要模型判斷。
+    """
+    if not new_shape:
+        return c
+    out = dict(c)
+    out["expect_flagged"] = (c.get("kind") == "base")
+    if c.get("kind") == "base":
+        out["branch"] = str(c.get("branch", "") or "")
+        out.setdefault("condition_id", f"__base__{out['branch']}")
+        out["direction"] = "true"
+    else:
+        out["direction"] = "false"
+    return out
 
 
 def _covered(plan: dict) -> int:
@@ -326,10 +456,36 @@ def _skeleton_prompt(spec_code: str, spec_text: str) -> str:
 
 
 def _missing_pairs(plan: dict) -> list[tuple[str, str]]:
-    """還缺哪些「條件 × 方向」。只看 plan 自己列出的條件,與 _shape_check 同一把尺。"""
-    have = {(c["condition_id"], c["direction"]) for c in plan["cases"]}
-    return [(c["id"], d) for c in plan["conditions"] for d in ("true", "false")
-            if (c["id"], d) not in have]
+    """還缺哪些案例。只看 plan 自己列出的條件,與 _shape_check 同一把尺。
+
+    新形狀回 ("base", 分支) 與 ("variant", 條件);舊形狀回 (條件, 方向)。
+    兩者都是 (種類, 對象) 的二元組,所以補缺的批量邏輯不用改。
+    **基準排在變體前面**:變體要從基準改出來,沒有基準就沒有東西可以改。
+    """
+    if not _is_new_shape(plan):
+        have = {(c["condition_id"], c["direction"]) for c in plan["cases"]}
+        return [(c["id"], d) for c in plan["conditions"] for d in ("true", "false")
+                if (c["id"], d) not in have]
+    cases = plan.get("cases") or []
+    have_base = {str(c.get("branch", "") or "") for c in cases if c.get("kind") == "base"}
+    have_var = {c.get("condition_id") for c in cases if c.get("kind") == "variant"}
+    out = [("base", b) for b in sorted(_branches(plan.get("conditions") or []))
+           if b not in have_base]
+    out += [("variant", c["id"]) for c in plan.get("conditions") or []
+            if _data_level(c) and c["id"] not in have_var]
+    return out
+
+
+def _base_rows_for(plan: dict, cond_id: str) -> tuple[str, list] | None:
+    """某個條件所屬分支的基準案例(變體要從它改出來)。沒有就回 None。"""
+    branch = next((str(c.get("branch", "") or "") for c in plan.get("conditions") or []
+                   if c.get("id") == cond_id), None)
+    if branch is None:
+        return None
+    for c in plan.get("cases") or []:
+        if c.get("kind") == "base" and str(c.get("branch", "") or "") == branch:
+            return branch, c.get("rows") or []
+    return None
 
 
 def _fill_gaps_prompt(spec_code: str, spec_text: str, plan: dict,
@@ -344,12 +500,35 @@ def _fill_gaps_prompt(spec_code: str, spec_text: str, plan: dict,
     """
     by_id = {c["id"]: c["desc"] for c in plan["conditions"]}
     todo = missing[:batch]
-    lines = [f"- 條件 {cid}({by_id.get(cid, '')}) 的 {d} 向" for cid, d in todo]
+    if not _is_new_shape(plan):
+        lines = [f"- 條件 {cid}({by_id.get(cid, '')}) 的 {d} 向" for cid, d in todo]
+        extra = ""
+    else:
+        lines, bases_shown = [], {}
+        for kind, target in todo:
+            if kind == "base":
+                members = [c["id"] for c in plan["conditions"]
+                           if str(c.get("branch", "") or "") == target]
+                lines.append(f"- 分支 {target} 的**基準案例**"
+                             f"(要讓這些條件同時成立:{', '.join(members)})")
+            else:
+                lines.append(f"- 條件 {target}({by_id.get(target, '')}) 的**變體**"
+                             f"——從該分支的基準只改一處,讓這一條不成立")
+                got = _base_rows_for(plan, target)
+                if got:
+                    bases_shown[got[0]] = got[1]
+        # 變體要「從基準改一處」,所以基準的資料列必須附上——不然沒有東西可以改,
+        # 模型只能自己重新發明一組,那正是預期值出錯的來源。
+        extra = ""
+        for b_id, rows in bases_shown.items():
+            extra += (f"\n分支 {b_id} 的基準資料(變體請照抄、只改要壞的那一處):\n"
+                      + json.dumps(rows, ensure_ascii=False) + "\n")
     return (
         f"先前已經產出部分測資計畫,現在**只要補缺的案例**,不要重新輸出整份。\n\n"
-        f"要補的({len(todo)} 個,共缺 {len(missing)} 個):\n" + "\n".join(lines) + "\n\n"
+        f"要補的({len(todo)} 個,共缺 {len(missing)} 個):\n" + "\n".join(lines) + "\n"
+        + extra + "\n"
         f"請只輸出 JSON 物件 `{{\"cases\": [...]}}`,裡面只放上面列出的那幾個案例。\n"
-        f"**`condition_id` 必須用上面的編號,不要自己改名或新增條件**;\n"
+        f"**編號必須用上面給的,不要自己改名或新增條件**;\n"
         f"資料表與欄位沿用先前的 schema(不要重新定義):\n"
         + "\n".join(plan["schema_ddl"]) + "\n\n"
         f"規則 {spec_code} 規格:\n{spec_text}")
@@ -700,6 +879,20 @@ def _label_expectation(conds: list[dict], case: dict) -> dict[str, bool]:
     要判定得先知道哪些條件屬於同一個 OR 分支,而計畫裡沒有這個結構。
     """
     target, direction = case["condition_id"], case["direction"]
+    if case.get("kind") in ("base", "variant"):
+        # 基準＋變體的形狀下,「其他條件都成立」**在分支內是做得到的**
+        # (分支內是純 AND),所以隔離性可以回來判定:
+        #   基準(branch B)  → B 的每一條都要成立
+        #   變體(壞 T,在 B)→ T 不成立,B 的其他條件都要成立
+        # 這正是原本因為 OR 結構互斥而不得不拔掉的那道檢查。
+        if case["kind"] == "base":
+            b_id = str(case.get("branch", "") or "")
+            return {c["id"]: True for c in conds
+                    if str(c.get("branch", "") or "") == b_id}
+        b_id = next((str(c.get("branch", "") or "") for c in conds
+                     if c["id"] == target), "")
+        return {c["id"]: (c["id"] != target) for c in conds
+                if str(c.get("branch", "") or "") == b_id}
     return {target: direction == "true"}
 
 

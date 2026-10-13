@@ -838,6 +838,23 @@ MUTANTS.update({
     "測資:判斷式算不出來時回部分結果": (S,
         "        except Exception:\n            return None\n        if not row:\n            return None",
         "        except Exception:\n            continue\n        if not row:\n            continue"),
+    # 基準＋變體(測資正確率的修法)。預期值由構造決定,不由模型判斷——實測
+    # 模型在 46 個案例裡填錯 12 個,其中 10 個是「只滿足一條卻說該命中」。
+    "測資:基準/變體的預期值照抄模型給的": (S,
+        "    out[\"expect_flagged\"] = (c.get(\"kind\") == \"base\")",
+        "    out[\"expect_flagged\"] = bool(c.get(\"expect_flagged\"))"),
+    "測資:非資料層面的條件也要求變體(永遠補不完)": (S,
+        "            if not _data_level(c0):",
+        "            if False:"),
+    # 變體要從基準改一處,所以補缺的 prompt 必須附上基準的資料列。少了它,
+    # 模型只能自己重新發明一組,那正是預期值出錯的來源。
+    "測資:要變體時不附基準的資料列": (S,
+        "                got = _base_rows_for(plan, target)" + NL
+        + "                if got:" + NL
+        + "                    bases_shown[got[0]] = got[1]",
+        "                got = None" + NL
+        + "                if got:" + NL
+        + "                    bases_shown[got[0]] = got[1]"),
     # 接著上次的缺口補(--resume):給了 seed_plan 卻還是先問整份計畫,等於把
     # 已經生好的案例丟掉重來——每次呼叫 11-16 分鐘,大規則一輪 151 分鐘。
     "測資:給了既有計畫仍重新生成整份": (S,
