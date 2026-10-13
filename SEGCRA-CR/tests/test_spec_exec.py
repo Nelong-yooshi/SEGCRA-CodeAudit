@@ -711,21 +711,35 @@ def test_沒給判斷式時行為完全不變():
 
 # ── 標籤應有的真假向量 ──
 
-def test_正向案例應該全部條件成立():
+def test_只驗被標的那一條_正向():
     conds = [{"id": "C1", "desc": "x"}, {"id": "C2", "desc": "y"}]
     want = spec_exec._label_expectation(conds, {"condition_id": "C1", "direction": "true"})
-    assert want == {"C1": True, "C2": True}
+    assert want == {"C1": True}
 
 
-def test_反向案例應該只有被標的那一條不成立():
-    """這是契約的重點:反向案例要能把失敗歸因到某一條。
-
-    同時讓兩條不成立的案例,就算行為符合預期(不命中)也證明不了是哪一條造成的
-    ——而那正是 #18 review 第 2 點實際遇到的情況。
-    """
+def test_只驗被標的那一條_反向():
     conds = [{"id": "C1", "desc": "x"}, {"id": "C2", "desc": "y"}, {"id": "C3", "desc": "z"}]
     want = spec_exec._label_expectation(conds, {"condition_id": "C2", "direction": "false"})
-    assert want == {"C1": True, "C2": False, "C3": True}
+    assert want == {"C2": False}
+
+
+def test_不要求其他條件成立_否則OR結構的規格100趴誤報():
+    """原本的版本要求「反向案例只有被標的那一條不成立,其餘全部成立」,用意是讓
+    反向案例能把失敗歸因到某一條。那對純 AND 的規格成立,對「條件 1/2/3 任一
+    成立」這種 OR 結構**在數學上不可能成立**:
+
+        C1-1:kiosk_outbound_cnt 介於 2–3
+        C3-1:kiosk_outbound_cnt 介於 4–10      ← 交集是空集合
+
+    真端點實測(RETAIL_M1_EVAL):30 個案例 30 個被判標籤不符,含 22 個行為
+    完全正確的。而 _label_gaps 會把標籤不符轉成覆蓋缺口 → 只要規格是 OR 結構,
+    spec_exec 的結果就全盤報廢。
+    """
+    conds = [{"id": "C1-1", "desc": "cnt 介於 2–3"},
+             {"id": "C3-1", "desc": "cnt 介於 4–10"}]   # 互斥,不可能同時成立
+    want = spec_exec._label_expectation(conds, {"condition_id": "C1-1",
+                                                "direction": "true"})
+    assert "C3-1" not in want, "對互斥的條件下判定 = 必然誤報"
 
 
 # ── 算不出來就整個放棄 ──
@@ -813,6 +827,40 @@ def _fake_sandbox(monkeypatch):
                         lambda: {"server": "x", "port": 1433, "user": "sa",
                                  "password": "pw"})
     monkeypatch.setattr(spec_exec, "_drop_stale_sandbox_dbs", lambda admin: None)
+
+
+class _CondCursor(_FakeCursor):
+    """判斷式查詢回固定答案:conds_true 裡的條件回 1,其餘回 0。"""
+
+    answers: dict = {}
+
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+        self._cond = self.answers.get(sql.strip())
+
+    def fetchone(self):
+        if self._cond is None:
+            return ("16.0.1000.6", "Developer Edition")
+        return (1 if self._cond else 0,)
+
+
+def test_其他條件同時不成立時只記錄不判定(monkeypatch):
+    """OR 結構的規格裡,不同分支的條件本來就互斥——同時有幾條不成立是正常的,
+    不可以當成「這個案例沒測到它宣稱的那一條」。所以記在 label_cofail,
+    不影響 label_ok。真端點實測:不這樣分開,30 個案例 30 個被判不符。"""
+    _fake_sandbox(monkeypatch)
+    _CondCursor.answers = {"SELECT 1 WHERE A": True,      # 被標的這一條:成立
+                           "SELECT 1 WHERE B": False}     # 別的分支:不成立
+    monkeypatch.setattr(_FakeCon, "cursor", lambda self: _CondCursor())
+    plan = {"schema_ddl": ["CREATE TABLE t (id INT)"],
+            "conditions": [{"id": "A", "desc": "a", "check_sql": "SELECT 1 WHERE A"},
+                           {"id": "B", "desc": "b", "check_sql": "SELECT 1 WHERE B"}],
+            "cases": [{"case_id": "A-T", "condition_id": "A", "direction": "true",
+                       "expect_flagged": True, "note": "", "rows": [["t", 1]]}]}
+    out = spec_exec.execute_cases("SELECT id FROM t", plan)
+    r = out["case_results"][0]
+    assert r["label_ok"] is True, f"被標的那一條成立,不該判不符:{r.get('label_mismatch')}"
+    assert r["label_cofail"] == ["B"], "其他條件不成立要記下來(供診斷)"
 
 
 def test_execute_cases_沒有conditions欄位也不能炸(monkeypatch):
