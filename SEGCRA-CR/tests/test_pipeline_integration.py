@@ -85,7 +85,7 @@ def run(monkeypatch, tmp_path):
 
         report_json = json.dumps(model_report or MODEL_REPORT, ensure_ascii=False)
 
-        async def fake_run_agent(cfg, profile, system, user, hub,
+        async def fake_run_agent(cfg, profile, system, user, hub, meta=None,
                                  verbose=True, use_tools=True, trace=None):
             return report_json
 

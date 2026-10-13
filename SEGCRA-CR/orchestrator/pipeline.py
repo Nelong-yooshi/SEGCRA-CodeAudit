@@ -366,12 +366,15 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         )
 
         trace = [] if capture is not None else None
-        raw = await run_agent(cfg, profile, system, user, hub, trace=trace)
+        output_meta: dict = {}
+        raw = await run_agent(cfg, profile, system, user, hub, trace=trace,
+                              meta=output_meta)
         if capture is not None:
             capture["system_prompt"] = system
             capture["user_prompt"] = user
             capture["agent_trace"] = trace
             capture["raw"] = raw
+            capture["output_meta"] = dict(output_meta)
         # 存模型原始輸出(未經 pipeline 後處理),供原汁原味檢視
         import os as _os
         _raw_dir = Path(_os.environ.get("REVIEW_OUTPUT", PKG_ROOT / "review_output"))
@@ -380,7 +383,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             (_raw_dir / f"mr_{mr_id}_raw.txt").write_text(raw, encoding="utf-8")
         except Exception:
             pass
-        report = extract_json(raw)
+        report = _parse_model_output(raw, output_meta, profile.max_output_tokens)
         if not report:
             raise RuntimeError(f"模型輸出無法解析為 JSON:\n{raw[:2000]}")
         report = validate_citations(report, spec_code)
@@ -394,6 +397,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述
         report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
         report = enforce_injection(report, injection_hits)  # 確定性 blocker,不論模型是否被攻陷
+        report = enforce_truncation(report, output_meta, profile.max_output_tokens)  # 輸出被截斷
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
 
         # 執行驗證(必跑;測資生成 → 沙盒執行 → 仲裁)——在 rubric 之前
@@ -793,6 +797,71 @@ def enforce_unreviewable(report: dict, mr: dict) -> dict:
         "title": "部分變更內容無法取得,未經審查",
         "detail": "".join(parts) + "這些內容沒有經過注入掃描、規則預掃與模型審查,需人工確認。",
         "suggestion": "拆分 MR 讓每個檔案都能被完整取得;或人工審查上列檔案後再合併。",
+        "citations": []})
+    return report
+
+
+_TRUNCATED_TITLE = "審查模型的輸出被截斷,審查結果可能不完整"
+_TRUNCATED_SUMMARY = "審查模型的輸出被截斷、無法解析;以下只有程式確定性檢查的結果。"
+
+
+def _output_truncated(meta: dict, max_output_tokens) -> bool:
+    """主審查的最後一次回應是不是被輸出長度上限切斷(#26 第 1 點)。
+
+    `meta` 由 run_agent 回填(#18)。兩個條件任一成立就算:
+    - 端點回報 `finish_reason == "length"`
+    - 回報的 `completion_tokens` 已達該 profile 的 `max_output_tokens`——不是每個端點都照規格
+      回 `length`,用量達到上限本身就代表輸出是被切斷的
+
+    端點什麼都沒回報時判成沒有截斷(與測資生成的做法一致):沒有依據就報,會讓每一個 MR
+    都轉人工。
+    """
+    if meta.get("finish_reason") == "length":
+        return True
+    used = meta.get("completion_tokens")
+    return (_is_count(used) and _is_count(max_output_tokens)
+            and 0 < max_output_tokens <= used)
+
+
+def _is_count(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _parse_model_output(raw: str, meta: dict, max_output_tokens) -> dict | None:
+    """解析主審查模型的輸出。被截斷又解析不出來時回一份空報告,讓審查繼續走完。
+
+    截斷的位置若在第一個 `}` 之前,extract_json 連修補都沒有東西可以修,回 None;原本會丟
+    例外讓整次審查中斷、MR 收不到任何結果。但程式的確定性檢查(規則命中、注入掃描、
+    預掃無法解析…)與模型無關,不該跟著消失——用空報告走完後處理,截斷本身由
+    enforce_truncation 補一條 major。
+
+    沒有截斷卻解析不出來的,維持原本的行為(回 None,由呼叫端丟例外)。
+    """
+    report = extract_json(raw)
+    if not report and _output_truncated(meta, max_output_tokens):
+        return {"summary": _TRUNCATED_SUMMARY, "findings": []}
+    return report
+
+
+def enforce_truncation(report: dict, meta: dict, max_output_tokens) -> dict:
+    """主審查的輸出被截斷 → 補一條 major(確定性,不得自動放行)。
+
+    extract_json 的修補退路會把被切斷的 JSON 補成合法物件:後半的 finding 不見了,報告
+    看起來卻一切正常,只是比較短;不見的可能正是該擋下 MR 的那一條。已解析出來的 finding
+    保留。不重試:主審查一次可能跑很久,再跑一次也不保證變短。
+
+    內容只有固定文字與數字,不回顯模型輸出,也不回顯端點回報的字串。必須排在
+    sanitize_findings 之後(近似標題去重可能留下模型那一條),也排在 enforce_hints /
+    enforce_style 之後(它們以報告全文含關鍵字判斷模型有沒有回應)。
+    """
+    if not _output_truncated(meta, max_output_tokens):
+        return report
+    limit = (f"(上限 {max_output_tokens} tokens)" if _is_count(max_output_tokens) else "")
+    _put_program_finding(report, {
+        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _TRUNCATED_TITLE,
+        "detail": f"審查模型的輸出達到長度上限{limit}而被切斷,切斷之後的內容沒有產出。"
+                  "已解析出來的 finding 予以保留,但可能有缺漏,這次的審查結果需人工確認。",
+        "suggestion": "重新觸發審查;若持續發生,請拆分 MR,或調高審查模型的輸出上限。",
         "citations": []})
     return report
 
