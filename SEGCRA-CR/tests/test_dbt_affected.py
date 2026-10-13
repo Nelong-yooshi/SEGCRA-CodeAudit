@@ -853,7 +853,7 @@ def review(monkeypatch, tmp_path):
         return {"engine": "stub", "sandbox_error": None, "testdata_error": None, "sql_error": None,
                 "case_results": [{"case_id": "C1-T"}, {"case_id": "C1-F"}], "mismatches": []}
 
-    async def fake_run_agent(cfg, profile, system, user, hub, verbose=True, use_tools=True, trace=None):
+    async def fake_run_agent(cfg, profile, system, user, hub, verbose=True, use_tools=True, trace=None, **kw):
         state["prompt"] = user
         return json.dumps({"summary": "沒有問題", "findings": []}, ensure_ascii=False)
 

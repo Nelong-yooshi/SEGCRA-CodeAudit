@@ -531,7 +531,7 @@ def test_review_mr_完整內容裡的注入文字_擋下(monkeypatch, tmp_path):
           "files": [_f("models/mrt_big.sql", diff="@@ -5 +5 @@\n+WHERE t.id > 5")]}
     (fixtures / "mr_900.json").write_text(json.dumps(mr), encoding="utf-8")
 
-    async def fake_run_agent(cfg, profile, system, user, hub, verbose=True, use_tools=True, trace=None):
+    async def fake_run_agent(cfg, profile, system, user, hub, verbose=True, use_tools=True, trace=None, **kw):
         return json.dumps({"summary": "沒有問題", "findings": []}, ensure_ascii=False)
 
     async def fake_spec_exec(cfg, hub, mr_, spec_code, spec_text):
