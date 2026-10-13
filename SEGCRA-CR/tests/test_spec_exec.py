@@ -948,6 +948,51 @@ def test_骨架可以成為補缺的起點(monkeypatch):
     assert "只要補缺的案例" in users[2], "第 3 次不是補缺模式"
 
 
+# ── 跨次累積:接著上次的缺口補(--resume) ──
+
+def test_seed_plan_直接進補缺模式不重新生成整份(monkeypatch):
+    """大規則一輪補不完(實測 46 個「條件×方向」,13 次呼叫 151 分鐘補到 30 個),
+    但補缺是可累積的:接著上次的結果再跑一輪就會往前推進。
+
+    所以給了 seed_plan 時,第一次呼叫就必須是**補缺**——不可以再問一次整份計畫
+    或骨架,那會把已經生好的案例丟掉重來(每次呼叫 11-16 分鐘)。
+    """
+    ids = ("C1", "C2", "C3")
+    seed = _shape_check(_plan(_all_dirs(("C1",)), conditions=ids))[0]  # 缺 C2/C3
+    rest = {"cases": _all_dirs(("C2", "C3"))}
+    (plan, gaps, _), users = _gen_meta_seed(
+        monkeypatch, seed, [json.dumps(rest, ensure_ascii=False)], ["stop"])
+    assert "只要補缺的案例" in users[0], f"第一次就該是補缺:{users[0][:120]}"
+    assert len(plan["cases"]) == 6 and not gaps, f"沒補滿:{len(plan['cases'])} {gaps}"
+
+
+def test_seed_plan_已經補滿時不呼叫模型(monkeypatch):
+    """已經滿了還去問模型 = 白付一次 11-16 分鐘的呼叫。"""
+    ids = ("C1",)
+    seed = _shape_check(_plan(_all_dirs(ids), conditions=ids))[0]
+    (plan, gaps, _), users = _gen_meta_seed(monkeypatch, seed, ["{}"], ["stop"])
+    assert users == [], "已經補滿卻還是呼叫了模型"
+    assert len(plan["cases"]) == 2 and not gaps
+
+
+def _gen_meta_seed(monkeypatch, seed, outputs, finish_reasons):
+    import asyncio as _a
+
+    from orchestrator import spec_exec as se
+    seq, fr, users = list(outputs), list(finish_reasons), []
+
+    async def fake(cfg, profile, system, user, hub=None, verbose=True,
+                   use_tools=True, trace=None, meta=None):
+        users.append(user)
+        if meta is not None:
+            meta["finish_reason"] = fr.pop(0) if len(fr) > 1 else fr[0]
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    monkeypatch.setattr(se, "run_agent", fake)
+    out = _a.run(se.generate_cases(_FakeCfg(), "R-999", "規格內容", seed_plan=seed))
+    return out, users
+
+
 def test_補缺被截斷時縮小批量而不是退回整份重來(monkeypatch):
     """補缺的回應被截斷,代表「這一批要太多」,不代表「補缺這條路不行」。
 

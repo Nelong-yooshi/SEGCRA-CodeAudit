@@ -383,7 +383,9 @@ def _retry_prompt(spec_code: str, spec_text: str, gaps: list[str],
 
 async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
                          profile_name: str | None = None,
-                         max_attempts: int = 3) -> tuple[dict, list[str], list[dict]]:
+                         max_attempts: int = 3,
+                         seed_plan: dict | None = None,
+                         ) -> tuple[dict, list[str], list[dict]]:
     """角色一:LLM 依 spec 生成測資計畫,回傳 (plan, gaps, dropped)。
 
     只要有合法案例就接受、不管 coverage_gaps 是否為空,曾經是這裡的行為——
@@ -405,7 +407,18 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
 
     仍然抽不到 0 缺口時,回傳嘗試過的最佳結果(而不是最後一次、也不是直接判定
     失敗)——覆蓋不完整要如實反映在 coverage_gaps 裡,由後續判斷是否需要人工
-    確認,不能因為「retry 用完了」就悄悄退化成沒案例。"""
+    確認,不能因為「retry 用完了」就悄悄退化成沒案例。
+
+    `seed_plan` 給定時,**接著它的缺口繼續補**,不重新生成整份(也不重新要骨架)。
+
+    為什麼需要:大規則一輪補不完。實測 RETAIL_M1_EVAL(46 個「條件×方向」)
+    13 次呼叫 151 分鐘只補到 30 個——不是機制失效,是一次呼叫只裝得下 3-6 個
+    案例,而輪數有上限。但補缺是**可累積**的:模型對補缺的要求完全照做
+    (成功的 11 次:要 N 個就回 N 個,沒多給、沒漏給、沒改條件編號),所以
+    接著上次的結果再跑一輪就會往前推進,兩三輪之後覆蓋必然收斂。
+
+    這比「把單次做得更強」可靠:不依賴任何一次呼叫的運氣(截斷與否取決於那次
+    思考燒掉多少 token),而且中途斷掉不會把已經生好的案例丟掉。"""
     system = testgen_system()
     user = f"規則 {spec_code} 的核定規格如下,請產出測資計畫 JSON:\n\n{spec_text}"
     profile = cfg.role_profile("testgen") if profile_name is None else cfg.profile(profile_name)
@@ -418,6 +431,17 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
     best: tuple[dict, list[str], list[dict]] | None = None
     best_repaired = False
     max_conds = 0
+    if seed_plan is not None:
+        # 接著上次的結果補:把它當成已經拿到的最佳版,直接進補缺模式。
+        seeded, seeded_gaps, seeded_dropped = _shape_check(seed_plan)
+        if seeded["conditions"] and seeded["schema_ddl"]:
+            missing = _missing_pairs(seeded)
+            if not missing:
+                return seeded, seeded_gaps, seeded_dropped   # 已經滿了,不用問模型
+            best = (seeded, seeded_gaps, seeded_dropped)
+            max_conds = len(seeded["conditions"])
+            filling = True
+            user = _fill_gaps_prompt(spec_code, spec_text, seeded, missing, fill_batch)
     # 補缺的輪數不佔整份生成的次數:它們是不同性質的呼叫(小輸出 vs 整份計畫),
     # 混在同一個預算裡會讓大規則永遠補不完——補一輪就用掉一次整份生成的機會。
     for attempt in range(max_attempts + _FILL_ROUNDS):

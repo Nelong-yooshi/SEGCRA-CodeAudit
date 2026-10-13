@@ -2,6 +2,7 @@
 """凍結一條規則的測資計畫,供 `run_eval.py --frozen-testdata` 使用。
 
   python eval/freeze_testdata.py R-140                  # 生成,0 缺口才存檔
+  python eval/freeze_testdata.py RETAIL_M1_EVAL --resume --force   # 接著上次的缺口補
   python eval/freeze_testdata.py R-140 --attempts 8      # 拉高嘗試次數,更容易抽到 0 缺口
   python eval/freeze_testdata.py R-140 --profile fast    # 換模型
   python eval/freeze_testdata.py R-140 --force           # 有缺口也要存(不建議,見下)
@@ -19,6 +20,7 @@
 """
 import argparse
 import asyncio
+import json
 import sys
 from pathlib import Path
 
@@ -38,6 +40,10 @@ async def main() -> int:
                     help="最多重試幾次去抽到 0 缺口(預設 5,比 generate_cases() "
                         "內建的 3 次更寬——凍結是一次性操作,值得多花幾次呼叫)")
     ap.add_argument("--profile", default=None, help="模型 profile(預設用 roles.testgen)")
+    ap.add_argument("--resume", action="store_true",
+                    help="接著現有凍結檔的缺口繼續補,不重新生成整份。大規則一輪"
+                        "補不完(實測 RETAIL_M1_EVAL 13 次呼叫 151 分鐘補到 30/46),"
+                        "而補缺是可累積的——再跑一輪就會往前推進")
     ap.add_argument("--force", action="store_true",
                     help="有覆蓋缺口也要存檔。不建議:golden set 跑起來會少測到"
                         "那些條件,而且會一直是同一批案例、不會自動變好")
@@ -50,9 +56,29 @@ async def main() -> int:
     spec_text = spec_path.read_text(encoding="utf-8")
 
     cfg = load_config()
+
+    seed = None
+    if args.resume:
+        path = PKG_ROOT / "eval" / "testdata_cache" / f"{args.spec_code}.json"
+        if not path.exists():
+            print(f"--resume 需要現有的凍結檔,但找不到 {path}")
+            return 1
+        data = json.loads(path.read_text(encoding="utf-8"))
+        seed = data.get("plan")
+        if data.get("spec_sha256") != testdata_cache._sha(spec_text):
+            # 規格變了,舊的條件編號可能對不上——接著補會補到錯的東西上。
+            print("規格已經改過(spec_sha256 不符),不能接著補:"
+                  "條件可能已經不同。請重新生成。")
+            return 1
+        if data.get("prompt_sha256") != testdata_cache._prompt_hash():
+            print("注意:TESTGEN prompt 已經改過(prompt_sha256 不符)。"
+                  "條件編號仍沿用舊的那一份,接著補出來的案例會是兩個版本的混合。")
+        have = len((seed or {}).get("cases") or [])
+        print(f"接著現有的 {have} 個案例繼續補(來自 {data.get('generated_at')})")
+
     plan, gaps, dropped = await generate_cases(
         cfg, args.spec_code, spec_text, profile_name=args.profile,
-        max_attempts=args.attempts)
+        max_attempts=args.attempts, seed_plan=seed)
 
     print(f"{args.spec_code}: {len(plan['cases'])} 案例、"
           f"{len(plan['conditions'])} 個條件、{len(gaps)} 個缺口、{len(dropped)} 個被剔除")

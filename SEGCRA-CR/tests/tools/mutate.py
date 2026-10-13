@@ -838,6 +838,17 @@ MUTANTS.update({
     "測資:判斷式算不出來時回部分結果": (S,
         "        except Exception:\n            return None\n        if not row:\n            return None",
         "        except Exception:\n            continue\n        if not row:\n            continue"),
+    # 接著上次的缺口補(--resume):給了 seed_plan 卻還是先問整份計畫,等於把
+    # 已經生好的案例丟掉重來——每次呼叫 11-16 分鐘,大規則一輪 151 分鐘。
+    "測資:給了既有計畫仍重新生成整份": (S,
+        "            filling = True" + NL
+        + "            user = _fill_gaps_prompt(spec_code, spec_text, seeded, missing, fill_batch)",
+        "            filling = False"),
+    "測資:既有計畫已補滿仍再問模型": (S,
+        "            if not missing:" + NL
+        + "                return seeded, seeded_gaps, seeded_dropped   # 已經滿了,不用問模型",
+        "            if False:" + NL
+        + "                return seeded, seeded_gaps, seeded_dropped   # 已經滿了,不用問模型"),
     # 沒有條件可比時若照樣下標籤結論,label_ok 會是 True——「標籤驗過了」的假訊號。
     # 工具輪次用光時回傳的是最後一則工具結果(不是報告),而端點回 finish_reason="stop"
     # ——呼叫端只能靠這個標記知道。少了它,工具結果會被當成審查報告收下(#26 第 1 點)。
