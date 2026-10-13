@@ -154,15 +154,36 @@ _MASKED_KEY_RE = re.compile(
 # `AND DB_NAME() NOT LIKE 'segcra%'`)——執行驗證反而會通過,規則層與沙盒都擋不住。
 # 刻意**不排除註解裡的寫法**:去註解的 regex 會被字串裡的 `--` 騙(`'--' AND DB_NAME()`
 # 會連真正會執行的呼叫一起被當成註解去掉);寫在註解裡的誤報只是多一次人工確認。
+# 函式名與括號之間可以夾空白**或註解**:`DB_NAME/**/()` 在 T-SQL 是合法的,
+# 只容許空白就漏掉了(#27 review)。`--` 到行尾的註解同理。
+_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/))*\*/|--[^\n]*\n)*"
+# 需要括號的環境函式。分三類只是為了讀起來分得清,比對時三條都跑。
 _ENV_FUNC_RE = re.compile(
-    r"(?i)(?<![\w.@\[])(DB_NAME|DB_ID|HOST_NAME|HOST_ID|SUSER_NAME|SUSER_SNAME|SUSER_ID"
-    r"|ORIGINAL_LOGIN|APP_NAME|SERVERPROPERTY|DATABASEPROPERTYEX)\s*\(")
+    r"(?i)(?<![\w.@\[])("
+    # 資料庫 / 連線資訊
+    r"DB_NAME|DB_ID|ORIGINAL_DB_NAME|DATABASEPROPERTYEX|SESSION_CONTEXT|CONTEXT_INFO"
+    r"|CONNECTIONPROPERTY"
+    # 主機 / 伺服器
+    r"|HOST_NAME|HOST_ID|SERVERPROPERTY|APP_NAME"
+    # 登入身分 / 權限
+    r"|SUSER_NAME|SUSER_SNAME|SUSER_ID|SUSER_SID|ORIGINAL_LOGIN|USER_NAME|USER_ID"
+    r"|IS_MEMBER|IS_SRVROLEMEMBER|IS_ROLEMEMBER|HAS_PERMS_BY_NAME"
+    r")" + _GAP + r"\(")
+# 不帶括號的(niladic)環境函式與全域變數。這類沒有 `(` 可以當界線,所以兩邊都要
+# 卡字界:`CURRENT_USER_ID` 這種欄位名不會命中(底線是 word char,\b 不成立)。
 _ENV_VAR_RE = re.compile(r"(?i)@@(SERVERNAME|SERVICENAME|VERSION|SPID)\b"
-                         r"|(?<![\w.@\[])SYSTEM_USER\b")
+                         r"|(?<![\w.@\[])(SYSTEM_USER|CURRENT_USER|SESSION_USER)\b")
+# 系統目錄。`sys.` 開頭**一律**算:只列幾個名字會漏掉 sys.server_principals、
+# sys.configurations、sys.all_objects…(#27 review)。
+#
+# 前面的 lookbehind 只排除 word char(`mysys.objects` 不算),**不排除點**——
+# 原本寫 (?<![\w.]) 把 `master.sys.databases` 這種三段式名稱排除掉了,
+# 而 `[master].[sys].[databases]` 反而抓得到,行為不一致(#27 review 指出的 bug)。
 _ENV_CATALOG_RE = re.compile(
-    r"(?i)(?<![\w.])\[?sys\]?\s*\.\s*\[?(databases|objects|tables|schemas|columns|servers"
-    r"|sysdatabases|sysobjects|dm_\w+)\b"
-    r"|(?<![\w.])\[?INFORMATION_SCHEMA\]?\s*\.")
+    r"(?i)(?<!\w)\[?sys\]?" + _GAP + r"\." + _GAP + r"\[?\w+\]?"
+    # 舊式的系統表名(master..sysdatabases、master.dbo.sysobjects),沒有 sys. 前綴
+    r"|(?<!\w)\[?sys(databases|objects|columns|users|logins|processes|servers|indexes)\]?(?!\w)"
+    r"|(?<!\w)\[?INFORMATION_SCHEMA\]?" + _GAP + r"\.")
 
 
 def _env_probes(sql: str) -> list[str]:

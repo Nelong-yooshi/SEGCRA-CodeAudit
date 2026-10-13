@@ -527,7 +527,9 @@ _RULE_KEYWORDS = {
     "R002": ["SELECT *", "明列欄位", "star"],
     "R003": ["NOT IN", "NULL 陷阱", "NOT EXISTS"],
     "R004": ["憑證", "密碼", "金鑰", "硬編碼", "hardcode", "credential", "secret"],
-    "R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys.", "沙盒"],
+    # 「沙盒」刻意不列(#27 review 的建議):它的範圍太廣,同一個檔案裡模型的其他
+    # major 只要提到沙盒,R005 就會被當成已經報過而不補報。
+    "R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys."],
 }
 
 

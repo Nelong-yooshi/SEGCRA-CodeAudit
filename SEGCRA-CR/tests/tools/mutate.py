@@ -588,6 +588,26 @@ MUTANTS.update({
  "R005:強制載入的判斷寫死成不載": ("pipeline.py",
      "        if \"secure-sql\" in skills and _needs_secure_sql(pre):",
      "        if False:"),
+ # 以下四項是 #27 review 補齊的,各自對應一個真實的漏抓:
+ # 三段式名稱(master.sys.databases)、系統目錄只列幾個名字、夾在函式名與括號之間
+ # 的註解、不帶括號的身分函式。
+ "R005:系統目錄的 lookbehind 連點一起排除(三段式名稱漏抓)": ("toolbox/sqltools.py",
+     r'r"(?i)(?<!\w)\[?sys\]?" + _GAP',
+     r'r"(?i)(?<![\w.])\[?sys\]?" + _GAP'),
+ "R005:系統目錄只認列舉的那幾個名字": ("toolbox/sqltools.py",
+     r'+ _GAP + r"\." + _GAP + r"\[?\w+\]?"',
+     r'+ _GAP + r"\." + _GAP + r"\[?(databases|objects|tables)\]?"'),
+ "R005:函式名與括號之間只容許空白(夾註解就漏抓)": ("toolbox/sqltools.py",
+     r'_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/))*\*/|--[^\n]*\n)*"',
+     r'_GAP = r"\s*"'),
+ "R005:不抓不帶括號的身分函式": ("toolbox/sqltools.py",
+     r'(SYSTEM_USER|CURRENT_USER|SESSION_USER)\b"',
+     r'(SYSTEM_USER)\b"'),
+ # review 的小建議:「沙盒」範圍太廣,同一個檔案裡其他 major 提到沙盒就會讓 R005
+ # 被當成已經報過。
+ "R005:已報判定關鍵詞含「沙盒」(範圍過廣)": ("pipeline.py",
+     '"R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys."],',
+     '"R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys.", "沙盒"],'),
 })
 
 # ---- 確定性防線不能被模型關掉(#16 review):程式專用標題、規則命中不可被降級
@@ -677,7 +697,9 @@ def _run_mutant(src: pathlib.Path, mutant, python: str, timeout: int, env: dict)
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="sgc_mut_"))
     try:
         copy_project(src, tmp)
-        path = tmp / "orchestrator" / module
+        # 目標字串帶斜線時當成「相對專案根目錄的路徑」,否則沿用 orchestrator/。
+        # R005 的規則在 toolbox/sqltools.py,不給路徑的話那一塊根本放不進突變。
+        path = (tmp / module) if "/" in module else (tmp / "orchestrator" / module)
         text = path.read_text(encoding="utf-8")
         if text.count(old) != 1:
             return "config", f"突變點出現 {text.count(old)} 次"

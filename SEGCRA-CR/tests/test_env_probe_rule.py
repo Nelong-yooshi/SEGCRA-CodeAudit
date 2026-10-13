@@ -114,3 +114,108 @@ def test_命中R005時強制載入secure_sql():
     """模型要知道這種寫法為什麼危險,secure-sql 的說明才會在 prompt 裡。"""
     assert pipeline._needs_secure_sql(_pre(f"{BASE} AND DB_NAME() <> 'x'"))
     assert not pipeline._needs_secure_sql(_pre(BASE))
+
+
+# ─────────────────── #27 review 補齊的項目 ───────────────────
+
+@pytest.mark.parametrize("probe", [
+    # 三段式的系統表名稱(review 指出的 bug:原本 (?<![\w.]) 把前面的點排除掉,
+    # 所以 master.sys.databases 抓不到,[master].[sys].[databases] 反而抓得到)
+    "AND EXISTS (SELECT 1 FROM master.sys.databases WHERE name LIKE 'segcra%')",
+    "AND EXISTS (SELECT 1 FROM [master].[sys].[databases])",
+    "AND EXISTS (SELECT 1 FROM master..sysdatabases)",
+    "AND EXISTS (SELECT 1 FROM master.dbo.sysdatabases)",
+    "AND EXISTS (SELECT 1 FROM msdb.sys.objects)",
+    # 系統目錄一律算(原本只列了幾個名字)
+    "AND EXISTS (SELECT 1 FROM sys.server_principals WHERE name = 'sa')",
+    "AND EXISTS (SELECT 1 FROM sys.configurations)",
+    "AND EXISTS (SELECT 1 FROM sys.all_objects)",
+    "AND EXISTS (SELECT 1 FROM sys.database_principals)",
+    # 其他身分函式
+    "AND CURRENT_USER <> 'dbo'",
+    "AND SESSION_USER <> 'sa'",
+    "AND USER_NAME() <> 'dbo'",
+    "AND USER_ID() > 1",
+    "AND IS_MEMBER('db_owner') = 0",
+    "AND IS_SRVROLEMEMBER('sysadmin') = 0",
+    "AND HAS_PERMS_BY_NAME(NULL, NULL, 'VIEW SERVER STATE') = 0",
+    # 其他資料庫與連線資訊
+    "AND ORIGINAL_DB_NAME() <> 'PROD'",
+    "AND SESSION_CONTEXT(N'env') <> 'prod'",
+    "AND CONTEXT_INFO() IS NULL",
+    "AND CONNECTIONPROPERTY('net_transport') = 'TCP'",
+    # 函式名與括號之間夾註解(T-SQL 合法)
+    "AND DB_NAME/**/() NOT LIKE 'segcra%'",
+    "AND DB_NAME /* which db? */ () <> 'PROD'",
+    "AND HOST_NAME/**/() = 'prod-01'",
+])
+def test_review_補齊的寫法都命中R005(probe):
+    hits = _r005(f"{BASE} {probe}")
+    assert len(hits) == 1, f"沒抓到:{probe}"
+    assert hits[0]["severity"] == "major"
+
+
+@pytest.mark.parametrize("sql", [
+    # 延續原本那組:名稱剛好含關鍵字不誤報
+    "SELECT current_user_id, session_user_id FROM t",        # 欄位名含 niladic 函式名
+    "SELECT t.user_name FROM t",                             # 欄位叫 user_name(沒有括號)
+    "SELECT dbo.fn_user_name(x) FROM t",                     # 自訂函式名含 user_name
+    "SELECT dbo.is_member_flag FROM t",                      # 欄位含 is_member
+    "SELECT * FROM mysys.databases",                         # schema 名只是含 sys
+    "SELECT * FROM t_sysobjects",                            # 表名以 sysobjects 結尾的字
+    "SELECT sysname_col FROM t",                             # 以 sys 開頭但不是系統表
+    "DECLARE @n sysname = 'x'",                              # sysname 是 T-SQL 型別
+    "SELECT * FROM mydb.dbo.accounts",                       # 一般的三段式名稱
+    "SELECT original_db_name_col FROM t",
+])
+def test_review補齊之後仍然不誤報(sql):
+    assert _r005(sql) == []
+
+
+def test_現有的SQL檔沒有誤報():
+    """PR 原本的驗收是「現有 71 個 SQL 檔 0 誤報」。這次把比對放寬(sys. 一律算、
+    多了身分函式、允許夾註解),要確認放寬沒有把正常的程式掃進來。
+
+    掃兩個來源:repo 裡的 .sql 檔(54 個),以及 golden set / fixtures 的 JSON 裡
+    `full_content` 與 `diff` 兩個欄位的 SQL(64 段)——golden case 的程式是放在
+    JSON 裡的,只掃 .sql 檔會漏掉受測的那些。"""
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parents[1]
+    bad, n = [], 0
+    for f in sorted(root.rglob("*.sql")):
+        if ".venv" in f.parts:
+            continue
+        n += 1
+        hits = _r005(f.read_text(encoding="utf-8", errors="replace"))
+        if hits:
+            bad.append((str(f.relative_to(root)), hits[0]["message"][:60]))
+    for f in sorted(root.glob("eval/golden/*.json")) + sorted(root.glob("tests/fixtures/*.json")):
+        for fl in json.loads(f.read_text(encoding="utf-8")).get("files") or []:
+            for key in ("full_content", "diff"):
+                if not fl.get(key):
+                    continue
+                n += 1
+                if _r005(fl[key]):
+                    bad.append((f"{f.name}:{fl.get('path')}:{key}", ""))
+    assert bad == [], f"誤報:{bad}"
+    assert n >= 110, f"只掃到 {n} 段,來源可能漏了(應該有 54 個 .sql + 64 段 JSON)"
+
+
+def test_已報判定的關鍵詞不含沙盒():
+    """review 的小建議:「沙盒」範圍太廣——同一個檔案裡模型的其他 major 只要提到
+    沙盒(例如「沙盒無法連線」),R005 就會被當成已經報過而不補報。"""
+    kws = pipeline._RULE_KEYWORDS["R005"]
+    assert "沙盒" not in kws, "「沙盒」會讓別的 finding 把 R005 吃掉"
+    assert "執行環境" in kws and "sys." in kws
+
+
+def test_模型報了別的沙盒問題時R005照樣補報():
+    """上一條的實際後果:模型只報「沙盒不可用」時,R005 仍然要補。"""
+    pre = [{"path": "models/m.sql",
+            "rules": [{"rule": "R005", "severity": "major",
+                       "message": "規則 SQL 讀取執行環境:DB_NAME"}]}]
+    report = {"findings": [{"file": "models/m.sql", "severity": "major",
+                            "title": "執行驗證沙盒不可用", "detail": "沙盒連線失敗"}]}
+    out = pipeline.enforce_rules(report, pre)
+    assert any("執行環境" in (f.get("title", "") + f.get("detail", ""))
+               for f in out["findings"]), "R005 被「沙盒」那條吃掉了"
