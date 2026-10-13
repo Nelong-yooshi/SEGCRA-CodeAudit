@@ -764,3 +764,80 @@ def test_標籤相符或沒驗時不產生缺口():
     """沒給判斷式(label_ok 不存在)時不該憑空生出缺口。"""
     assert spec_exec._label_gaps([{"case_id": "A", "label_ok": True}]) == []
     assert spec_exec._label_gaps([{"case_id": "A"}]) == []
+
+
+# ─────────────────── 大規則:截斷 → 骨架 → 逐批補(#23 第 2 點的實際可用性) ───────────────────
+
+def _trunc_raw():
+    """模擬被輸出上限切斷的回應。"""
+    return "{"
+
+
+def _gen_meta(monkeypatch, outputs, finish_reasons):
+    """outputs 與 finish_reasons 一一對應,讓測試能模擬「前幾次截斷」。"""
+    import asyncio
+
+    from orchestrator import spec_exec as se
+    seq, fr = list(outputs), list(finish_reasons)
+    users = []
+
+    async def fake(cfg, profile, system, user, hub=None, verbose=True,
+                   use_tools=True, trace=None, meta=None):
+        users.append(user)
+        if meta is not None:
+            meta["finish_reason"] = fr.pop(0) if len(fr) > 1 else fr[0]
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    monkeypatch.setattr(se, "run_agent", fake)
+    out = asyncio.run(se.generate_cases(_FakeCfg(), "R-999", "規格內容"))
+    return out, users
+
+
+def test_第一次截斷時改要骨架而不是精簡版的完整計畫(monkeypatch):
+    """大規則連精簡過的完整計畫都裝不下——實測 RETAIL_M1_EVAL 在正式設定下
+    3/3 次截斷、0 個案例。繼續要「完整計畫但精簡一點」只會再截斷三次。
+
+    骨架(只有 schema 與條件)的輸出小得多,拿到之後案例靠補缺一批一批補。
+    """
+    skeleton = {"schema_ddl": ["CREATE TABLE t (a INT)"],
+                "conditions": [{"id": "C1", "desc": "a > 0"}], "cases": []}
+    _, users = _gen_meta(monkeypatch,
+                         [_trunc_raw(), json.dumps(skeleton, ensure_ascii=False)],
+                         ["length", "stop"])
+    assert "骨架" in users[1], f"截斷後沒有改要骨架:{users[1][:140]}"
+    assert "cases 一律留空" in users[1]
+
+
+def test_骨架可以成為補缺的起點(monkeypatch):
+    """沒有這一條,大規則會停在「第一次截斷 → 沒有計畫 → 補缺永遠不啟動」。"""
+    skeleton = {"schema_ddl": ["CREATE TABLE t (a INT)"],
+                "conditions": [{"id": "C1", "desc": "a > 0"}], "cases": []}
+    both = {"cases": _shape_check(_plan(_all_dirs(("C1",)), conditions=("C1",)))[0]["cases"]}
+    (plan, gaps, _), users = _gen_meta(
+        monkeypatch,
+        [_trunc_raw(), json.dumps(skeleton, ensure_ascii=False),
+         json.dumps(both, ensure_ascii=False)],
+        ["length", "stop", "stop"])
+    assert len(plan["cases"]) == 2, f"骨架之後沒有補進案例:{plan['cases']}"
+    assert not gaps, f"補完了卻還有缺口:{gaps}"
+    assert "只要補缺的案例" in users[2], "第 3 次不是補缺模式"
+
+
+def test_補缺的輪數不佔整份生成的次數(monkeypatch):
+    """混在同一個預算裡,補一輪就用掉一次整份生成的機會,大規則永遠補不完。
+
+    這裡:1 次截斷 + 1 次骨架 + 多輪補缺,總呼叫數要超過 max_attempts(3)。
+    """
+    skeleton = {"schema_ddl": ["CREATE TABLE t (a INT)"],
+                "conditions": [{"id": f"C{i}", "desc": "x"} for i in range(1, 6)],
+                "cases": []}
+    # 每輪只補一個案例,所以要補很多輪才補得完 5 個條件 × 2 向 = 10 個
+    one = {"cases": [{"case_id": "C1-T", "condition_id": "C1", "direction": "true",
+                      "note": "", "rows": [["t", 1]], "expect_flagged": True}]}
+    (plan, _, _), users = _gen_meta(
+        monkeypatch,
+        [_trunc_raw(), json.dumps(skeleton, ensure_ascii=False),
+         json.dumps(one, ensure_ascii=False)],
+        ["length", "stop", "stop"])
+    assert len(users) > 3, (
+        f"只呼叫了 {len(users)} 次——補缺用掉了整份生成的預算")

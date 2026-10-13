@@ -262,7 +262,28 @@ def _malformed_prompt(spec_code: str, spec_text: str) -> str:
 
 # 一次補幾個「條件 × 方向」。太大就回到「一次生不完」的老問題,太小則會把重試
 # 次數用在湊數上。6 是依 RETAIL_M1 實測的輸出量粗估的起點,不是調校過的值。
-_FILL_BATCH = 6
+_FILL_BATCH = 8
+# 補缺的輪數與整份生成的次數分開算:補缺每次只要幾個案例,輸出小、也不跟已經生好
+# 的部分搶空間,所以可以多試幾輪。RETAIL_M1_EVAL 需要 46 個案例,8 × 6 = 48,
+# 剛好夠一輪補完(前提是骨架拿得到)。
+#
+# 這兩個數字是依實測的輸出量粗估的,**沒有調校過**:端點上單次呼叫動輒 10 分鐘以上,
+# 6 輪就是一小時起跳。真正該量的是「每輪實際補進幾個」,再回頭調 batch。
+_FILL_ROUNDS = 6
+
+
+def _skeleton_prompt(spec_code: str, spec_text: str) -> str:
+    """只要 schema 與條件清單,**不要案例**。
+
+    大規則的第一次生成會直接撞上輸出上限(實測 RETAIL_M1_EVAL 在正式設定下
+    3/3 次截斷、0 個案例),於是連一份可以拿來補的計畫都沒有——補缺模式永遠
+    不會啟動。骨架的輸出小得多,拿到之後再逐批補案例。
+    """
+    return (f"先**只**產出測資計畫的骨架,不要任何案例:\n"
+            f'只輸出 {{"schema_ddl": [...], "conditions": [...], "cases": []}}。\n'
+            f"conditions 要依規格完整拆解成原子條件(這一步最重要,之後的案例都掛在\n"
+            f"它上面),每條附 id、desc 與 check_sql。**cases 一律留空陣列。**\n\n"
+            f"規則 {spec_code} 規格:\n{spec_text}")
 
 
 def _missing_pairs(plan: dict) -> list[tuple[str, str]]:
@@ -378,7 +399,11 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
     best: tuple[dict, list[str], list[dict]] | None = None
     best_repaired = False
     max_conds = 0
-    for attempt in range(max_attempts):
+    # 補缺的輪數不佔整份生成的次數:它們是不同性質的呼叫(小輸出 vs 整份計畫),
+    # 混在同一個預算裡會讓大規則永遠補不完——補一輪就用掉一次整份生成的機會。
+    for attempt in range(max_attempts + _FILL_ROUNDS):
+        if not filling and attempt >= max_attempts:
+            break           # 整份生成的次數用完了,而且目前不在補缺模式
         meta: dict = {}
         try:
             raw = await run_agent(cfg, profile, system, user, hub=None,
@@ -394,10 +419,15 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
         # 案例從應有的 46 個掉到 9 個——而那 9 個會被當成正常結果收下。
         if meta.get("finish_reason") == "length":
             truncated += 1
-            user = (f"上一次的輸出超過長度上限被截斷了。請**大幅精簡**:"
-                    f"`note` 一律留空字串,每個案例只放最少必要的資料列,"
-                    f"但**條件的 true/false 兩向都不可省略**。\n\n"
-                    f"規則 {spec_code} 規格:\n{spec_text}")
+            # 還沒有任何可用計畫就被截斷 → 改要骨架(只有 schema 與條件,不要案例)。
+            # 繼續要「精簡版的完整計畫」沒有用:大規則連精簡過的完整計畫都裝不下,
+            # 實測 RETAIL_M1_EVAL 3/3 次都是這樣,最後 0 個案例。
+            # 骨架拿到之後,案例靠補缺模式一批一批補。
+            user = (_skeleton_prompt(spec_code, spec_text) if best is None else
+                    (f"上一次的輸出超過長度上限被截斷了。請**大幅精簡**:"
+                     f"`note` 一律留空字串,每個案例只放最少必要的資料列,"
+                     f"但**條件的 true/false 兩向都不可省略**。\n\n"
+                     f"規則 {spec_code} 規格:\n{spec_text}"))
             continue
         # JSON 不合法、靠 json-repair 救回來的輸出**不可信**,理由跟截斷同一類:
         # repair 不會失敗,它會把壞掉的 JSON 修補成一個**合法但語意錯誤**的物件。
@@ -438,6 +468,15 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
             continue
         if plan:
             cleaned, gaps, dropped = _shape_check(plan)
+            # 骨架(有條件、沒案例)也要收:它是補缺模式的起點。沒有這一條,
+            # 大規則會停在「第一次就截斷 → 沒有計畫 → 補缺永遠不啟動」。
+            if not cleaned["cases"] and cleaned["conditions"] and cleaned["schema_ddl"]:
+                best, best_repaired = (cleaned, gaps, dropped), repaired
+                max_conds = max(max_conds, len(cleaned["conditions"]))
+                filling = True
+                user = _fill_gaps_prompt(spec_code, spec_text, cleaned,
+                                         _missing_pairs(cleaned), _FILL_BATCH)
+                continue
             if cleaned["cases"]:
                 n_conds = len(cleaned["conditions"])
                 max_conds = max(max_conds, n_conds)

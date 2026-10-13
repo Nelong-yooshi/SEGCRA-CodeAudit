@@ -836,6 +836,18 @@ MUTANTS.update({
     "測資:標籤不符不列入覆蓋缺口": (S,
         "        if r.get(\"label_ok\") is False:",
         "        if False:"),
+    # #23 第 2 點的實際可用性:沒有這三道,補缺模式對大規則完全不會啟動——
+    # 第一次就截斷 → 沒有計畫 → 永遠進不去補缺。實測 RETAIL_M1_EVAL 在正式設定下
+    # 就是 3/3 次截斷、0 個案例。
+    "測資:截斷後仍要精簡版的完整計畫(大規則永遠裝不下)": (S,
+        "            user = (_skeleton_prompt(spec_code, spec_text) if best is None else",
+        "            user = (None if False else"),
+    "測資:骨架不收(補缺永遠不啟動)": (S,
+        "            if not cleaned[\"cases\"] and cleaned[\"conditions\"] and cleaned[\"schema_ddl\"]:",
+        "            if False:"),
+    "測資:補缺佔用整份生成的預算(補一輪少一次機會)": (S,
+        "    for attempt in range(max_attempts + _FILL_ROUNDS):",
+        "    for attempt in range(max_attempts):"),
     "測資:重試用完就判失敗(丟掉已抽到的最佳版)": (S,
         "    if best is not None:\n        if best_repaired:",
         "    if False:\n        if best_repaired:"),
