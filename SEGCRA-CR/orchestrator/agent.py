@@ -100,6 +100,10 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
         print(f"[agent] model={profile.model} tools={'on' if use_tools else 'off'} "
               f"prompt≈{estimate_tokens(system + user)} tokens")
 
+    if meta is not None:
+        # 一開始就寫 False:呼叫端用 meta.get("exhausted") 時,"沒有這個 key"
+        # (舊版程式)與"跑完沒用光輪次"要分得出來。
+        meta["exhausted"] = False
     tool_kwargs = ({"tools": hub.openai_tools, "tool_choice": "auto"}
                    if use_tools and hub else {})
     # seed 沒設定(None)時不傳這個參數,讓模型維持原本的隨機性(能力報告用)
@@ -157,6 +161,12 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
                               "result_preview": (result or "")[:400]})
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
+    # 工具輪次用完 → 這裡回傳的是 messages[-1],也就是**最後一則工具結果**,不是報告。
+    # 那則結果是 JSON 物件時 extract_json 會把它當成報告收下,而最後一次模型呼叫的
+    # finish_reason 是 "stop",呼叫端從 meta 完全看不出發生了這件事(#26 第 1 點
+    # 實測過)。所以由 run_agent 自己標記——只有它知道迴圈是跑完還是被 return 出去的。
+    if meta is not None:
+        meta["exhausted"] = True
     return messages[-1].get("content") or "(達到工具呼叫上限,未產出最終結果)"
 
 
