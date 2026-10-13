@@ -992,6 +992,51 @@ MUTANTS.update({
      "        if _LIBYAML:", "        if False:"),
 })
 
+# ---- 審查模型只拿得到唯讀工具(#17):清單、執行入口、被拒絕時的揭露
+MUTANTS.update({
+ "工具:寫判例開放給模型": ("tool_hub.py",
+     '    "memory__lookup_similar_reviews",\n    "load_skill",\n})',
+     '    "memory__lookup_similar_reviews", "memory__record_feedback",\n    "load_skill",\n})'),
+ "工具:清單不過濾(全部交給模型)": ("tool_hub.py",
+     "        return [schema for name, schema in self.tools.items() if name in MODEL_TOOLS]",
+     "        return list(self.tools.values())"),
+ "工具:執行入口不擋": ("tool_hub.py",
+     "        if full_name not in MODEL_TOOLS:\n            if full_name in self._functions",
+     "        if False:\n            if full_name in self._functions"),
+ "工具:被拒絕不記錄": ("tool_hub.py",
+     "                self.refused_calls.append(full_name)",
+     "                pass"),
+ "工具:編造的名稱也記錄(雜訊 finding)": ("tool_hub.py",
+     "            if full_name in self._functions or full_name in self.local_tools:\n"
+     "                self.refused_calls.append(full_name)",
+     "            if True:\n"
+     "                self.refused_calls.append(full_name)"),
+ "工具:審查迴圈直接呼叫(繞過白名單)": ("agent.py",
+     "                result = await hub.call_from_model(tc.function.name, args)",
+     "                result = await hub.call(tc.function.name, args)"),
+ "工具:被拒絕不補 finding": ("pipeline.py",
+     "        report = enforce_tool_refusals(report, hub.refused_calls)  # 模型要求了寫入工具\n",
+     ""),
+ "工具:被拒絕只補 info(可自動放行)": ("pipeline.py",
+     '    finding = {"file": "(MR 內容)", "line": 0, "severity": "major",',
+     '    finding = {"file": "(MR 內容)", "line": 0, "severity": "info",'),
+ "工具:改回直接附加(模型同標題的 info 可取代)": ("pipeline.py",
+     "    _put_program_finding(report, finding)\n    return report",
+     '    report.setdefault("findings", []).insert(0, finding)\n    return report'),
+ "工具:MR 編號不檢查(get_mr_diff 可打別的端點)": ("../toolbox/gitlab.py",
+     "    mr_id = _check_mr_id(mr_id)\n    if REAL_MODE:",
+     "    if REAL_MODE:"),
+ "工具:mock 讀 fixture 不檢查 MR 編號(路徑穿越)": ("../toolbox/gitlab.py",
+     '    f = FIXTURES_DIR / f"mr_{_check_mr_id(mr_id)}.json"',
+     '    f = FIXTURES_DIR / f"mr_{mr_id}.json"'),
+ "工具:MR 編號接受 Unicode 數字": ("../toolbox/gitlab.py",
+     "    if not (mr_id.isascii() and mr_id.isdigit() and len(mr_id) <= 10):",
+     "    if not (mr_id.isdigit() and len(mr_id) <= 10):"),
+ "工具:MR 編號長度不限": ("../toolbox/gitlab.py",
+     "    if not (mr_id.isascii() and mr_id.isdigit() and len(mr_id) <= 10):",
+     "    if not (mr_id.isascii() and mr_id.isdigit()):"),
+})
+
 # ---- 接進審查管線(#7 管線端):開關、檔名對應、樣板不進沙盒、資料庫名
 MUTANTS.update({
  "接線:預掃開關接受任何真值": ("pipeline.py",
@@ -1722,6 +1767,63 @@ def _mutate_all(args, src: pathlib.Path) -> int:
     if config_errors:
         print("設定錯誤:", config_errors)
     return 1 if survived or config_errors else 0
+
+
+# ---- 測資生成的覆蓋度重試(spec_exec)
+# 這道防線的失效是**靜默**的:覆蓋不完整的測資照樣跑得完、報告看起來正常,
+# 只是執行驗證少驗了幾個條件。沒有突變點的話,測試是不是真的守著它無從得知。
+S = "spec_exec.py"
+MUTANTS.update({
+    "測資:有缺口也直接收下(回到舊行為)": (S,
+        "                if not gaps and n_conds >= max_conds:",
+        "                if True:"),
+    "測資:不留覆蓋最多的一版(只認最後一次)": (S,
+        "                if best is None or _covered(cleaned) > _covered(best[0]):\n"
+        "                    best = (cleaned, gaps, dropped)",
+        "                best = (cleaned, gaps, dropped)"),
+    # review 第 4 點:缺口是對照模型自己拆的條件算的,拆得少的 0 缺口版本不能
+    # 勝過拆得齊、只缺一點的版本;重試 prompt 不帶缺口,固定 seed 下等於白跑。
+    "測資:0 缺口就提前結束,不看條件數有沒有變少": (S,
+        "                if not gaps and n_conds >= max_conds:",
+        "                if not gaps:"),
+    "測資:最佳版本改回比缺口數": (S,
+        "                if best is None or _covered(cleaned) > _covered(best[0]):",
+        "                if best is None or len(gaps) < len(best[1]):"),
+    "測資:重試 prompt 不帶上一次的缺口": (S,
+        "        issues.append(\"上一次的測資計畫覆蓋不完整,缺:\\n\" + \"\\n\".join(f\"- {g}\" for g in gaps))",
+        "        issues.append(\"上一次的測資計畫覆蓋不完整。\")"),
+    "測資:重試用完就判失敗(丟掉已抽到的最佳版)": (S,
+        "    if best is not None:\n        return best",
+        "    if False:\n        return best"),
+    # 執行中止後,沒跑到的案例必須列入覆蓋缺口。少了它,報告會顯示「跑了 N 個
+    # 案例、零缺口」,讀起來像全覆蓋,實際上多數案例根本沒執行——而 coverage_gaps
+    # 正是人用來判斷「這次到底驗了多少」的欄位。兩個早退點各一個突變點。
+    "執行中止:SQL 錯時沒跑到的案例不算缺口": (S,
+        '"執行錯誤(語法/欄位):{ex[\'sql_error\']}",' + NL
+        + '                                 "修正 SQL 使其可依規格的資料表定義在 MS SQL 上執行。"))' + NL
+        + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
+        + '                "conditions": plan["conditions"],' + NL
+        + '                "coverage_gaps": coverage_gaps + _unrun_gaps(plan, ex["case_results"]),',
+        '"執行錯誤(語法/欄位):{ex[\'sql_error\']}",' + NL
+        + '                                 "修正 SQL 使其可依規格的資料表定義在 MS SQL 上執行。"))' + NL
+        + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
+        + '                "conditions": plan["conditions"],' + NL
+        + '                "coverage_gaps": coverage_gaps,'),
+    # 截斷偵測:被 max_tokens 硬切的 JSON 會被 json-repair 修補成合法物件,
+    # 形狀檢查只看得到「案例比較少」。拿掉這一關,殘骸會被當成正常結果收下。
+    "測資:不理會輸出被截斷(殘骸當結果收下)": (S,
+        '        if meta.get("finish_reason") == "length":',
+        "        if False:"),
+    "執行中止:測資建不起來時沒跑到的案例不算缺口": (S,
+        'f"{ex[\'testdata_error\']}。需人工執行驗證。"))' + NL
+        + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
+        + '                "conditions": plan["conditions"],' + NL
+        + '                "coverage_gaps": coverage_gaps + _unrun_gaps(plan, ex["case_results"]),',
+        'f"{ex[\'testdata_error\']}。需人工執行驗證。"))' + NL
+        + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
+        + '                "conditions": plan["conditions"],' + NL
+        + '                "coverage_gaps": coverage_gaps,'),
+})
 
 
 if __name__ == "__main__":

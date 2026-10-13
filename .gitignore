@@ -12,6 +12,9 @@ __pycache__/
 # 執行產物
 review_output/
 **/eval/_output/
+# --dump-reports 的落檔目錄(一律用 _ 開頭命名)。跑批的正式 baseline 是交付物、
+# 要能 commit(見 eval/BASELINE.md),但臨時跑一兩個 case 的存檔不必進版控。
+**/eval/_reports*/
 
 # dbt 對照專案(若直接在該目錄手動執行 dbt 會產生這些)
 **/dbt_reference/target/
