@@ -26,11 +26,13 @@ DUMP_PROMPTS = os.environ.get("SEGCRA_DUMP_PROMPTS", "")
 _dump_seq = 0
 
 
-def _dump(profile_model: str, messages: list, iteration: int) -> None:
-    """把一次呼叫的完整 messages 寫成一個檔。失敗一律吞掉——診斷功能不該弄垮跑批。"""
+def _dump(profile_model: str, messages: list, iteration: int) -> str:
+    """把一次呼叫的完整 messages 寫成一個檔,回傳檔名(供回應接在同一個檔後面)。
+
+    失敗一律吞掉——診斷功能不該弄垮跑批。"""
     global _dump_seq
     if not DUMP_PROMPTS:
-        return
+        return ""
     try:
         from pathlib import Path
         _dump_seq += 1
@@ -44,6 +46,27 @@ def _dump(profile_model: str, messages: list, iteration: int) -> None:
             if m.get("tool_calls"):
                 parts.append(f"----- tool_calls -----\n{json.dumps(m['tool_calls'], ensure_ascii=False, sort_keys=True, indent=2)}")
         f.write_text("\n".join(parts), encoding="utf-8")
+        return str(f)
+    except Exception:
+        return ""
+
+
+def _dump_response(path: str, content: str, finish_reason: str,
+                   completion_tokens) -> None:
+    """把模型的回應接在同一個落檔後面。
+
+    **為什麼回應也要落檔**:只落請求看不出最關鍵的事——模型到底有沒有照
+    「只補缺的那幾個」做(可能改條件編號、可能整份重寫、可能只回一部分)。
+    那是測資生成唯一只有真端點答得出來的問題,而它每次呼叫動輒數分鐘,
+    沒落檔就得重跑一輪才能回答。純觀測,不改送進模型的任何內容。"""
+    if not path:
+        return
+    try:
+        from pathlib import Path
+        with Path(path).open("a", encoding="utf-8") as fh:
+            fh.write(f"\n\n===== response finish_reason={finish_reason} "
+                     f"completion_tokens={completion_tokens} chars={len(content or '')} =====\n")
+            fh.write(content or "")
     except Exception:
         pass
 
@@ -82,7 +105,7 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
     # seed 沒設定(None)時不傳這個參數,讓模型維持原本的隨機性(能力報告用)
     seed_kwargs = {"seed": profile.seed} if profile.seed is not None else {}
     for i in range(MAX_ITERATIONS):
-        _dump(profile.model, messages, i)
+        dump_path = _dump(profile.model, messages, i)
         resp = await client.chat.completions.create(
             model=profile.model, messages=messages, **tool_kwargs,
             temperature=profile.temperature,
@@ -106,6 +129,8 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
             # 中間輪次的工具呼叫回合即使碰到上限也會繼續跑下去。
             meta["finish_reason"] = resp.choices[0].finish_reason
             meta["completion_tokens"] = getattr(usage, "completion_tokens", None) if usage else None
+        _dump_response(dump_path, msg.content or "", resp.choices[0].finish_reason,
+                       getattr(usage, "completion_tokens", None) if usage else None)
         messages.append(msg.model_dump(exclude_none=True))
 
         if not msg.tool_calls:
