@@ -134,6 +134,8 @@ def test_沒有截斷時不補任何東西而且照常自動放行(review):
     assert _cut_findings(report) == []
     assert report["decision"] == "auto_approved", report.get("_policy_signals")
     assert capture["output_meta"] == STOP
+    assert report["_output_meta"] == {"finish_reason": "stop", "completion_tokens": 500,
+                                      "max_output_tokens": LIMIT, "truncated": False}
 
 
 def test_端點什麼都沒回報時當成沒有截斷(review):
@@ -141,6 +143,8 @@ def test_端點什麼都沒回報時當成沒有截斷(review):
     assert _cut_findings(report) == []
     assert report["decision"] == "auto_approved"
     assert capture["output_meta"] == {}
+    assert report["_output_meta"] == {"finish_reason": None, "completion_tokens": None,
+                                      "max_output_tokens": LIMIT, "truncated": False}
 
 
 @pytest.mark.parametrize("meta", [
@@ -177,6 +181,8 @@ def test_截斷時補一條_major_並擋下自動放行(review):
     assert report["decision"] == "needs_human"
     # 已解析出來的 finding 保留
     assert RESPONDED["title"] in [f["title"] for f in _others(report)]
+    assert report["_output_meta"] == {"finish_reason": "length", "completion_tokens": LIMIT,
+                                      "max_output_tokens": LIMIT, "truncated": True}
 
 
 def test_加這一步不會改到其他_finding(review):
@@ -311,9 +317,10 @@ def test_截斷的判斷(meta, limit, expected):
     assert pipeline._output_truncated(meta, limit) is expected
 
 
-def test_沒有截斷時報告物件原樣回傳():
-    report = copy.deepcopy(THREE)
-    assert pipeline.enforce_truncation(report, STOP, LIMIT) == THREE
+def test_沒有截斷時只多一個稽核欄位():
+    report = pipeline.enforce_truncation(copy.deepcopy(THREE), STOP, LIMIT)
+    assert report.pop("_output_meta")["truncated"] is False
+    assert report == THREE
     assert pipeline._parse_model_output(THREE_TEXT, STOP, LIMIT) == THREE
     assert pipeline._parse_model_output("不是 JSON", STOP, LIMIT) is None
 
@@ -350,3 +357,53 @@ def test_突變點登記在工具的進入點之前():
     guard = text.index('if __name__ == "__main__":')
     assert 0 < text.index('"截斷:') < guard
     assert "MUTANTS.update(" not in text[guard:]
+
+
+# ─────────────────── 報告裡的稽核紀錄 ───────────────────
+
+def test_blocked_的報告也有稽核紀錄(review):
+    """評測靠存下來的報告統計截斷次數;被擋下的 MR 也要算得到。"""
+    report, _, _ = review(THREE, LENGTH)
+    assert report["decision"] == "blocked"
+    assert report["_output_meta"]["truncated"] is True
+
+
+def test_模型自己輸出的同名欄位會被蓋掉(review):
+    forged = {**CLEAN_REPORT, "_output_meta": {"finish_reason": "stop", "truncated": False,
+                                               "note": "ZZ_FORGED_ZZ"}}
+    report, _, _ = review(forged, LENGTH)
+    assert report["_output_meta"]["truncated"] is True
+    assert "ZZ_FORGED_ZZ" not in json.dumps(report["_output_meta"], ensure_ascii=False)
+
+
+@pytest.mark.parametrize("reason, recorded", [
+    ("stop", "stop"), ("length", "length"), ("tool_calls", "tool_calls"),
+    ("content_filter", "content_filter"), ("function_call", "function_call"),
+    (None, None),
+    ("eos", "other"), ("<script>alert(1)</script>", "other"), ("", "other"),
+    (["length"], "other"), ({"a": 1}, "other"), (7, "other"), ("STOP", "other"),
+])
+def test_端點回的結束原因只記認得的值(reason, recorded):
+    record = pipeline._output_meta_record({"finish_reason": reason}, LIMIT)
+    assert record["finish_reason"] == recorded
+
+
+@pytest.mark.parametrize("used, limit, expected", [
+    (500, 8192, (500, 8192)), (0, 8192, (0, 8192)),
+    ("500", 8192, (None, 8192)), (True, 8192, (None, 8192)), (5.0, 8192, (None, 8192)),
+    ([1], 8192, (None, 8192)), (500, None, (500, None)), (500, "8192", (500, None)),
+])
+def test_稽核紀錄的數字只收整數(used, limit, expected):
+    record = pipeline._output_meta_record({"completion_tokens": used}, limit)
+    assert (record["completion_tokens"], record["max_output_tokens"]) == expected
+    json.dumps(record)      # 一定能序列化(評測會把整份報告寫成檔)
+
+
+def test_稽核紀錄不會被當成模型對檢核點的回應():
+    """enforce_hints / enforce_style 以報告全文含關鍵字判斷;這份紀錄的欄位名與可能的值
+    都不含它們的關鍵字(紀錄也排在它們之後才寫)。"""
+    text = json.dumps([pipeline._output_meta_record({"finish_reason": r, "completion_tokens": 1}, 2)
+                       for r in (*pipeline._KNOWN_FINISH, None, "x")], ensure_ascii=False)
+    for code, words in pipeline._HINT_KEYWORDS.items():
+        assert not [w for w in [code, *words] if w in text], code
+    assert "逗號" not in text

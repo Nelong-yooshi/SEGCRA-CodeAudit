@@ -827,6 +827,27 @@ def _is_count(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+# 端點回報的 finish_reason 只認這幾個值;其餘一律記成 "other",不把端點給的任意字串寫進報告
+_KNOWN_FINISH = ("stop", "length", "tool_calls", "content_filter", "function_call")
+
+
+def _output_meta_record(meta: dict, max_output_tokens) -> dict:
+    """寫進報告 `_output_meta` 的稽核紀錄:主審查最後一次回應的結束原因與用量。
+
+    評測存下來的報告靠它統計截斷發生的次數(run_eval 不傳 capture,只有報告會留下來)。
+    """
+    reason = meta.get("finish_reason")
+    used = meta.get("completion_tokens")
+    return {
+        "finish_reason": (None if reason is None
+                          else reason if isinstance(reason, str) and reason in _KNOWN_FINISH
+                          else "other"),
+        "completion_tokens": used if _is_count(used) else None,
+        "max_output_tokens": max_output_tokens if _is_count(max_output_tokens) else None,
+        "truncated": _output_truncated(meta, max_output_tokens),
+    }
+
+
 def _parse_model_output(raw: str, meta: dict, max_output_tokens) -> dict | None:
     """解析主審查模型的輸出。被截斷又解析不出來時回一份空報告,讓審查繼續走完。
 
@@ -853,7 +874,11 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens) -> dict:
     內容只有固定文字與數字,不回顯模型輸出,也不回顯端點回報的字串。必須排在
     sanitize_findings 之後(近似標題去重可能留下模型那一條),也排在 enforce_hints /
     enforce_style 之後(它們以報告全文含關鍵字判斷模型有沒有回應)。
+
+    不論有沒有截斷,都把結束原因與用量記在 `_output_meta`(只由這裡寫:模型自己輸出的
+    同名欄位會被蓋掉)。
     """
+    report["_output_meta"] = _output_meta_record(meta, max_output_tokens)
     if not _output_truncated(meta, max_output_tokens):
         return report
     limit = f"({max_output_tokens} tokens)" if _is_count(max_output_tokens) else ""
