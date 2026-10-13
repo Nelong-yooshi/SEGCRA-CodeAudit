@@ -151,6 +151,12 @@ TESTGEN_SYSTEM = """你是測試資料工程師。給你一份異常交易規則
    T-SQL 的 NVARCHAR 不寫長度等於長度 1。"""
 
 
+def testgen_system() -> str:
+    """實際送出的測資生成 system prompt(代入時間窗)。eval 的凍結檔以它的雜湊
+    判斷「這份測資是不是用現在的 prompt 生的」,所以兩邊必須拿同一份字串。"""
+    return TESTGEN_SYSTEM.replace("{win_start}", WIN_START).replace("{win_end}", WIN_END)
+
+
 def _shape_check(plan: dict) -> tuple[dict, list[str], list[dict]]:
     """確定性檢查測資計畫:JSON 形狀 + 逐條件 true/false 覆蓋。
     回傳 (清洗後 plan, coverage_gaps, dropped_malformed)。"""
@@ -184,29 +190,109 @@ def _shape_check(plan: dict) -> tuple[dict, list[str], list[dict]]:
     return {"schema_ddl": ddl, "conditions": conds, "cases": cases}, gaps, dropped
 
 
+def _covered(plan: dict) -> int:
+    """已覆蓋的「條件 × 方向」數。plan 須已經過 _shape_check(案例都指向存在的條件)。"""
+    return len({(c["condition_id"], c["direction"]) for c in plan["cases"]})
+
+
+def _retry_prompt(spec_code: str, spec_text: str, gaps: list[str],
+                  n_conds: int, max_conds: int) -> str:
+    """有合法案例但不夠好時的重試提示:講清楚上一次差在哪,讓每次重試的 prompt
+    都不同(固定 seed 下同一個 prompt 只會得到同一份輸出)。仍要求輸出**完整**
+    計畫,不是只補缺的部分——這裡收的是整份計畫,不做合併。"""
+    issues = []
+    if gaps:
+        issues.append("上一次的測資計畫覆蓋不完整,缺:\n" + "\n".join(f"- {g}" for g in gaps))
+    if n_conds < max_conds:
+        issues.append(f"上一次只拆出 {n_conds} 個原子條件,先前的嘗試拆出過 {max_conds} 個;"
+                      f"請依規格完整拆解,不要合併或省略條件。")
+    return ("\n\n".join(issues)
+            + "\n\n請重新輸出**完整的**測資計畫 JSON(包含已經有的案例),"
+              "每個條件的 true/false 兩向都要有案例。\n\n"
+            + f"規則 {spec_code} 規格:\n{spec_text}")
+
+
 async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
-                         profile_name: str | None = None) -> tuple[dict, list[str], list[dict]]:
-    """角色一:LLM 依 spec 生成測資計畫,含一次重試;回傳 (plan, gaps, dropped)。"""
-    system = TESTGEN_SYSTEM.replace("{win_start}", WIN_START).replace("{win_end}", WIN_END)
+                         profile_name: str | None = None,
+                         max_attempts: int = 3) -> tuple[dict, list[str], list[dict]]:
+    """角色一:LLM 依 spec 生成測資計畫,回傳 (plan, gaps, dropped)。
+
+    只要有合法案例就接受、不管 coverage_gaps 是否為空,曾經是這裡的行為——
+    但單次 LLM 取樣的覆蓋度本身會飄(同一份規格、同一個 prompt,不同次呼叫
+    可能拆出不同數量的條件與案例)。只在「解析失敗/零案例」才重試,等於把
+    這次取樣抽到的覆蓋度直接當結果收下,抽到不完整的就是不完整的結果。
+
+    所以現在 coverage_gaps 非空也算「這次不夠好」,一樣觸發重試,而且重試的
+    prompt 會列出上一次缺了哪些條件、哪個方向。固定 temperature/seed 時,同一個
+    prompt 會得到逐位元組相同的輸出,不帶缺口的重試等於白跑。
+
+    「最佳」看的是**已覆蓋的「條件 × 方向」數**,不是缺口數:缺口是對照模型
+    自己拆出的條件算的,拆 12 個條件全覆蓋的那次是 0 缺口,會勝過拆齊 23 個、
+    只缺幾個案例的那次。同理,0 缺口也要條件數不少於之前各次嘗試的最大值
+    才提前結束,否則繼續試、最後仍收覆蓋數最多的一版。
+
+    已知限制:第一次就抽到「拆得少、0 缺口」時沒有東西可比,仍會直接收下。
+    要擋這個得拿規格本身的條件數比對,不是靠多次嘗試互比。
+
+    仍然抽不到 0 缺口時,回傳嘗試過的最佳結果(而不是最後一次、也不是直接判定
+    失敗)——覆蓋不完整要如實反映在 coverage_gaps 裡,由後續判斷是否需要人工
+    確認,不能因為「retry 用完了」就悄悄退化成沒案例。"""
+    system = testgen_system()
     user = f"規則 {spec_code} 的核定規格如下,請產出測資計畫 JSON:\n\n{spec_text}"
     profile = cfg.role_profile("testgen") if profile_name is None else cfg.profile(profile_name)
     llm_error = None
-    for attempt in range(2):
+    truncated = 0
+    best: tuple[dict, list[str], list[dict]] | None = None
+    max_conds = 0
+    for attempt in range(max_attempts):
+        meta: dict = {}
         try:
             raw = await run_agent(cfg, profile, system, user, hub=None,
-                                  use_tools=False, verbose=False)
+                                  use_tools=False, verbose=False, meta=meta)
         except Exception as e:   # LLM 傳輸層失敗(連線/逾時)→ 降級為「測資生成失敗」,不炸管線
             llm_error = f"{type(e).__name__}: {e}"
+            continue
+        # 被 max_tokens 截斷 → 這次結果一律不可信,連看都不看就重試。
+        # **這一關不能靠 _shape_check 代勞**:截斷的 JSON 會被 extract_json 的
+        # json-repair 修補成合法物件,形狀檢查只會看到「案例比較少」,看不出
+        # 它其實是被硬切的殘骸。實測 RETAIL_M1:finish_reason=length、
+        # completion_tokens 剛好 8192、輸出斷在一個數字中間,但照樣解析成功,
+        # 案例從應有的 46 個掉到 9 個——而那 9 個會被當成正常結果收下。
+        if meta.get("finish_reason") == "length":
+            truncated += 1
+            user = (f"上一次的輸出超過長度上限被截斷了。請**大幅精簡**:"
+                    f"`note` 一律留空字串,每個案例只放最少必要的資料列,"
+                    f"但**條件的 true/false 兩向都不可省略**。\n\n"
+                    f"規則 {spec_code} 規格:\n{spec_text}")
             continue
         plan = extract_json(raw)
         if plan:
             cleaned, gaps, dropped = _shape_check(plan)
             if cleaned["cases"]:
-                return cleaned, gaps, dropped
-        user = (f"上一次輸出無法解析或沒有任何合法案例,請重新只輸出符合格式的 JSON。\n\n"
+                n_conds = len(cleaned["conditions"])
+                max_conds = max(max_conds, n_conds)
+                if not gaps and n_conds >= max_conds:
+                    return cleaned, gaps, dropped   # 完整覆蓋且沒有拆得比之前少,不用再試
+                if best is None or _covered(cleaned) > _covered(best[0]):
+                    best = (cleaned, gaps, dropped)
+                user = _retry_prompt(spec_code, spec_text, gaps, n_conds, max_conds)
+                continue
+        user = (f"上一次輸出無法解析或沒有任何合法案例,"
+                f"請重新輸出**完整覆蓋每個條件 true/false 兩向**的 JSON。\n\n"
                 f"規則 {spec_code} 規格:\n{spec_text}")
-    reason = (f"測資生成失敗(LLM 呼叫失敗:{llm_error})" if llm_error
-              else "測資生成失敗(兩次皆無合法輸出)")
+    if best is not None:
+        return best
+    if truncated:
+        # 這條失敗原因要講得夠具體才有用:「規則太大、輸出裝不下」跟「模型輸出
+        # 亂七八糟」的修法完全不同——前者要調 max_output_tokens 或分批生成,
+        # 後者是 prompt 或模型的問題。混在同一句話裡,看的人無從判斷。
+        reason = (f"測資生成失敗({truncated}/{max_attempts} 次因超過輸出長度上限被截斷)。"
+                  f"這條規則的測資計畫裝不進目前的 max_output_tokens;"
+                  f"需調高 roles.testgen 所用 profile 的上限,或改成分批生成。")
+    elif llm_error:
+        reason = f"測資生成失敗(LLM 呼叫失敗:{llm_error})"
+    else:
+        reason = f"測資生成失敗({max_attempts} 次嘗試皆無合法輸出)"
     return {"schema_ddl": [], "conditions": [], "cases": []}, [reason], []
 
 
@@ -418,6 +504,28 @@ def _finding(path: str, severity: str, title: str, detail: str, suggestion: str 
             "detail": detail, "suggestion": suggestion, "citations": []}
 
 
+def _unrun_gaps(plan: dict, case_results: list[dict]) -> list[str]:
+    """執行中止後,還沒跑到的案例一律列入覆蓋缺口。
+
+    `execute_cases` 的 per-case 迴圈裡,測資建不起來或 SQL 跑不起來會直接
+    `return out`,放棄剩下的案例——這個行為本身是合理的(SQL 真的壞掉時,
+    跑完 46 個案例只會得到 46 個相同錯誤)。**不合理的是報告沒有交代這件事**:
+    `coverage_gaps` 維持原樣,報告看起來像「跑了 N 個案例、零缺口」,
+    但實際上計畫裡多數案例根本沒執行。
+
+    仲裁剔除案例時已經有對應處理(見下方「被剔除的案例 = 該條件該向未經驗證」),
+    這裡補的是同一個道理的另一半:**沒跑到 = 沒驗到**,兩者都必須反映在
+    coverage_gaps 上,人才讀得出「這次到底驗了多少」。
+
+    決策層本來就會因為 major finding 擋下自動放行,所以這不是放行漏洞;
+    修的是報告的誠實度——而那正是人用來判斷「這次驗證可不可信」的依據。
+    """
+    ran = {c.get("case_id") for c in case_results}
+    missing = [c for c in plan.get("cases", []) if c.get("case_id") not in ran]
+    return [f"案例 {c.get('case_id')}(條件 {c.get('condition_id')} "
+            f"{c.get('direction')} 向)因執行中止而未驗證" for c in missing]
+
+
 async def run_spec_exec(cfg: Config, hub, mr: dict,
                         spec_code: str | None = None,
                         spec_text: str | None = None) -> dict:
@@ -498,7 +606,8 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                                  f"測資生成 agent 產出的 schema/資料無法建置:"
                                  f"{ex['testdata_error']}。需人工執行驗證。"))
         return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],
-                "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
+                "conditions": plan["conditions"],
+                "coverage_gaps": coverage_gaps + _unrun_gaps(plan, ex["case_results"]),
                 "case_results": ex["case_results"], "dropped_cases": dropped_cases,
                 "findings": findings}
     if ex["sql_error"]:
@@ -506,7 +615,8 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                                  f"執行錯誤(語法/欄位):{ex['sql_error']}",
                                  "修正 SQL 使其可依規格的資料表定義在 MS SQL 上執行。"))
         return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],
-                "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
+                "conditions": plan["conditions"],
+                "coverage_gaps": coverage_gaps + _unrun_gaps(plan, ex["case_results"]),
                 "case_results": ex["case_results"], "dropped_cases": dropped_cases,
                 "findings": findings}
 
