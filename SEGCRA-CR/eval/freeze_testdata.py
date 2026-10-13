@@ -33,6 +33,35 @@ from orchestrator.spec_exec import generate_cases  # noqa: E402
 import testdata_cache  # noqa: E402 - 與本檔同目錄(eval/),執行時已在 sys.path[0]
 
 
+def _reference_check(spec_code: str, plan: dict) -> str | None:
+    """用該規則的正向對照 SQL 跑一遍測資;回傳問題描述,沒問題回 None。
+
+    沙盒不可用、或這條規則還沒設定正向對照 → 回 None(跳過,不阻擋):
+    這道檢查是加分的,不該讓沒有沙盒的環境無法凍結測資。
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import check_frozen_testdata as cft
+
+        from orchestrator.spec_exec import execute_cases
+        if spec_code not in cft.REFERENCE:
+            return None
+        ex = execute_cases(cft.reference_sql(spec_code), plan)
+        if ex["sandbox_error"] or ex["sql_error"] or ex["testdata_error"]:
+            return None          # 環境問題不是測資的錯,不擋
+        bad = [m.get("case_id") for m in ex["mismatches"]]
+        if not bad:
+            return None
+        return (f"正向對照({cft.REFERENCE[spec_code]})跑這份測資有 {len(bad)} "
+                f"個案例不符預期:{', '.join(str(b) for b in bad)}\n"
+                f"0 缺口不代表測資是對的——這些案例的 expect_flagged 與正確實作"
+                f"的行為不一致,凍結後 golden set 會一直拿錯的預期去跑。")
+    except Exception:
+        # 這道檢查壞掉不該讓凍結無法進行(它是加分的,不是必要路徑)。
+        # 真的壞掉時 check_frozen_testdata.py 仍然可以單獨跑,會明確報錯。
+        return None
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("spec_code", help="規則碼,如 R-140(對應 specs/R-140.md)")
@@ -88,6 +117,21 @@ async def main() -> int:
     if not plan["cases"]:
         print("沒有任何合法案例,不存檔。")
         return 1
+
+    # 0 缺口**不代表**測資是對的。實測 RETAIL_M1_EVAL:46 個案例、0 缺口,
+    # 其中 12 個連正確的 SQL 都過不了(10 個是「只滿足自己宣稱的那一條、
+    # 其他條件湊不齊」,2 個是模型把資料算錯)。那種測資凍結進 repo 之後,
+    # golden set 會一直拿錯的預期去跑,而且不會有人發現。
+    # 所以只要這條規則有正向對照(check_frozen_testdata.py 的 REFERENCE),
+    # 就在存檔前先用它驗一遍。沒有沙盒或沒有對照時跳過,不阻擋。
+    verdict = _reference_check(args.spec_code, plan)
+    if verdict:
+        print(f"\n{verdict}")
+        if not args.force:
+            print("不存檔。修好測資或用 --force 強制存(不建議:golden set 會拿"
+                  "錯的預期去跑)。")
+            return 1
+        print("--force:仍然存檔。")
 
     try:
         testdata_cache.save(
