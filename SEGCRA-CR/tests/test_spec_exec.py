@@ -21,7 +21,9 @@
 """
 import asyncio
 import json
+import pathlib
 import re
+import sys
 
 import pytest
 
@@ -765,6 +767,80 @@ def test_標籤相符或沒驗時不產生缺口():
     """沒給判斷式(label_ok 不存在)時不該憑空生出缺口。"""
     assert spec_exec._label_gaps([{"case_id": "A", "label_ok": True}]) == []
     assert spec_exec._label_gaps([{"case_id": "A"}]) == []
+
+
+class _FakeCursor:
+    """只做 execute_cases 用到的事:execute / fetchall / fetchone / description。"""
+
+    def __init__(self):
+        self.description = None
+
+    def execute(self, sql, params=None):
+        self.description = [("col",)] if sql.lstrip().upper().startswith("SELECT") else None
+        self._sql = sql
+
+    def fetchone(self):
+        return ("16.0.1000.6", "Developer Edition")
+
+    def fetchall(self):
+        return [(1,)]
+
+    def close(self):
+        pass
+
+
+class _FakeCon:
+    def __init__(self, **kw):
+        pass
+
+    def cursor(self):
+        return _FakeCursor()
+
+    def rollback(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _fake_sandbox(monkeypatch):
+    """把 pymssql 換成假的,讓 execute_cases 整條路跑得完——不連真沙盒。"""
+    import types
+    fake = types.ModuleType("pymssql")
+    fake.connect = lambda **kw: _FakeCon(**kw)
+    monkeypatch.setitem(sys.modules, "pymssql", fake)
+    monkeypatch.setattr(spec_exec, "_sandbox_params",
+                        lambda: {"server": "x", "port": 1433, "user": "sa",
+                                 "password": "pw"})
+    monkeypatch.setattr(spec_exec, "_drop_stale_sandbox_dbs", lambda admin: None)
+
+
+def test_execute_cases_沒有conditions欄位也不能炸(monkeypatch):
+    """`execute_cases` 不只收 `generate_cases()` 的結果:`eval/preflight.py` 的沙盒
+    探針與 `eval/check_frozen_testdata.py` 都自己組 plan。#23 第 3 點的標籤檢查
+    直接取 `plan["conditions"]`,少了這個欄位就 KeyError——而 execute_cases 把所有
+    例外都包成 `sandbox_error`,於是 preflight 回報「沙盒執行異常」、整輪跑批中止在
+    「環境壞了」,實際上是我們的程式。真的發生過(公司端點上的起飛前檢查第一次
+    就撞到,而且本機沒有沙盒、重現不了)。
+    """
+    _fake_sandbox(monkeypatch)
+    plan = {"schema_ddl": ["CREATE TABLE t (id INT, amt INT)"],
+            "cases": [{"case_id": "P1", "condition_id": "C1", "direction": "positive",
+                       "expect_flagged": True, "note": "", "rows": [["t", 1, 500]]}]}
+    out = spec_exec.execute_cases("SELECT id FROM t WHERE amt > 100", plan)
+    assert not out["sandbox_error"], out["sandbox_error"]
+    assert len(out["case_results"]) == 1
+    assert "label_ok" not in out["case_results"][0], "沒有條件可比就不該下標籤結論"
+
+
+def test_preflight的沙盒探針帶得動標籤檢查():
+    """探針的案例宣稱測 C1,plan 就要有 C1——不然它只驗到「少了 conditions 不會炸」,
+    驗不到正常情況。這條是在上面那個迴歸之後補的。"""
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "eval"))
+    import preflight
+    ids = {c["id"] for c in preflight.PROBE_PLAN.get("conditions", [])}
+    used = {c["condition_id"] for c in preflight.PROBE_PLAN["cases"]}
+    assert used <= ids, f"探針的案例宣稱測 {used - ids},但 plan 裡沒有這些條件"
 
 
 # ─────────────────── 大規則:截斷 → 骨架 → 逐批補(#23 第 2 點的實際可用性) ───────────────────

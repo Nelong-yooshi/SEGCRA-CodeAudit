@@ -304,6 +304,10 @@ PROBE_PLAN = {
     # 故意做成「一正一反」:只有正向案例的話,SQL 永遠回傳列也會通過,
     # 等於沒驗到比對邏輯。兩個方向都對,才證明整條(建表→灌資料→執行→比對→rollback)是活的。
     "schema_ddl": ["CREATE TABLE preflight_probe (id INT, amt INT)"],
+    # 案例宣稱測 C1,就要有 C1:execute_cases 的標籤檢查(#23 第 3 點)要用它。
+    # 刻意不給 check_sql——探針的工作是確認「沙盒這條路是活的」,不是驗標籤邏輯
+    # 對不對;給了 check_sql 就多一個會讓環境檢查紅燈的理由,那不是它該管的事。
+    "conditions": [{"id": "C1", "desc": "金額超過門檻"}],
     "cases": [
         {"case_id": "P1", "condition_id": "C1", "direction": "positive",
          "expect_flagged": True, "note": "超過門檻應被標記",

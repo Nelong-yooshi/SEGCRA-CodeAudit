@@ -727,7 +727,18 @@ def execute_cases(sql: str, plan: dict) -> dict:
                 # 每個條件的真假,確認這個案例真的在測它自己宣稱的那一條。
                 # 覆蓋檢查原本完全相信模型貼的標籤,所以「標籤對、資料卻沒測到」
                 # (反向案例同時讓兩條不成立)看起來跟正確的案例一模一樣。
-                actual_conds = _eval_conditions(c, plan["conditions"])
+                # 用 .get 而不是 plan["conditions"]:execute_cases 不只收
+                # generate_cases() 的結果,eval/preflight.py 的沙盒探針與
+                # eval/check_frozen_testdata.py 都自己組 plan。少了這個欄位會
+                # KeyError,而所有例外都被包成 sandbox_error → preflight 回報
+                # 「沙盒執行異常」、整輪跑批中止在「環境壞了」,實際上是我們的程式。
+                # 公司端點上的起飛前檢查第一次就撞到這個。
+                #
+                # 沒有條件可比時一律不下標籤結論(傳 None):空的 conds 會讓
+                # _eval_conditions 回 {},那樣 label_ok 會變成 True——一個
+                # 「標籤驗過了」的假訊號,比沒有這一欄更糟。
+                conds = plan.get("conditions") or []
+                actual_conds = _eval_conditions(c, conds) if conds else None
             finally:
                 try:
                     con.rollback()
@@ -740,7 +751,7 @@ def execute_cases(sql: str, plan: dict) -> dict:
                  "actual_rows": [[str(v) for v in row] for row in rows[:5]],
                  "ok": actual == case["expect_flagged"]}
             if actual_conds is not None:
-                want = _label_expectation(plan["conditions"], case)
+                want = _label_expectation(conds, case)
                 wrong = sorted(k for k, v in want.items() if actual_conds.get(k) is not v)
                 r["label_ok"] = not wrong
                 if wrong:

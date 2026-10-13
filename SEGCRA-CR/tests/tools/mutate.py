@@ -833,6 +833,10 @@ MUTANTS.update({
     "測資:判斷式算不出來時回部分結果": (S,
         "        except Exception:\n            return None\n        if not row:\n            return None",
         "        except Exception:\n            continue\n        if not row:\n            continue"),
+    # 沒有條件可比時若照樣下標籤結論,label_ok 會是 True——「標籤驗過了」的假訊號。
+    "執行:沒有條件可比也下標籤結論": (S,
+        "                actual_conds = _eval_conditions(c, conds) if conds else None",
+        "                actual_conds = _eval_conditions(c, conds)"),
     "測資:標籤不符不列入覆蓋缺口": (S,
         "        if r.get(\"label_ok\") is False:",
         "        if False:"),
