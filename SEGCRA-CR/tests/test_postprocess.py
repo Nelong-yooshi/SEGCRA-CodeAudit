@@ -204,6 +204,172 @@ def test_同檔多個命中都要補():
     assert [f["title"][:6] for f in report["findings"]] == ["[R001]", "[R001]"]
 
 
+# ---- 同一個檔案有多處相同規則的命中(#28 review)
+
+def _hit(statement, message="DELETE 沒有 WHERE 條件,將影響全表", rule="R001", severity="blocker"):
+    return {"rule": rule, "severity": severity, "message": message, "statement": statement}
+
+
+def _finding(text, severity="blocker", file=FILE, field="detail"):
+    base = {"severity": severity, "file": file, "title": "資料異動沒有條件", "detail": "",
+            "suggestion": ""}
+    return {**base, field: text}
+
+
+TWO = [_hit("DELETE FROM ledger_a"), _hit("DELETE FROM ledger_b")]
+
+
+def _added(report, before):
+    return report["findings"][len(before):]
+
+
+def test_同檔兩處命中_模型只報一處_另一處要補():
+    """#28 review 的情況:兩句 DELETE 都沒有 WHERE,模型只報了第一句。以前同檔只要有一條
+    提到關鍵詞,整個檔案的 R001 都算報過,第二句就從報告上消失。"""
+    model = [_finding("第一句 DELETE 沒有 WHERE")]
+    report = enforce_rules({"findings": list(model)}, _pre(list(TWO)))
+    added = _added(report, model)
+    assert len(added) == 1
+    assert added[0]["severity"] == "blocker" and added[0]["file"] == FILE
+    assert added[0]["title"].startswith("[R001]")
+
+
+@pytest.mark.parametrize("n_hits, n_model, expected", [
+    (1, 0, 1), (1, 1, 0), (1, 3, 0),
+    (2, 0, 2), (2, 1, 1), (2, 2, 0), (2, 5, 0),
+    (5, 0, 5), (5, 2, 3), (5, 5, 0),
+])
+def test_補的數量等於命中數減掉模型報的數量(n_hits, n_model, expected):
+    hits = [_hit(f"DELETE FROM t{i}") for i in range(n_hits)]
+    model = [_finding(f"第 {i} 個全表刪除") for i in range(n_model)]
+    report = enforce_rules({"findings": list(model)}, _pre(hits))
+    assert len(_added(report, model)) == expected
+
+
+def test_兩條_finding_講的是同一句_另一句仍要補():
+    """模型把同一句報了兩次(引用了語句),數量對得上,但第二句其實沒人提。"""
+    model = [_finding("`DELETE FROM ledger_a` 沒有 WHERE"),
+             _finding("建議改成 DELETE FROM ledger_a WHERE id = @id", field="suggestion")]
+    report = enforce_rules({"findings": list(model)}, _pre(list(TWO)))
+    assert len(_added(report, model)) == 1
+
+
+def test_各引用一句就都不補():
+    model = [_finding("delete   from LEDGER_B 沒有 WHERE"),          # 大小寫與空白不同也認得
+             _finding("DELETE FROM ledger_a 沒有 WHERE")]
+    report = enforce_rules({"findings": list(model)}, _pre(list(TWO)))
+    assert _added(report, model) == []
+
+
+def test_引用語句的比對不分大小寫與空白():
+    """兩條都在講第一句,只是大小寫、換行與空白不同:仍然認得出是同一句,第二句要補。"""
+    model = [_finding("delete   from\n  LEDGER_A 沒有 WHERE"),
+             _finding("Delete From Ledger_A\t沒有 WHERE")]
+    report = enforce_rules({"findings": list(model)}, _pre(list(TWO)))
+    assert len(_added(report, model)) == 1
+
+
+def test_不變量_一條_finding_最多抵一處():
+    """隨機組合命中與 finding(有引用、沒引用、嚴重度不夠、別的檔案、沒提關鍵詞):
+    補的數量一定不少於「命中數 − 算數的 finding 數」,也不會超過命中數;
+    沒有算數的 finding 時每一處都補。"""
+    import random
+    rng = random.Random(28)
+    tables = ["ledger_a", "ledger_b", "ledger_c", "ledger_a"]      # 含重複的語句
+    for _ in range(400):
+        hits = [_hit(f"DELETE FROM {rng.choice(tables)}") for _ in range(rng.randint(1, 5))]
+        model, counted = [], 0
+        for _ in range(rng.randint(0, 6)):
+            quote = rng.choice(["", "", f"DELETE FROM {rng.choice(tables)} ", "DELETE FROM other_t "])
+            keyword = rng.choice(["沒有 WHERE", "沒有 WHERE", "寫法怪怪的"])
+            severity = rng.choice(["blocker", "blocker", "major", "info"])
+            file = rng.choice([FILE, FILE, "sql/rules/r002_other.sql"])
+            model.append(_finding(quote + keyword, severity=severity, file=file))
+            counted += (keyword == "沒有 WHERE" and severity == "blocker" and file == FILE)
+        report = enforce_rules({"findings": list(model)}, _pre(hits))
+        added = len(_added(report, model))
+        assert max(0, len(hits) - counted) <= added <= len(hits), (hits, model)
+        if counted == 0:
+            assert added == len(hits)
+        assert report["findings"][:len(model)] == model        # 模型的 finding 原樣保留
+
+
+def test_一條引用語句一條沒引用_兩處都算報過():
+    """沒引用語句的那條排在前面,也不能搶走另一條唯一能對應的那一句(否則會多補)。"""
+    model = [_finding("還有一句全表刪除沒有 WHERE"),
+             _finding("DELETE FROM ledger_a 沒有 WHERE")]
+    report = enforce_rules({"findings": list(model)}, _pre(list(TWO)))
+    assert _added(report, model) == []
+
+
+def test_引用兩句的排在引用一句的後面對應():
+    model = [_finding("DELETE FROM ledger_a 與 DELETE FROM ledger_b 都沒有 WHERE"),
+             _finding("DELETE FROM ledger_a 沒有 WHERE")]
+    report = enforce_rules({"findings": list(model)}, _pre(list(TWO)))
+    assert _added(report, model) == []
+
+
+def test_一條_finding_同時提到兩句也只抵一處():
+    """寧可多補:一條 finding 寫「兩句都沒有 WHERE」時,程式仍補一條。"""
+    model = [_finding("DELETE FROM ledger_a 與 DELETE FROM ledger_b 都沒有 WHERE")]
+    report = enforce_rules({"findings": list(model)}, _pre(list(TWO)))
+    assert len(_added(report, model)) == 1
+
+
+def test_嚴重度不夠的_finding_不抵任何一處():
+    model = [_finding("DELETE FROM ledger_a 沒有 WHERE", severity="major"),
+             _finding("另一句也沒有 WHERE", severity="info")]
+    report = enforce_rules({"findings": list(model)}, _pre(list(TWO)))
+    assert len(_added(report, model)) == 2
+
+
+def test_不同規則分開計算():
+    """R001 報了兩條,不能拿來抵 R003 的命中。"""
+    hits = list(TWO) + [_hit("SELECT 1 FROM t WHERE NOT a IN (SELECT b FROM u)", rule="R003",
+                             severity="major", message="NOT IN + 子查詢(NULL 陷阱)")]
+    model = [_finding("第一句沒有 WHERE"), _finding("第二句沒有 WHERE")]
+    report = enforce_rules({"findings": list(model)}, _pre(hits))
+    assert [f["title"][:6] for f in _added(report, model)] == ["[R003]"]
+
+
+def test_別的檔案的_finding_不抵這個檔案的命中():
+    other = "sql/rules/r002_other.sql"
+    model = [_finding("沒有 WHERE"), _finding("沒有 WHERE", file=other),
+             _finding("沒有 WHERE", file=other)]
+    report = enforce_rules({"findings": list(model)}, _pre(list(TWO)))
+    assert len(_added(report, model)) == 1
+
+
+def test_沒有語句的命中照數量算():
+    """文字層規則(R004)的命中沒有語句;預掃結果也可能沒有 statement 這個欄位。"""
+    hits = [{"rule": "R004", "severity": "blocker", "message": "疑似硬編碼憑證", "statement": ""},
+            {"rule": "R004", "severity": "blocker", "message": "疑似硬編碼憑證"}]
+    model = [_finding("這裡有硬編碼的密碼")]
+    report = enforce_rules({"findings": list(model)}, _pre(hits))
+    assert len(_added(report, model)) == 1
+
+
+def test_多處命中時說明寫出數量_單一命中的說明不變():
+    report = enforce_rules({"findings": [_finding("第一句沒有 WHERE")]},
+                           _pre(list(TWO) + [_hit("DELETE FROM ledger_c")]))
+    details = [f["detail"] for f in report["findings"][1:]]
+    assert len(details) == 2
+    assert all("共有 3 處命中 R001" in d and "只對應到 1 處" in d for d in details)
+    assert "第 1 條" in details[0] and "第 2 條" in details[1]
+
+    single = enforce_rules({"findings": []}, _pre([_hit("DELETE FROM ledger_a")]))
+    assert single["findings"][0]["detail"] == "DELETE 沒有 WHERE 條件,將影響全表"
+
+
+def test_補的內容不回顯命中的語句():
+    """語句是 MR 作者寫的文字,補的 finding 會被貼回 MR 留言。"""
+    hits = [_hit("DELETE FROM zz_marker_one"), _hit("DELETE FROM zz_marker_two")]
+    for model in ([], [_finding("第一句沒有 WHERE")]):
+        report = enforce_rules({"findings": list(model)}, _pre(hits))
+        for f in _added(report, model):
+            assert "zz_marker" not in " ".join(str(v) for v in f.values())
+
+
 def test_hint_系列不由_enforce_rules_處理():
     """H 系列是檢核點,走 enforce_hints;enforce_rules 只管 R 系列。"""
     pre = _pre([{"rule": "H001", "severity": "hint", "message": "沖正/退匯是否已處理"}])

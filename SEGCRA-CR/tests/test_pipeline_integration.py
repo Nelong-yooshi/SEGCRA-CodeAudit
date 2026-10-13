@@ -174,6 +174,21 @@ def test_執行驗證抓到不符時要變成_major_並擋下自動放行(run):
 
 # ─────────────────── 後處理 enforce 鏈真的在管線裡跑 ───────────────────
 
+def test_同檔兩處命中模型只報一處時另一處也在報告上(run):
+    """#28 review:一個檔案有兩句 DELETE 都沒有 WHERE,模型只報了第一句。
+    用真的預掃結果走整條管線:第二句的 R001 也要出現在報告上。"""
+    path = "sql/maintenance/purge.sql"
+    sql = "-- R-201 相關的清理腳本\nDELETE FROM transactions;\nDELETE FROM accounts;"
+    model = {**MODEL_REPORT, "findings": [{
+        "file": path, "line": 2, "severity": "blocker", "title": "DELETE 沒有 WHERE 條件",
+        "detail": "transactions 會被整張清空。", "suggestion": "", "citations": []}]}
+    report, _, _ = run(_mr(sql, path=path), model)
+    r001 = [f for f in report["findings"]
+            if f["file"] == path and f["severity"] == "blocker" and "WHERE" in f["title"]]
+    assert len(r001) == 2, [f["title"] for f in report["findings"]]
+    assert report["decision"] == "blocked"
+
+
 def test_模型漏報的預掃命中會被補回來(run):
     """模型回了空的 findings,但預掃命中 R001(DELETE 無 WHERE)。
 

@@ -629,21 +629,56 @@ def enforce_dbt_notice(report: dict, pre: list[dict]) -> dict:
 
 def _reported_at_least(findings: list[dict], path: str, keywords: list[str],
                        severity: str) -> bool:
-    """path 這個檔案有沒有一條嚴重度不低於 severity 的 finding 提到任一關鍵詞。
-    只看同一個檔案(#16 review:模型只在 a.sql 報了 R001,b.sql 的 R001 不能因此消失)。
-    只看 findings 的標題、內文與建議(summary、檔名等欄位不算:檔名 `r001_purge.sql`
-    含關鍵詞 purge,不代表講的是 R001)。不認得的嚴重度一律當成最嚴重
-    (只有 blocker 才算報過),寧可多補也不漏補。"""
-    need = _SEVERITY_RANK.get(severity, _SEVERITY_RANK["blocker"])
+    """path 這個檔案有沒有一條嚴重度不低於 severity 的 finding 提到任一關鍵詞
+    (判斷方式見 _uncovered_hits;這裡等於只有一處命中的情況)。"""
+    return not _uncovered_hits(findings, path, keywords, [{"severity": severity}])
+
+
+def _flat(text: str) -> str:
+    return " ".join(str(text or "").split()).lower()
+
+
+def _uncovered_hits(findings: list[dict], path: str, keywords: list[str],
+                    hits: list[dict]) -> list[dict]:
+    """同一個檔案、同一條規則的命中(hits)裡,模型的 findings 沒有對應到的那幾處。
+
+    一條 finding 最多對應一處命中(#28 review):一個檔案有兩句 DELETE 都沒有 WHERE、
+    模型只報了第一句時,第二句也要出現在報告上——決策不受影響(已經有 blocker),但作者
+    可能以為只有一個問題,只修第一句。
+
+    哪些 finding 算數:
+    - 只看同一個檔案(#16 review:模型只在 a.sql 報了 R001,b.sql 的 R001 不能因此消失)。
+    - 嚴重度不低於該命中。不認得的嚴重度一律當成最嚴重(只有 blocker 才算報過),
+      寧可多補也不漏補。
+    - 標題、內文或建議提到任一關鍵詞(summary、檔名等欄位不算:檔名 `r001_purge.sql`
+      含關鍵詞 purge,不代表講的是 R001)。
+
+    對應方式:finding 的文字若原樣引用了某幾處命中的語句,它只能對應那幾處之一——兩條
+    finding 講的是同一句時,另一句仍要補;沒有引用任何一句的,依序對應還沒被對應到的命中
+    (退回比數量)。不論哪一種,一條 finding 都不會抵掉超過一處。
+    """
+    need = [_SEVERITY_RANK.get(h.get("severity", "major"), _SEVERITY_RANK["blocker"])
+            for h in hits]
+    statements = [_flat(h.get("statement")) for h in hits]
+    quoted, generic = [], []
     for f in findings:
         if f.get("file") != path:
             continue
-        if _SEVERITY_RANK.get(f.get("severity"), -1) < need:
-            continue
         text = " ".join(str(f.get(k) or "") for k in ("title", "detail", "suggestion"))
-        if any(k in text for k in keywords):
-            return True
-    return False
+        if not any(k in text for k in keywords):
+            continue
+        rank = _SEVERITY_RANK.get(f.get("severity"), -1)
+        flat = _flat(text)
+        refs = [i for i, st in enumerate(statements) if st and st in flat]
+        (quoted if refs else generic).append((rank, refs or range(len(hits))))
+    covered: set[int] = set()
+    quoted.sort(key=lambda q: len(q[1]))        # 能對應的語句越少的越先
+    for rank, options in quoted + generic:      # 有引用語句的先對應
+        for i in options:
+            if i not in covered and rank >= need[i]:
+                covered.add(i)
+                break
+    return [h for i, h in enumerate(hits) if i not in covered]
 
 
 def enforce_rules(report: dict, pre: list[dict]) -> dict:
@@ -658,21 +693,31 @@ def enforce_rules(report: dict, pre: list[dict]) -> dict:
     跳過時報告裡一定已有同等或更嚴重的 finding,決策不會因此變寬鬆。
     只看同一個檔案的 finding:兩個檔案都有 R001、模型只報了 a.sql,b.sql 的仍要補
     (#16 review;決策不受影響,但 b.sql 的問題會從報告上消失,作者可能只修 a.sql)。
-    只比對進來時就有的 findings:本函式自己補的(標題含 WHERE 等關鍵詞)不能讓同一個檔案的
-    第二個命中被當成「已經報過」(兩句 DML 都沒有 WHERE,兩條都要出現在報告上)。"""
+    同一個檔案有多處相同規則的命中時逐處對應,一條 finding 最多抵一處(#28 review,
+    見 _uncovered_hits)。
+    只比對進來時就有的 findings,不拿本函式自己補的來比對。
+
+    補的內容只有規則的固定訊息與數量,不回顯命中的語句(那是 MR 作者寫的文字)。"""
     before = list(report.get("findings", []))
     for entry in pre:
+        by_code: dict[str, list[dict]] = {}
         for h in entry.get("rules", []):
             code = h.get("rule", "")
-            if not code.startswith("R"):   # hint(H 系列)由 enforce_hints 處理
-                continue
-            if _reported_at_least(before, entry["path"], _RULE_KEYWORDS.get(code, [code]),
-                                  h.get("severity", "major")):
-                continue
-            report.setdefault("findings", []).append({
-                "file": entry["path"], "line": 0, "severity": h.get("severity", "major"),
-                "title": f"[{code}] {h.get('message', '')[:60]}",
-                "detail": h.get("message", ""), "suggestion": "", "citations": []})
+            if code.startswith("R"):       # hint(H 系列)由 enforce_hints 處理
+                by_code.setdefault(code, []).append(h)
+        for code, hits in by_code.items():
+            missing = _uncovered_hits(before, entry["path"], _RULE_KEYWORDS.get(code, [code]),
+                                      hits)
+            for n, h in enumerate(missing, 1):
+                detail = h.get("message", "")
+                if len(hits) > 1:
+                    detail += (f"(這個檔案共有 {len(hits)} 處命中 {code},模型的 finding 只對應到 "
+                               f"{len(hits) - len(missing)} 處;這是程式補上的第 {n} 條,"
+                               f"共 {len(missing)} 條。請逐一檢查每一處。)")
+                report.setdefault("findings", []).append({
+                    "file": entry["path"], "line": 0, "severity": h.get("severity", "major"),
+                    "title": f"[{code}] {h.get('message', '')[:60]}",
+                    "detail": detail, "suggestion": "", "citations": []})
     return report
 
 
