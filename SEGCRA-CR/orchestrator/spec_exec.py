@@ -260,16 +260,36 @@ def _malformed_prompt(spec_code: str, spec_text: str) -> str:
             f"\n\n規則 {spec_code} 規格:\n{spec_text}")
 
 
-# 一次補幾個「條件 × 方向」。太大就回到「一次生不完」的老問題,太小則會把重試
-# 次數用在湊數上。6 是依 RETAIL_M1 實測的輸出量粗估的起點,不是調校過的值。
-_FILL_BATCH = 8
-# 補缺的輪數與整份生成的次數分開算:補缺每次只要幾個案例,輸出小、也不跟已經生好
-# 的部分搶空間,所以可以多試幾輪。RETAIL_M1_EVAL 需要 46 個案例,8 × 6 = 48,
-# 剛好夠一輪補完(前提是骨架拿得到)。
+# 一次補幾個「條件 × 方向」,以及最多補幾輪。
 #
-# 這兩個數字是依實測的輸出量粗估的,**沒有調校過**:端點上單次呼叫動輒 10 分鐘以上,
-# 6 輪就是一小時起跳。真正該量的是「每輪實際補進幾個」,再回頭調 batch。
-_FILL_ROUNDS = 6
+# 這兩個值是用重放模擬掃出來的(假模型,輸出上限 8192 tokens ≈ 24,576 字元,
+# 每個案例取 873 字元——RETAIL_M1_EVAL 那次實跑的量,也是目前見過最寬的)。
+# **掃出來的 ≠ 在真模型上驗過**:模擬只驗「機制會不會收斂」,不驗真模型會不會
+# 乖乖只回缺的那幾個。案例大小也是規則相依的(R-140 的凍結測資只有 196 字元/案例,
+# 那種規模 46 個案例一次就裝得下,根本不會進補缺模式),所以下面的表讀的是
+# 「相對大小」,不是絕對保證。工具與限制見 tests/tools/sim_testgen.py 檔頭。
+#
+# 重現方式:python tests/tools/sim_testgen.py --sweep [--comply 0.5]
+#
+#   RETAIL_M1 規模(23 個條件 = 46 個「條件×方向」),模型完全照做:
+#   batch |   4 |  8 | 12 | 16 | 20 | 24 | 32 | 46
+#   呼叫  |  11 |  8 |  6 |  5 |  5 |  4 |  6 |  5
+#   覆蓋  |36/46|  46|  46|  46|  46|  46|  46|  46
+#
+# batch 太小會把輪數用在湊數上(4 → 用完 8 輪還差 10 個)。往大的方向則不再有以前
+# 的風險:一批要太多而被截斷時,下面的 length 分支會把批量減半重試,32 與 46 因此
+# 照樣補滿,只多付 1-2 次呼叫。24 × 873 ≈ 21k 字元,在 24.5k 的輸出上限內還有餘裕,
+# 所以正常情況一次都不會被截斷(模擬中 batch 24 從頭到尾沒被截斷過)。
+#
+# 模型只照做一部分時(真模型常見),大 batch 明顯更耐撐 —— 只照做一半:
+#   batch |  4 |  8 | 12 | 16 | 20 | 24
+#   覆蓋  |18/46|36 | 44 | 46 | 46 | 46
+_FILL_BATCH = 24
+# 輪數是「上限」不是固定成本:模型照做時 batch 24 只要 4 次呼叫就收工,把上限從 6
+# 拉到 8 不會讓正常案例多花一次呼叫(模擬:兩者都是 4 次),只在補不滿時多給幾次
+# 機會(只照做一半時 batch 24:6 輪 45/46 → 8 輪 46/46)。補不進任何東西時另有
+# 「換回整份重來」的出口,不會在這裡空轉到上限。
+_FILL_ROUNDS = 8
 
 
 def _skeleton_prompt(spec_code: str, spec_text: str) -> str:
@@ -395,6 +415,7 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
     truncated = 0
     malformed = 0
     filling = False          # 這一輪送出去的是「只補缺的」還是整份重來
+    fill_batch = _FILL_BATCH # 補缺的批量;一旦被截斷就減半(見下方 length 分支)
     filled_total = 0         # 靠補生成多拿到幾個案例(寫進失敗原因,供判讀)
     best: tuple[dict, list[str], list[dict]] | None = None
     best_repaired = False
@@ -419,15 +440,19 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
         # 案例從應有的 46 個掉到 9 個——而那 9 個會被當成正常結果收下。
         if meta.get("finish_reason") == "length":
             truncated += 1
+            if filling and best is not None:
+                # **補缺的回應被截斷 → 這一批要得太多,下次少要一點。**
+                # 不可以退回去要「精簡版的完整計畫」:那條路已知裝不下(大規則
+                # 3/3 次截斷),等於把已經拿到的骨架與案例丟掉重來。
+                fill_batch = max(1, fill_batch // 2)
+                user = _fill_gaps_prompt(spec_code, spec_text, best[0],
+                                         _missing_pairs(best[0]), fill_batch)
+                continue
             # 還沒有任何可用計畫就被截斷 → 改要骨架(只有 schema 與條件,不要案例)。
             # 繼續要「精簡版的完整計畫」沒有用:大規則連精簡過的完整計畫都裝不下,
             # 實測 RETAIL_M1_EVAL 3/3 次都是這樣,最後 0 個案例。
             # 骨架拿到之後,案例靠補缺模式一批一批補。
-            user = (_skeleton_prompt(spec_code, spec_text) if best is None else
-                    (f"上一次的輸出超過長度上限被截斷了。請**大幅精簡**:"
-                     f"`note` 一律留空字串,每個案例只放最少必要的資料列,"
-                     f"但**條件的 true/false 兩向都不可省略**。\n\n"
-                     f"規則 {spec_code} 規格:\n{spec_text}"))
+            user = _skeleton_prompt(spec_code, spec_text)
             continue
         # JSON 不合法、靠 json-repair 救回來的輸出**不可信**,理由跟截斷同一類:
         # repair 不會失敗,它會把壞掉的 JSON 修補成一個**合法但語意錯誤**的物件。
@@ -464,7 +489,7 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
                                      len(attempted["conditions"]), max_conds)
                 continue
             user = _fill_gaps_prompt(spec_code, spec_text, cleaned,
-                                     _missing_pairs(cleaned), _FILL_BATCH)
+                                     _missing_pairs(cleaned), fill_batch)
             continue
         if plan:
             cleaned, gaps, dropped = _shape_check(plan)
@@ -475,7 +500,7 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
                 max_conds = max(max_conds, len(cleaned["conditions"]))
                 filling = True
                 user = _fill_gaps_prompt(spec_code, spec_text, cleaned,
-                                         _missing_pairs(cleaned), _FILL_BATCH)
+                                         _missing_pairs(cleaned), fill_batch)
                 continue
             if cleaned["cases"]:
                 n_conds = len(cleaned["conditions"])
@@ -501,7 +526,7 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
                 if missing and best is not None and cleaned is best[0]:
                     filling = True
                     user = _fill_gaps_prompt(spec_code, spec_text, cleaned,
-                                             missing, _FILL_BATCH)
+                                             missing, fill_batch)
                 else:
                     user = _retry_prompt(spec_code, spec_text, gaps, n_conds, max_conds)
                 continue

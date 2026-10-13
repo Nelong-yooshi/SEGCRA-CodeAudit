@@ -839,9 +839,17 @@ MUTANTS.update({
     # #23 第 2 點的實際可用性:沒有這三道,補缺模式對大規則完全不會啟動——
     # 第一次就截斷 → 沒有計畫 → 永遠進不去補缺。實測 RETAIL_M1_EVAL 在正式設定下
     # 就是 3/3 次截斷、0 個案例。
-    "測資:截斷後仍要精簡版的完整計畫(大規則永遠裝不下)": (S,
-        "            user = (_skeleton_prompt(spec_code, spec_text) if best is None else",
-        "            user = (None if False else"),
+    "測資:截斷後不要骨架(大規則永遠裝不下)": (S,
+        "            user = _skeleton_prompt(spec_code, spec_text)" + NL
+        + "            continue",
+        "            user = _retry_prompt(spec_code, spec_text, [], 0, max_conds)" + NL
+        + "            continue"),
+    # 補缺被截斷時退回「整份重來」= 把已經拿到的骨架與案例丟掉,再走一次已知裝不下
+    # 的路。重放模擬:這樣改最後拿到 0/46 個案例(真實端點量到的就是 0 個、3/3 截斷),
+    # 減半重試則補滿 46/46。
+    "測資:補缺被截斷就退回整份重來(丟掉骨架)": (S,
+        "            if filling and best is not None:",
+        "            if False:"),
     "測資:骨架不收(補缺永遠不啟動)": (S,
         "            if not cleaned[\"cases\"] and cleaned[\"conditions\"] and cleaned[\"schema_ddl\"]:",
         "            if False:"),

@@ -21,6 +21,7 @@
 """
 import asyncio
 import json
+import re
 
 import pytest
 
@@ -821,6 +822,46 @@ def test_骨架可以成為補缺的起點(monkeypatch):
     assert len(plan["cases"]) == 2, f"骨架之後沒有補進案例:{plan['cases']}"
     assert not gaps, f"補完了卻還有缺口:{gaps}"
     assert "只要補缺的案例" in users[2], "第 3 次不是補缺模式"
+
+
+def test_補缺被截斷時縮小批量而不是退回整份重來(monkeypatch):
+    """補缺的回應被截斷,代表「這一批要太多」,不代表「補缺這條路不行」。
+
+    退回去要整份計畫會把已經拿到的骨架與案例全部丟掉,再走一次已知裝不下的路
+    ——重放模擬:補缺被截斷時退回整份,最後拿到 **0/46** 個案例(真實端點量到的
+    正是 0 個案例、3/3 截斷);改成把批量減半重試則補滿 46/46。
+    """
+    skeleton = {"schema_ddl": ["CREATE TABLE t (a INT)"],
+                "conditions": [{"id": f"C{i}", "desc": "x"} for i in range(1, 21)],
+                "cases": []}
+    ids = tuple(f"C{i}" for i in range(1, 21))   # 20 個條件 = 40 個「條件×方向」,
+    both = {"cases": _shape_check(_plan(_all_dirs(ids),               # 比一批的量多
+                                        conditions=ids))[0]["cases"]}
+    # 第 3 次(第一批補缺)被截斷 → 第 4 次必須還是補缺,而且要的數量更少
+    (plan, gaps, _), users = _gen_meta(
+        monkeypatch,
+        [_trunc_raw(), json.dumps(skeleton, ensure_ascii=False),
+         _trunc_raw(), json.dumps(both, ensure_ascii=False)],
+        ["length", "stop", "length", "stop"])
+    assert "只要補缺的案例" in users[3], (
+        f"補缺被截斷後退回整份重來了:{users[3][:140]}")
+    asked = [int(re.search(r"要補的\((\d+) 個", u).group(1))
+             for u in users if "只要補缺的案例" in u]
+    assert asked[1] < asked[0], f"批量沒有縮小:{asked}"
+    assert len(plan["cases"]) == 40 and not gaps, f"最後沒補滿:{len(plan['cases'])} 案例 {gaps}"
+
+
+def test_補缺被截斷且還沒有任何計畫時才要骨架(monkeypatch):
+    """縮批量的前提是「手上已經有一份計畫(骨架)」。還沒有計畫就被截斷時,
+    要的仍然是骨架——不要把兩種情況混在一起。"""
+    skeleton = {"schema_ddl": ["CREATE TABLE t (a INT)"],
+                "conditions": [{"id": "C1", "desc": "x"}], "cases": []}
+    _, users = _gen_meta(monkeypatch,
+                         [_trunc_raw(), _trunc_raw(),
+                          json.dumps(skeleton, ensure_ascii=False)],
+                         ["length", "length", "stop"])
+    assert "骨架" in users[1] and "骨架" in users[2], (
+        f"沒有計畫時被截斷卻沒要骨架:{users[1][:80]} / {users[2][:80]}")
 
 
 def test_補缺的輪數不佔整份生成的次數(monkeypatch):
