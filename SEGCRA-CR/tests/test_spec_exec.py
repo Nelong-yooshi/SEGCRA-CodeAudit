@@ -20,11 +20,12 @@
   6. 仲裁 LLM 掛掉時保守倒向「SQL 錯」(寧可誤報待人工,不可誤放)。
 """
 import asyncio
+import json
 
 import pytest
 
 from orchestrator import spec_exec
-from orchestrator.spec_exec import _shape_check, extract_rule_codes, run_spec_exec
+from orchestrator.spec_exec import _shape_check, extract_rule_codes, generate_cases, run_spec_exec
 
 
 def _case(cid, cond, direction, flagged=True, table="transactions"):
@@ -102,6 +103,173 @@ def test_沒有合法_DDL_算缺口():
 def test_整份計畫不是物件時不炸():
     plan, gaps, _ = _shape_check("這不是 JSON 物件")
     assert plan["cases"] == [] and gaps
+
+
+# ─────────────────── 測資生成的重試(覆蓋不完整也要重試) ───────────────────
+#
+# 背景:舊行為只要解析出任何合法案例就直接收下,不管 coverage_gaps 是不是空的。
+# 同一份規格、同一個 prompt,不同次呼叫可能拆出不同數量的條件與案例——單次取樣
+# 抽到不完整覆蓋,舊版就把那次不完整的結果直接當成生成完成,不會再試。
+
+class _FakeCfg:
+    """只需要 role_profile 回傳一個有 model / temperature 等欄位的東西。"""
+    def role_profile(self, role):
+        from orchestrator.config import ModelProfile
+        return ModelProfile(model="fake", num_ctx=1024, temperature=0,
+                            max_output_tokens=256)
+
+
+def _raw(plan):
+    return json.dumps(plan)
+
+
+def test_第一次覆蓋不完整_補齊後就採用補齊的那版(monkeypatch):
+    incomplete = _plan([_case("C1-T", "C1", "true")])                        # 缺 false 向
+    complete = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)])
+    calls = [_raw(incomplete), _raw(complete)]
+
+    async def fake_run_agent(*a, **kw):
+        return calls.pop(0)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    plan, gaps, dropped = asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容"))
+    assert gaps == []
+    assert len(plan["cases"]) == 2
+    assert calls == [], "第一次不完整,必須觸發第二次呼叫"
+
+
+def test_多次都沒抽到完整覆蓋時保留覆蓋最多的一版(monkeypatch):
+    """三次都沒抽到 0 缺口——不能因為「試完了」就退化成空案例,也不能只認最後一次
+    (最後一次剛好抽差也要收較好的那次),要保留看過的裡面覆蓋最多的。"""
+    worse = _plan([_case("C1-T", "C1", "true")], conditions=("C1", "C2"))       # 3 個缺口
+    better = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False),
+                    _case("C2-T", "C2", "true")], conditions=("C1", "C2"))       # 1 個缺口
+    calls = [_raw(worse), _raw(better), _raw(worse)]
+
+    async def fake_run_agent(*a, **kw):
+        return calls.pop(0)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    plan, gaps, dropped = asyncio.run(
+        generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=3))
+    assert len(gaps) == 1
+    assert len(plan["cases"]) == 3, "留下的應該是缺口較少的 better,不是最後一次的 worse"
+    assert calls == [], "三次都沒抽到 0 缺口,應該用完全部嘗試次數"
+
+
+def test_全部嘗試都沒有合法案例才真的失敗(monkeypatch):
+    async def fake_run_agent(*a, **kw):
+        return "這次模型完全沒輸出 JSON"
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    plan, gaps, dropped = asyncio.run(
+        generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=2))
+    assert plan["cases"] == []
+    assert len(gaps) == 1 and "測資生成失敗" in gaps[0]
+    assert "2" in gaps[0], "失敗原因要帶出試了幾次,方便回溯"
+
+
+def test_LLM_呼叫失敗後仍能在下次成功時採用完整結果(monkeypatch):
+    """第一次連線失敗、第二次才拿到完整覆蓋——不能因為中途掛過一次就整體判失敗。"""
+    complete = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)])
+    calls = [ConnectionError("端點連不到"), _raw(complete)]
+
+    async def fake_run_agent(*a, **kw):
+        nxt = calls.pop(0)
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    plan, gaps, dropped = asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容"))
+    assert gaps == []
+    assert len(plan["cases"]) == 2
+
+
+def _all_dirs(conditions):
+    """每個條件兩向都有案例(0 缺口)。"""
+    return [_case(f"{c}-{d[0].upper()}", c, d, d == "true")
+            for c in conditions for d in ("true", "false")]
+
+
+def test_挑最佳版本看覆蓋數_不被拆得少的0缺口版本騙走(monkeypatch):
+    """review 第 4 點:缺口是對照模型**自己拆出的**條件算的。拆得少、全覆蓋的
+    那次是 0 缺口,但實際驗到的「條件 × 方向」比拆得齊、只缺一點的那次少。
+
+      第 1 次:拆 4 個條件、覆蓋 7/8(1 缺口)
+      第 2 次:只拆 1 個條件、覆蓋 2/2(0 缺口)← 不能因為 0 缺口就提前收下
+      第 3 次:拆 4 個條件、覆蓋 4/8(4 缺口)
+    應收第 1 次,而且第 2 次的 0 缺口不能讓它提前結束(第 3 次要被呼叫到)。"""
+    four = ("C1", "C2", "C3", "C4")
+    first = _plan(_all_dirs(four)[:-1], conditions=four)
+    second = _plan(_all_dirs(("C1",)), conditions=("C1",))
+    third = _plan(_all_dirs(four)[::2], conditions=four)
+    calls = [_raw(first), _raw(second), _raw(third)]
+
+    async def fake_run_agent(*a, **kw):
+        return calls.pop(0)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    plan, gaps, _ = asyncio.run(
+        generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=3))
+    assert calls == [], "第 2 次拆得比第 1 次少,0 缺口也不能提前結束"
+    assert len(plan["conditions"]) == 4 and len(plan["cases"]) == 7, \
+        "應收覆蓋 7 個「條件 × 方向」的第 1 次,不是 0 缺口但只覆蓋 2 個的第 2 次"
+    assert gaps == ["條件 C4 缺 false 向案例"]
+
+
+def test_0缺口且條件數不少於之前的最大值才提前結束(monkeypatch):
+    """第 1 次拆 2 個條件有缺口,第 2 次拆齊 2 個且 0 缺口 → 收第 2 次,不再試。"""
+    two = ("C1", "C2")
+    calls = [_raw(_plan(_all_dirs(two)[:3], conditions=two)),
+             _raw(_plan(_all_dirs(two), conditions=two)),
+             "不該被呼叫到"]
+
+    async def fake_run_agent(*a, **kw):
+        return calls.pop(0)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    plan, gaps, _ = asyncio.run(
+        generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=3))
+    assert gaps == [] and len(plan["cases"]) == 4
+    assert calls == ["不該被呼叫到"]
+
+
+def test_重試的prompt帶上一次的缺口_每次都不同(monkeypatch):
+    """review 第 4 點:評測固定 temperature 0 + seed 42,同一個 prompt 會得到逐位元組
+    相同的輸出。重試不帶這次的缺口,第 2、3 次送的是同一個 prompt,第 3 次等於白跑。"""
+    two = ("C1", "C2")
+    calls = [_raw(_plan(_all_dirs(two)[:3], conditions=two)),       # 缺 C2 false
+             _raw(_plan(_all_dirs(two)[:2], conditions=two)),       # 缺 C2 兩向
+             _raw(_plan(_all_dirs(two)[:3], conditions=two))]
+    users = []
+
+    async def fake_run_agent(cfg, profile, system, user, **kw):
+        users.append(user)
+        return calls.pop(0)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=3))
+    assert len(users) == 3
+    assert "條件 C2 缺 false 向案例" in users[1]
+    assert "條件 C2 缺 true 向案例" in users[2]
+    assert len(set(users)) == 3, "三次嘗試的 prompt 必須互不相同"
+
+
+def test_重試的prompt指出條件拆得比之前少(monkeypatch):
+    four = ("C1", "C2", "C3", "C4")
+    calls = [_raw(_plan(_all_dirs(four)[:-1], conditions=four)),
+             _raw(_plan(_all_dirs(("C1",)), conditions=("C1",))),
+             _raw(_plan(_all_dirs(four)[:-1], conditions=four))]
+    users = []
+
+    async def fake_run_agent(cfg, profile, system, user, **kw):
+        users.append(user)
+        return calls.pop(0)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=3))
+    assert "只拆出 1 個原子條件" in users[2] and "4 個" in users[2]
 
 
 # ─────────────────── 規則碼抽取 ───────────────────
@@ -198,3 +366,138 @@ def test_仲裁結果可以從_dropped_cases_看出來(monkeypatch):
 
     r = _stub_spec_exec(monkeypatch, {"who_is_wrong": "sql", "reason": "x"})
     assert [d["by"] for d in r["dropped_cases"]] == []
+
+
+# ─────────────────── 執行中止後,沒跑到的案例也是覆蓋缺口 ───────────────────
+
+def _plan_n(n_conditions: int):
+    conds = [f"C{i}" for i in range(1, n_conditions + 1)]
+    cases = []
+    for c in conds:
+        cases.append(_case(f"{c}-T", c, "true"))
+        cases.append(_case(f"{c}-F", c, "false", False))
+    return _plan(cases, conditions=tuple(conds))
+
+
+def _stub_abort(monkeypatch, plan, ran: int, error_key: str):
+    """模擬:跑到第 ran+1 個案例時中止(現行行為是直接放棄剩下全部)。"""
+    async def fake_generate(cfg, code, text, profile_name=None, max_attempts=3):
+        return plan, [], []
+
+    def fake_execute(sql, plan_):
+        results = [{"case_id": c["case_id"], "condition_id": c["condition_id"],
+                    "direction": c["direction"], "note": "", "expect_flagged": True,
+                    "actual_flagged": True, "actual_rows": [], "ok": True}
+                   for c in plan_["cases"][:ran]]
+        out = {"engine": "stub", "sandbox_error": None, "testdata_error": None,
+               "sql_error": None, "case_results": results, "mismatches": []}
+        out[error_key] = "模擬的中止原因"
+        return out
+
+    monkeypatch.setattr(spec_exec, "generate_cases", fake_generate)
+    monkeypatch.setattr(spec_exec, "execute_cases", fake_execute)
+    mr = {"files": [{"path": "sql/rules/r201.sql", "full_content": "SELECT 1;"}]}
+    return asyncio.run(run_spec_exec(None, None, mr, "R-201", "規格內容"))
+
+
+@pytest.mark.parametrize("error_key", ["sql_error", "testdata_error"])
+def test_執行中止時沒跑到的案例要列入覆蓋缺口(monkeypatch, error_key):
+    """`execute_cases` 的 per-case 迴圈遇到測資建不起來或 SQL 跑不起來會直接
+    `return out`,放棄剩下的案例。**中止本身是合理的**(SQL 真的壞掉時跑完只會
+    得到一堆相同錯誤),不合理的是報告沒交代這件事。
+
+    仲裁剔除案例時已經有對應處理(「被剔除 = 該向未驗證 → 列入覆蓋缺口」),
+    這裡是同一個道理的另一半:**沒跑到 = 沒驗到**。少了它,報告會顯示
+    「跑了 3 個案例、零缺口」,讀起來像全覆蓋,實際上多數案例根本沒執行——
+    而 coverage_gaps 正是人用來判斷「這次到底驗了多少」的欄位。
+    """
+    plan = _plan_n(10)                      # 10 條件 → 20 案例
+    r = _stub_abort(monkeypatch, plan, ran=3, error_key=error_key)
+
+    assert r["passed"] is False
+    assert len(r["case_results"]) == 3, "中止後只有前 3 個案例有結果"
+    unrun = [g for g in r["coverage_gaps"] if "因執行中止而未驗證" in g]
+    assert len(unrun) == 17, f"17 個沒跑到的案例都要列成缺口,實得 {len(unrun)}"
+    assert any("C10-F" in g for g in unrun), "最後一個案例也要在列"
+    assert not any("C1-T" in g for g in unrun), "已經跑過的案例不該被列成未驗證"
+
+
+def test_全部跑完時不會冒出未驗證的缺口(monkeypatch):
+    """反向:正常跑完不該因為這個修改多出任何缺口(否則每份報告都會被汙染)。"""
+    plan = _plan_n(3)
+    r = _stub_abort(monkeypatch, plan, ran=len(plan["cases"]), error_key="sql_error")
+    assert [g for g in r["coverage_gaps"] if "因執行中止而未驗證" in g] == []
+
+
+# ─────────────────── 輸出被截斷時不可把殘骸當結果 ───────────────────
+
+def _truncating_agent(sequence):
+    """sequence 的每一項是 (finish_reason, raw)。"""
+    seq = list(sequence)
+
+    async def fake(cfg, profile, system, user, hub=None, use_tools=True,
+                   verbose=True, trace=None, meta=None):
+        reason, raw = seq.pop(0)
+        if meta is not None:
+            meta["finish_reason"] = reason
+            meta["completion_tokens"] = 8192 if reason == "length" else 1234
+        return raw
+    return fake, seq
+
+
+def test_截斷的輸出不採用_即使修補後解析得出來(monkeypatch):
+    """**這是這道防線的全部意義**:被 max_tokens 硬切的 JSON,會被 extract_json
+    的 json-repair 修補成合法物件,`_shape_check` 只看得到「案例比較少」,
+    看不出它是殘骸。實測 RETAIL_M1 就是這樣:finish_reason=length、
+    completion_tokens 剛好 8192、輸出斷在一個數字中間,卻照樣解析成功,
+    案例從應有的 46 個掉到 9 個——然後那 9 個被當成正常結果收下。
+
+    所以截斷必須在**看內容之前**就判定為失敗,不能指望形狀檢查代勞。
+    """
+    # 關鍵:截斷的那次**剛好 0 缺口**(殘骸裡剩下的案例,對它自己列出的條件是
+    # 齊全的)。這時「缺口非空才重試」完全幫不上忙——舊邏輯會把它當完美結果
+    # 立刻回傳,而它其實只涵蓋了規格的一小部分。只有看 finish_reason 擋得住。
+    truncated_but_looks_perfect = _raw(
+        _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)]))
+    full = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False),
+                  _case("C2-T", "C2", "true"), _case("C2-F", "C2", "false", False)],
+                 conditions=("C1", "C2"))
+    fake, seq = _truncating_agent([("length", truncated_but_looks_perfect),
+                                   ("stop", _raw(full))])
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake)
+    plan, gaps, dropped = asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容"))
+
+    assert seq == [], "截斷那次必須觸發重試,即使它看起來零缺口"
+    assert gaps == []
+    assert len(plan["cases"]) == 4, "採用的應該是沒被截斷的完整那次,不是截斷的殘骸"
+
+
+def test_全部嘗試都被截斷時的失敗原因要指出是長度問題(monkeypatch):
+    """「規則太大裝不下」跟「模型輸出亂七八糟」的修法完全不同——
+    前者要調 max_output_tokens 或分批生成,後者是 prompt/模型的問題。
+    失敗原因混為一談,看的人無從判斷該修哪邊。"""
+    raw = _raw(_plan([_case("C1-T", "C1", "true")]))
+    fake, _ = _truncating_agent([("length", raw)] * 3)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake)
+    plan, gaps, dropped = asyncio.run(
+        generate_cases(_FakeCfg(), "R-999", "規格內容", max_attempts=3))
+
+    assert plan["cases"] == []
+    assert len(gaps) == 1
+    assert "截斷" in gaps[0] and "3/3" in gaps[0]
+    assert "max_output_tokens" in gaps[0], "要指出可以調哪個設定"
+
+
+def test_沒給meta的呼叫端不受影響(monkeypatch):
+    """meta 是選用參數,既有的 5 個呼叫點都沒傳——不能因為加了它就改變行為。"""
+    complete = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)])
+
+    async def fake_no_meta(*a, **kw):
+        assert "meta" in kw, "generate_cases 應該要傳 meta"
+        return _raw(complete)
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_no_meta)
+    plan, gaps, _ = asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容"))
+    assert gaps == [] and len(plan["cases"]) == 2
