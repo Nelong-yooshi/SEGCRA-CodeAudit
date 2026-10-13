@@ -1189,3 +1189,38 @@ def test_舊形狀的補缺描述不變():
     plan = _shape_check(_plan([], conditions=("C1",)))[0]
     text = spec_exec._fill_gaps_prompt("R-1", "規格", plan, [("C1", "true")], 8)
     assert "條件 C1" in text and "true 向" in text
+
+
+def test_補缺回來的基準與變體都要併得進去():
+    """`_merge_cases` 原本一律用 condition_id 判斷「這個條件在不在原計畫裡」,
+    而基準的 condition_id 是我們自己補的 `__base__<分支>`、不在條件清單裡
+    ——於是補缺回來的基準被整批拒收,補缺模式永遠拿不到基準。實測確認過。
+    """
+    conds = [{"id": "C1", "desc": "a", "branch": "B1"},
+             {"id": "C2", "desc": "b", "branch": "B1"},
+             {"id": "C3", "desc": "c", "branch": "B2"}]
+    plan, _, _ = _shape_check({"schema_ddl": ["CREATE TABLE t (id INT)"],
+                               "conditions": conds, "cases": []})
+    add = {"cases": [
+        {"case_id": "b1", "kind": "base", "branch": "B1", "rows": [["t", 1]]},
+        {"case_id": "v1", "kind": "variant", "condition_id": "C1", "rows": [["t", 1]]},
+        {"case_id": "x1", "kind": "base", "branch": "沒宣告過", "rows": [["t", 1]]},
+        {"case_id": "x2", "kind": "variant", "condition_id": "C9", "rows": [["t", 1]]}]}
+    merged, added, dropped = spec_exec._merge_cases(plan, add)
+    assert added == 2, f"基準/變體沒併進去:{[d.get('reason') for d in dropped]}"
+    assert len(dropped) == 2, "沒宣告的分支與不存在的條件要拒收"
+    got = {(c["case_id"], c["kind"], c["expect_flagged"]) for c in merged["cases"]}
+    assert got == {("b1", "base", True), ("v1", "variant", False)}
+
+
+def test_同一個分支的基準不會被補第二次():
+    """補缺是只併不覆寫:已經驗過的基準不該被後來的回應改寫。"""
+    conds = [{"id": "C1", "desc": "a", "branch": "B1"}]
+    plan, _, _ = _shape_check({"schema_ddl": ["CREATE TABLE t (id INT)"],
+                               "conditions": conds,
+                               "cases": [_base("first", "B1")]})
+    add = {"cases": [{"case_id": "second", "kind": "base", "branch": "B1",
+                      "rows": [["t", 2]]}]}
+    merged, added, dropped = spec_exec._merge_cases(plan, add)
+    assert added == 0 and len(dropped) == 1
+    assert [c["case_id"] for c in merged["cases"]] == ["first"]

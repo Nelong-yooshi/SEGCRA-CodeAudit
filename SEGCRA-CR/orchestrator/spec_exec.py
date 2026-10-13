@@ -548,16 +548,36 @@ def _merge_cases(base: dict, addition: dict) -> tuple[dict, int, list[dict]]:
     base 的 schema 寫的,換了表結構那些案例就跑不起來了。
     """
     cond_ids = {c["id"] for c in base["conditions"]}
-    have = {(c["condition_id"], c["direction"]) for c in base["cases"]}
+    branch_ids = _branches(base["conditions"])
     # 借 _shape_check 驗形狀:把補生成的案例掛在 base 的條件上一起檢查
     probe = {"schema_ddl": base["schema_ddl"], "conditions": base["conditions"],
              "cases": addition.get("cases", []) if isinstance(addition, dict) else []}
     cleaned, _, dropped = _shape_check(probe)
+    # 「已經有了」的判斷依形狀而異:
+    #   新形狀 → 基準看分支、變體看條件
+    #   舊形狀 → 看「條件 × 方向」
+    # 不可以一律用 condition_id:基準的 condition_id 是我們自己補的
+    # `__base__<分支>`,不在條件清單裡,會被下面那條「條件不在原計畫裡」整批拒收
+    # ——補缺模式就永遠拿不到基準(實測確認過)。
+    def _key(c):
+        if c.get("kind") == "base":
+            return ("base", str(c.get("branch", "") or ""))
+        if c.get("kind") == "variant":
+            return ("variant", c["condition_id"])
+        return (c["condition_id"], c["direction"])
+
+    def _known(c):
+        if c.get("kind") == "base":
+            return str(c.get("branch", "") or "") in branch_ids
+        return c["condition_id"] in cond_ids
+
+    have = {_key(c) for c in base["cases"]}
     added = []
     for c in cleaned["cases"]:
-        key = (c["condition_id"], c["direction"])
-        if c["condition_id"] not in cond_ids or key in have:
-            dropped.append({"case": c, "reason": "補生成:條件不在原計畫裡,或該方向已有案例"})
+        key = _key(c)
+        if not _known(c) or key in have:
+            dropped.append({"case": c,
+                            "reason": "補生成:條件/分支不在原計畫裡,或已經有這一個案例"})
             continue
         have.add(key)
         added.append(c)

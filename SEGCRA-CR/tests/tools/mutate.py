@@ -1458,7 +1458,7 @@ MUTANTS.update({
         "        if filling and plan and best is not None and not repaired:",
         "        if False:"),
     "測資:補生成可以發明新條件(用假分母灌覆蓋率)": (S,
-        "        if c[\"condition_id\"] not in cond_ids or key in have:",
+        "        if not _known(c) or key in have:",
         "        if False:"),
     "測資:補生成的 schema 蓋掉先前的(已有案例跑不起來)": (S,
         "    return ({**base, \"cases\": [*base[\"cases\"], *added]}, len(added), dropped)",
@@ -1499,6 +1499,14 @@ MUTANTS.update({
         "                got = None" + NL
         + "                if got:" + NL
         + "                    bases_shown[got[0]] = got[1]"),
+    # 基準的 condition_id 是我們補的 `__base__<分支>`、不在條件清單裡,所以
+    # 「已經有了/認不認得」的判斷要依形狀而異。一律用 condition_id 判斷的話,
+    # 補缺回來的基準會被整批拒收,補缺模式永遠拿不到基準(實測確認過)。
+    "測資:合併時一律用 condition_id 判斷(補缺拿不到基準)": (S,
+        "        if c.get(\"kind\") == \"base\":" + NL
+        + "            return str(c.get(\"branch\", \"\") or \"\") in branch_ids" + NL
+        + "        return c[\"condition_id\"] in cond_ids",
+        "        return c[\"condition_id\"] in cond_ids"),
     # 接著上次的缺口補(--resume):給了 seed_plan 卻還是先問整份計畫,等於把
     # 已經生好的案例丟掉重來——每次呼叫 11-16 分鐘,大規則一輪 151 分鐘。
     "測資:給了既有計畫仍重新生成整份": (S,
