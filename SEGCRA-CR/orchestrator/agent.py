@@ -52,7 +52,8 @@ def _dump(profile_model: str, messages: list, iteration: int) -> str:
 
 
 def _dump_response(path: str, content: str, finish_reason: str,
-                   completion_tokens) -> None:
+                   completion_tokens, prompt_tokens=None,
+                   estimated_prompt_tokens=None) -> None:
     """把模型的回應接在同一個落檔後面。
 
     **為什麼回應也要落檔**:只落請求看不出最關鍵的事——模型到底有沒有照
@@ -64,8 +65,14 @@ def _dump_response(path: str, content: str, finish_reason: str,
     try:
         from pathlib import Path
         with Path(path).open("a", encoding="utf-8") as fh:
+            # prompt_tokens 與我們的估算一起記:estimate_tokens() 用的是 len/3,
+            # 而實測測資那種「日期+數字」的 JSON 一個 token 不到 0.5 個字元
+            # (completion_tokens=8192 只換到 3923 字元)。輸入側若也差這麼多,
+            # budget.diff 的 8000 就不是真的 8000——這一欄就是為了量它。
             fh.write(f"\n\n===== response finish_reason={finish_reason} "
-                     f"completion_tokens={completion_tokens} chars={len(content or '')} =====\n")
+                     f"completion_tokens={completion_tokens} chars={len(content or '')} "
+                     f"prompt_tokens={prompt_tokens} "
+                     f"estimated_prompt_tokens={estimated_prompt_tokens} =====\n")
             fh.write(content or "")
     except Exception:
         pass
@@ -134,7 +141,9 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
             meta["finish_reason"] = resp.choices[0].finish_reason
             meta["completion_tokens"] = getattr(usage, "completion_tokens", None) if usage else None
         _dump_response(dump_path, msg.content or "", resp.choices[0].finish_reason,
-                       getattr(usage, "completion_tokens", None) if usage else None)
+                       getattr(usage, "completion_tokens", None) if usage else None,
+                       prompt_tokens,
+                       sum(estimate_tokens(m.get("content") or "") for m in messages))
         messages.append(msg.model_dump(exclude_none=True))
 
         if not msg.tool_calls:
