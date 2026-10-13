@@ -827,10 +827,6 @@ MUTANTS.update({
 })
 
 
-if __name__ == "__main__":
-    sys.exit(main())
-
-
 # ---- 主審查的輸出被截斷(#26 第 1 點)
 # 失效是靜默的:被切斷的 JSON 會被修補成合法物件,報告只是比較短。
 P = "pipeline.py"
@@ -865,8 +861,8 @@ MUTANTS.update({
         ""),
     "截斷:一律補 major(沒有截斷也補)": (P,
         "    if not _output_truncated(meta, max_output_tokens):" + NL + "        return report" + NL
-        + "    limit = (",
-        "    limit = ("),
+        + "    limit = f",
+        "    limit = f"),
     "截斷:補成 minor(擋不住自動放行)": (P,
         '"severity": "major", "title": _TRUNCATED_TITLE,',
         '"severity": "minor", "title": _TRUNCATED_TITLE,'),
@@ -882,3 +878,7 @@ MUTANTS.update({
         '            capture["output_meta"] = dict(output_meta)' + NL,
         ""),
 })
+
+
+if __name__ == "__main__":
+    sys.exit(main())

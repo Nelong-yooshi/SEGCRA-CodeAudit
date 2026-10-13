@@ -322,3 +322,31 @@ def test_上限不是整數時說明裡不寫數字():
     report = pipeline.enforce_truncation({"findings": []}, {"finish_reason": "length"}, None)
     assert "None" not in report["findings"][0]["detail"]
     assert "上限" in report["findings"][0]["detail"]
+
+
+# ─────────────────── 程式補的文字不能被當成模型的回應 ───────────────────
+
+def test_空報告不會讓檢核點被當成已回應(review):
+    """enforce_hints 以報告全文含關鍵字判斷模型有沒有回應;空報告的摘要是程式寫的,
+    而且在 enforce_hints 之前就在報告裡——它若含關鍵字,檢核點會被悄悄吞掉。"""
+    normal, _, _ = review({"summary": "x", "findings": []}, STOP)
+    hints = [f["title"] for f in normal["findings"] if "模型未回應" in f["title"]]
+    assert hints, "對照組沒有任何檢核點,這個測試驗不到東西"
+    raw = THREE_TEXT[:THREE_TEXT.index("}")]
+    report, _, _ = review(raw, LENGTH)
+    assert [f["title"] for f in report["findings"] if "模型未回應" in f["title"]] == hints
+
+
+def test_程式寫的摘要不含任何檢核點的關鍵字():
+    for code, words in pipeline._HINT_KEYWORDS.items():
+        assert not [w for w in [code, *words] if w in pipeline._TRUNCATED_SUMMARY], code
+
+
+def test_突變點登記在工具的進入點之前():
+    """mutate.py 以腳本執行時,寫在 `if __name__ == "__main__":` 之後的突變點不會被登記,
+    `--only "截斷:"` 會回報 0 個突變而且看起來一切正常。"""
+    import pathlib
+    text = (pathlib.Path(__file__).parent / "tools" / "mutate.py").read_text(encoding="utf-8")
+    guard = text.index('if __name__ == "__main__":')
+    assert 0 < text.index('"截斷:') < guard
+    assert "MUTANTS.update(" not in text[guard:]

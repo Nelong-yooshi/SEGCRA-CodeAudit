@@ -856,7 +856,7 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens) -> dict:
     """
     if not _output_truncated(meta, max_output_tokens):
         return report
-    limit = (f"(上限 {max_output_tokens} tokens)" if _is_count(max_output_tokens) else "")
+    limit = f"({max_output_tokens} tokens)" if _is_count(max_output_tokens) else ""
     _put_program_finding(report, {
         "file": "(MR 內容)", "line": 0, "severity": "major", "title": _TRUNCATED_TITLE,
         "detail": f"審查模型的輸出達到長度上限{limit}而被切斷,切斷之後的內容沒有產出。"
