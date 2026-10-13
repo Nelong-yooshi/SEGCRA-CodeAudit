@@ -48,7 +48,7 @@ def parse(path: pathlib.Path) -> dict:
     text = path.read_text(encoding="utf-8", errors="replace")
     m = RESP_RE.search(text)
     req, resp = (text[:m.start()], text[m.end():]) if m else (text, "")
-    out = {"file": path.name, "mode": mode_of(req),
+    out = {"file": path.name, "mode": mode_of(req), "mtime": path.stat().st_mtime,
            "finish": m.group(1) if m else "(無回應)",
            "tokens": m.group(2) if m else "-",
            "chars": int(m.group(3)) if m else 0,
@@ -85,14 +85,19 @@ def main() -> int:
         known |= {c for c in r.get("conds", []) if c}
         rows.append(r)
 
+    # 耗時用落檔的 mtime 差:檔案在送出請求時就建好、回應回來才追加,
+    # 所以「下一個檔的 mtime - 這個檔的 mtime」≈ 這次呼叫的實際等待時間。
+    # 最後一次沒有下一個檔可比,留白不猜。
     print(f"{'#':>2} {'模式':<10} {'批量':>4} {'缺':>4} {'finish':<7} {'tok':>5} "
-          f"{'要':>3} {'回':>3} {'多給':>4} {'漏給':>4} {'改名':>4} repaired")
+          f"{'秒':>5} {'要':>3} {'回':>3} {'多給':>4} {'漏給':>4} {'改名':>4} repaired")
     for i, r in enumerate(rows, 1):
+        nxt = rows[i]["mtime"] if i < len(rows) else None
+        secs = f"{nxt - r['mtime']:.0f}" if nxt else "-"
         asked, got = set(r["asked"]), set(r["got"])
         renamed = {cid for cid, _ in got if known and cid not in known}
         extra = len(got - asked) if asked else len(got)
         print(f"{i:>2} {r['mode']:<10} {r['batch']:>4} {r['missing']:>4} "
-              f"{r['finish']:<7} {str(r['tokens']):>5} "
+              f"{r['finish']:<7} {str(r['tokens']):>5} {secs:>5} "
               f"{len(asked) or '-':>3} {len(got):>3} {extra:>4} "
               f"{len(asked - got) if asked else '-':>4} {len(renamed):>4} "
               f"{r['repaired']}")
@@ -104,6 +109,9 @@ def main() -> int:
         print(f"\n補缺 {len(fills)} 次:要了 {tot_asked} 個,其中 {tot_hit} 個真的回來了"
               f"({(100 * tot_hit // tot_asked) if tot_asked else 0}%)")
         print("「多給」不一定是壞事,但代表模型沒在遵守批量——輸出會變大、更容易截斷。")
+    span = rows[-1]["mtime"] - rows[0]["mtime"]
+    print(f"\n共 {len(rows)} 次呼叫,第一次到最後一次之間 {span / 60:.1f} 分鐘"
+          f"(最後一次的生成時間不含在內)。")
     return 0
 
 
