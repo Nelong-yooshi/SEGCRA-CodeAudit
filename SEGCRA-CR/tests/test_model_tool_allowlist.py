@@ -173,7 +173,8 @@ def test_run_agent_不執行模型要求的寫入工具(monkeypatch):
                                        "sqltools__run_rules")}
     hub._functions.update(spies)
     cfg = SimpleNamespace(endpoint="http://127.0.0.1:1/v1", api_key="test")
-    profile = SimpleNamespace(model="fake", temperature=0, max_output_tokens=100, seed=None)
+    profile = SimpleNamespace(model="fake", temperature=0, max_output_tokens=100, seed=None,
+                              reasoning_effort=None)
     trace = []
     out = asyncio.run(agent.run_agent(cfg, profile, "sys", "user", hub,
                                       verbose=False, trace=trace))
