@@ -395,6 +395,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
         report = enforce_injection(report, injection_hits)  # 確定性 blocker,不論模型是否被攻陷
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
+        report = enforce_tool_refusals(report, hub.refused_calls)  # 模型要求了寫入工具
 
         # 執行驗證(必跑;測資生成 → 沙盒執行 → 仲裁)——在 rubric 之前
         spec_result = await run_spec_exec(cfg, hub, mr, spec_code, spec_text)
@@ -760,6 +761,32 @@ def enforce_injection(report: dict, hits: list[dict]) -> dict:
         "suggestion": "移除 MR 描述/註解中試圖指示審查器的文字;若為誤植請改寫。",
         "citations": []})
     report["_injection_scan"] = hits
+    return report
+
+
+_TOOL_REFUSAL_TITLE = "審查模型嘗試呼叫未開放的寫入工具"
+
+
+def enforce_tool_refusals(report: dict, refused: list[str]) -> dict:
+    """審查模型要求了它拿不到的寫入工具(#17)→ 補一條 major,不得自動放行。
+
+    寫入類工具不在交給模型的清單裡(tool_hub.MODEL_TOOLS),模型連名稱都看不到;
+    它若仍要求呼叫,幾乎可以確定是照著 MR 內容(標題、描述、SQL 註解)的指示在做——
+    與注入掃描是同一類訊號。呼叫本身已被拒絕、沒有執行,這條是讓它在報告裡看得到。
+    用 major 而非 blocker:避免模型偶發的誤呼叫直接擋下 MR,交人工判斷即可。
+
+    detail 只列工具名稱(已確認是我們註冊的名稱),不寫模型給的參數:參數可能是攻擊者
+    寫的文字,寫進 finding 會被回貼到 MR 留言。標題只能由程式產生(_put_program_finding)。"""
+    if not refused:
+        return report
+    finding = {"file": "(MR 內容)", "line": 0, "severity": "major",
+               "title": _TOOL_REFUSAL_TITLE,
+               "detail": (f"審查模型要求呼叫:{', '.join(sorted(set(refused)))}。這些工具只由管線"
+                          "自己執行,呼叫已被拒絕、沒有執行。模型很可能受到 MR 內容的指示,"
+                          "這次審查結果需要人工確認。"),
+               "suggestion": "檢查 MR 標題、描述與 SQL 註解中是否有指示審查器的文字。",
+               "citations": []}
+    _put_program_finding(report, finding)
     return report
 
 

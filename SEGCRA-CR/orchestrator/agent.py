@@ -124,7 +124,8 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
             if verbose:
                 print(f"[agent] tool #{i}: {tc.function.name}({str(args)[:120]})")
             try:
-                result = await hub.call(tc.function.name, args)
+                # 模型要求的只走白名單入口:寫入類工具不執行(#17,見 tool_hub.MODEL_TOOLS)
+                result = await hub.call_from_model(tc.function.name, args)
             except Exception as e:
                 result = f"(工具執行失敗:{e})"
             if trace is not None:
