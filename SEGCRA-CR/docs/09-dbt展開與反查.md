@@ -83,7 +83,9 @@
      以 `root_files_checked=True` 明確確認已檢查專案根目錄的 `packages.yml` /
      `dependencies.yml`(沒傳進來不等於沒有)
    - **只偵測、不模擬**:alias、自訂 schema、snapshot 的 `target_schema` / `target_database`
-     (dbt 用它們覆蓋 schema / database)、`generate_*_name`、樣板值、ephemeral
+     (dbt 用它們覆蓋 schema / database;只看屬性檔與 `config()` 的參數。`dbt_project.yml` 的
+     `+target_schema` 不讓整個專案無法確定:snapshot 本來就一律無法確定,見下一點)、
+     `generate_*_name`、樣板值、ephemeral
      (被引用時展開成 CTE,不是表名)、停用(`enabled` 不是 true,被引用時 dbt 編譯失敗)、
      model 版本、同名的 model(dbt 編譯失敗;model 與 seed / snapshot 同名也算)、
      Python model(內容不讀)、macro 裡呼叫的 `config()`(作用在呼叫它的 model 上,

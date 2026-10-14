@@ -699,12 +699,16 @@ def test_example_registry_macro_does_not_make_the_project_uncertain():
 
 
 @pytest.mark.parametrize("key", ["target_schema", "target_database"])
-def test_snapshot_target_schema_in_dbt_project_is_uncertain(key):
-    """snapshot 的 target_schema / target_database 會覆蓋 schema / database,_NAME_KEYS 原本沒收。"""
+def test_snapshot_target_schema_in_dbt_project_keeps_models_certain(key):
+    """snapshot 的 target_schema / target_database 會覆蓋 schema / database(#19 review)。
+    dbt_project.yml 的 snapshots 區塊設 +target_schema 很常見(舊版 snapshot 必填):snapshot 本來就
+    一律無法確定(名稱來自呼叫端),不能因此讓整個專案的 model 都失去表名驗證。"""
     project = BASE["dbt_project.yml"] + f"snapshots:\n  demo:\n    +{key}: snap\n"
     info = _info(BASE | {"dbt_project.yml": project}, other=("orders_snapshot",))
-    assert info.global_uncertain
+    assert info.global_uncertain is None and info.refs_complete
     assert _render("select * from {{ ref('orders_snapshot') }}", info).relation_notice
+    assert "stg_txn" not in info.uncertain_models
+    assert not _render("select * from {{ ref('stg_txn') }}", info).relation_notice
 
 
 @pytest.mark.parametrize("yml", [

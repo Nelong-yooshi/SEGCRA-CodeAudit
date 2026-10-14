@@ -32,10 +32,13 @@ from .dbt_render import DbtProjectInfo
 
 _PACKAGE_FILES = ("packages.yml", "dependencies.yml")
 # 會改變 ref() 展開出的表名的設定鍵(dbt_project.yml 用 + 前綴,屬性檔不用)
-# target_schema / target_database 是 snapshot 的設定:dbt 用它們覆蓋 schema / database
-_NAME_KEYS = frozenset(
-    key for name in ("alias", "schema", "database", "target_schema", "target_database")
-    for key in (name, "+" + name))
+_NAME_KEYS = frozenset({"alias", "schema", "database", "+alias", "+schema", "+database"})
+# snapshot 的 target_schema / target_database:dbt 用它們覆蓋 schema / database(#19 review)。
+# 只用在指名到某一個 snapshot 的地方(屬性檔、config() 的參數),不用在 dbt_project.yml 的
+# 整個專案層級:那裡設 +target_schema 很常見(舊版 snapshot 必填),而 snapshot 的名稱來自
+# 呼叫端、本來就一律無法確定——拿來判整個專案,只會讓所有 model 都失去表名驗證
+_ENTRY_NAME_KEYS = _NAME_KEYS | frozenset(
+    key for name in ("target_schema", "target_database") for key in (name, "+" + name))
 _MATERIALIZED_KEYS = ("materialized", "+materialized")
 _ENABLED_KEYS = ("enabled", "+enabled")
 # 專案自訂 schema / alias / database 的命名規則:我們不模擬,只偵測
@@ -219,7 +222,7 @@ def _config_may_rename(text: str) -> bool:
             if m is None:
                 return True
             key, value = m.group(1).lower(), m.group(2)
-            if key in _NAME_KEYS or (key == "materialized"
+            if key in _ENTRY_NAME_KEYS or (key == "materialized"
                                      and value.strip("'\"").lower() == "ephemeral"):
                 return True
             if key == "enabled" and value.lower() != "true":
@@ -348,7 +351,7 @@ def _read_properties(text: str, sources: dict, uncertain_sources: set,
 def _has_name_key(mapping: dict) -> bool:
     """有會改變表名的鍵:alias / schema / database、materialized 為 ephemeral / 樣板值,
     或 enabled 不是 true。"""
-    return (any(key in mapping for key in _NAME_KEYS)
+    return (any(key in mapping for key in _ENTRY_NAME_KEYS)
             or any(key in mapping and _materialization_unknown(mapping[key])
                    for key in _MATERIALIZED_KEYS)
             or any(key in mapping and _maybe_disabled(mapping[key]) for key in _ENABLED_KEYS))
