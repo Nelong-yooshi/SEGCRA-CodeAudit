@@ -590,8 +590,8 @@ def test_notice_keeps_model_findings_untouched():
 
 def test_review_mr_enforces_notice_after_keyword_checks_and_before_policy():
     """review_mr() 的後處理鏈必須呼叫它:
-    * 在 enforce_hints / enforce_style 之後——它們以「報告全文含關鍵字」判斷模型是否
-      已回應檢核點,程式補的文字若先進報告,可能被誤當成回應而吞掉檢核點
+    * 在 enforce_hints / enforce_style 之後——它們以關鍵詞判斷模型是否已回應,
+      程式補的文字若先進報告,可能被誤當成回應而吞掉檢核點
     * 在 apply_policy 之前——決策要看得到它"""
     import inspect
     import orchestrator.pipeline as pipeline_mod

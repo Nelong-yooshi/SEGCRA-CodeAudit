@@ -49,6 +49,14 @@ MODEL_REPORT = {
     "findings": [],
 }
 
+# 模型在檔案上回應了檢核點(CLEAN_SQL 提到 R-201 → H003「與核定規格逐項核對」)。
+# 只寫在 summary 不算回應(#16 review),自動放行要靠這種 info finding
+RESPONDED_REPORT = {**MODEL_REPORT, "findings": [{
+    "file": "sql/maintenance/x.sql", "line": 1, "severity": "info",
+    "title": "已與核定規格 R-201 逐項核對",
+    "detail": "門檻 >= 100000 與規格「達」一致;時間窗與通報粒度相符。",
+    "suggestion": "", "citations": []}]}
+
 
 def _mr(sql: str, *, description: str = "例行維護", path: str = "sql/maintenance/x.sql",
         diff: str | None = None) -> dict:
@@ -166,6 +174,65 @@ def test_執行驗證抓到不符時要變成_major_並擋下自動放行(run):
 
 # ─────────────────── 後處理 enforce 鏈真的在管線裡跑 ───────────────────
 
+TWO_JOINS = """SELECT a.owner_id, b.branch_id, COUNT(*) AS n
+FROM accounts a JOIN branches b ON a.branch_id = b.id GROUP BY a.owner_id, b.branch_id;
+SELECT a.owner_id, c.region_id, COUNT(*) AS n
+FROM accounts a JOIN regions c ON a.region_id = c.id GROUP BY a.owner_id, c.region_id;"""
+
+
+def _h002_reply(text, title="通報粒度"):
+    return {"file": "sql/maintenance/x.sql", "line": 1, "severity": "info",
+            "title": title, "detail": text, "suggestion": "", "citations": []}
+
+
+def _pending_h002(report):
+    return [f for f in report["findings"] if f["title"].startswith("[H002] 檢核點待人工確認")]
+
+
+def test_同檔兩處相同檢核點模型只回應一處時不得自動放行(run):
+    """#28 review 的同一類情況發生在檢核點上,而且會影響決策:兩段 JOIN + GROUP BY 的查詢
+    各有一處 H002(通報粒度),模型只回應一處。用真的預掃結果走整條管線:另一處仍是
+    「模型未回應」,擋下自動放行;兩處都回應時就不再有待確認的 H002。"""
+    assert len(_pending_h002(run(_mr(TWO_JOINS))[0])) == 2       # 對照:都沒回應時兩處都待確認
+
+    one = {**MODEL_REPORT, "findings": [_h002_reply("第一段以分行為粒度,聯名戶不會重複通報。")]}
+    report, _, _ = run(_mr(TWO_JOINS), one)
+    assert len(_pending_h002(report)) == 1, [f["title"] for f in report["findings"]]
+    assert report["_policy_signals"]["pending_hints"] is True
+    assert report["decision"] != "auto_approved"
+
+    both = {**MODEL_REPORT, "findings": [
+        _h002_reply("第一段以分行為粒度,聯名戶不會重複通報。", "分行彙總的處理方式"),
+        _h002_reply("第二段以區域為粒度,同樣不會多筆通報。", "區域查詢沒有一對多的關聯")]}
+    assert _pending_h002(run(_mr(TWO_JOINS), both)[0]) == []
+
+
+def test_兩條回應的標題近似時會先被去重_只算一條(run):
+    """已知的交互作用,寫成測試免得它藏著:sanitize_findings 會把同檔標題近似的 finding
+    去重成一條(排在檢核點比對之前),所以模型對兩處檢核點各寫一條、標題卻一樣時,
+    只算回應了一處,另一處仍待確認、不會自動放行(偏保守)。"""
+    same = {**MODEL_REPORT, "findings": [_h002_reply("第一段以分行為粒度,聯名戶不會重複通報。"),
+                                         _h002_reply("第二段以區域為粒度,同樣不會多筆通報。")]}
+    report, _, _ = run(_mr(TWO_JOINS), same)
+    assert len(_pending_h002(report)) == 1
+    assert report["decision"] != "auto_approved"
+
+
+def test_同檔兩處命中模型只報一處時另一處也在報告上(run):
+    """#28 review:一個檔案有兩句 DELETE 都沒有 WHERE,模型只報了第一句。
+    用真的預掃結果走整條管線:第二句的 R001 也要出現在報告上。"""
+    path = "sql/maintenance/purge.sql"
+    sql = "-- R-201 相關的清理腳本\nDELETE FROM transactions;\nDELETE FROM accounts;"
+    model = {**MODEL_REPORT, "findings": [{
+        "file": path, "line": 2, "severity": "blocker", "title": "DELETE 沒有 WHERE 條件",
+        "detail": "transactions 會被整張清空。", "suggestion": "", "citations": []}]}
+    report, _, _ = run(_mr(sql, path=path), model)
+    r001 = [f for f in report["findings"]
+            if f["file"] == path and f["severity"] == "blocker" and "WHERE" in f["title"]]
+    assert len(r001) == 2, [f["title"] for f in report["findings"]]
+    assert report["decision"] == "blocked"
+
+
 def test_模型漏報的預掃命中會被補回來(run):
     """模型回了空的 findings,但預掃命中 R001(DELETE 無 WHERE)。
 
@@ -230,8 +297,8 @@ def test_三態決策都到得了(run):
     `auto_approved` 走不到的話,整套工具的價值(不擾人)就不成立——
     而這件事只有端到端跑過才知道。
     """
-    # ① auto_approved:小改、非規則檔、spec_exec 通過、無 finding
-    report, _, _ = run(_mr(CLEAN_SQL), spec_exec_kind="pass")
+    # ① auto_approved:小改、非規則檔、spec_exec 通過、只有 info(模型回應檢核點)
+    report, _, _ = run(_mr(CLEAN_SQL), RESPONDED_REPORT, spec_exec_kind="pass")
     assert report["decision"] == "auto_approved", (
         f"自動放行走不到,阻礙訊號:{report.get('_policy_signals')}")
 
@@ -270,10 +337,28 @@ def test_審查結果有寫回去(run):
 
 def test_自動放行時_commit_status_要是_success(run):
     """CE 的 merge 閘門靠 commit status,這個值錯了就等於閘門失效。"""
-    report, output, mr_id = run(_mr(CLEAN_SQL), spec_exec_kind="pass")
+    report, output, mr_id = run(_mr(CLEAN_SQL), RESPONDED_REPORT, spec_exec_kind="pass")
     assert report["decision"] == "auto_approved"
     review = json.loads((output / f"mr_{mr_id}_review.json").read_text(encoding="utf-8"))
     assert review["commit_status"]["state"] == "success"
+
+
+def test_檢核點只在_summary_回應不能自動放行(run):
+    """#16 review:檢核點只認同一個檔案的 finding 的回應。summary 寫「實作與核定規格相符」、
+    沒有任何 finding(以前算回應過)→ 檢核點待人工確認,不得自動放行。"""
+    report, _, _ = run(_mr(CLEAN_SQL), MODEL_REPORT, spec_exec_kind="pass")
+    assert report["_policy_signals"]["pending_hints"] is True
+    assert report["decision"] == "needs_human"
+    assert any(f["title"].startswith("[H003]") for f in report["findings"])
+
+
+def test_程式補的規則命中不能當成模型對檢核點的回應(run):
+    """R004 與 H004 同時命中:程式補的 R004 內文含「憑證」「密碼」(H004 的關鍵詞)。
+    檢核點排在程式補報之前,H004 仍要補上(只認模型自己的回應)。"""
+    report, _, _ = run(_mr("SELECT id FROM users WHERE password = 'abc123';"), MODEL_REPORT)
+    titles = [f["title"] for f in report["findings"]]
+    assert any(t.startswith("[R004]") for t in titles)
+    assert any(t.startswith("[H004]") for t in titles), titles
 
 
 def test_模型原始輸出有存檔(run):
