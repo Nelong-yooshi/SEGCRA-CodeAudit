@@ -14,11 +14,15 @@ model 存在、source() 才能套用 sources.yml 的 schema / identifier(PR #10 
     合計超過 MAX_PROPERTY_ENTRIES 筆就判成看不懂(無法確定),不會被「別名炸彈」拖垮
 
 不處理(一律視為無法確定,保留提醒):dbt 套件(packages.yml / dependencies.yml)
-的 model 與 source、會改變表名的設定(alias、自訂 schema、generate_*_name、
-樣板值)、ephemeral(被引用時展開成 CTE,不是表名)、停用(enabled 不是 true)、
-model 版本(versions)、同名的 model、Python model(內容不讀)、macro 裡呼叫的 config()。
+的 model 與 source、會改變表名的設定(alias、自訂 schema、snapshot 的 target_schema /
+target_database、generate_*_name、樣板值)、ephemeral(被引用時展開成 CTE,不是表名)、
+停用(enabled 不是 true)、model 版本(versions)、同名的 model(含 model 與 seed /
+snapshot 同名)、Python model(內容不讀)、macro 裡呼叫的 config()、config.set()。
+偵測不到(會被當成確定):先把 config 指給別的變數再呼叫它的 set(`{% set c = config %}`
+之後 `c.set(...)`)——名為 config 的區域變數很常見,只看字面分不出來。
 seed / snapshot / Python model 的名稱由呼叫端提供(打包下載只收 .sql / .yml 的內容);
-沒提供時 ref() 找不到也不能判定不存在。
+沒提供時 ref() 找不到也不能判定不存在。提供的只有名稱:存在可以確定,表名一律無法確定
+(snapshot 的 target_schema、Python model 的 dbt.config() 都寫在看不到的內容裡)。
 """
 import re
 
@@ -28,7 +32,10 @@ from .dbt_render import DbtProjectInfo
 
 _PACKAGE_FILES = ("packages.yml", "dependencies.yml")
 # 會改變 ref() 展開出的表名的設定鍵(dbt_project.yml 用 + 前綴,屬性檔不用)
-_NAME_KEYS = frozenset({"alias", "schema", "database", "+alias", "+schema", "+database"})
+# target_schema / target_database 是 snapshot 的設定:dbt 用它們覆蓋 schema / database
+_NAME_KEYS = frozenset(
+    key for name in ("alias", "schema", "database", "target_schema", "target_database")
+    for key in (name, "+" + name))
 _MATERIALIZED_KEYS = ("materialized", "+materialized")
 _ENABLED_KEYS = ("enabled", "+enabled")
 # 專案自訂 schema / alias / database 的命名規則:我們不模擬,只偵測
@@ -41,6 +48,10 @@ _SCALAR = r"""'[^'\\]*'|"[^"\\]*"|-?\d+(?:\.\d+)?|True|False|None|true|false|non
 _SIMPLE = r"""'[^'\\]*'|"[^"\\]*"|-?\d+(?:\.\d+)?"""
 _LIST = rf"\[\s*(?:(?:{_SIMPLE})\s*(?:,\s*(?:{_SIMPLE})\s*)*,?\s*)?\]"
 _CONFIG_ARG = re.compile(rf"\s*([A-Za-z_]\w*)\s*=\s*({_SCALAR}|{_LIST})\s*(?:,|$)")
+# 不經過 config( 呼叫就改設定的寫法(#19 review):dbt 的 config.set(name, value) 等同
+# config({name: value})。連同等價的取用方式一起認:config['set']、config|attr('set')。
+# 不看第一個參數是什麼,一律當成可能改表名(專案裡很少用;寧可多判)。
+_CONFIG_SET = re.compile(r"""\bconfig\s*(?:\.\s*set\b|\[\s*['"]set['"]\s*\]|\|\s*attr\b)""")
 _NON_SPACE = re.compile(r"\S")
 _LIBYAML = getattr(yaml, "__with_libyaml__", False) and hasattr(yaml, "CSafeLoader")
 # 所有屬性檔合計最多處理幾筆來源 / 表 / model。真實專案遠低於此;超過多半是別名炸彈
@@ -73,7 +84,10 @@ def project_info_from_files(files: dict, *, model_paths=("models",), macro_paths
                         None = 不知道(ref() 找不到時不能判定不存在)。打包下載只收
                         .sql / .yml 的內容,呼叫端要從檔名清單取得完整名單才能給;
                         給了就代表呼叫端確認名單完整
-                        (files 裡若有 model 目錄下的 .py 路徑,只取檔名,不讀內容)
+                        (files 裡若有 model 目錄下的 .py 路徑,只取檔名,不讀內容)。
+                        這些名稱只代表「存在」,表名一律無法確定:只有名稱、看不到內容,
+                        而 snapshot 的 target_schema、Python model 的 dbt.config() 都寫在
+                        內容裡;與 model 同名時 dbt 會編譯失敗(AmbiguousAliasError)
     root_files_checked  呼叫端確認 files 已包含專案根目錄的 packages.yml / dependencies.yml
                         (若存在的話)。預設 False:files 裡沒有這兩個檔,可能只是沒傳進來,
                         不能據此斷定「沒用套件」——否則套件裡的 model 會被誤判成不存在
@@ -136,6 +150,9 @@ def project_info_from_files(files: dict, *, model_paths=("models",), macro_paths
                 global_uncertain = global_uncertain or "macro 裡呼叫的 config() 可能改掉表名"
     # 同名的 model:dbt 編譯會失敗,不能當成「確定存在」
     uncertain_models.update(name for name, count in model_files.items() if count > 1)
+    # 呼叫端提供的 seed / snapshot / Python model:只有名稱,表名無法確定(#19 review)。
+    # 與 model 同名的也在這裡一併涵蓋
+    uncertain_models.update(other_ref_names or ())
     if all_sources_uncertain:
         # dbt_project.yml 的 sources 區塊有停用等設定,或 dbt_project.yml 看不懂
         uncertain_sources.update(sources)
@@ -186,7 +203,11 @@ def _config_may_rename(text: str) -> bool:
     不是 ephemeral(被引用時展開成 CTE),enabled 不是 false(停用的 model 被引用會編譯
     失敗)——否則一律判成可能會改。
     `config({'alias': 'x'})`、`config(**c)`、`config(materialized=var('m'))`、
-    沒有右括號的 `config(`,都看不懂 → 會改。"""
+    沒有右括號的 `config(`,都看不懂 → 會改。
+    `{% do config.set('alias', 'x') %}`(與 `config['set']`、`config|attr('set')`)不看
+    參數,一律算會改。"""
+    if _CONFIG_SET.search(text):
+        return True
     bodies = _config_bodies(text)
     if bodies is None:
         return True

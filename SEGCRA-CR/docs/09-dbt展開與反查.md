@@ -82,17 +82,27 @@
      檔名清單取得,snapshot 的名稱寫在 `{% snapshot %}` 區塊上)、所有屬性檔都解析得了、呼叫端
      以 `root_files_checked=True` 明確確認已檢查專案根目錄的 `packages.yml` /
      `dependencies.yml`(沒傳進來不等於沒有)
-   - **只偵測、不模擬**:alias、自訂 schema、`generate_*_name`、樣板值、ephemeral
+   - **只偵測、不模擬**:alias、自訂 schema、snapshot 的 `target_schema` / `target_database`
+     (dbt 用它們覆蓋 schema / database)、`generate_*_name`、樣板值、ephemeral
      (被引用時展開成 CTE,不是表名)、停用(`enabled` 不是 true,被引用時 dbt 編譯失敗)、
-     model 版本、同名的 model(dbt 編譯失敗)、Python model(內容不讀)、macro 裡呼叫的
-     `config()`(作用在呼叫它的 model 上,看不出是哪些,整個專案都無法確定);屬性檔的
-     `seeds:` / `snapshots:` 區段同樣檢查。有這類設定就保留提醒;規則層檢查語法結構、
-     不看表名,模擬的成本高、價值低
+     model 版本、同名的 model(dbt 編譯失敗;model 與 seed / snapshot 同名也算)、
+     Python model(內容不讀)、macro 裡呼叫的 `config()`(作用在呼叫它的 model 上,
+     看不出是哪些,整個專案都無法確定);屬性檔的 `seeds:` / `snapshots:` 區段同樣檢查。
+     有這類設定就保留提醒;規則層檢查語法結構、不看表名,模擬的成本高、價值低
+   - **呼叫端提供的名稱(seed / snapshot / Python model)只代表存在,表名一律無法確定**
+     (#19 review):只有名稱、看不到內容,而 snapshot 的 `target_schema`、Python model 的
+     `dbt.config()` 都寫在內容裡。`ref()` 得到名單上沒有的名稱時照樣判成不存在
    - **model 檔內 `config()` 的偵測用白名單**:每個參數都必須是「名稱 = 常值」(字串、數字、
      布林、字串清單),名稱不是 alias / schema / database,`materialized` 也不是 ephemeral,
      才算確定。字典寫法、`**` 展開、變數、`var()`、樣板運算、沒有右括號,一律算可能改名——
      看不懂的寫法會自動往「無法確定」靠,不會漏判。屬性檔與 `dbt_project.yml` 的
      `materialized` 為 ephemeral 或樣板值時同樣無法確定
+   - **`config.set()` 一律算可能改名**(#19 review):dbt 的 `config.set(name, value)` 等同
+     `config({name: value})`,寫在 model 或 macro 裡都一樣。連同 `config['set']`、
+     `config|attr(...)` 一起認,不看參數。**只認這幾種寫法,不是看到 config 這個字就算**:
+     註解、欄位名、名為 config 的區域變數(範例專案的註冊表 macro 就這樣寫)都很常見,
+     全部算進去會讓整個專案都帶提醒。已知偵測不到:先把 `config` 指給別的變數再呼叫
+     它的 `set`(`{% set c = config %}` 之後 `c.set(...)`),會被當成確定
    - **資料庫名一律用呼叫端給的約定假名**,不採用 `sources.yml` 宣告的 database:
      展開結果會出現在審查報告裡,不放正式資料庫名;規則也不看資料庫名
    - **macro 檔最外層的 `ref()` 不判定**:dbt 不會執行那段程式碼,在那裡失敗會冤枉開發者

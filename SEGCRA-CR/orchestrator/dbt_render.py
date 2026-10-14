@@ -188,7 +188,8 @@ class DbtProjectInfo:
     資料庫——展開後的 SQL 會出現在審查結果裡,不放正式資料庫名;規則也不看資料庫名。
 
     project_name       dbt_project.yml 的 name(ref('本專案', 'x') 的第一個參數)
-    ref_names          ref() 找得到的名稱:model 檔名,加上呼叫端提供的 seed / snapshot
+    ref_names          ref() 找得到的名稱:model 檔名,加上呼叫端提供的 seed / snapshot /
+                       Python model(呼叫端提供的只代表存在,一律列在 uncertain_models)
     sources            {(來源名, 表名): (schema 或 None, identifier 或 None)};None = 沒宣告
     uncertain_models   被引用時表名無法確定的 model / seed / snapshot(alias / schema / database、
                        ephemeral、停用、同名、版本、Python model 等;見 dbt_relations)

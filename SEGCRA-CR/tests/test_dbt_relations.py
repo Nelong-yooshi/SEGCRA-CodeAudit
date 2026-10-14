@@ -640,3 +640,126 @@ def test_default_project_info_is_fully_uncertain():
     assert not info.refs_complete and not info.sources_complete
     r = _render("{{ ref('x') }} {{ source('a', 'b') }}", info)
     assert r.ok and r.relation_notice
+
+
+# ------------------------------------------------ #19 review 後續(合併後補的四點)
+@pytest.mark.parametrize("src", [
+    "{% do config.set('alias', 'renamed') %} select 1",
+    "{% do config.set('materialized', 'ephemeral') %} select 1",
+    "{{ config.set('schema', 'x') }} select 1",
+    "{% do config . set ( 'alias', 'x' ) %} select 1",                # 中間有空白
+    "{%- do config.set(name, value) -%} select 1",                    # 參數是變數
+    "{% do config['set']('alias', 'x') %} select 1",                  # 等價的取用方式
+    "{% do config[\"set\"]('alias', 'x') %} select 1",
+    "{% do (config|attr('set'))('alias', 'x') %} select 1",
+    "{% do config.set('tags', ['a']) %} select 1",                    # 不看參數,一律算
+], ids=["alias", "ephemeral", "expression", "spaces", "variables", "bracket", "bracket-dq",
+        "attr-filter", "harmless-key"])
+def test_config_set_is_uncertain(src):
+    """dbt 的 config.set(name, value) 等同 config({name: value}),但偵測原本只認 `config(`:
+    refs_complete 為 True 時這些 model 被判成確定,提醒不見了。"""
+    info = _info(BASE | {"models/stg/stg_txn.sql": src})
+    assert info.refs_complete and "stg_txn" in info.uncertain_models
+    assert _render("select * from {{ ref('stg_txn') }}", info).relation_notice
+
+
+@pytest.mark.parametrize("macro", [
+    "{% macro setup() %}{% do config.set('alias', 'x') %}{% endmacro %}",
+    "{% macro setup() %}{% do config.set('materialized', 'ephemeral') %}{% endmacro %}",
+])
+def test_config_set_inside_a_macro_makes_the_project_uncertain(macro):
+    info = _info(BASE | {"macros/setup.sql": macro})
+    assert info.global_uncertain
+    assert _render("select * from {{ ref('stg_txn') }}", info).relation_notice
+
+
+@pytest.mark.parametrize("src", [
+    "-- dbt config\nselect 1",                                        # 註解裡的 config
+    "{{ config.get('x') }} select 1",
+    "{{ config.require('x') }} select 1",
+    "select config, config_set, my_config.setting from t",            # 欄位與別的識別字
+    "{% set config = {'a': 1} %}{{ config['a'] }} select 1",          # 名為 config 的區域變數
+    "{% set r = {'config': 1} %}{{ r.config }} select 1",
+    "{% do settings.set('alias', 'x') %} select 1",                   # 不是 config 的 set
+], ids=["comment", "get", "require", "identifiers", "local-variable", "attribute", "other-object"])
+def test_other_uses_of_the_word_config_stay_certain(src):
+    """只認 config.set 與等價的取用方式。光看 config 這個字會把註解、欄位、名為 config 的
+    區域變數(範例專案的註冊表 macro 就這樣寫)都算進去,整個專案都會帶提醒。"""
+    info = _info(BASE | {"models/stg/stg_txn.sql": src, "macros/m.sql": "{% macro m() %}" + src
+                         + "{% endmacro %}"})
+    assert "stg_txn" not in info.uncertain_models and info.global_uncertain is None
+
+
+def test_example_registry_macro_does_not_make_the_project_uncertain():
+    """repo 內附範例的註冊表 macro 用了名為 config 的區域變數;它不能讓整個專案變成無法確定。"""
+    macro = (PKG_ROOT / "examples" / "sample" / "RETAIL_M1_code" / "macros" / "anomaly"
+             / "config.sql").read_text(encoding="utf-8")
+    assert "set config" in macro
+    assert _info(BASE | {"macros/anomaly/config.sql": macro}).global_uncertain is None
+
+
+@pytest.mark.parametrize("key", ["target_schema", "target_database"])
+def test_snapshot_target_schema_in_dbt_project_is_uncertain(key):
+    """snapshot 的 target_schema / target_database 會覆蓋 schema / database,_NAME_KEYS 原本沒收。"""
+    project = BASE["dbt_project.yml"] + f"snapshots:\n  demo:\n    +{key}: snap\n"
+    info = _info(BASE | {"dbt_project.yml": project}, other=("orders_snapshot",))
+    assert info.global_uncertain
+    assert _render("select * from {{ ref('orders_snapshot') }}", info).relation_notice
+
+
+@pytest.mark.parametrize("yml", [
+    "snapshots:\n  - name: orders_snapshot\n    config: {target_schema: snap}\n",
+    "snapshots:\n  - name: orders_snapshot\n    target_schema: snap\n",
+    "snapshots:\n  - name: orders_snapshot\n    config: {target_database: other}\n",
+], ids=["config", "top-level", "database"])
+def test_snapshot_target_schema_in_properties_is_uncertain(yml):
+    info = _info(BASE | {"models/p.yml": yml}, other=())
+    assert "orders_snapshot" in info.uncertain_models
+
+
+def test_target_schema_in_a_config_call_is_uncertain():
+    src = "{{ config(target_schema='snap', unique_key='id') }} select 1"
+    assert "stg_txn" in _info(BASE | {"models/stg/stg_txn.sql": src}).uncertain_models
+
+
+def test_names_from_the_caller_exist_but_are_never_certain():
+    """seed / snapshot / Python model 由呼叫端提供名稱:只有名稱、看不到內容(snapshot 的
+    target_schema、Python model 的 dbt.config() 都寫在內容裡),所以存在可以確定、表名不行。
+    以前 Python model 經這裡傳入會被判成確定,與「Python model 一律無法確定」不一致。"""
+    info = _info(other=("country_codes", "orders_snapshot", "py_model"))
+    assert info.refs_complete
+    for name in ("country_codes", "orders_snapshot", "py_model"):
+        assert name in info.ref_names and name in info.uncertain_models
+        r = _render("select * from {{ ref('" + name + "') }}", info)
+        assert r.ok and r.relation_notice
+    # model 本身不受影響;不在名單上的照樣判成不存在
+    assert "stg_txn" not in info.uncertain_models
+    assert not _render("select * from {{ ref('stg_txn') }}", info).relation_notice
+    assert not _render("select * from {{ ref('nope') }}", info).ok
+
+
+def test_model_and_seed_with_the_same_name_is_uncertain():
+    """model 與 seed 同名時 dbt 會報 AmbiguousAliasError,不能當成「確定存在、照名稱展開」。"""
+    info = _info(other=("stg_txn",))
+    assert info.refs_complete and "stg_txn" in info.uncertain_models
+    assert _render("select * from {{ ref('stg_txn') }}", info).relation_notice
+    assert "mrt_daily" not in info.uncertain_models
+
+
+def test_no_names_from_the_caller_changes_nothing():
+    assert _info(other=()).uncertain_models == frozenset()
+    assert _info(other=None).uncertain_models == frozenset()
+
+
+@pytest.mark.parametrize("src", [
+    "config " * 200_000,                       # 很多個 config,後面都不是 .set
+    "config" + " " * 400_000 + "x",            # 一個 config 後面接很長的空白
+    "config . " * 150_000,                     # 有點、沒有 set
+    "config | " * 150_000,                     # 有過濾器符號、沒有 attr
+    "config[ '" * 150_000,                     # 有中括號、沒有 set
+], ids=["many", "long-space", "dots", "pipes", "brackets"])
+def test_config_set_scan_is_linear(src):
+    start = time.monotonic()
+    info = _info(BASE | {"models/stg/stg_txn.sql": src, "macros/m.sql": src})
+    assert time.monotonic() - start < 5
+    assert "stg_txn" not in info.uncertain_models and info.global_uncertain is None
