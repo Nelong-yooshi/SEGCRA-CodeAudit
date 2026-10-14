@@ -63,10 +63,7 @@ def test_every_mutation_target_appears_exactly_once():
                for label, entry in mutate.MUTANTS.items()]
     entries.append(("金絲雀", mutate.CANARY))
     for label, (module, old, _new) in entries:
-        # 帶斜線的目標是「相對專案根目錄」(例如 toolbox/sqltools.py),
-        # 其餘沿用 orchestrator/——與 mutate.py 的解析方式一致。
-        path = (proj / module) if "/" in module else (proj / "orchestrator" / module)
-        count = path.read_text(encoding="utf-8").count(old)
+        count = (proj / "orchestrator" / module).read_text(encoding="utf-8").count(old)
         if count != 1:
             bad.append(f"{label}({module}:{count} 次)")
     assert bad == []
@@ -95,8 +92,7 @@ def test_every_mutant_produces_valid_python():
                for label, entry in mutate.MUTANTS.items()]
     entries.append(("金絲雀", mutate.CANARY))
     for label, (module, old, new) in entries:
-        path = (proj / module) if "/" in module else (proj / "orchestrator" / module)
-        text = path.read_text(encoding="utf-8")
+        text = (proj / "orchestrator" / module).read_text(encoding="utf-8")
         try:
             ast.parse(text.replace(old, new))
         except SyntaxError as e:

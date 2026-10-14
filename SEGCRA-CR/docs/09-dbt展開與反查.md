@@ -41,7 +41,8 @@
 (`tests/dbt_reference/` → `tests/fixtures/dbt_compiled/`),不拿自己寫的預期值比。
 
 1. **`build_env()`**:建立含 dbt 樁的 `SandboxedEnvironment`。
-   - `ref()` / `source()` 展開成 `"<資料庫>"."dbo"."<表>"`(資料庫名由呼叫端傳入,不猜)
+   - `ref()` / `source()` 展開成 `"<資料庫>"."<綱要>"."<表>"`(資料庫名由呼叫端傳入,不猜);
+     沒有專案資訊時綱要固定為 `dbo`,有專案資訊時見下方「`ref()` / `source()` 的精確度」
    - `config()` 回傳空字串、`var()` 取呼叫端給的值、`execute` 為 True、
      `is_incremental()` 為 False(比照 compile 期)
    - `this`、`env_var` **刻意不定義**:給錯值會靜靜產出錯的 SQL,或把審查機的環境變數
@@ -65,6 +66,56 @@
    空白控制),改把左修剪拆成一個只輸出標記的 `{{- '標記' }}`,後面接去掉 `-` 的原
    標記:輸出只多了標記,這行(例如 `{{- 巨集() }}` 展開出的多行)仍有自己的行號。
    空白控制把幾行接成一個輸出行時,這行歸給內容開頭所在的原始行。
+4. **`ref()` / `source()` 的精確度(`dbt_relations`)**:呼叫端從專案檔案整理出
+   `DbtProjectInfo`(`project_info_from_files()`),交給 `render_model(project=...)`。
+
+   | 情況 | 沒給專案資訊 | 有給專案資訊 |
+   |---|---|---|
+   | 找得到的 `ref()` | 以 model 名稱為表名,帶提醒 | 照 dbt 規則展開,不帶提醒 |
+   | 找得到的 `source()` | 綱要固定 `dbo`,帶提醒 | 用 `sources.yml` 的 schema / identifier(schema 預設 = 來源名),不帶提醒 |
+   | 確定不存在 | 照常展開,帶提醒 | 展開失敗(dbt compile 一樣會失敗) |
+   | 無法確定 | — | 以慣例展開,帶「表名無法確定」提醒 |
+
+   - **「確定不存在」的條件**(缺一就只提醒、不判失敗,寧可保留提醒也不冤枉開發者):
+     沒用 dbt 套件(套件的 model / source 不在 repo 裡)、呼叫端提供了 seed / snapshot /
+     Python model 的名單(打包只收 `.sql` / `.yml` 的內容,看不到 `.csv` 與 `.py`;名單要從
+     檔名清單取得,snapshot 的名稱寫在 `{% snapshot %}` 區塊上)、所有屬性檔都解析得了、呼叫端
+     以 `root_files_checked=True` 明確確認已檢查專案根目錄的 `packages.yml` /
+     `dependencies.yml`(沒傳進來不等於沒有)
+   - **只偵測、不模擬**:alias、自訂 schema、snapshot 的 `target_schema` / `target_database`
+     (dbt 用它們覆蓋 schema / database;只看屬性檔與 `config()` 的參數。`dbt_project.yml` 的
+     `+target_schema` 不讓整個專案無法確定:snapshot 本來就一律無法確定,見下一點)、
+     `generate_*_name`、樣板值、ephemeral
+     (被引用時展開成 CTE,不是表名)、停用(`enabled` 不是 true,被引用時 dbt 編譯失敗)、
+     model 版本、同名的 model(dbt 編譯失敗;model 與 seed / snapshot 同名也算)、
+     Python model(內容不讀)、macro 裡呼叫的 `config()`(作用在呼叫它的 model 上,
+     看不出是哪些,整個專案都無法確定);屬性檔的 `seeds:` / `snapshots:` 區段同樣檢查。
+     有這類設定就保留提醒;規則層檢查語法結構、不看表名,模擬的成本高、價值低
+   - **呼叫端提供的名稱(seed / snapshot / Python model)只代表存在,表名一律無法確定**
+     (#19 review):只有名稱、看不到內容,而 snapshot 的 `target_schema`、Python model 的
+     `dbt.config()` 都寫在內容裡。`ref()` 得到名單上沒有的名稱時照樣判成不存在
+   - **model 檔內 `config()` 的偵測用白名單**:每個參數都必須是「名稱 = 常值」(字串、數字、
+     布林、字串清單),名稱不是 alias / schema / database,`materialized` 也不是 ephemeral,
+     才算確定。字典寫法、`**` 展開、變數、`var()`、樣板運算、沒有右括號,一律算可能改名——
+     看不懂的寫法會自動往「無法確定」靠,不會漏判。屬性檔與 `dbt_project.yml` 的
+     `materialized` 為 ephemeral 或樣板值時同樣無法確定
+   - **`config.set()` 一律算可能改名**(#19 review):dbt 的 `config.set(name, value)` 等同
+     `config({name: value})`,寫在 model 或 macro 裡都一樣。連同 `config['set']`、
+     `config|attr(...)` 一起認,不看參數。**只認這幾種寫法,不是看到 config 這個字就算**:
+     註解、欄位名、名為 config 的區域變數(範例專案的註冊表 macro 就這樣寫)都很常見,
+     全部算進去會讓整個專案都帶提醒。已知偵測不到:先把 `config` 指給別的變數再呼叫
+     它的 `set`(`{% set c = config %}` 之後 `c.set(...)`),會被當成確定
+   - **資料庫名一律用呼叫端給的約定假名**,不採用 `sources.yml` 宣告的 database:
+     展開結果會出現在審查報告裡,不放正式資料庫名;規則也不看資料庫名
+   - **macro 檔最外層的 `ref()` 不判定**:dbt 不會執行那段程式碼,在那裡失敗會冤枉開發者
+   - 專案檔案來自待審的 commit:YAML 一律用安全的載入器(有 libyaml 時用 C 版,行為相同、
+     約快 4 倍);輸入形狀不對就回傳「全部無法確定」;`sources.yml` 宣告的名稱拼進 SQL 前過
+     識別字白名單;YAML 別名可以把「來源 × 表」放大成平方級,所有屬性檔合計最多處理
+     `MAX_PROPERTY_ENTRIES`(50,000)筆,超過即無法確定;`config()` 的掃描是線性時間
+   - 接線時:屬性檔的解析放進子行程並設逾時(純 Python 解析 50 MB 最壞約一分鐘),
+     屬性檔設單檔大小上限
+
+   以 `tests/dbt_reference` 驗證:有專案資訊時,與 `dbt compile` 逐字一致且不帶提醒。
 
 ### 二、反查與規格對應(dbt_impact)
 
@@ -249,17 +300,79 @@ python tests/dbt_impact_reference/generate.py --dbt <dbt 執行檔>
 python tests/dbt_impact_reference/random_projects.py --dbt <dbt 執行檔>
 ```
 
+## 取回 dbt 專案(#15,已實作、尚未接進管線)
+
+審查機要能展開呼叫自訂 macro 的 model、做 macro 反查,必須拿到整個專案的 models / macros。
+以 GitLab `/repository/archive` 依 MR 的 commit 一次取回,分四個模組:
+
+| 模組 | 做什麼 | 主要防線 |
+|---|---|---|
+| `toolbox/gitlab.py` 的 `download_archive()` | 下載 tar.gz | 只用唯讀的 `GITLAB_READ_TOKEN`(不退回、不可與 `GITLAB_TOKEN` 相同);只接受完整 commit 編號;本機以外必須 https;不讀代理設定;不跟隨轉址;不做傳輸層解壓;大小與時間上限;**不在模型可呼叫的工具清單內** |
+| `orchestrator/archive.py` 的 `extract_archive()` | 解開成 {路徑: 內容};另可只列指定目錄的檔名(不解出) | 邊解壓邊計數(壓縮炸彈);**所有成員**檢查單一頂層目錄、絕對路徑、`..`、`.` 或空段落、重複(要收內容的目錄內另含大小寫與 Unicode 正規化),指定目錄的上層不能是連結或檔案(否則目錄看起來是空的);**要收內容的目錄內**不能有連結或特殊檔;**會解出的檔案**另外檢查控制字元、反斜線、冒號、Windows 保留名稱——不解出的成員(目錄外,或 `.md`、`.csv`、`.py` 等)不讓整包失敗;只收 `.sql` / `.yml` / `.yaml`;`filter="data"`;權限 700 的暫存目錄、讀完即刪 |
+| `orchestrator/dbt_project.py` 的 `load_dbt_project()` | 讀 `dbt_project.yml` 的目錄設定(model / macro / seed / snapshot),取回這些目錄的內容、model / seed / snapshot 目錄的檔名清單,以及專案根目錄的 `packages.yml` / `dependencies.yml`(`root_files`,判斷有沒有用 dbt 套件);`extra_ref_names()` 從同一包算出 seed / Python model / snapshot 的名稱(看不懂就回 `None`) | 同一包讀設定與檔案(不另外用讀檔 API,那預設讀 main);目錄設定當不可信內容檢查;記憶體快取(以 commit 為鍵、有筆數與總量上限、只收成功結果、進出都複製) |
+| `orchestrator/dbt_mr_impact.py` 的 `analyze_mr_macro_impact()` | 把 MR(變更清單 + head / base commit)轉成 macro 反查的輸入並執行 | 路徑換成相對專案根目錄;新增檔以 head / base 兩個專案比對判斷(不依賴 GitLab 的旗標),改名與刪除的舊路徑一併列入;反查看得到 `dbt_project.yml` 的 hook;變更清單被截斷、路徑看不懂、取回失敗 → 全部 model 可能受影響;改到專案設定檔或兩邊目錄設定不同 → 全部 model 可能受影響;反查只追 model,有 macro 變更而專案有 snapshot 時交人工;反查一律在子行程 |
+
+任何一步失敗都是整包失敗(`ok=False`),**不會當成「專案沒有 macro」**。
+
+**真實 GitLab 實測**(2026-10-01,測試用 GitLab、只含假資料的專案;project access token,
+角色 Reporter、只勾 `read_api`):
+
+| 項目 | 結果 |
+|---|---|
+| 依 commit 打包下載整個 repo | 成功;單一頂層目錄 `<專案>-<sha>-<sha>/` |
+| 指定 `path=dbt_sub` | 成功;頂層目錄變成 `<專案>-<sha>-<sha>-dbt_sub/`,**底下保留 `dbt_sub/` 這一層** |
+| `load_dbt_project()`,專案在 repo 根目錄 | 成功;只取回 models / macros 的 `.sql` / `.yml`(`README.md`、`seeds/*.csv` 排除) |
+| `load_dbt_project()`,專案在 `dbt_sub/` | 成功;路徑換算成相對專案根目錄 |
+| 不存在的 commit | HTTP 404,乾淨失敗並附處理提示 |
+| 同一個 token 只勾 `read_repository`(先前實測) | 讀單檔 200,打包與列目錄 403 |
+
+#20 review 修正後重測(2026-10-04,同一個測試專案新增一個 commit;token 條件同上,
+另建新的一把):
+
+| 項目 | 結果 |
+|---|---|
+| repo 裡有 `docs/aux.md`、`notes/con.txt`(review 實測會讓整包失敗的檔名) | 取回根目錄的專案**成功**;兩個檔案在 dbt 目錄外,不解出 |
+| `models/props.yaml` | 有收進來 |
+| seed、Python model、snapshot(`.sql` 區塊與 yml) | snapshot 的 `.sql` 與 yml 收內容;`.csv`、`.py` 只列檔名(清單含 `seeds/sample.csv`、`models/py_score.py`);`extra_ref_names()` 得到 `py_score`、`sample`、`snap_dim`、`snap_sample` |
+| `load_dbt_project()`,專案在 `dbt_sub/` | 成功 |
+| 不存在的 commit | HTTP 404,乾淨失敗 |
+
+正式環境的條件(#15 review 回覆):正式的 dbt 專案**沒有用 dbt 套件**(共用邏輯都是自己寫的
+macro);正式環境的主機**不連外網**,審查流程裡不能有任何執行時才從網路下載的步驟(包括
+`dbt deps`);正式環境用 dbt-sqlserver,預設 schema 是 `dbo`。含 dbt 樣板的 MR 這一階段**不需要
+自動放行**:接線完成就是終點,最後由人決定(dbt 的執行驗證另排,前提是測資生成在真實規模下
+穩定、測試資料的持久化方式定案)。
+
+已知限制(接線時要處理):
+
+- **dbt 套件的 macro 拿不到**:`packages.yml` 宣告的套件(例如 `dbt_utils`)由 `dbt deps`
+  下載到 `dbt_packages/`,不在 repo 裡。呼叫套件 macro 的 model 仍會展開失敗(以展開失敗
+  揭露,不會靜默放行)。正式專案沒有用套件(見上)
+- 反查只追 model,不追 snapshot:有 macro 變更、而專案有 snapshot 時一律交人工
+- `ref()` / `source()` 的專案資訊(#19)目前只讀 model 目錄的屬性檔;seed / snapshot 目錄的
+  屬性檔(可能設 alias)已一併取回,接線時要一起交給它。`extra_ref_names()` 在呼叫它的
+  行程裡解析 snapshot 的 yml(合計 1 MB 上限,超過就視為名單不完整);接線時與 #19 的屬性檔
+  解析一起放進有逾時的子行程
+- 權限:唯讀 token 需要 `read_api`(仍然只能讀;見 README),`read_repository` 不夠(見上表)
+- 解壓與讀 `dbt_project.yml` 在審查行程內執行(不在子行程),由各項大小上限約束記憶體
+
 ## 後續
 
-- **macro 反查接進管線**:需要列 GitLab 目錄(或以 `/repository/archive` 依 commit
-  一次取回 `models/`、`macros/`)的工具,並先定好下載量上限
+- **macro 反查接進管線**:下載、解壓與轉接層已實作(見上一節),尚待接進 pipeline
+  與實測。MR 的 base / head commit 已由 `get_mr_diff` 帶出(`base_sha` / `head_sha` /
+  `start_sha`,欄位名照 GitLab 的 `diff_refs`);拿不到或不是完整 commit 編號時是 None,
+  接線時遇到 None 不做前後版本比較、交人工
+- **真實 GitLab 模式只拿得到 diff 新增的行**:預掃與執行驗證目前用的是 diff 還原出的新增行,
+  只改了幾行的檔案送去檢查的是殘缺片段。接線後,dbt 專案內被改到的檔案改用取回的 head
+  版本全文;dbt 專案以外的 SQL 檔用 Files API 依 head sha 取全文
 - **展開結果尚未在 MS SQL 沙盒實際執行過**(目前只驗證了展開字串與 `dbt compile`
   逐字一致)。要支援樣板的執行驗證,需把 `ref()`/`source()` 對應到沙盒每次建立的
   資料庫,且 model 引用的上游表與規格建立的測資表名稱不同,需要處理
 - `{% if is_incremental() %}` 內的 SQL 不會被掃到(比照 compile 固定為 False),接線時
   需另以 True 再展開一次
-- `source()` 尚未讀取 `sources.yml`;`ref()` 尚未套用 alias 與自訂 `generate_schema_name`;
-  也不檢查 model 是否存在(接 manifest 時一起處理)
+- `ref()` / `source()` 的精確度(見「一、展開」第 4 點)已實作,**尚待接線**:需要取回的
+  專案檔案、seed / snapshot 名單,以及專案根目錄的 `packages.yml` / `dependencies.yml`
 - 反查以檔案為單位;不分析第三方套件內的 macro;目錄由呼叫端指定
-- `invocation_id` 為固定值,樣板若輸出它,結果會與 dbt compile 不同- 待確認:規格檔名慣例(目前只去除 `mrt_` 前綴);earlyjob model 應歸屬主規則的規格,
+- `invocation_id` 為固定值,樣板若輸出它,結果會與 dbt compile 不同
+- 待確認:規格檔名慣例(目前只去除 `mrt_` 前綴);earlyjob model 應歸屬主規則的規格,
   確認前會交人工
