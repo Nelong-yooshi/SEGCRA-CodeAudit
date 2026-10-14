@@ -565,14 +565,16 @@ def test_設定沒有project_dir這個鍵_當成repo根目錄():
 
 
 def test_取回失敗_專案裡不是sql的樣板也交人工_不退回沒有macro(monkeypatch):
-    """例如副檔名大寫的 MODEL.SQL、或含樣板的 yml:沒有專案就沒有 macro 可用。"""
+    """例如副檔名大寫的 MODEL.SQL:沒有專案就沒有 macro 可用。含樣板的 yml 不是 SQL,
+    不拿去展開,改報「非 SQL 檔」(一樣交人工)。"""
     def no_render(*a, **kw):
         raise AssertionError("取回失敗時不應該展開")
     monkeypatch.setattr(pipeline, "render_model_isolated", no_render)
     files = [_f("models/MODEL.SQL", full_content=MODEL),
              _f("models/schema.yml", full_content="description: \"{{ doc('x') }}\"")]
     pre, hub = _prescan(files, ctx=_failed_ctx())
-    assert all(e["dbt_render_error"].startswith(_DBT_FETCH_FAILED) for e in pre)
+    assert pre[0]["dbt_render_error"].startswith(_DBT_FETCH_FAILED)
+    assert pre[1]["non_sql"] == "other" and "dbt_render_error" not in pre[1]
 
 
 def test_取回成功_專案裡不是sql的樣板_用專案的macro展開():

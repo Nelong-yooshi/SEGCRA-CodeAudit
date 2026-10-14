@@ -1733,6 +1733,44 @@ MUTANTS.update({
 })
 
 
+# ---- 非 SQL 檔只留嚴重命中
+MUTANTS.update({
+ '非SQL:照舊送語法樹規則與 lint': ('pipeline.py',
+     '        if kind is not None:\n            entry.update(',
+     '        if False:\n            entry.update('),
+ '非SQL:不跑規則(憑證也不抓)': ('pipeline.py',
+     '            entry.update(await _non_sql_entry(hub, sql, kind))',
+     '            entry.update(non_sql=kind, rules=[], lint=[])'),
+ '非SQL:副檔名分大小寫': ('pipeline.py',
+     '    name = str(path or "").lower()\n    if name.endswith(".sql"):',
+     '    name = str(path or "")\n    if name.endswith(".sql"):'),
+ '非SQL:說明文件也當成其他檔案': ('pipeline.py',
+     '    return "doc" if name.endswith(_DOC_SUFFIXES) else "other"',
+     '    return "other"'),
+ '非SQL:其他檔案也當成說明文件': ('pipeline.py',
+     '    return "doc" if name.endswith(_DOC_SUFFIXES) else "other"',
+     '    return "doc"'),
+ '非SQL:留下 minor 與檢核點': ('pipeline.py',
+     '            and _SEVERITY_RANK.get(h.get("severity"), -1) >= _SEVERITY_RANK["major"]',
+     '            and _SEVERITY_RANK.get(h.get("severity"), -1) >= -1'),
+ '非SQL:說明文件也留語法樹規則的命中': ('pipeline.py',
+     '            and (kind != "doc" or not h.get("statement"))]',
+     ']'),
+ '非SQL:其他檔案只給 info': ('pipeline.py',
+     '                severity="major", title=_NON_SQL_OTHER_TITLE,',
+     '                severity="info", title=_NON_SQL_OTHER_TITLE,'),
+ '非SQL:不補 finding': ('pipeline.py',
+     '        report = enforce_non_sql(report, pre)  # 非 SQL 檔沒跑 SQL 規則:說明文件 info,其他 major\n',
+     ''),
+ '非SQL:dry-run 不補': ('pipeline.py',
+     '    report = enforce_non_sql(report, pre)      # 與正式路徑一致\n',
+     ''),
+ '非SQL:直接附加(模型同標題的 info 可取代)': ('pipeline.py',
+     '請改用 .sql 副檔名。")\n        _put_program_finding(report, item)',
+     '請改用 .sql 副檔名。")\n        report["findings"].append(item)'),
+})
+
+
 def _run_baseline(src: pathlib.Path, python: str, timeout: int) -> tuple[str | None, float]:
     """複製一份未突變的專案,跑一次測試套件,確認完全乾淨才能開始判斷突變。
 

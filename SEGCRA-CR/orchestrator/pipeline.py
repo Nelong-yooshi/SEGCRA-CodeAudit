@@ -266,6 +266,36 @@ def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None) -> dict:
     return {**mr, "files": [*mr["files"], *extra]} if extra else mr
 
 
+# 送進 SQL 規則與 lint 的只有 .sql(dbt 的 model、macro 也是 .sql)。其餘檔案裡,說明文件
+# 與其他檔案(設定檔、程式碼、副檔名不認得的)分開處理,見 enforce_non_sql。
+_DOC_SUFFIXES = (".md", ".markdown", ".rst")
+
+
+def _non_sql_kind(path) -> str | None:
+    """.sql 回傳 None;說明文件回傳 "doc";其他檔案回傳 "other"。只看副檔名,不分大小寫。"""
+    name = str(path or "").lower()
+    if name.endswith(".sql"):
+        return None
+    return "doc" if name.endswith(_DOC_SUFFIXES) else "other"
+
+
+async def _non_sql_entry(hub: ToolHub, text: str, kind: str) -> dict:
+    """非 SQL 檔的預掃結果:不解析、不跑 lint,只留規則層的嚴重命中。
+
+    拿去當 SQL 解析只會得到「無法解析」,錯誤訊息還帶著檔案內容,進到 prompt 與報告。
+    但不能整個跳過:寫死的憑證不需要語法樹,而設定檔正是它最常出現的地方。所以照樣跑規則,
+    只留 major 以上的命中;檢核點與 minor 不留(說明文件提到規則編號,不代表要核對規格)。
+    說明文件只留不需要語法樹的命中:文件裡的 SQL 範例(例如一句 DELETE)不會被執行。
+    其他檔案語法樹規則有命中也留:副檔名不是 .sql 的檔案仍可能是會被執行的 SQL。"""
+    rules = await hub.call_json("sqltools__run_rules", {"sql": text})
+    hits = rules.get("hits") if isinstance(rules, dict) else rules
+    kept = [h for h in (hits if isinstance(hits, list) else [])
+            if isinstance(h, dict)
+            and _SEVERITY_RANK.get(h.get("severity"), -1) >= _SEVERITY_RANK["major"]
+            and (kind != "doc" or not h.get("statement"))]
+    return {"non_sql": kind, "rules": kept, "lint": []}
+
+
 async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
                   dbt_ctx: DbtContext | None = None) -> list[dict]:
     """對每個變更檔跑 rule-base + lint(不經 LLM)。
@@ -283,6 +313,11 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
     for f in files:
         sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or f.get("diff", "")
         entry = {"path": f["path"]}
+        kind = _non_sql_kind(f.get("path"))
+        if kind is not None:
+            entry.update(await _non_sql_entry(hub, sql, kind))
+            results.append(entry)
+            continue
         dbt_error, in_project = None, False
         # 專案的 macro 檔不是 model:拿去當 model 展開只會得到幾乎空白的結果、規則 0 命中,
         # 看起來沒問題。它對 model 的影響由 macro 反查負責(enforce_dbt_impact);這裡仍對
@@ -493,6 +528,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 程式補的文字若先進報告,可能被誤當成模型的回應而吞掉檢核點
         report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述
         report = enforce_dbt_impact(report, affected, dbt_ctx)  # macro 等變更影響的其他 model
+        report = enforce_non_sql(report, pre)  # 非 SQL 檔沒跑 SQL 規則:說明文件 info,其他 major
         report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
         report = enforce_injection(report, injection_hits)  # 確定性 blocker,不論模型是否被攻陷
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
@@ -666,6 +702,39 @@ def enforce_parse(report: dict, pre: list[dict]) -> dict:
             continue
         if entry.get("parse_error"):
             _put_program_finding(report, _parse_fail_finding(entry))
+    return report
+
+
+_NON_SQL_DOC_TITLE = "說明文件,未做 SQL 規則檢查"
+_NON_SQL_OTHER_TITLE = "非 SQL 檔,未經 SQL 規則檢查,需人工確認"
+
+
+def enforce_non_sql(report: dict, pre: list[dict]) -> dict:
+    """非 SQL 檔沒有跑完整的 SQL 規則與 lint(見 _non_sql_entry):每個檔案補一條 finding,
+    讓報告看得到這個缺口。內容只有固定文字,不回顯檔案內容。
+
+    說明文件給 info,不影響決策。其他檔案(設定檔、程式碼、CI 設定、副檔名不認得的檔案)給
+    major、不得自動放行:這些檔案以前因為「無法解析」被擋下,改成不解析之後若只給 info,
+    改了 CI 設定或腳本的 MR 就可能因為沒有任何檢查而被自動放行。
+    標題只能由程式產生(見 _put_program_finding)。"""
+    for entry in pre:
+        kind = entry.get("non_sql")
+        if kind is None:
+            continue
+        item = {"file": entry["path"], "line": 0, "citations": []}
+        if kind == "doc":
+            item.update(
+                severity="info", title=_NON_SQL_DOC_TITLE, suggestion="",
+                detail="這個檔案是說明文件,沒有做 SQL 規則檢查與 lint;"
+                       "不需要解析 SQL 的嚴重命中(例如寫死的憑證)仍會列出。")
+        else:
+            item.update(
+                severity="major", title=_NON_SQL_OTHER_TITLE,
+                detail="這個檔案不是 .sql,沒有做完整的 SQL 規則檢查與 lint(規則層的嚴重命中,"
+                       "例如寫死的憑證,仍會列出)。設定檔、腳本這類變更沒有確定性的檢查,"
+                       "不得自動放行。",
+                suggestion="人工確認這個檔案的變更;若它其實是要執行的 SQL,請改用 .sql 副檔名。")
+        _put_program_finding(report, item)
     return report
 
 
@@ -1193,6 +1262,7 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
               "_plumbing": {"memory_ok": mem_sample is not None,
                             "spec_found": bool(spec_text), "spec_code": spec_code,
                             "files_scanned": len(pre)}}
+    report = enforce_non_sql(report, pre)      # 與正式路徑一致
     report = enforce_dbt_notice(report, pre)   # 與正式路徑一致:表名未驗證的提醒不可少
     report = enforce_dbt_impact(report, affected, dbt_ctx)
     for fd in report["findings"]:
