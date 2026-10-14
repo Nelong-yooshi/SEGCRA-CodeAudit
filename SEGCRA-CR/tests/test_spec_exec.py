@@ -1246,3 +1246,77 @@ def test_prompt要求門檻類條件測在邊界上():
     assert "剛好跨過門檻一格" in t, "變體沒有要求最小幅度破壞"
     assert "壓在端點上" in t, "基準沒有要求取門檻端點"
     assert "剛好被排除掉" in t, "排除類條件沒有要求放「否則就會符合」的資料列"
+
+
+# ── 全域條件(branch="*")與區間的兩個變體 ──
+
+def _gplan(cases):
+    """兩個真分支 + 一個全域條件。"""
+    return {"schema_ddl": ["CREATE TABLE t (id INT);"],
+            "conditions": [{"id": "C1-1", "desc": "介於 2-3", "branch": "C1"},
+                           {"id": "C2-1", "desc": "介於 4-10", "branch": "C2"},
+                           {"id": "G-1", "desc": "帳號非空白", "branch": "*"}],
+            "cases": list(cases)}
+
+
+def test_全域條件不需要自己的基準():
+    """「只讓全域條件成立」的資料不會讓規則命中(篩選條件都還不成立),
+    那種基準的預期必然是錯的。實測:模型開了一個 GLOBAL 分支,它的基準與兩個
+    變體全部失效,連帶讓「拿掉空白帳號排除」「拿掉 EarlyJob」兩個突變測不到。"""
+    _, gaps, _ = _shape_check(_gplan([_base("b1", "C1"), _base("b2", "C2"),
+                                      _variant("v1", "C1-1"),
+                                      _variant("v2", "C2-1"),
+                                      _variant("vg", "G-1")]))
+    assert gaps == [], gaps
+    assert "*" not in spec_exec._branches(_gplan([])["conditions"])
+
+
+def test_全域條件仍然要有變體():
+    _, gaps, _ = _shape_check(_gplan([_base("b1", "C1"), _base("b2", "C2"),
+                                      _variant("v1", "C1-1"), _variant("v2", "C2-1")]))
+    assert any("G-1 缺變體" in g for g in gaps), gaps
+
+
+def test_基準的隔離期望要含全域條件():
+    conds = _gplan([])["conditions"]
+    want = spec_exec._label_expectation(conds, {"kind": "base", "branch": "C1",
+                                                "condition_id": "__base__C1",
+                                                "direction": "true"})
+    assert want == {"C1-1": True, "G-1": True}, "少驗全域條件 = 沒驗到規則真正的前提"
+
+
+def test_全域條件的變體只驗它自己():
+    """它是從某個分支的基準改出來的,但計畫沒記是哪一個,所以不對其他條件下判定。"""
+    conds = _gplan([])["conditions"]
+    want = spec_exec._label_expectation(conds, {"kind": "variant", "condition_id": "G-1",
+                                                "direction": "false"})
+    assert want == {"G-1": False}
+
+
+def test_區間條件可以有兩個變體():
+    """一個變體只驗得到一邊的門檻 —— 實測只給一個時,「上界被寫寬一格」抓得到、
+    「下界被寫寬一格」9 個全漏。"""
+    plan, _, _ = _shape_check(_gplan([_base("b1", "C1"), _base("b2", "C2"),
+                                      _variant("C1-1-lo", "C1-1"),
+                                      _variant("v2", "C2-1"), _variant("vg", "G-1")]))
+    add = {"cases": [{"case_id": "C1-1-hi", "kind": "variant",
+                      "condition_id": "C1-1", "rows": [["t", 9]]}]}
+    merged, added, dropped = spec_exec._merge_cases(plan, add)
+    assert added == 1, f"第二個變體被拒收了:{[d.get('reason') for d in dropped]}"
+    assert sum(1 for c in merged["cases"]
+               if c.get("condition_id") == "C1-1") == 2
+
+
+def test_同一個case_id不會被補第二次():
+    plan, _, _ = _shape_check(_gplan([_base("b1", "C1"), _variant("C1-1-lo", "C1-1")]))
+    add = {"cases": [{"case_id": "C1-1-lo", "kind": "variant",
+                      "condition_id": "C1-1", "rows": [["t", 9]]}]}
+    _, added, dropped = spec_exec._merge_cases(plan, add)
+    assert added == 0 and len(dropped) == 1
+
+
+def test_全域條件的變體抄任一個分支的基準():
+    plan, _, _ = _shape_check(_gplan([_base("b1", "C1")]))
+    plan["cases"][0]["rows"] = [["t", 555]]
+    text = spec_exec._fill_gaps_prompt("R-1", "規格", plan, [("variant", "G-1")], 8)
+    assert "555" in text, "全域條件的變體沒有基準可抄"

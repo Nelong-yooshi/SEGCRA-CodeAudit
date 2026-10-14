@@ -1499,6 +1499,20 @@ MUTANTS.update({
         "                got = None" + NL
         + "                if got:" + NL
         + "                    bases_shown[got[0]] = got[1]"),
+    # 全域條件(branch="*")不是一個分支:要求它有自己的基準 = 要求一份「只讓全域
+    # 條件成立」的資料,而那不會讓規則命中,預期必然錯。實測發生過(GLOBAL 分支)。
+    "測資:全域條件被當成一個需要基準的分支": (S,
+        "    out.discard(GLOBAL_BRANCH)",
+        "    pass"),
+    # 基準的隔離期望少了全域條件 = 沒驗到規則真正的前提。
+    "測資:基準的隔離期望不含全域條件": (S,
+        "                    if str(c.get(\"branch\", \"\") or \"\") in (b_id, GLOBAL_BRANCH)}",
+        "                    if str(c.get(\"branch\", \"\") or \"\") == b_id}"),
+    # 區間類的條件要兩個變體(下界、上界各一個);只認 condition_id 的話第二個會被
+    # 當成「已經有了」拒收,於是只驗得到一邊的門檻(實測漏掉 9 個突變)。
+    "測資:同一條件只收一個變體(只驗得到一邊門檻)": (S,
+        "            return (\"variant\", c[\"condition_id\"], c[\"case_id\"])",
+        "            return (\"variant\", c[\"condition_id\"])"),
     # 基準的 condition_id 是我們補的 `__base__<分支>`、不在條件清單裡,所以
     # 「已經有了/認不認得」的判斷要依形狀而異。一律用 condition_id 判斷的話,
     # 補缺回來的基準會被整批拒收,補缺模式永遠拿不到基準(實測確認過)。

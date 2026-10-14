@@ -157,13 +157,19 @@ TESTGEN_SYSTEM = """你是測試資料工程師。給你一份異常交易規則
 # 硬性要求
 1. conditions:把 spec 的需求拆成**原子條件**(每個可獨立為真/假)。每條要標:
    * `branch`:屬於哪一個分支(spec 寫「條件 1 / 條件 2 / 條件 3 任一成立」就用
-     "C1"/"C2"/"C3")。全域必要條件(排除空白帳號、時間窗、已出帳排除等)屬於
-     **每一個**分支,放在它們共同的分支裡各寫一條,或標同一個 branch 並在每個
-     基準裡都讓它成立。spec 沒有分支結構(全部 AND)時,一律標 branch="C1"。
+     "C1"/"C2"/"C3")。spec 沒有分支結構(全部 AND)時,一律標 branch="C1"。
+     **全域必要條件**(排除空白帳號、時間窗、已出帳排除等)標 `branch: "*"`,
+     表示它屬於每一個分支。**不要為全域條件開一個自己的分支**——「只讓全域條件
+     成立」的資料不會讓規則命中(篩選條件都還不成立),那種基準的預期必然是錯的。
+     實測就發生過:模型開了一個 GLOBAL 分支,它的基準與兩個變體全部失效。
    * `data_level`:這一條是不是**資料層面**可以驗的。「每帳戶每日至多輸出一筆」、
      「輸出欄位要有哪些」、「待補事項」這類**不是**(標 false,不要為它造變體);
      只有「某筆/某彙總值符不符合」這種才標 true。
-2. 每個分支一個基準案例;每個 `data_level: true` 的條件一個變體案例。
+2. 每個分支一個基準案例;每個 `data_level: true` 的條件**至少**一個變體案例。
+   **區間類的條件(「介於 a-b」)要兩個變體**:一個剛好低於下界、一個剛好高於上界。
+   一個變體只能驗一邊的門檻——實測只給一個時,「上界被寫寬一格」抓得到、
+   「下界被寫寬一格」全部漏掉。兩個變體的 `condition_id` 相同,`case_id` 要不同
+   (例如 `C1-1-lo`、`C1-1-hi`)。
    **不要**產生 `direction` 欄位,那是舊格式。
 3. 基準的 `checks`:逐項寫出你算出來的值與要求區間,方便人工複核。
    注意**比值類門檻是別的指標算出來的**(例如出入帳總額比 = 出帳總額 ÷ 入帳總額),
@@ -181,6 +187,12 @@ TESTGEN_SYSTEM = """你是測試資料工程師。給你一份異常交易規則
      **剛好被排除掉、否則就會符合**的資料列(例如金額剛好等於門檻而規格寫「大於」
      才列計的那一筆、日期落在時間窗外的那一筆、已出現在排除清單裡的那個帳戶)。
      沒有這種資料列,整段排除邏輯被拿掉也不會改變結果。
+   * **跨一格時要避開別的分支**:如果往上跨一格剛好落進另一個分支的區間
+     (例如「介於 2-3」往上到 4,而另一個分支是「介於 4-10」),規則會因為那個分支
+     而命中,變體的預期就錯了。這種情況改從**另一邊**跨(往下到 1),或同時讓
+     那個分支的其他條件不成立。實測這一項造成 5 個變體的預期出錯。
+   * **分類清單類的條件**(「op_code 屬於 OP01/OP02/OP03」)的基準資料要**每個代碼
+     都用到至少一次**。只用其中一個的話,清單裡少列一個代碼也不會改變結果。
 5. rows:每列 = [資料表名, 各欄位值...],順序與 schema_ddl 欄位順序一致;
    時間值用 "YYYY-MM-DD HH:MM:SS" 字串、日期用 "YYYY-MM-DD"、BIT 欄位用 1 或 0。
    只用 spec 資料表定義裡存在的表與欄位,不得發明欄位。
@@ -314,13 +326,23 @@ def _is_new_shape(plan: dict) -> bool:
                for c in plan.get("conditions") or [])
 
 
+GLOBAL_BRANCH = "*"   # 這個條件屬於**每一個**分支(排除空白帳號、時間窗…)
+
+
 def _branches(conds: list[dict]) -> set[str]:
-    """條件分成哪幾個 OR 分支。
+    """條件分成哪幾個 OR 分支。**不含 "*"** ——那不是一個分支。
 
     沒有宣告 branch 的計畫視為單一分支(空字串):純 AND 的規格(例如 R-140)
     本來就只有一個分支,基準＝全部條件成立,變體＝只壞一條,語意完全成立。
+
+    全域條件標 `branch: "*"`,表示它屬於每一個分支。它**不該有自己的基準**:
+    「只讓全域條件成立」的資料不會讓規則命中(篩選條件都還不成立),那種基準的
+    預期必然是錯的。實測發生過:模型開了一個 GLOBAL 分支,它的基準與兩個變體
+    全部失效,而且連帶讓「拿掉空白帳號排除」「拿掉 EarlyJob」兩個突變測不到。
     """
-    return {str(c.get("branch", "") or "") for c in conds}
+    out = {str(c.get("branch", "") or "") for c in conds}
+    out.discard(GLOBAL_BRANCH)
+    return out or {""}
 
 
 def _rows_ok(rows) -> bool:
@@ -493,13 +515,19 @@ def _missing_pairs(plan: dict) -> list[tuple[str, str]]:
 
 
 def _base_rows_for(plan: dict, cond_id: str) -> tuple[str, list] | None:
-    """某個條件所屬分支的基準案例(變體要從它改出來)。沒有就回 None。"""
+    """某個條件所屬分支的基準案例(變體要從它改出來)。沒有就回 None。
+
+    全域條件(branch="*")屬於每一個分支,沒有自己的基準——取任一個分支的基準即可。
+    """
     branch = next((str(c.get("branch", "") or "") for c in plan.get("conditions") or []
                    if c.get("id") == cond_id), None)
     if branch is None:
         return None
-    for c in plan.get("cases") or []:
-        if c.get("kind") == "base" and str(c.get("branch", "") or "") == branch:
+    bases = [c for c in plan.get("cases") or [] if c.get("kind") == "base"]
+    if branch == GLOBAL_BRANCH:
+        return (bases[0].get("branch", ""), bases[0].get("rows") or []) if bases else None
+    for c in bases:
+        if str(c.get("branch", "") or "") == branch:
             return branch, c.get("rows") or []
     return None
 
@@ -579,7 +607,10 @@ def _merge_cases(base: dict, addition: dict) -> tuple[dict, int, list[dict]]:
         if c.get("kind") == "base":
             return ("base", str(c.get("branch", "") or ""))
         if c.get("kind") == "variant":
-            return ("variant", c["condition_id"])
+            # 認 case_id:區間類的條件要**兩個**變體(剛好低於下界、剛好高於上界),
+            # 一個變體只驗得到一邊的門檻。只認 condition_id 的話第二個會被當成
+            # 「已經有了」拒收。
+            return ("variant", c["condition_id"], c["case_id"])
         return (c["condition_id"], c["direction"])
 
     def _known(c):
@@ -922,13 +953,20 @@ def _label_expectation(conds: list[dict], case: dict) -> dict[str, bool]:
         #   變體(壞 T,在 B)→ T 不成立,B 的其他條件都要成立
         # 這正是原本因為 OR 結構互斥而不得不拔掉的那道檢查。
         if case["kind"] == "base":
+            # 基準要讓「該分支的條件」**加上全域條件**全部成立——全域條件屬於
+            # 每一個分支,少驗它們就等於沒驗到規則真正的前提。
             b_id = str(case.get("branch", "") or "")
             return {c["id"]: True for c in conds
-                    if str(c.get("branch", "") or "") == b_id}
+                    if str(c.get("branch", "") or "") in (b_id, GLOBAL_BRANCH)}
         b_id = next((str(c.get("branch", "") or "") for c in conds
                      if c["id"] == target), "")
+        if b_id == GLOBAL_BRANCH:
+            # 全域條件的變體是從某個分支的基準改出來的,但計畫沒記是哪一個,
+            # 所以只驗它自己有沒有被破壞,不對其他條件下判定。
+            return {target: False}
         return {c["id"]: (c["id"] != target) for c in conds
-                if str(c.get("branch", "") or "") == b_id}
+                if str(c.get("branch", "") or "") in (b_id, GLOBAL_BRANCH)
+                or c["id"] == target}
     return {target: direction == "true"}
 
 
