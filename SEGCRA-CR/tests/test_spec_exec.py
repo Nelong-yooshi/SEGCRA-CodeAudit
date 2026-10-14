@@ -1224,3 +1224,12 @@ def test_同一個分支的基準不會被補第二次():
     merged, added, dropped = spec_exec._merge_cases(plan, add)
     assert added == 0 and len(dropped) == 1
     assert [c["case_id"] for c in merged["cases"]] == ["first"]
+
+
+def test_骨架的prompt要明確要求branch與data_level():
+    """`_is_new_shape()` 靠條件帶不帶 branch 判斷形狀。骨架漏掉這個欄位,
+    後面的補缺會整輪退回舊的「每條件兩向」——而那個形狀對合取規則定義不出
+    正確的預期(昨天 46 個案例 12 個錯的根因)。"""
+    text = spec_exec._skeleton_prompt("R-1", "規格內容")
+    assert "branch" in text and "data_level" in text
+    assert "cases 一律留空" in text

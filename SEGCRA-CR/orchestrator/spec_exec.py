@@ -451,7 +451,13 @@ def _skeleton_prompt(spec_code: str, spec_text: str) -> str:
     return (f"先**只**產出測資計畫的骨架,不要任何案例:\n"
             f'只輸出 {{"schema_ddl": [...], "conditions": [...], "cases": []}}。\n'
             f"conditions 要依規格完整拆解成原子條件(這一步最重要,之後的案例都掛在\n"
-            f"它上面),每條附 id、desc 與 check_sql。**cases 一律留空陣列。**\n\n"
+            f"它上面),每條附 **id、branch、data_level、desc、check_sql** 五個欄位:\n"
+            f"  * branch:屬於哪一個分支(規格寫「條件 1/2/3 任一成立」就用 C1/C2/C3;\n"
+            f"    全部都是 AND 的規格一律 C1)。**漏掉這個欄位,後面的案例會照錯的\n"
+            f"    方式產生。**\n"
+            f"  * data_level:這一條能不能用資料驗(「每帳戶每日至多一筆」、「輸出欄位」、\n"
+            f"    「待補事項」這類標 false)。\n"
+            f"**cases 一律留空陣列。**\n\n"
             f"規則 {spec_code} 規格:\n{spec_text}")
 
 
