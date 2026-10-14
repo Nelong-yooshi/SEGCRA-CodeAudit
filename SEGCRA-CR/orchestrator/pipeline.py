@@ -97,8 +97,9 @@ _FORMAT_NO_TITLE = "(標題格式不正確)"
 def _as_text(value) -> tuple[str, bool]:
     """把應該是文字的欄位轉成字串。回傳 (文字, 型別是否不對)。
 
-    缺漏或 null 視為空字串、不算格式錯誤(模型常把沒有的建議寫成 null);字串清單接成
-    一段,其餘型別轉成字串(巢狀太深、轉不出來的給空字串)。"""
+    缺漏或 null 視為空字串、不算格式錯誤(模型常把沒有的建議寫成 null;title 的 null 由
+    normalize_findings 另外算);字串清單接成一段,其餘型別轉成字串(巢狀太深、轉不出來的給
+    空字串)。"""
     if value is None:
         return "", False
     if isinstance(value, str):
@@ -135,8 +136,12 @@ def normalize_findings(report: dict) -> dict:
     模型輸出不可信,這是可以預期的輸入。
 
     原則:
-    - **原本不會出錯的輸入,行為不變**:欄位缺漏或 null 照舊當成空值;不合法的 severity
-      字串(模型常原樣抄預掃的 hint)照舊由 sanitize_findings 靜默丟棄。這些都不算格式錯誤。
+    - **原本不會出錯的輸入,行為不變**:欄位缺漏、或 detail / suggestion / file / line 是 null,
+      照舊當成空值;不合法的 severity 字串(模型常原樣抄預掃的 hint)照舊由 sanitize_findings
+      靜默丟棄。這些都不算格式錯誤。
+    - title 是 null(有這個鍵、值是 null)算格式錯誤,補「(標題格式不正確)」:以前後處理會在
+      這裡丟例外,沒有標題的 finding 也看不出在講什麼。標題缺漏不算(與以前相同)。
+      citations 是 null 以前也會丟例外;現在當成空清單,沒有內容遺失,不算格式錯誤。
     - **能修就修,不輕易丟**:severity 是字串的 finding 一律保留(其他欄位修正)。丟掉一條
       標題格式錯的 blocker,決策會從 blocked 變成 needs_human,後處理不可以讓決策變寬鬆。
     - 只有「finding 不是物件」與「severity 不是字串」會丟掉:沒有可以依據的嚴重度。
@@ -160,8 +165,11 @@ def normalize_findings(report: dict) -> dict:
             dropped += 1
             continue
         wrong = False
+        null_title = "title" in fd and fd["title"] is None
         for key in ("title", "detail", "suggestion"):
             fd[key], bad = _as_text(fd.get(key))
+            if key == "title":
+                bad = bad or null_title
             wrong |= bad
             if bad and key == "title" and not fd[key].strip():
                 fd[key] = _FORMAT_NO_TITLE

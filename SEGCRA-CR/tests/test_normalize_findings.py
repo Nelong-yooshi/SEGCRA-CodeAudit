@@ -166,11 +166,14 @@ def test_格式正確的報告_完全不變():
     assert _format_findings(_chain(copy.deepcopy(before))) == []
 
 
-@pytest.mark.parametrize("key", ["title", "detail", "suggestion", "file", "line", "citations"])
-@pytest.mark.parametrize("how", ["缺漏", "null"])
+@pytest.mark.parametrize("key, how", [
+    *[(key, how) for key in ("detail", "suggestion", "file", "line", "citations")
+      for how in ("缺漏", "null")],
+    ("title", "缺漏")])
 def test_欄位缺漏或null_當成空值且不算格式錯誤(key, how):
-    """模型常把沒有的建議寫成 null、MR 層級的 finding 不寫 file;這些以前就不會出錯,
-    算成格式錯誤的話幾乎每個 MR 都會多一條 major。"""
+    """模型常把沒有的建議寫成 null、MR 層級的 finding 不寫 file;算成格式錯誤的話幾乎每個
+    MR 都會多一條 major。citations 是 null 時以前的後處理其實會丟例外;當成空清單沒有內容
+    遺失,所以不算格式錯誤。title 是 null 另外算(見下一個測試)。"""
     fd = _fd()
     if how == "缺漏":
         del fd[key]
@@ -179,6 +182,19 @@ def test_欄位缺漏或null_當成空值且不算格式錯誤(key, how):
     r = _norm([fd])
     assert "_format_issues" not in r
     assert r["findings"][0][key] == {"line": 0, "citations": []}.get(key, "")
+
+
+def test_title是null_算格式錯誤並補說明():
+    """有 title 這個鍵、值是 null:以前後處理會在這裡丟例外,沒有標題也看不出在講什麼。"""
+    r = _norm([_fd(title=None, severity="info")])
+    assert [(f["title"], f["severity"]) for f in r["findings"]] == [(_FORMAT_NO_TITLE, "info")]
+    assert r["_format_issues"] == {"fixed": 1, "dropped": 0, "findings_not_a_list": False}
+
+
+def test_只有一條title是null的info_不得自動放行():
+    r = _chain({"summary": "x", "findings": [_fd(title=None, severity="info")]})
+    assert [f["severity"] for f in _format_findings(r)] == ["major"]
+    assert apply_policy(r, {"files": []}, load_config().policy)["decision"] == "needs_human"
 
 
 def test_沒有findings欄位_當成空清單且不算格式錯誤():
@@ -375,6 +391,7 @@ MALFORMED = {
     "severity 是物件": {"summary": "x", "findings": [_fd(severity={"a": 1})]},
     "title 是清單": {"summary": "x", "findings": [_fd(severity="info", title=["x"])]},
     "title 是數字": {"summary": "x", "findings": [_fd(severity="info", title=5)]},
+    "title 是 null": {"summary": "x", "findings": [_fd(severity="info", title=None)]},
     "detail 是清單": {"summary": "x", "findings": [_fd(severity="info", detail=["x"])]},
     "suggestion 是物件": {"summary": "x", "findings": [_fd(severity="info", suggestion={"a": 1})]},
     "file 是清單": {"summary": "x", "findings": [_fd(severity="info", file=["x.sql"])]},
@@ -431,7 +448,9 @@ def test_模型照抄標題並附長建議_整條管線裡也換不掉程式的m
 
 def test_標題缺漏而別的欄位型別不對_標題維持空的():
     """補「(標題格式不正確)」只在標題本身型別不對時;別的欄位錯不該改到標題。"""
-    r = _norm([_fd(title=None, detail=["x"])])
+    fd = _fd(detail=["x"])
+    del fd["title"]
+    r = _norm([fd])
     assert r["findings"][0]["title"] == "" and r["_format_issues"]["fixed"] == 1
 
 
