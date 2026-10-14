@@ -9,14 +9,17 @@ macro 反查(dbt_context 準備好的 ImpactReport)只說「哪些 model 受影�
   * 變更後展開失敗、或展開後無法解析:macro 的變更可能把它弄壞了,要看得到
   * 對應到的規格(依檔名;#7 驗收「只改 macro 的 MR,能對應到受影響的 model 與規格」)
 
-這些 model 不放進預掃結果、也不放進模型的 prompt:它們不在 diff 裡,放進預掃會讓每個
-檢核點(H 系列)各補一條「模型未回應」,放進 prompt 會佔掉預算並多一個注入的入口。
+這些 model 的內容不放進預掃結果、也不放進模型的 prompt:它們不在 diff 裡,放進預掃會讓
+每個檢核點(H 系列)各補一條「模型未回應」,放進 prompt 會佔掉預算並多一個注入的入口。
+它們對到的**規格**會放進 prompt(specs_by_priority;#38 第 2 點):規格是核定的內容,
+不是待審的程式。
 
 上限(都算「沒檢查完」,由後處理補 major,不可以當成沒有問題):
   * 每個 MR 最多檢查 MAX_CHECKED_MODELS 個受影響的 model(每個要開兩次子行程)
   * 整段檢查最多 MAX_SECONDS 秒
 """
 import dataclasses
+import re
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -57,6 +60,49 @@ class AffectedCheck:
     unchecked: tuple[str, ...] = ()        # 受影響但沒檢查到的 model(超過數量或時間上限)
     spec: tuple[str, str] | None = None    # 受影響的 model 全部對到同一份規格時:(代號, 內容)
     specs_found: dict = field(default_factory=dict)   # 代號 → 內容
+
+
+@dataclass(frozen=True)
+class SpecForModels:
+    """一份規格,以及對到它的受影響 model(專案內的相對路徑)。"""
+    code: str
+    text: str
+    models: tuple[str, ...]
+    mentioned: bool = False                # 代號或 model 名稱出現在這次的 diff 裡
+
+
+def specs_by_priority(check: AffectedCheck | None, diff_text: str) -> tuple[SpecForModels, ...]:
+    """受影響的 model 對到的規格,依「這次改到的值會影響到哪幾份」排序(#38 第 2 點)。
+
+    排序只決定預算不夠時先放哪幾份,不影響判斷:
+      1. 規格代號或 model 名稱出現在這次的 diff 裡(含上下文行)。共用的註冊表 macro 常以
+         規格代號當鍵(內附範例的 `'RETAIL_M1': {...}`),改到哪一段,diff 附近通常就有那個鍵
+      2. 直接呼叫被改 macro 的 model(呼叫鏈較短)排在間接呼叫的前面
+      3. 其餘照路徑
+    名稱比對要前後都不是英數字或底線,短名稱(例如 `a`)不會因為出現在別的字裡就算。
+    """
+    if check is None:
+        return ()
+    groups: dict[str, list[CheckedModel]] = {}
+    for m in check.models:
+        if m.spec and m.spec in check.specs_found:
+            groups.setdefault(m.spec, []).append(m)
+    lowered = (diff_text or "").lower()
+
+    def appears(word: str) -> bool:
+        return bool(word) and re.search(
+            rf"(?<![0-9a-z_]){re.escape(word.lower())}(?![0-9a-z_])", lowered) is not None
+
+    specs = []
+    for code, models in groups.items():
+        models = sorted(models, key=lambda m: m.path)
+        specs.append((
+            (not (appears(code) or any(appears(m.name) for m in models)),
+             min(len(m.chain) for m in models), models[0].path),
+            SpecForModels(code=code, text=check.specs_found[code],
+                          models=tuple(m.path for m in models),
+                          mentioned=appears(code) or any(appears(m.name) for m in models))))
+    return tuple(spec for _, spec in sorted(specs, key=lambda item: item[0]))
 
 
 async def check_affected_models(hub, mr: dict, dbt_cfg: dict, ctx: DbtContext | None, *,

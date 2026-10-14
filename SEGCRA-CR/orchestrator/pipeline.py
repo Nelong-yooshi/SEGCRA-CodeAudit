@@ -11,7 +11,9 @@ from pathlib import Path
 
 from .agent import extract_json, run_agent
 from .config import DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, estimate_tokens
-from .dbt_affected import AffectedCheck, check_affected_models, impact_finding
+from .dbt_affected import (
+    AffectedCheck, SpecForModels, check_affected_models, impact_finding, specs_by_priority,
+)
 from .change_view import build_full_text_section
 from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_render import is_dbt_template, render_model_isolated
@@ -97,8 +99,9 @@ def _norm(s: str) -> str:
 _CITE_CODE = re.compile(r"r-?\d{2,4}")
 
 
-def validate_citations(report: dict, spec_code: str | None) -> dict:
+def validate_citations(report: dict, spec_code) -> dict:
     """引用白名單驗證(簡化版):引用只允許「spec 檔 / 團隊慣例」來源。
+    spec_code 是附上的規格代號:一個字串,或多個(受影響的 model 對到多份規格時;#38)。
     - spec:source 含規則碼(且該規格確實附上);或不指名規則碼的泛稱 + 含「規格/spec」
     - 慣例:source 含「慣例/convention」或對得上知識庫項目 id
     其餘(憑印象的法規、未附上的文件)一律剔除,防捏造。"""
@@ -107,7 +110,8 @@ def validate_citations(report: dict, spec_code: str | None) -> dict:
         kb_ids = {_norm(it.id) for it in load_items()}
     except Exception:
         kb_ids = set()
-    spec_ok = _norm(spec_code) if spec_code else None
+    codes = (spec_code,) if isinstance(spec_code, str) else tuple(spec_code or ())
+    spec_ok = {_norm(code) for code in codes if isinstance(code, str) and code}
     removed = []
     for fd in report.get("findings", []):
         kept = []
@@ -118,7 +122,7 @@ def validate_citations(report: dict, spec_code: str | None) -> dict:
             # 具體依據會因為含 "spec" 字樣而被放行,而防捏造正是白名單的目的。
             named_code = _CITE_CODE.search(src)
             allow = (("convention" in src or "慣例" in src or src in kb_ids)
-                     or (spec_ok and spec_ok in src)
+                     or any(code in src for code in spec_ok)
                      or (spec_ok and not named_code
                          and ("規格" in src or "spec" in src)))
             if allow:
@@ -350,6 +354,69 @@ def build_diff_section(files: list[dict], budget_tokens: int) -> str:
     return "\n\n".join(parts)
 
 
+def _diff_text(mr: dict) -> str:
+    return "\n".join(f.get("diff") or "" for f in mr.get("files", []) if isinstance(f, dict))
+
+
+_AFFECTED_SPECS_HEADER = """這個 MR 沒有對到自己的規格:它改的是共用的 macro / 設定,影響下列 model。\
+以下是這些 model 各自的核定規格(檔名後面寫的是對到它的 model)。
+- 請逐一核對:這次的變更讓哪個 model 的行為與**它自己的**規格不符(例如門檻、代碼清單、方向條件)。
+- 引用規格時寫出是哪一份(specs/<代號>.md);不要拿 A model 的規格去要求 B model。
+- 下面列為沒有附上規格的 model,不要自行推測它的規格。"""
+
+
+def _affected_spec_section(specs: tuple[SpecForModels, ...], affected: AffectedCheck,
+                           prefix: str, budget_chars: int) -> tuple[str, tuple[str, ...]]:
+    """受影響的 model 對到的規格(#38 第 2 點)。回傳(prompt 的規格段, 附上的規格代號)。
+
+    依 specs_by_priority 的順序放,放不下的不截斷、改列在「沒有附上」;第一份放不下時截斷著放,
+    至少給一份。沒有對到規格、沒查、沒檢查到的 model 也列出來:審查要知道哪些沒有規格可比。
+    """
+    def full(rel: str) -> str:
+        return f"{prefix}/{rel}" if prefix else rel
+
+    parts, attached, omitted, left = [_AFFECTED_SPECS_HEADER], [], [], budget_chars
+    for spec in specs:
+        title = f"### specs/{spec.code}.md(受影響的 model:{'、'.join(full(p) for p in spec.models)})"
+        if len(spec.text) <= left or not attached:
+            text = spec.text[:max(left, 0)]
+            parts.append(f"{title}\n{text}")
+            attached.append(spec.code)
+            left -= len(text)
+        else:
+            omitted.append(f"specs/{spec.code}.md(" + "、".join(full(p) for p in spec.models) + ")")
+    missing = []
+    if omitted:
+        missing.append("- 超出預算、沒有附上的規格:" + ";".join(omitted))
+    unmapped = [full(m.path) for m in affected.models if m.spec_looked_up and not m.spec]
+    if unmapped:
+        missing.append("- 沒有對應到規格的 model:" + "、".join(unmapped))
+    not_looked = [full(m.path) for m in affected.models if not m.spec_looked_up]
+    if not_looked:
+        missing.append("- 沒有查規格的 model(超過查詢上限):" + "、".join(not_looked))
+    if affected.unchecked:
+        missing.append("- 沒有檢查的 model(超過數量或時間上限):"
+                       + "、".join(full(p) for p in affected.unchecked))
+    if missing:
+        parts.append("沒有附上規格的受影響 model:\n" + "\n".join(missing))
+    return "\n\n".join(parts), tuple(attached)
+
+
+def _spec_for_exec(spec_code, spec_text, affected_specs: tuple[SpecForModels, ...],
+                   exec_mr: dict) -> tuple:
+    """交給執行驗證的規格。MR 自己的(或受影響的 model 全部對到的同一份)照舊;對到多份時,
+    沒有一份能代表整個 MR,只在交給執行驗證的檔案**全部是 dbt 樣板**時傳第一優先的那份:
+    樣板不會被執行,執行驗證會照實回報「dbt 樣板尚未支援執行驗證」,而不是說成「無規格可驗」。
+    其他情況照舊不傳,避免拿某個 model 的規格去驗不相干的 SQL。"""
+    if spec_text or not affected_specs:
+        return spec_code, spec_text
+    files = [f for f in exec_mr.get("files", []) if isinstance(f, dict)]
+    if files and all(is_dbt_template(f.get("full_content") or _sql_from_diff(f.get("diff", ""))
+                                     or f.get("diff", "")) for f in files):
+        return affected_specs[0].code, affected_specs[0].text
+    return spec_code, spec_text
+
+
 def _head_texts(files: list[dict], dbt_ctx: DbtContext | None) -> dict:
     """{路徑: 變更後的完整內容}。mock 模式的 fixture 自帶 full_content;真實模式下,dbt 專案
     裡的檔案用取回的 head commit 內容。兩者都沒有的檔案不列(prompt 只有它的 diff)。"""
@@ -485,6 +552,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         if spec_code is None and spec_text is None and affected is not None and affected.spec:
             # MR 本身對不到規格(只改了 macro),而受影響的 model 都對到同一份:用它來審
             spec_code, spec_text = affected.spec
+        # 對到多份規格、或只有部分對到:找到的都附上,標明對應哪個 model(#38 第 2 點)
+        affected_specs = (specs_by_priority(affected, _diff_text(mr))
+                          if spec_code is None and spec_text is None else ())
 
         # 分層知識檢索:依變更內容的 scope + query,
         # 只注入 binding 恆常規範(scope 內全數)+ 相關 guideline top_k。
@@ -519,6 +589,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         if capture is not None:
             capture.update({"scope": scope, "kb_query": kb_query, "knowledge": know,
                             "conventions": conventions, "spec_code": spec_code,
+                            "affected_specs": [s.code for s in affected_specs],
                             "prescan_final": copy.deepcopy(pre)})
 
         if dry_run:
@@ -545,6 +616,10 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         spec_section = (f"### specs/{spec_code}.md\n{spec_text[:spec_budget]}"
                         if spec_text else
                         "(未找到對應規格檔;執行驗證將以「無規格可驗」處理)")
+        cited_codes: tuple[str, ...] = (spec_code,) if spec_code else ()
+        if affected_specs:
+            spec_section, cited_codes = _affected_spec_section(
+                affected_specs, affected, dbt_ctx.prefix if dbt_ctx is not None else "", spec_budget)
         # MR 改到規格檔時,規格的 diff 不跟程式的 diff 放在一起(#38):見 _split_spec_changes
         code_files, spec_changes = _split_spec_changes(mr["files"], cfg.budget.get("spec", 3000))
         # 變更後的完整內容(#38 第 1 點):只有 diff 時,不在 hunk 上下文裡的條件會被報成「遺漏」
@@ -575,7 +650,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = extract_json(raw)
         if not report:
             raise RuntimeError(f"模型輸出無法解析為 JSON:\n{raw[:2000]}")
-        report = validate_citations(report, spec_code)
+        report = validate_citations(report, cited_codes)
         report = sanitize_findings(report)
         report = enforce_rules(report, pre)    # rule-base 命中不因模型省略而消失
         report = enforce_parse(report, pre)    # 預掃解析失敗 = 確定性規則沒跑,必須看得見
@@ -591,8 +666,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_tool_refusals(report, hub.refused_calls)  # 模型要求了寫入工具
 
         # 執行驗證(必跑;測資生成 → 沙盒執行 → 仲裁)——在 rubric 之前
-        spec_result = await run_spec_exec(cfg, hub, _mr_for_spec_exec(mr, dbt_ctx),
-                                          spec_code, spec_text)
+        exec_mr = _mr_for_spec_exec(mr, dbt_ctx)
+        spec_result = await run_spec_exec(cfg, hub, exec_mr,
+                                          *_spec_for_exec(spec_code, spec_text, affected_specs, exec_mr))
         report.setdefault("findings", []).extend(spec_result["findings"])
         report["_spec_exec"] = {k: v for k, v in spec_result.items() if k != "findings"}
         report = enforce_dbt_unexecuted(report, mr, dbt_ctx, cfg.dbt)  # dbt 的變更沒被執行驗證到
