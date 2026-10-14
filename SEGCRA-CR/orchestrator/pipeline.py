@@ -15,6 +15,7 @@ from .config import DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, estimate_tokens
 from .dbt_affected import AffectedCheck, check_affected_models, impact_finding
 from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_render import is_dbt_template, render_model_isolated
+from .dbt_config_change import config_changes
 from .security import scan_mr
 from .skills_loader import always_skills, load_skills, skills_index
 from .spec_exec import find_spec, run_spec_exec
@@ -529,6 +530,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述
         report = enforce_dbt_impact(report, affected, dbt_ctx)  # macro 等變更影響的其他 model
         report = enforce_non_sql(report, pre)  # 非 SQL 檔沒跑 SQL 規則:說明文件 info,其他 major
+        report = enforce_dbt_config_change(report, mr, dbt_ctx)  # 只改設定時展開結果不變
         report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
         report = enforce_injection(report, injection_hits)  # 確定性 blocker,不論模型是否被攻陷
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
@@ -734,6 +736,58 @@ def enforce_non_sql(report: dict, pre: list[dict]) -> dict:
                        "例如寫死的憑證,仍會列出)。設定檔、腳本這類變更沒有確定性的檢查,"
                        "不得自動放行。",
                 suggestion="人工確認這個檔案的變更;若它其實是要執行的 SQL,請改用 .sql 副檔名。")
+        _put_program_finding(report, item)
+    return report
+
+
+_DBT_CONFIG_TITLE = "改動了 dbt 物化 / 排程設定,沙盒無法驗證"
+_DBT_CONFIG_OTHER_TITLE = "改動了 dbt 的其他設定"
+# 受關注的設定各自的風險說明(固定文字;同一句只寫一次)
+_DBT_CONFIG_RISKS = {
+    "tags": "這個 model 可能不再被排程選到,或多被選到",
+    "enabled": "這個 model 可能不再被排程選到,或多被選到",
+    "materialized": "可能改成每次全量重建、覆蓋歷史資料,或改變欄位變動時的處理方式",
+    "full_refresh": "可能改成每次全量重建、覆蓋歷史資料,或改變欄位變動時的處理方式",
+    "on_schema_change": "可能改成每次全量重建、覆蓋歷史資料,或改變欄位變動時的處理方式",
+    "unique_key": "重跑同一天時可能重複寫入,或覆蓋不該覆蓋的資料",
+    "incremental_strategy": "重跑同一天時可能重複寫入,或覆蓋不該覆蓋的資料",
+    "incremental_predicates": "重跑同一天時可能重複寫入,或覆蓋不該覆蓋的資料",
+    "pre_hook": "hook 裡的 SQL 不會出現在展開結果裡,規則層與沙盒都沒有檢查到",
+    "post_hook": "hook 裡的 SQL 不會出現在展開結果裡,規則層與沙盒都沒有檢查到",
+    "alias": "寫入的目標表會換到別的位置,原本的表與歷史資料不再更新",
+    "schema": "寫入的目標表會換到別的位置,原本的表與歷史資料不再更新",
+    "database": "寫入的目標表會換到別的位置,原本的表與歷史資料不再更新",
+}
+
+
+def enforce_dbt_config_change(report: dict, mr: dict, dbt_ctx: DbtContext | None = None) -> dict:
+    """改到 dbt 的物化、排程或寫入相關設定(config()、dbt_project.yml、屬性檔)時,每個檔案補一條
+    finding(比較方式見 dbt_config_change)。
+
+    這些設定不會改變展開出來的 SQL,規則層和沙盒都沒有著力點,只能請人確認對排程、重跑與
+    歷史資料的影響:受關注的設定有變、或看不出改了什麼時給 major;只改到其他設定時給 info。
+    內容只有設定名稱(固定清單)與固定文字,不回顯設定值。標題只能由程式產生
+    (見 _put_program_finding)。不看 dbt 開關:比較的是原文,不需要展開。"""
+    head_text = dbt_ctx.head_text if dbt_ctx is not None else None
+    for change in config_changes(mr.get("files", []), head_text):
+        parts = []
+        if change.keys:
+            parts.append(f"改到的設定:{'、'.join(change.keys)}。")
+            risks = dict.fromkeys(_DBT_CONFIG_RISKS[k] for k in change.keys)
+            parts.append("可能的影響:" + ";".join(risks) + "。")
+        if change.unknown:
+            parts.append("設定有變更,但寫法看不出改了哪些項目,保守視為需要確認。")
+        if change.other:
+            parts.append(("另外" if parts else "") + "改到受關注清單以外的設定。")
+        major = bool(change.keys or change.unknown)
+        if major:
+            parts.append("這些設定不會改變展開出來的 SQL,規則層與沙盒都無法驗證。")
+        item = {"file": change.path, "line": change.line, "citations": [],
+                "severity": "major" if major else "info",
+                "title": _DBT_CONFIG_TITLE if major else _DBT_CONFIG_OTHER_TITLE,
+                "detail": "".join(parts),
+                "suggestion": ("請確認對排程、重跑與歷史資料的影響;必要時以 dbt ls --select 與 "
+                               "dbt compile 比對變更前後。" if major else "")}
         _put_program_finding(report, item)
     return report
 
@@ -1263,6 +1317,7 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                             "spec_found": bool(spec_text), "spec_code": spec_code,
                             "files_scanned": len(pre)}}
     report = enforce_non_sql(report, pre)      # 與正式路徑一致
+    report = enforce_dbt_config_change(report, mr, dbt_ctx)
     report = enforce_dbt_notice(report, pre)   # 與正式路徑一致:表名未驗證的提醒不可少
     report = enforce_dbt_impact(report, affected, dbt_ctx)
     for fd in report["findings"]:

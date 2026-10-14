@@ -375,6 +375,7 @@ review_mr
  ├─ check_affected_models  受影響、但不在變更清單裡的 model:變更前後各展開一次,比較規則命中
  ├─ …模型審查…
  ├─ enforce_dbt_impact     影響範圍與檢查結果 → 一條 finding
+ ├─ enforce_dbt_config_change 只改設定(config()、dbt_project.yml、屬性檔)→ 每個檔案一條(見 04 篇)
  ├─ run_spec_exec          樣板檔帶上完整內容再交給它(如實回報「尚未支援」)
  └─ enforce_dbt_unexecuted 改到 dbt 而執行驗證卻通過 → major
 ```
