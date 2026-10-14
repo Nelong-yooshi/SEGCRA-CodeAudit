@@ -6,6 +6,7 @@ MR → 確定性前處理(注入掃描‖rule-base 預掃‖分層記憶/binding
 """
 import json
 import re
+from collections import Counter
 
 from pathlib import Path
 
@@ -365,6 +366,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             prescan=json.dumps(pre, ensure_ascii=False),
             spec_section=spec_section,
         )
+        _attach_statement_lines(pre, mr["files"])   # 給程式補的 finding 用;prompt 已組好,不受影響
 
         trace = [] if capture is not None else None
         raw = await run_agent(cfg, profile, system, user, hub, trace=trace)
@@ -523,11 +525,11 @@ def enforce_hints(report: dict, pre: list[dict]) -> dict:
                 by_code.setdefault(h.get("rule", ""), []).append(h)
         for code, hits in by_code.items():
             # 回應不限嚴重度:比對時把每一處都當成 info
-            missing = _uncovered_hits(before, entry["path"], _HINT_KEYWORDS.get(code, [code]),
-                                      [{**h, "severity": "info"} for h in hits])
+            missing, exact = _coverage(before, entry["path"], _HINT_KEYWORDS.get(code, [code]),
+                                       [{**h, "severity": "info"} for h in hits])
             for n, h in enumerate(missing, 1):
                 report.setdefault("findings", []).append({
-                    "file": entry["path"], "line": 0, "severity": "info",
+                    "file": entry["path"], "line": _hit_line(h, exact), "severity": "info",
                     "title": f"[{code}] 檢核點待人工確認(模型未回應)",
                     "detail": h.get("message", "") + _count_note(code, len(hits), len(missing), n),
                     "suggestion": "", "citations": []})
@@ -633,6 +635,12 @@ def enforce_dbt_notice(report: dict, pre: list[dict]) -> dict:
     return report
 
 
+def _hit_line(hit: dict, exact: bool) -> int:
+    """程式補的 finding 的行號:能確定是哪一處、而且找得到那句的位置時才寫,否則 0。"""
+    line = hit.get("line")
+    return line if exact and isinstance(line, int) and not isinstance(line, bool) else 0
+
+
 def _count_note(code: str, total: int, missing: int, n: int) -> str:
     """同一個檔案同一個代碼有多處命中時,附在補的說明後面的數量(只有一處時不加)。"""
     if total <= 1:
@@ -641,13 +649,17 @@ def _count_note(code: str, total: int, missing: int, n: int) -> str:
             f"這是程式補上的第 {n} 條,共 {missing} 條。請逐一檢查每一處。)")
 
 
+_COMMENT = re.compile(r"/\*.*?\*/", re.S)
+
+
 def _flat(text: str) -> str:
     return " ".join(str(text or "").split()).lower()
 
 
-def _uncovered_hits(findings: list[dict], path: str, keywords: list[str],
-                    hits: list[dict]) -> list[dict]:
-    """同一個檔案、同一個代碼(規則或檢核點)的命中(hits)裡,模型的 findings 沒有對應到的那幾處。
+def _coverage(findings: list[dict], path: str, keywords: list[str],
+              hits: list[dict]) -> tuple[list[dict], bool]:
+    """同一個檔案、同一個代碼(規則或檢核點)的命中(hits)裡,模型的 findings 沒有對應到的那幾處,
+    以及「沒對應到的是哪幾處」能不能確定(見最後一段)。
 
     一條 finding 最多對應一處命中(#28 review):一個檔案有兩句 DELETE 都沒有 WHERE、
     模型只報了第一句時,第二句也要出現在報告上——決策不受影響(已經有 blocker),但作者
@@ -662,11 +674,16 @@ def _uncovered_hits(findings: list[dict], path: str, keywords: list[str],
 
     對應方式:finding 的文字若原樣引用了某幾處命中的語句,它只能對應那幾處之一——兩條
     finding 講的是同一句時,另一句仍要補;沒有引用任何一句的,依序對應還沒被對應到的命中
-    (退回比數量)。不論哪一種,一條 finding 都不會抵掉超過一處。
+    (退回比數量)。不論哪一種,一條 finding 都不會抵掉超過一處。模型給的行號不拿來對應:
+    模型常把行號填成 1 或填錯,拿來對應會讓有回應的檢核點被判成沒回應。
+
+    能不能確定:退回比數量的 finding 實際抵掉了某一處時,不知道它講的是哪一句,剩下沒對應到的
+    是哪幾處也就不確定(數量仍然對)。這時程式補的 finding 不寫行號(#28 review:寫錯行比不寫更糟)。
     """
     need = [_SEVERITY_RANK.get(h.get("severity", "major"), _SEVERITY_RANK["blocker"])
             for h in hits]
-    statements = [_flat(h.get("statement")) for h in hits]
+    # 預掃的語句文字會帶著前面的註解(sqlglot 寫成 /* ... */);模型引用時不會連註解一起抄
+    statements = [_flat(_COMMENT.sub(" ", str(h.get("statement") or ""))) for h in hits]
     quoted, generic = [], []
     for f in findings:
         if f.get("file") != path:
@@ -679,13 +696,91 @@ def _uncovered_hits(findings: list[dict], path: str, keywords: list[str],
         refs = [i for i, st in enumerate(statements) if st and st in flat]
         (quoted if refs else generic).append((rank, refs or range(len(hits))))
     covered: set[int] = set()
+    guessed = False
     quoted.sort(key=lambda q: len(q[1]))        # 能對應的語句越少的越先
-    for rank, options in quoted + generic:      # 有引用語句的先對應
+    for n, (rank, options) in enumerate(quoted + generic):   # 有引用語句的先對應
         for i in options:
             if i not in covered and rank >= need[i]:
                 covered.add(i)
+                guessed = guessed or n >= len(quoted)
                 break
-    return [h for i, h in enumerate(hits) if i not in covered]
+    return [h for i, h in enumerate(hits) if i not in covered], not guessed
+
+
+# 算語句行號的檔案大小上限:要再切一次語句,太大的檔案不算(維持 0)
+MAX_LINE_SOURCE_CHARS = 200_000
+
+
+def _statement_starts(sql: str) -> dict | None:
+    """{語句文字(與預掃命中的 statement 同一個寫法): [(起始行, 完整語句), ...]}。
+
+    用預掃同一個 sqlglot 方言把檔案切成語句:token 帶行號,分號是邊界;語句文字由同一個函式產生,
+    所以能和命中的 statement 逐字比對,不必在原文裡猜(sqlglot 產生的文字跟原文的大小寫、空白、
+    寫法都不同)。只有註解的「語句」(檔尾分號之後的註解)不算。切出來的數量對不上就回 None。
+    """
+    import sqlglot
+    from sqlglot import exp
+    from sqlglot.tokens import TokenType
+    from toolbox.sqltools import DIALECT, _parse
+
+    try:
+        tokens = sqlglot.tokenize(sql, read=DIALECT)
+        statements = [st for st in _parse(sql)
+                      if st is not None and not isinstance(st, exp.Semicolon)]
+    except Exception:                        # noqa: BLE001 — 切不出來就不寫行號
+        return None
+    starts, start = [], None
+    for tok in tokens:
+        if tok.token_type == TokenType.SEMICOLON:
+            if start is not None:
+                starts.append(start)
+            start = None
+        elif start is None:
+            start = tok.line
+    if start is not None:
+        starts.append(start)
+    if len(starts) != len(statements):
+        return None
+    by_text: dict[str, list] = {}
+    for first, st in zip(starts, statements):
+        full = st.sql(dialect=DIALECT)
+        by_text.setdefault(full[:200], []).append((first, full))
+    return by_text
+
+
+def _attach_statement_lines(pre: list[dict], files: list[dict]) -> None:
+    """在預掃命中上加 line(那句在檔案裡的起始行),給程式補的 finding 寫行號用
+    (#28 review:只有數字,沒有回顯的風險)。
+
+    要在組好 prompt 之後才呼叫:預掃結果整份放進 prompt,先加行號 prompt 就變了。
+    只處理「規則跑的就是這份檔案原文」的檔案:有完整內容、不是 dbt 樣板(展開後的行號對不回
+    原始檔,#35)、不是規格檔。相同文字的語句出現多次時,第 k 個命中對第 k 句;前 200 字相同、
+    後面不同的語句分不出來,不寫。任何一步對不上就不寫(維持 0),不猜。
+    """
+    for f, entry in zip(files, pre):
+        if (not isinstance(f, dict) or entry.get("path") != f.get("path")
+                or any(entry.get(k) for k in ("spec_file", "dbt_macro", "dbt_render_error",
+                                              "dbt_render_notice"))):
+            continue
+        text = f.get("full_content")
+        if (not isinstance(text, str) or not text or len(text) > MAX_LINE_SOURCE_CHARS
+                or is_dbt_template(text)):
+            continue
+        hits = [h for h in entry.get("rules", []) if isinstance(h, dict) and h.get("statement")]
+        if not hits:
+            continue
+        starts = _statement_starts(text)
+        if starts is None:
+            continue
+        used: Counter = Counter()
+        for h in hits:
+            found = starts.get(h["statement"])
+            if not found or len({full for _, full in found}) > 1:
+                continue
+            key = (h.get("rule"), h["statement"])
+            if used[key] < len(found):
+                h["line"] = found[used[key]][0]
+            used[key] += 1
 
 
 def enforce_rules(report: dict, pre: list[dict]) -> dict:
@@ -713,12 +808,13 @@ def enforce_rules(report: dict, pre: list[dict]) -> dict:
             if code.startswith("R"):       # hint(H 系列)由 enforce_hints 處理
                 by_code.setdefault(code, []).append(h)
         for code, hits in by_code.items():
-            missing = _uncovered_hits(before, entry["path"], _RULE_KEYWORDS.get(code, [code]),
-                                      hits)
+            missing, exact = _coverage(before, entry["path"], _RULE_KEYWORDS.get(code, [code]),
+                                       hits)
             for n, h in enumerate(missing, 1):
                 detail = h.get("message", "")
                 report.setdefault("findings", []).append({
-                    "file": entry["path"], "line": 0, "severity": h.get("severity", "major"),
+                    "file": entry["path"], "line": _hit_line(h, exact),
+                    "severity": h.get("severity", "major"),
                     "title": f"[{code}] {h.get('message', '')[:60]}",
                     "detail": detail + _count_note(code, len(hits), len(missing), n),
                     "suggestion": "", "citations": []})
