@@ -287,7 +287,9 @@ def test_規格檔不放進完整內容(prompt):
     user = prompt(_mr(FILE, spec))
     full_part = user.split(HEADER)[1].split("## 確定性預掃結果")[0]
     assert "ZZ_SPEC_TEXT" not in full_part and "specs/R-201.md" not in full_part
-    assert "完整的規格內容" not in user
+    # 規格以這次 MR 的版本為準:完整的規格只出現在規格那一段,一次
+    assert user.count("完整的規格內容") == 1
+    assert "完整的規格內容" in user.split("## 核定規格")[1].split("## 本次 MR 對規格的修改")[0]
 
 
 def test_完整內容取自_fixture_沒有時取_dbt_取回的內容():
