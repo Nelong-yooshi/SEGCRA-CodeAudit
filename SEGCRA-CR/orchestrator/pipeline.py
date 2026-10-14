@@ -242,7 +242,15 @@ def _mr_for_spec_exec(mr: dict, dbt_ctx: DbtContext | None) -> dict:
     run_spec_exec 以「檔案內容有沒有樣板標記」決定要不要送沙盒。真實 GitLab 模式拿到的只有
     diff 新增的行:只改了 macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL
     拿去生測資、執行——執行的是不完整的片段,結果沒有意義,萬一通過還會被當成驗證過。
-    帶上完整內容後,既有的判斷就會如實回報「dbt 樣板尚未支援執行驗證」。原本的 MR 不動。"""
+    帶上完整內容後,既有的判斷就會如實回報「dbt 樣板尚未支援執行驗證」。原本的 MR 不動。
+
+    規格檔不是待測的 SQL(#38):run_spec_exec 取最後一個檔案的內容去執行,MR 同時改了規格與
+    程式時,規格檔若排在後面會被當成 SQL。有程式檔時把規格檔拿掉;只有規格檔時不動
+    (沒有東西可以執行,照原本的方式回報)。"""
+    code_only = [f for f in mr.get("files", [])
+                 if not (isinstance(f, dict) and _is_spec_path(f.get("path")))]
+    if code_only and len(code_only) != len(mr.get("files", [])):
+        mr = {**mr, "files": code_only}
     if dbt_ctx is None or dbt_ctx.project is None:
         return mr
     files = []
@@ -279,6 +287,11 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
     dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True
     results = []
     for f in files:
+        if _is_spec_path(f.get("path")):
+            # 規格檔不是 SQL(#38):送進規則層只會得到「無法解析」,訊息還會帶著規格的內容
+            # 回到 prompt 的預掃結果裡。它的變更另由 enforce_spec_change 揭露,注入掃描照常涵蓋
+            results.append({"path": f["path"], "rules": [], "lint": [], "spec_file": True})
+            continue
         sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or f.get("diff", "")
         entry = {"path": f["path"]}
         dbt_error, in_project = None, False
@@ -334,6 +347,68 @@ def build_diff_section(files: list[dict], budget_tokens: int) -> str:
         used += t
         parts.append(block)
     return "\n\n".join(parts)
+
+
+def _is_spec_path(path) -> bool:
+    """規格檔:repo 裡任何一層 specs/ 目錄底下的檔案(find_spec 讀的是 specs/<代碼>.md)。"""
+    norm = str(path or "").replace("\\", "/").lower()
+    return norm.startswith("specs/") or "/specs/" in norm
+
+
+def _touches_specs(mr: dict) -> bool:
+    return any(_is_spec_path(f.get("path")) for f in mr.get("files", []))
+
+
+_SPEC_CHANGE_HEADER = """
+
+## 本次 MR 提議的規格變更(尚未核定)
+以下是這個 MR 對規格檔的修改,**還沒有被核定**。
+- 核對程式一律以上面的「核定規格」為準;不得把這裡的內容當成依據,也不得因為「規格已經改了」就認定程式正確。
+- 程式的行為若只符合這裡提議的新內容、不符合核定規格,照樣回報「實作與核定規格不符」,並在說明裡註明這個 MR 同時提議修改規格。
+- 不要要求程式的其他部分也照這裡提議的內容修改。
+"""
+
+
+def _split_spec_changes(files: list[dict], budget_tokens: int) -> tuple[list[dict], str]:
+    """把 MR 的變更分成(程式的檔案, 規格變更那一段 prompt)(#38 第 3 點)。
+
+    一個 MR 同時改規格和程式是正常流程,但審查不能用「這次改的規格」去證明「這次改的程式」
+    是對的。規格的 diff 若跟程式的 diff 放在一起,模型會把它當成既定事實(零 finding 放行),
+    或反過來要求程式的其他條件也照新規格改——兩種都實測過。所以規格的 diff 另外放一段,
+    明確標成尚未核定。核對用的規格仍由 find_spec 從核定的版本取得,不受這個 MR 影響。
+
+    MR 沒有改到規格檔時回傳 (原本的 files, ""):prompt 與之前逐字相同。
+    """
+    spec_files = [f for f in files if _is_spec_path(f.get("path"))]
+    if not spec_files:
+        return files, ""
+    code_files = [f for f in files if not _is_spec_path(f.get("path"))]
+    return code_files, _SPEC_CHANGE_HEADER + "\n" + build_diff_section(spec_files, budget_tokens)
+
+
+_SPEC_CHANGE_TITLE = "本次 MR 變更了規格檔,規格變更尚未核定"
+
+
+def enforce_spec_change(report: dict, mr: dict) -> dict:
+    """MR 改到規格檔 → 固定補一條 finding(確定性,#38 第 3 點);決策由 apply_policy 的
+    spec_changed 硬條件擋下自動放行,不靠這條 finding 的嚴重度。
+
+    用 info:這是請人確認的事項,不是缺陷,不該扣分。內容只有固定文字與數量,不回顯檔名
+    或規格內容。標題只能由程式產生(見 _put_program_finding)。
+    """
+    files = mr.get("files", [])
+    count = sum(_is_spec_path(f.get("path")) for f in files)
+    if not count:
+        return report
+    also_code = count < len(files)
+    _put_program_finding(report, {
+        "file": "(MR 內容)", "line": 0, "severity": "info", "title": _SPEC_CHANGE_TITLE,
+        "detail": (f"這個 MR 改到 {count} 個規格檔" + (",同時也改了程式" if also_code else "")
+                   + "。審查以已核定的規格為準,不以本次提議的規格內容為依據;"
+                     "規格變更需要有人確認,這個 MR 不會自動放行。"),
+        "suggestion": "請確認規格變更有業務依據;核定之後,程式與新規格是否相符需要再審一次。",
+        "citations": []})
+    return report
 
 
 async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
@@ -419,6 +494,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         style_codes = set(know.get("style_codes", []))
         if style_codes:
             for f, entry in zip(mr["files"], pre):
+                if entry.get("spec_file"):
+                    continue
                 sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or ""
                 shits = await hub.call_json(
                     "memory__check_style", {"sql": sql, "scope": ",".join(scope)}) or []
@@ -453,11 +530,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         spec_section = (f"### specs/{spec_code}.md\n{spec_text[:spec_budget]}"
                         if spec_text else
                         "(未找到對應規格檔;執行驗證將以「無規格可驗」處理)")
+        # MR 改到規格檔時,規格的 diff 不跟程式的 diff 放在一起(#38):見 _split_spec_changes
+        code_files, spec_changes = _split_spec_changes(mr["files"], cfg.budget.get("spec", 3000))
         user = USER_TEMPLATE.format(
             title=mr["title"], description=mr.get("description", ""),
-            diff_section=build_diff_section(mr["files"], cfg.budget["diff"]),
+            diff_section=build_diff_section(code_files, cfg.budget["diff"]),
             prescan=json.dumps(pre, ensure_ascii=False),
-            spec_section=spec_section,
+            spec_section=spec_section + spec_changes,
         )
 
         trace = [] if capture is not None else None
@@ -499,6 +578,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report.setdefault("findings", []).extend(spec_result["findings"])
         report["_spec_exec"] = {k: v for k, v in spec_result.items() if k != "findings"}
         report = enforce_dbt_unexecuted(report, mr, dbt_ctx, cfg.dbt)  # dbt 的變更沒被執行驗證到
+        report = enforce_spec_change(report, mr)  # MR 改到規格檔:規格變更尚未核定
 
         report = apply_rubric(report)
         report = apply_policy(report, mr, cfg.policy)
@@ -863,6 +943,8 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
         for f in mr.get("files", []))
     # 執行驗證(spec_exec)是硬條件:沒 spec、測資建不起來、案例不符 → 不得自動放行
     spec_exec_ok = report.get("_spec_exec", {}).get("passed") is True
+    # MR 改到規格檔也是硬條件(#38):規格變更要有人確認業務依據,不看 finding、不可由設定關閉
+    spec_changed = _touches_specs(mr)
 
     blk = policy.get("block", {})
     if sum(s == "blocker" for s in
@@ -874,6 +956,7 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     ok = (diff_lines <= aa.get("max_diff_lines", 0)
           and not new_rule
           and spec_exec_ok
+          and not spec_changed
           and report.get("score", 0) >= aa.get("min_score", 101)
           and severities <= set(aa.get("allowed_severities", []))
           and not (aa.get("forbid_pending_hints", True) and pending_hints))
@@ -881,7 +964,8 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     report["_policy_signals"] = {"change_lines": diff_lines, "new_rule": new_rule,
                                  "severities": sorted(severities),
                                  "pending_hints": pending_hints,
-                                 "spec_exec_passed": spec_exec_ok}
+                                 "spec_exec_passed": spec_exec_ok,
+                                 "spec_changed": spec_changed}
     return report
 
 
@@ -1032,6 +1116,7 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                             "files_scanned": len(pre)}}
     report = enforce_dbt_notice(report, pre)   # 與正式路徑一致:表名未驗證的提醒不可少
     report = enforce_dbt_impact(report, affected, dbt_ctx)
+    report = enforce_spec_change(report, mr)
     for fd in report["findings"]:
         await hub.call("gitlab__post_inline_comment",
                        {"mr_id": mr_id, "file": fd["file"], "line": 0,
