@@ -1233,3 +1233,16 @@ def test_骨架的prompt要明確要求branch與data_level():
     text = spec_exec._skeleton_prompt("R-1", "規格內容")
     assert "branch" in text and "data_level" in text
     assert "cases 一律留空" in text
+
+
+def test_prompt要求門檻類條件測在邊界上():
+    """實測:沒有這條要求時,34 個「照規格寫錯」的 SQL 只抓得到 9 個,而抓不到的
+    25 個幾乎全是邊界類(上界放寬一格、含端點改成不含)。對照組 R-140 是舊 prompt
+    生的、有專門的邊界案例,10 個突變全部抓得到。
+
+    舊 prompt 有「涉及數值門檻的條件另加邊界案例」,改寫成基準＋變體時漏掉了。
+    """
+    t = spec_exec.testgen_system()
+    assert "剛好跨過門檻一格" in t, "變體沒有要求最小幅度破壞"
+    assert "壓在端點上" in t, "基準沒有要求取門檻端點"
+    assert "剛好被排除掉" in t, "排除類條件沒有要求放「否則就會符合」的資料列"
