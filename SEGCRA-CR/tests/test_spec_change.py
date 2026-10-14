@@ -106,7 +106,9 @@ def _spec_findings(report):
 
 @pytest.mark.parametrize("path, expected", [
     ("specs/R-201.md", True), ("specs/sub/R-201.md", True), ("SPECS/R-201.MD", True),
-    ("dbt/specs/mrt_x.md", True), ("specs\\R-201.md", True), ("specs/notes.txt", True),
+    ("dbt/specs/mrt_x.md", True), ("specs\\R-201.md", True),
+    ("specs/notes.txt", False), ("specs/evil.sql", False), ("specs/R-201.md.sql", False),
+    ("specs/sub/macro.SQL", False), ("specs/schema.yml", False), ("specs/", False),
     ("sql/rules/r201.sql", False), ("docs/specs.md", False), ("myspecs/R-201.md", False),
     ("specs.md", False), ("specs", False), ("", False), (None, False), (123, False),
 ])
@@ -297,3 +299,15 @@ def test_已學會的風格檢查不跑在規格檔上(review, monkeypatch):
     monkeypatch.setattr(pipeline.ToolHub, "call_json", call_json)
     review(_mr(SQL_FILE, SPEC_FILE))
     assert len(checked) == 1 and "ZZ_SPEC_MARKER" not in checked[0]
+
+
+def test_放在_specs_底下的_SQL_檔照樣被檢查(review):
+    """規格檔不跑規則、不進執行驗證;若 specs/ 底下的任何檔案都算規格檔,把 SQL 放在那裡就能
+    躲過規則層(決策雖然一定是 needs_human,但 DELETE 無 WHERE 的 blocker 不會出現在報告上)。"""
+    evil = {"path": "specs/cleanup.sql", "diff": "@@ -0,0 +1 @@\n+DELETE FROM transactions;",
+            "full_content": "DELETE FROM transactions;"}
+    report, user = review(_mr(evil))
+    assert HEADER not in user and "### specs/cleanup.sql" in user.split("## 確定性預掃結果")[0]
+    assert any("R001" in f["title"] and f["severity"] == "blocker" for f in report["findings"])
+    assert report["decision"] == "blocked"
+    assert _spec_findings(report) == []

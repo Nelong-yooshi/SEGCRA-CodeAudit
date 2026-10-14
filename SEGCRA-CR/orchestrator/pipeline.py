@@ -364,9 +364,10 @@ def _head_texts(files: list[dict], dbt_ctx: DbtContext | None) -> dict:
 
 
 def _is_spec_path(path) -> bool:
-    """規格檔:repo 裡任何一層 specs/ 目錄底下的檔案(find_spec 讀的是 specs/<代碼>.md)。"""
+    """規格檔:repo 裡任何一層 specs/ 目錄底下的 .md(find_spec 讀的是 specs/<代碼>.md)。
+    只認 .md:規格檔不跑規則、不進執行驗證,放在 specs/ 底下的 .sql 不能因此躲過檢查。"""
     norm = str(path or "").replace("\\", "/").lower()
-    return norm.startswith("specs/") or "/specs/" in norm
+    return (norm.startswith("specs/") or "/specs/" in norm) and norm.endswith(".md")
 
 
 def _touches_specs(mr: dict) -> bool:
