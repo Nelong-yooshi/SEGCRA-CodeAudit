@@ -12,6 +12,7 @@ from pathlib import Path
 from .agent import extract_json, run_agent
 from .config import DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, estimate_tokens
 from .dbt_affected import AffectedCheck, check_affected_models, impact_finding
+from .change_view import build_full_text_section
 from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_render import is_dbt_template, render_model_isolated
 from .security import scan_mr
@@ -349,6 +350,19 @@ def build_diff_section(files: list[dict], budget_tokens: int) -> str:
     return "\n\n".join(parts)
 
 
+def _head_texts(files: list[dict], dbt_ctx: DbtContext | None) -> dict:
+    """{路徑: 變更後的完整內容}。mock 模式的 fixture 自帶 full_content;真實模式下,dbt 專案
+    裡的檔案用取回的 head commit 內容。兩者都沒有的檔案不列(prompt 只有它的 diff)。"""
+    texts = {}
+    for f in files:
+        text = f.get("full_content")
+        if not (isinstance(text, str) and text) and dbt_ctx is not None:
+            text = dbt_ctx.head_text(f.get("path"))
+        if isinstance(text, str) and text:
+            texts[f.get("path")] = text
+    return texts
+
+
 def _is_spec_path(path) -> bool:
     """規格檔:repo 裡任何一層 specs/ 目錄底下的檔案(find_spec 讀的是 specs/<代碼>.md)。"""
     norm = str(path or "").replace("\\", "/").lower()
@@ -532,9 +546,12 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                         "(未找到對應規格檔;執行驗證將以「無規格可驗」處理)")
         # MR 改到規格檔時,規格的 diff 不跟程式的 diff 放在一起(#38):見 _split_spec_changes
         code_files, spec_changes = _split_spec_changes(mr["files"], cfg.budget.get("spec", 3000))
+        # 變更後的完整內容(#38 第 1 點):只有 diff 時,不在 hunk 上下文裡的條件會被報成「遺漏」
+        full_text = build_full_text_section(code_files, _head_texts(code_files, dbt_ctx),
+                                            cfg.budget.get("full_content", 6000))
         user = USER_TEMPLATE.format(
             title=mr["title"], description=mr.get("description", ""),
-            diff_section=build_diff_section(code_files, cfg.budget["diff"]),
+            diff_section=build_diff_section(code_files, cfg.budget["diff"]) + full_text,
             prescan=json.dumps(pre, ensure_ascii=False),
             spec_section=spec_section + spec_changes,
         )
