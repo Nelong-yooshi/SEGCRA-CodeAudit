@@ -300,3 +300,31 @@ def test_完整內容取自_fixture_沒有時取_dbt_取回的內容():
     assert pipeline._head_texts(files, Ctx()) == {"models/a.sql": "select 'head'",
                                                   "sql/b.sql": "select 'fixture'"}
     assert pipeline._head_texts(files, None) == {"sql/b.sql": "select 'fixture'"}
+
+
+def test_內容明顯超過預算時不先排整份(monkeypatch):
+    """檔案可能很大:內容本身就超過預算時,加了行號只會更大,不必先排好整份再丟掉。"""
+    calls = []
+    real = change_view._numbered
+
+    def spy(lines, keep, marked):
+        calls.append(keep)
+        return real(lines, keep, marked)
+
+    monkeypatch.setattr(change_view, "_numbered", spy)
+    text = _lines(20_000, changed={10_000})
+    block, used = file_view(PATH, text, "@@ -10000 +10000 @@\n-old\n+select 10000;", 300)
+    assert "> 10000 | select 10000;" in block and used <= 300
+    assert calls and all(keep != [(1, 20_000)] for keep in calls)
+
+    calls.clear()
+    small, _ = file_view(PATH, "select 1;\nselect 2;", None, 300)   # 放得下的照常放整份
+    assert calls == [[(1, 2)]] and "select 2;" in small
+
+
+def test_內容放得下但加了行號放不下時不放整份():
+    """行號與標記也佔預算:內容本身剛好放得下、加了行號就超過時,不能照放。"""
+    text = "\n".join("x" for _ in range(300))           # 約 600 字元;每行加行號後約 9 倍
+    assert change_view.estimate_tokens(text) <= 300
+    block, used = file_view(PATH, text, None, 300)
+    assert used <= 300 and "完整內容超出 context 預算" in block

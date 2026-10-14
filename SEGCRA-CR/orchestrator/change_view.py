@@ -121,9 +121,11 @@ def file_view(path: str, text: str, diff, budget_tokens: int) -> tuple[str, int]
     if not lines:
         block = f"{title}\n(空檔案)"
         return block, estimate_tokens(block)
-    whole = f"{title}\n```\n{_numbered(lines, [(1, len(lines))], marked or set())}\n```"
-    if estimate_tokens(whole) <= budget_tokens:
-        return whole, estimate_tokens(whole)
+    # 內容本身就超過預算時,加了行號只會更大:不必先排好整份(檔案可能很大)
+    if estimate_tokens(text) <= budget_tokens:
+        whole = f"{title}\n```\n{_numbered(lines, [(1, len(lines))], marked or set())}\n```"
+        if estimate_tokens(whole) <= budget_tokens:
+            return whole, estimate_tokens(whole)
     if marked:
         part = (f"{title}(內容超出預算,只放改動所在的語句)\n```\n"
                 f"{_numbered(lines, _statement_ranges(lines, marked), marked)}\n```")
