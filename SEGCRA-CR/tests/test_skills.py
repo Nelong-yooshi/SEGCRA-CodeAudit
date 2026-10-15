@@ -3,7 +3,7 @@
 為什麼值得單獨測:skill 決定模型「知道什麼」。常駐的 skill 每次都進 prompt,按需的
 要模型自己用 load_skill 工具取——而「模型會不會主動去載」正是三明治架構其他地方都
 不敢賭的事。管線因此對兩個 skill 做了**確定性強制載入**(改到 rules/ 檔案就一定載
-anomaly-rules;預掃命中 R004/H004 就一定載 secure-sql),不讓模型自己決定。
+anomaly-rules;預掃命中 R004/R005/H004 就一定載 secure-sql),不讓模型自己決定。
 
 eval/README「覆蓋缺口」列的「skill 載入(目前沒有效能類 case)」指的就是:
 `perf-review` 這個 skill 存在,但既沒有強制載入的觸發條件、也沒有任何 golden case
@@ -121,7 +121,7 @@ def test_現況_perf_review_完全靠模型自己想到要載():
     """管線目前只對兩個 skill 做確定性強制載入(見 pipeline.review_mr):
 
       - 改到 sql/rules/ 底下的檔案  → 一定載 anomaly-rules
-      - 預掃命中 R004 / H004(資安)→ 一定載 secure-sql
+      - 預掃命中 R004 / R005 / H004(資安)→ 一定載 secure-sql
 
     `perf-review`(SQL 效能:索引、掃描、JOIN 成本)**沒有任何觸發條件**,
     只出現在索引裡等模型自己決定要不要載——這正是架構其他地方都不賭的事。
