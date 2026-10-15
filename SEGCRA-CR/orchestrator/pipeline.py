@@ -92,6 +92,140 @@ def _norm(s: str) -> str:
     return re.sub(r"[《》()()\s]", "", (s or "")).lower()
 
 
+_FORMAT_TITLE = "模型輸出的格式不正確"
+_FORMAT_NO_TITLE = "(標題格式不正確)"
+
+
+def _as_text(value) -> tuple[str, bool]:
+    """把應該是文字的欄位轉成字串。回傳 (文字, 型別是否不對)。
+
+    缺漏或 null 視為空字串、不算格式錯誤(模型常把沒有的建議寫成 null;title 的 null 由
+    normalize_findings 另外算);字串清單接成一段,其餘型別轉成字串(巢狀太深、轉不出來的給
+    空字串)。"""
+    if value is None:
+        return "", False
+    if isinstance(value, str):
+        return value, False
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return "\n".join(value), True
+    try:
+        return str(value), True
+    except RecursionError:
+        return "", True
+
+
+def _as_line(value) -> tuple[int, bool]:
+    """行號轉成整數。回傳 (行號, 是否無法轉換)。
+
+    整數、整數樣子的字串、有限的浮點數照舊接受(寫回留言時本來就會 int());其餘
+    (文字、清單、物件、NaN / Infinity)設成 0——寫回留言的迴圈不能因為一個行號中斷。"""
+    if value is None or value == "":
+        return 0, False
+    try:
+        if isinstance(value, (int, float, str)):
+            return int(value), False
+    except (ValueError, OverflowError):
+        pass
+    return 0, True
+
+
+def normalize_findings(report: dict) -> dict:
+    """後處理的第一步:把模型輸出整理成後面每一步都假設的形狀(#21)。
+
+    模型輸出的 JSON 解析得過、但欄位型別不對時(finding 是字串、severity 是清單、
+    title 是 null、line 是 "abc"…),後面的步驟會丟例外讓整次審查中斷:MR 收不到結果;
+    若是在寫回留言時才中斷,還會停在「留言貼了一半、沒有 label 也沒有 commit status」。
+    模型輸出不可信,這是可以預期的輸入。
+
+    原則:
+    - **原本不會出錯的輸入,行為不變**:欄位缺漏、或 detail / suggestion / file / line 是 null,
+      照舊當成空值;不合法的 severity 字串(模型常原樣抄預掃的 hint)照舊由 sanitize_findings
+      靜默丟棄。這些都不算格式錯誤。
+    - title 是 null(有這個鍵、值是 null)算格式錯誤,補「(標題格式不正確)」:以前後處理會在
+      這裡丟例外,沒有標題的 finding 也看不出在講什麼。標題缺漏不算(與以前相同)。
+      citations 是 null 以前也會丟例外;現在當成空清單,沒有內容遺失,不算格式錯誤。
+    - **能修就修,不輕易丟**:severity 是字串的 finding 一律保留(其他欄位修正)。丟掉一條
+      標題格式錯的 blocker,決策會從 blocked 變成 needs_human,後處理不可以讓決策變寬鬆。
+    - 只有「finding 不是物件」與「severity 不是字串」會丟掉:沒有可以依據的嚴重度。
+
+    修正與丟掉的數量記在 `_format_issues`,由 enforce_format 補一條 major(要排在
+    sanitize_findings 之後,見該函式)。這個欄位只由這裡寫:模型自己輸出的同名欄位會被移除。
+    """
+    report.pop("_format_issues", None)
+    summary, _ = _as_text(report.get("summary"))
+    report["summary"] = summary
+    raw = report.get("findings", [])
+    bad_container = not isinstance(raw, list)
+    fixed = dropped = 0
+    findings = []
+    for fd in ([] if bad_container else raw):
+        if not isinstance(fd, dict):
+            dropped += 1
+            continue
+        severity = fd.get("severity")
+        if severity is not None and not isinstance(severity, str):
+            dropped += 1
+            continue
+        wrong = False
+        null_title = "title" in fd and fd["title"] is None
+        for key in ("title", "detail", "suggestion"):
+            fd[key], bad = _as_text(fd.get(key))
+            if key == "title":
+                bad = bad or null_title
+            wrong |= bad
+            if bad and key == "title" and not fd[key].strip():
+                fd[key] = _FORMAT_NO_TITLE
+        file = fd.get("file")
+        if file is not None and not isinstance(file, str):
+            wrong = True
+        fd["file"] = file if isinstance(file, str) else ""
+        fd["line"], bad = _as_line(fd.get("line"))
+        wrong |= bad
+        cites = fd.get("citations")
+        if cites is None:
+            cites = []
+        elif not isinstance(cites, list):
+            cites, wrong = [], True
+        kept = [c for c in cites if isinstance(c, dict)
+                and isinstance(c.get("source", ""), (str, type(None)))]
+        wrong |= len(kept) != len(cites)
+        fd["citations"] = kept
+        fixed += wrong
+        findings.append(fd)
+    report["findings"] = findings
+    if bad_container or fixed or dropped:
+        report["_format_issues"] = {"fixed": fixed, "dropped": dropped,
+                                    "findings_not_a_list": bad_container}
+    return report
+
+
+def enforce_format(report: dict) -> dict:
+    """模型輸出有格式不正確的 finding → 補一條 major(確定性,不得自動放行)。
+
+    「模型輸出壞掉」本身要在報告裡看得到:被丟掉的 finding 可能正是該擋下 MR 的那一條。
+    只寫數量,**不回顯模型輸出的內容**(那是不可信的文字,會被貼回 MR 留言)。
+
+    必須排在 sanitize_findings 之後:它的近似標題去重會保留「建議較長」的那條,模型若
+    輸出一條標題**近似**(不必相同)的 info 並附上一段建議,去重時留下的會是模型那條,
+    程式的 major 就不見了。標題完全相同的則由 _put_program_finding 取代。"""
+    issues = report.get("_format_issues")
+    if not issues:
+        return report
+    parts = []
+    if issues["findings_not_a_list"]:
+        parts.append("findings 欄位不是清單,整份當作沒有 finding。")
+    if issues["fixed"] or issues["dropped"]:
+        parts.append(f"有 {issues['fixed'] + issues['dropped']} 條 finding 的格式不正確"
+                     f"(修正後保留 {issues['fixed']} 條、無法判讀而略過 {issues['dropped']} 條)。")
+    major = {
+        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _FORMAT_TITLE,
+        "detail": "".join(parts) + "被略過或修正的內容可能不完整,這次的審查結果需人工確認。",
+        "suggestion": "重新觸發審查;若持續發生,請檢查審查模型的輸出。",
+        "citations": []}
+    _put_program_finding(report, major)
+    return report
+
+
 # 引用來源裡指名的規則碼(_norm 已小寫化,所以只需比對小寫)
 _CITE_CODE = re.compile(r"r-?\d{2,4}")
 
@@ -384,6 +518,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = extract_json(raw)
         if not report:
             raise RuntimeError(f"模型輸出無法解析為 JSON:\n{raw[:2000]}")
+        report = normalize_findings(report)    # 模型輸出的形狀不可信,先整理再往下走(#21)
         report = validate_citations(report, spec_code)
         report = sanitize_findings(report)
         # 檢核點只認模型自己的回應:放在任何程式補報之前(enforce_rules 補的 R004 內文含
@@ -396,6 +531,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 程式補的文字若先進報告,可能被誤當成模型的回應而吞掉檢核點
         report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述
         report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
+        report = enforce_format(report)        # 模型輸出有格式錯誤 → major;須在 sanitize 之後
         report = enforce_injection(report, injection_hits)  # 確定性 blocker,不論模型是否被攻陷
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
         report = enforce_tool_refusals(report, hub.refused_calls)  # 模型要求了寫入工具
