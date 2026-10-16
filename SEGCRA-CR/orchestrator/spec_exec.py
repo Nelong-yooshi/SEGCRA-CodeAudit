@@ -1205,6 +1205,15 @@ def _other_branch_satisfied(conds: list[dict], actual: dict[str, bool],
     原本只寫在 prompt 裡要模型避開,但那是靠它遵守。每個條件都有 `check_sql`,
     所以可以直接算。
     """
+    # 全域條件不成立時,**任何一支都不會命中**:它屬於每一支,少了它規則連篩選都
+    # 篩不出東西來。漏了這個判斷,全域條件的變體(例如把日期全部移出時間窗)會被
+    # 判成「別支整個成立」——那一支自己的條件確實都還成立,但規則並不會命中,所以
+    # 「不命中」的預期本來就是對的。影響是全域條件幾乎每份規格都有(時間窗、排除
+    # 空白帳號),等於有全域條件的規格,執行驗證永遠通不過。
+    glob = [c["id"] for c in conds
+            if str(c.get("branch", "") or "") == GLOBAL_BRANCH]
+    if not all(actual.get(i) is True for i in glob):
+        return []
     by_branch: dict[str, list[str]] = {}
     for c in conds:
         b_id = str(c.get("branch", "") or "")

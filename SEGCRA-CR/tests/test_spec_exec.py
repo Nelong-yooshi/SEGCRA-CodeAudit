@@ -1359,6 +1359,36 @@ def test_基準也要驗別支沒整個成立():
     assert spec_exec._other_branch_satisfied(conds, actual, "C1") == ["C2"]
 
 
+def test_全域條件不成立時任何一支都不算成立():
+    """#47 review 第 1 點:全域條件的變體(例如日期全部移出時間窗)是從某一支的基準
+    改出來的,所以那一支自己的條件仍然全部成立;但全域條件已經不成立,規則根本不會
+    命中,「不命中」的預期是對的。漏了這個判斷,全域條件幾乎每份規格都有(時間窗、
+    排除空白帳號)→ 有全域條件的規格,執行驗證永遠通不過。"""
+    conds = _2branch_conds()
+    actual = {"C1-1": True, "C1-2": True, "C2-1": False, "C2-2": False, "G-1": False}
+    assert spec_exec._other_branch_satisfied(conds, actual, "*") == []
+    # 自己是某一支時也一樣:全域條件不成立,別支就算條件齊了也不會命中
+    actual = {"C1-1": False, "C1-2": True, "C2-1": True, "C2-2": True, "G-1": False}
+    assert spec_exec._other_branch_satisfied(conds, actual, "C1") == []
+    # 對照:只有 G-1 轉成立,同一份真假值就會判出 C2(證明是 G-1 在起作用)
+    actual["G-1"] = True
+    assert spec_exec._other_branch_satisfied(conds, actual, "C1") == ["C2"]
+
+
+def test_算不出來的全域條件不當成立():
+    """全域條件沒有 check_sql(算不出來 → None)時不得當成成立。往「不報」倒:
+    把沒驗到的說成驗過了,比漏報更糟。"""
+    conds = _2branch_conds()
+    actual = {"C1-1": False, "C1-2": True, "C2-1": True, "C2-2": True}   # G-1 算不出來
+    assert spec_exec._other_branch_satisfied(conds, actual, "C1") == []
+
+
+def test_沒有全域條件時行為不變():
+    conds = [c for c in _2branch_conds() if c["branch"] != "*"]
+    actual = {"C1-1": False, "C1-2": True, "C2-1": True, "C2-2": True}
+    assert spec_exec._other_branch_satisfied(conds, actual, "C1") == ["C2"]
+
+
 def test_全域條件不算一支():
     conds = _2branch_conds()
     actual = {"C1-1": True, "C1-2": True, "C2-1": False, "C2-2": True, "G-1": True}

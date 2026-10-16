@@ -1792,6 +1792,20 @@ MUTANTS.update({
         + "                    others = _other_branch_satisfied(",
         "                if False:" + NL
         + "                    others = _other_branch_satisfied("),
+    # 全域條件不成立時任何一支都不會命中(#47 review 第 1 點)。漏了這個判斷,
+    # 全域條件的變體會被判成「別支整個成立」→ 有全域條件的規格永遠通不過。
+    "測資:別支判定不看全域條件有沒有成立": (S,
+        "    if not all(actual.get(i) is True for i in glob):" + NL
+        + "        return []",
+        "    if False:" + NL
+        + "        return []"),
+    "測資:算不出來的全域條件當成立": (S,
+        '    glob = [c["id"] for c in conds' + NL
+        + '            if str(c.get("branch", "") or "") == GLOBAL_BRANCH]' + NL
+        + "    if not all(actual.get(i) is True for i in glob):",
+        '    glob = [c["id"] for c in conds' + NL
+        + '            if str(c.get("branch", "") or "") == GLOBAL_BRANCH]' + NL
+        + "    if not all(actual.get(i) is not False for i in glob):"),
     "測資:其他分支整個成立時不算有效驗證": (S,
         "                        r[\"label_ok\"] = False" + NL
         + "                        r.setdefault(\"label_mismatch\", []).extend(",
