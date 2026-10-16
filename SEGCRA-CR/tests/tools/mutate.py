@@ -1729,5 +1729,70 @@ MUTANTS.update({
 })
 
 
+# ---- 主審查的輸出被截斷(#26 第 1 點)
+# 失效是靜默的:被切斷的 JSON 會被修補成合法物件,報告只是比較短。
+P = "pipeline.py"
+MUTANTS.update({
+    "截斷:主審查不把 meta 傳給 run_agent": (P,
+        "                              meta=output_meta)",
+        "                              )"),
+    "截斷:不理會 finish_reason": (P,
+        '    if meta.get("finish_reason") == "length":' + NL + "        return True" + NL
+        + '    used = meta.get("completion_tokens")',
+        '    used = meta.get("completion_tokens")'),
+    "截斷:不看用量是否達到上限": (P,
+        "            and 0 < max_output_tokens <= used)",
+        "            and False)"),
+    "截斷:用量要超過上限才算(剛好等於不算)": (P,
+        "            and 0 < max_output_tokens <= used)",
+        "            and 0 < max_output_tokens < used)"),
+    "截斷:上限沒設定時也拿用量來判斷": (P,
+        "            and 0 < max_output_tokens <= used)",
+        "            and max_output_tokens <= used)"),
+    "截斷:布林值當成用量": (P,
+        "    return isinstance(value, int) and not isinstance(value, bool)",
+        "    return isinstance(value, int)"),
+    "截斷:解析不出來時照舊中斷審查": (P,
+        "    if not report and _output_truncated(meta, max_output_tokens):",
+        "    if False:"),
+    "截斷:沒有截斷的解析失敗也用空報告帶過": (P,
+        "    if not report and _output_truncated(meta, max_output_tokens):",
+        "    if not report:"),
+    "截斷:不補 major": (P,
+        "        report = enforce_truncation(report, output_meta, profile.max_output_tokens)  # 輸出被截斷" + NL,
+        ""),
+    "截斷:一律補 major(沒有截斷也補)": (P,
+        "    if not _output_truncated(meta, max_output_tokens):" + NL + "        return report" + NL
+        + "    limit = f",
+        "    limit = f"),
+    "截斷:補成 minor(擋不住自動放行)": (P,
+        '"severity": "major", "title": _TRUNCATED_TITLE,',
+        '"severity": "minor", "title": _TRUNCATED_TITLE,'),
+    "截斷:同標題已存在就不補(模型可以關掉)": (P,
+        '    _put_program_finding(report, {' + NL
+        + '        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _TRUNCATED_TITLE,',
+        '    report.setdefault("findings", []).append({' + NL
+        + '        "file": "(MR 內容)", "line": 0, "severity": "info", "title": _TRUNCATED_TITLE,'),
+    "截斷:說明裡回顯端點回報的字串": (P,
+        'f"審查模型的輸出達到長度上限{limit}而被切斷,',
+        'f"審查模型的輸出達到長度上限{limit}{meta.get(\'finish_reason\')}而被切斷,'),
+    "截斷:報告不記稽核紀錄": (P,
+        '    report["_output_meta"] = _output_meta_record(meta, max_output_tokens)' + NL,
+        ""),
+    "截斷:模型自己輸出的稽核紀錄不蓋掉": (P,
+        '    report["_output_meta"] = _output_meta_record(meta, max_output_tokens)',
+        '    report.setdefault("_output_meta", _output_meta_record(meta, max_output_tokens))'),
+    "截斷:端點回的結束原因原樣寫進報告": (P,
+        '                          else reason if isinstance(reason, str) and reason in _KNOWN_FINISH',
+        '                          else reason if isinstance(reason, str)'),
+    "截斷:稽核紀錄的用量不檢查型別": (P,
+        '        "completion_tokens": used if _is_count(used) else None,',
+        '        "completion_tokens": used,'),
+    "截斷:capture 不記 finish_reason": (P,
+        '            capture["output_meta"] = dict(output_meta)' + NL,
+        ""),
+})
+
+
 if __name__ == "__main__":
     sys.exit(main())
