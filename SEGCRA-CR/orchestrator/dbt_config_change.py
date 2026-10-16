@@ -5,25 +5,35 @@
 每次全量重建、歷史資料被覆蓋;拿掉 unique_key,重跑同一天會重複寫入。同一組設定也可以寫在
 dbt_project.yml(`+materialized:`)或屬性檔的 `config:` 底下,效果相同,一起檢查。
 
+哪些檔案算 dbt 的檔案,看**位置**不看檔名或內容:呼叫端給 relative(路徑 → 相對 dbt 專案根目錄
+的路徑,依 dbt_project.yml 的目錄設定;見 pipeline._dbt_relative)。說明文件裡的範例
+dbt_project.yml、頂層剛好有 models: 的 CI 設定、一般 SQL 範本裡的 config( 都不算。
+
 做法:用變更後的完整內容加上 diff,反推出變更前的內容,再把前後兩份的設定逐項比較。
   * model / macro 的 .sql:比較每個 config( 呼叫的參數(引號、空白、換行不同不算改);
     看不懂的寫法(`**` 展開、樣板運算)退回比較原文,有差異就算「看不出改了什麼」;
-    config.set(...) 有變更、參數用到的變數在同一個檔案裡的 {% set %} 那一行被改到,也算
-    「看不出改了什麼」
-  * dbt_project.yml、屬性檔:看改到的那幾行位在哪個設定鍵底下(依縮排判斷)。只看
-    models / snapshots / seeds 底下,欄位(columns)與測試底下的不算
+    config.set(...) 有變更(跨行的整段一起比)、改到的行落在跨行的 {% set %} 裡、或參數用到的
+    變數在同一個檔案裡的 {% set %} 那一行被改到,也算「看不出改了什麼」
+  * dbt_project.yml、屬性檔:看改到的那幾行位在哪個設定鍵底下(依縮排判斷;跨行的字串算它
+    所屬的鍵)。只看 models / snapshots / seeds 底下:受關注的設定、config 底下或 + 開頭的
+    其他設定分開列;欄位、測試、說明不算;其餘對不到已知鍵的行算「看不出改了什麼」。
+    用 tab 縮排(YAML 不允許,無法判斷層級)、或檔案裡有別名 / merge key(`*名稱`、`<<:`,
+    改到的值可能被別處引用)時,改到的行也算「看不出改了什麼」
   * 反推不出來時(diff 與完整內容對不上、沒有完整內容),只用 diff 裡看得到的內容判斷:
     config( 不在 diff 的範圍內就看不到——寧可多報,這種情況下改到的行出現受關注的設定名稱
     也算「看不出改了什麼」
-新增、刪除整個檔案不算(不是「改了設定」)。
+  * 新增整個檔案:列出它設定的受關注項目(added);刪除整個檔案:記下來(deleted)。
+    嚴重度由呼叫端決定(見 pipeline.enforce_dbt_config_change)
 
-輸出只有設定名稱(固定清單)與行號,不含設定值:值是 MR 作者寫的文字,會被貼回 MR 留言。
-純文字處理,不執行樣板、不載入 YAML、不丟例外。
+輸出只有設定名稱(固定清單)、行號與例外的類型名稱,不含設定值:值是 MR 作者寫的文字,會被
+貼回 MR 留言。純文字處理,不執行樣板、不載入 YAML;處理中出錯時記成「看不出改了什麼」。
 """
 import ast
 import re
 from dataclasses import dataclass
 
+from .dbt_impact import normalize_path
+from .dbt_project import DEFAULT_LAYOUT, LAYOUT_ROOT_FILES
 from .dbt_relations import _CONFIG_SET, _config_bodies
 from .dbt_render import is_dbt_template
 
@@ -31,11 +41,18 @@ from .dbt_render import is_dbt_template
 WATCHED = ("tags", "enabled", "materialized", "full_refresh", "on_schema_change",
            "unique_key", "incremental_strategy", "incremental_predicates",
            "pre_hook", "post_hook", "alias", "schema", "database")
+# 新增的檔案設定了這些時,不只是列出來:全量重建與 hook 裡的 SQL 都不在展開結果裡
+HIGH_RISK_NEW = ("full_refresh", "pre_hook", "post_hook")
 # 沒有完整內容、只看 diff 的行時,出現這些名稱就算可能改到設定。tags、enabled、alias、
 # schema、database 太常出現在一般 SQL(欄位名稱、WHERE enabled = 1),不列入
 _SNIPPET_KEY = re.compile(
     r"(?<![@\w.])(materialized|full_refresh|on_schema_change|unique_key|incremental_strategy"
     r"|incremental_predicates|pre_hook|post_hook)\s*=")
+# 同一組名稱寫成字串(字典的鍵、config.set 的參數):只看得到 diff 時,出現在 diff 的任何一行
+# (含上下文)就算可能改到設定——跨行的 {% set %}、config.set( 的開頭可能不在 diff 的範圍內
+_SNIPPET_QUOTED = re.compile(
+    r"""['"](materialized|full_refresh|on_schema_change|unique_key|incremental_strategy"""
+    r"""|incremental_predicates|pre_hook|post_hook|pre-hook|post-hook)['"]""")
 _CONFIG_WORD = re.compile(r"\bconfig\b")
 # config( 參數裡引用的變數名稱:去掉字串後的識別字,但不含參數名稱(後面接 =)、函式名稱
 # (後面接 ()、屬性(前面是 .)
@@ -43,73 +60,118 @@ _STRING = re.compile(r"""'[^'\\\n]*'|"[^"\\\n]*\"""")
 _NAME = re.compile(r"(?<![\w.])([A-Za-z_]\w*)\b(?!\s*=(?!=))(?!\s*\()")
 _NOT_NAMES = frozenset({"true", "false", "none", "True", "False", "None", "if", "else", "and",
                         "or", "not", "in", "is"})
+_SET_START = re.compile(r"\{%-?\s*set\s+[A-Za-z_]\w*")
+_ENDSET = re.compile(r"\{%-?\s*endset\b")
 _HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-_SQL_SUFFIX = ".sql"
+_SQL_SUFFIX = ".sql"                    # 跟 dbt 一樣分大小寫(dbt_context、dbt_impact 也是)
 _YAML_SUFFIXES = (".yml", ".yaml")
-_PROJECT_FILES = ("dbt_project.yml", "dbt_project.yaml")
 _CONFIG_ROOTS = ("models", "snapshots", "seeds")
 _NOT_CONFIG = ("columns", "tests", "data_tests")
-_ROOT_LINE = re.compile(r"(?m)^(?:models|snapshots|seeds)\s*:")
+# 不影響執行的鍵:改了不報
+_INERT = ("description", "docs")
+# 只看得到 diff 的行時,行的上層看不到;這些鍵在那種情況下也當成不影響執行
+_INERT_SNIPPET = _INERT + ("name",)
 # YAML 的「鍵:」行:縮排、清單的 -、鍵(可帶引號、+ 前綴)、冒號後的值
 _YAML_KEY = re.compile(
     r"""^(?P<ind>[ ]*)(?P<dash>(?:-[ ]+)*)(?P<key>[+\w.\-]+|'[^'\n]*'|"[^"\n]*")[ ]*:(?:[ ]+(?P<val>.*))?$""")
 _YAML_DASH = re.compile(r"^(?P<ind>[ ]*)-(?:[ ]|$)")
+# 別名與 merge key:改到的值可能被別處引用
+_YAML_ALIAS = re.compile(r"(?:^|[\s\[{,:-])\*[A-Za-z0-9_\-]|<<[ ]*:")
 # 超過就不反推、不解析(只看 diff 的行):真實的 model 與設定檔遠小於此
 MAX_TEXT_CHARS = 500_000
+# 跨行的 config.set( / {% set %} 最多往下找幾行(找不到結尾就算到這裡)
+MAX_SPAN_LINES = 200
 
 
 @dataclass(frozen=True)
 class ConfigChange:
     path: str
-    keys: tuple[str, ...] = ()      # 改到的受關注設定(WATCHED 裡的名稱)
+    keys: tuple[str, ...] = ()      # 改到的受關注設定(WATCHED 裡的名稱);新增的檔案是它設定的
     other: bool = False             # 改到其他設定
     unknown: bool = False           # 有改到設定的跡象,但看不出改了什麼
-    line: int = 0                   # 變更後第一個 config( 的行號;0 = 不知道
+    line: int = 0                   # 變更後的行號(.sql 是第一個 config(,yml 是第一個改到的設定);0 = 不知道
+    added: bool = False             # 新增整個檔案
+    deleted: bool = False           # 刪除整個檔案
+    error: str | None = None        # 處理中出錯時,例外的類型名稱
 
 
-def config_changes(files, head_text=None) -> list[ConfigChange]:
+def default_relative(path, prefix: str = "") -> str | None:
+    """不知道專案的目錄設定時:專案在 prefix(空字串 = repo 根目錄)、目錄是 dbt 的預設值。"""
+    path = normalize_path(path)
+    if path is None:
+        return None
+    if prefix:
+        if not path.startswith(prefix + "/"):
+            return None
+        path = path[len(prefix) + 1:]
+    return path if DEFAULT_LAYOUT.contains(path) else None
+
+
+def is_dbt_yaml(rel: str) -> bool:
+    """dbt 會讀設定的 yml(相對專案根目錄的路徑,已確定在 dbt 的目錄裡):dbt_project.yml 與
+    各目錄裡的屬性檔。packages.yml、selectors.yml 這類根目錄的其他檔案不是(不在這裡比較)。"""
+    return rel.endswith(_YAML_SUFFIXES) and (rel == "dbt_project.yml" or rel not in LAYOUT_ROOT_FILES)
+
+
+def config_changes(files, head_text=None, relative=None) -> list[ConfigChange]:
     """MR 的變更檔裡,改到 dbt 設定的那些(沒改到的不列)。
 
     head_text  路徑 → 變更後完整內容的函式(dbt_context.DbtContext.head_text);沒給、或回
                None 時用檔案自己的 full_content
+    relative   路徑 → 相對 dbt 專案根目錄的路徑;不是 dbt 會讀的檔回 None。沒給時用
+               default_relative(專案在 repo 根目錄、dbt 的預設目錄)
     """
+    relative = relative or default_relative
     found = []
     for f in files if isinstance(files, list) else []:
         if not isinstance(f, dict) or not isinstance(f.get("path"), str):
             continue
         try:
-            change = _file_change(f, head_text)
-        except Exception:                   # noqa: BLE001 — 看不懂就當成「看不出改了什麼」
-            change = ConfigChange(f["path"], unknown=True)
+            change = _file_change(f, head_text, relative)
+        except Exception as e:              # noqa: BLE001 — 看不懂就當成「看不出改了什麼」
+            change = ConfigChange(f["path"], unknown=True, error=type(e).__name__)
         if change is not None:
             found.append(change)
     return found
 
 
-def _file_change(f: dict, head_text) -> ConfigChange | None:
+@dataclass
+class _Sides:
+    """變更前後的內容。changed 是改到的行(從 0 起算);new_no 是變更後每一行的實際行號,
+    old_at 是變更前每一行在變更後的位置(被刪掉的行:刪除處的行號)。"""
+    old: list
+    new: list
+    old_changed: set
+    new_changed: set
+    new_no: list
+    old_at: list
+
+
+def _file_change(f: dict, head_text, relative) -> ConfigChange | None:
     path = f["path"]
-    name = path.replace("\\", "/").lower()
-    is_sql, is_yaml = name.endswith(_SQL_SUFFIX), name.endswith(_YAML_SUFFIXES)
+    rel = relative(path)
+    if rel is None:
+        return None
+    is_sql, is_yaml = rel.endswith(_SQL_SUFFIX), is_dbt_yaml(rel)
     if not (is_sql or is_yaml):
         return None
     hunks = _parse_hunks(f.get("diff"))
-    if not hunks or _whole_file(hunks):
+    if not hunks:
         return None
     new_text = head_text(path) if head_text is not None else None
     if not isinstance(new_text, str):
         new_text = f.get("full_content")
+    if _whole_file(hunks):
+        return _whole_file_change(path, is_sql, hunks, new_text)
     sides = None
     if isinstance(new_text, str) and len(new_text) <= MAX_TEXT_CHARS:
         sides = _reverse(new_text, hunks)
     full = sides is not None
     if not full:
         sides = _snippets(hunks)
-    old_lines, new_lines, old_changed, new_changed = sides
     if is_sql:
-        return _sql_change(path, old_lines, new_lines, old_changed, new_changed, full)
-    in_project = head_text is not None and head_text(path) is not None
-    return _yaml_change(path, old_lines, new_lines, old_changed, new_changed, full,
-                        in_project or name.rsplit("/", 1)[-1] in _PROJECT_FILES)
+        return _sql_change(path, sides, full)
+    return _yaml_change(path, sides, full)
 
 
 # ─────────────────── diff ───────────────────
@@ -155,21 +217,21 @@ def _whole_file(hunks) -> bool:
 
 
 def _reverse(new_text: str, hunks):
-    """用變更後的完整內容與 diff 反推變更前的內容。
-    回傳 (變更前的行, 變更後的行, 變更前被刪的行號集合, 變更後新增的行號集合)(從 0 起算);
-    diff 的內文與完整內容對不上時回 None。"""
+    """用變更後的完整內容與 diff 反推變更前的內容;diff 的內文與完整內容對不上時回 None。"""
     new_lines = [ln.rstrip("\r") for ln in new_text.split("\n")]
-    old, old_changed, new_changed, i = [], set(), set(), 0
+    old, old_at, old_changed, new_changed, i = [], [], set(), set(), 0
     for _, _, new_start, new_count, body in hunks:
         start = new_start if new_count == 0 else new_start - 1
         if start < i or start > len(new_lines):
             return None
         old.extend(new_lines[i:start])
+        old_at.extend(range(i + 1, start + 1))
         i = start
         for tag, text in body:
             if tag == "-":
                 old_changed.add(len(old))
                 old.append(text)
+                old_at.append(i + 1)
                 continue
             if i >= len(new_lines) or new_lines[i] != text:
                 return None
@@ -177,34 +239,96 @@ def _reverse(new_text: str, hunks):
                 new_changed.add(i)
             else:
                 old.append(text)
+                old_at.append(i + 1)
             i += 1
     old.extend(new_lines[i:])
-    return old, new_lines, old_changed, new_changed
+    old_at.extend(range(i + 1, len(new_lines) + 1))
+    return _Sides(old, new_lines, old_changed, new_changed,
+                  list(range(1, len(new_lines) + 1)), old_at)
 
 
 def _snippets(hunks):
-    """沒有完整內容時:只用 diff 看得到的行拼成前後兩份(每段之間空一行)。"""
-    old, new, old_changed, new_changed = [], [], set(), set()
-    for *_, body in hunks:
-        if old or new:
-            old.append("")
-            new.append("")
+    """沒有完整內容時:只用 diff 看得到的行拼成前後兩份(每段之間空一行,行號記 0)。"""
+    s = _Sides([], [], set(), set(), [], [])
+    for _, _, new_start, _, body in hunks:
+        if s.old or s.new:
+            s.old.append("")
+            s.old_at.append(0)
+            s.new.append("")
+            s.new_no.append(0)
+        no = new_start
         for tag, text in body:
             if tag == "-":
-                old_changed.add(len(old))
+                s.old_changed.add(len(s.old))
             elif tag == "+":
-                new_changed.add(len(new))
+                s.new_changed.add(len(s.new))
             if tag != "+":
-                old.append(text)
+                s.old.append(text)
+                s.old_at.append(no)
             if tag != "-":
-                new.append(text)
-    return old, new, old_changed, new_changed
+                s.new.append(text)
+                s.new_no.append(no)
+                no += 1
+    return s
+
+
+def _first_changed_line(sides: _Sides, counted_new, counted_old) -> int:
+    """算進去的改動裡,變更後最前面的行號;只有刪除時是刪除處。0 = 不知道。"""
+    numbers = [sides.new_no[i] for i in counted_new] + [sides.old_at[i] for i in counted_old]
+    numbers = [n for n in numbers if n > 0]
+    return min(numbers) if numbers else 0
+
+
+# ─────────────────── 新增 / 刪除整個檔案 ───────────────────
+
+def _whole_file_change(path, is_sql, hunks, new_text) -> ConfigChange | None:
+    """刪除整個檔案:記下來(呼叫端給 info)。新增整個檔案:列出它設定的受關注項目。"""
+    if hunks[0][3] == 0:
+        return ConfigChange(path, deleted=True)
+    if not (isinstance(new_text, str) and new_text and len(new_text) <= MAX_TEXT_CHARS):
+        new_text = "\n".join(text for tag, text in hunks[0][4] if tag == "+")
+    lines = new_text.split("\n")
+    if is_sql:
+        if not (is_dbt_template(new_text) and _CONFIG_WORD.search(new_text)):
+            return None
+        values = _config_values(new_text)
+        unknown = values is None or bool(_config_set_spans(lines))
+        keys = () if values is None else tuple(k for k in WATCHED if k in values)
+        other = values is not None and bool(set(values) - set(WATCHED))
+        line = _first_config_line(lines)
+    else:
+        keys, other, unknown, counted = set(), False, _tab_indented(lines), []
+        aliases = bool(_YAML_ALIAS.search(new_text))
+        for idx, chain in enumerate(_yaml_chains(lines)):
+            kind = _yaml_line(chain, lines[idx], True)
+            if kind is None:
+                if aliases and chain and not _inert(chain, True):
+                    unknown = True           # 設定的值可能來自別名,看不出設定了什麼
+                continue
+            # 寫成一行 { } 的設定(config: {tags: [...]})逐項列出
+            flow = {k for k, _ in _flow_pairs(lines[idx])} if "{" in lines[idx] else set()
+            if flow & set(WATCHED):
+                counted.append(idx)
+                keys |= flow & set(WATCHED)
+            # 新檔沒有「改之前」可以比:只列有值的設定;models:、config:、- name: 這類結構行不算
+            if kind == "unknown" or _container(lines[idx]):
+                continue
+            counted.append(idx)
+            if kind == "other":
+                other = True
+            else:
+                keys.add(kind)
+        keys = tuple(k for k in WATCHED if k in keys)
+        line = counted[0] + 1 if counted else 0
+    if not (keys or other or unknown):
+        return None
+    return ConfigChange(path, keys=keys, other=other, unknown=unknown, line=line, added=True)
 
 
 # ─────────────────── model / macro 的 .sql ───────────────────
 
-def _sql_change(path, old_lines, new_lines, old_changed, new_changed, full) -> ConfigChange | None:
-    old_text, new_text = "\n".join(old_lines), "\n".join(new_lines)
+def _sql_change(path, sides: _Sides, full) -> ConfigChange | None:
+    old_text, new_text = "\n".join(sides.old), "\n".join(sides.new)
     marked = is_dbt_template(old_text) or is_dbt_template(new_text)
     if not full:
         # 只看得到 diff 的幾行:config( 的開頭可能不在裡面,結尾的 }} 也算樣板的跡象
@@ -214,9 +338,14 @@ def _sql_change(path, old_lines, new_lines, old_changed, new_changed, full) -> C
     if full and not (_CONFIG_WORD.search(old_text) or _CONFIG_WORD.search(new_text)):
         return None
     keys, other, unknown = _compare_configs(old_text, new_text)
-    if _config_sets(old_text) != _config_sets(new_text):
+    if _span_texts(sides.old, _config_set_spans(sides.old)) != \
+            _span_texts(sides.new, _config_set_spans(sides.new)):
         unknown = True
-    changed = [old_lines[i] for i in old_changed] + [new_lines[i] for i in new_changed]
+    # 改到的行落在跨行的 {% set %} 裡:那個變數可能被 config 用到,看不出改了什麼
+    if _in_spans(sides.old_changed, _set_spans(sides.old)) or \
+            _in_spans(sides.new_changed, _set_spans(sides.new)):
+        unknown = True
+    changed = [sides.old[i] for i in sides.old_changed] + [sides.new[i] for i in sides.new_changed]
     names = _config_names(old_text) | _config_names(new_text)
     if names and not unknown:
         # 參數用的是同一個檔案裡 {% set %} 的變數:改到 set 那一行,設定就可能變了
@@ -225,12 +354,15 @@ def _sql_change(path, old_lines, new_lines, old_changed, new_changed, full) -> C
         unknown = any(set_line.search(line) for line in changed)
     if not full and not (keys or other or unknown) and not (_config_bodies(old_text)
                                                              and _config_bodies(new_text)):
-        # diff 裡看不到完整的 config( 呼叫:改到的行可能落在它裡面
-        unknown = any(map(_SNIPPET_KEY.search, changed))
+        # diff 裡看不到完整的 config( 呼叫:改到的行可能落在它裡面;跨行的 {% set %} 與
+        # config.set( 的開頭也可能不在 diff 裡,只看得到中間的字典鍵或參數
+        unknown = (any(map(_SNIPPET_KEY.search, changed))
+                   or any(map(_SNIPPET_QUOTED.search, sides.old + sides.new)))
     if not (keys or other or unknown):
         return None
-    return ConfigChange(path, keys=keys, other=other, unknown=unknown,
-                        line=_first_config_line(new_lines) if full else 0)
+    line = (_first_config_line(sides.new) if full
+            else _first_changed_line(sides, sides.new_changed, sides.old_changed))
+    return ConfigChange(path, keys=keys, other=other, unknown=unknown, line=line)
 
 
 def _compare_configs(old_text: str, new_text: str):
@@ -279,9 +411,69 @@ def _config_names(text: str) -> set[str]:
     return {n for body in bodies for n in _NAME.findall(_STRING.sub("''", body))} - _NOT_NAMES
 
 
-def _config_sets(text: str) -> list[str]:
-    """config.set(...) 等寫法所在的那幾行(去掉空白),比較前後有沒有變。"""
-    return [_squash(line) for line in text.split("\n") if _CONFIG_SET.search(line)]
+def _config_set_spans(lines) -> list[tuple[int, int]]:
+    """config.set(...) 等寫法所在的行範圍(含頭尾):從那一行往下數括號,到括號全部關上為止
+    (跨行的整段;找不到結尾就算到 MAX_SPAN_LINES 行)。"""
+    spans, i = [], 0
+    while i < len(lines):
+        m = _CONFIG_SET.search(lines[i])
+        if not m:
+            i += 1
+            continue
+        depth, end, opened = 0, None, False
+        for j in range(i, min(len(lines), i + MAX_SPAN_LINES)):
+            text = lines[j][m.end():] if j == i else lines[j]
+            for ch in text:
+                if ch == "(":
+                    depth, opened = depth + 1, True
+                elif ch == ")":
+                    depth -= 1
+            if (opened and depth <= 0) or (not opened and ("}}" in text or "%}" in text)):
+                end = j
+                break
+        end = min(len(lines), i + MAX_SPAN_LINES) - 1 if end is None else end
+        spans.append((i, end))
+        i = end + 1
+    return spans
+
+
+def _set_spans(lines) -> list[tuple[int, int]]:
+    """跨行的 {% set %}:`{% set x = ... %}` 到 %} 為止;`{% set x %}...{% endset %}` 到
+    endset 為止。只回傳跨了兩行以上的(單行的由 _sql_change 依變數名稱判斷)。"""
+    spans, i = [], 0
+    while i < len(lines):
+        m = _SET_START.search(lines[i])
+        if not m:
+            i += 1
+            continue
+        rest = lines[i][m.end():]
+        block = not rest.lstrip().startswith("=")
+        end = None
+        for j in range(i, min(len(lines), i + MAX_SPAN_LINES)):
+            text = rest if j == i else lines[j]
+            if (block and _ENDSET.search(text)) or (not block and "%}" in text):
+                end = j
+                break
+        end = min(len(lines), i + MAX_SPAN_LINES) - 1 if end is None else end
+        if end > i:
+            spans.append((i, end))
+        i = end + 1
+    return spans
+
+
+def _span_texts(lines, spans) -> list[str]:
+    return [_squash("".join(lines[a:b + 1])) for a, b in spans]
+
+
+def _in_spans(indexes, spans) -> bool:
+    """indexes 裡有沒有任何一行落在 spans 裡。先標出每一行在不在範圍內再查(行數與範圍數都由
+    MR 決定,兩兩比對會是平方時間)。"""
+    if not indexes or not spans:
+        return False
+    inside = bytearray(max(b for _, b in spans) + 1)
+    for a, b in spans:
+        inside[a:b + 1] = b"\x01" * (b - a + 1)
+    return any(i < len(inside) and inside[i] for i in indexes)
 
 
 def _first_config_line(lines) -> int:
@@ -301,41 +493,75 @@ def _norm_key(key: str) -> str:
 
 # ─────────────────── dbt_project.yml 與屬性檔 ───────────────────
 
-def _yaml_change(path, old_lines, new_lines, old_changed, new_changed, full,
-                 known_dbt) -> ConfigChange | None:
-    if not known_dbt and not (_ROOT_LINE.search("\n".join(old_lines))
-                              or _ROOT_LINE.search("\n".join(new_lines))):
+def _inert(chain, full) -> bool:
+    inert = _INERT if full else _INERT_SNIPPET
+    return any(k in _NOT_CONFIG or k in inert for k in chain)
+
+
+def _yaml_line(chain, line: str, full) -> str | None:
+    """一行改動算什麼:受關注設定的名稱、"other"(其他設定)、"unknown"(看不出改了什麼),
+    或 None(不算:空行、註解、models / snapshots / seeds 以外、欄位、測試、說明)。"""
+    if not chain:
         return None
-    keys, other = set(), False
+    if full and chain[0] not in _CONFIG_ROOTS:
+        return None
+    if _inert(chain, full):
+        return None
+    # 最靠近這一行的受關注鍵(hook 底下的清單、跨行的字串都算那個 hook)
+    hit = next((k for k in reversed(chain) if k in WATCHED), None)
+    if hit is not None:
+        return hit
+    if "config" in chain or "meta" in chain or _plus_key(line):
+        return "other"
+    return "unknown"
+
+
+def _tab_indented(lines) -> bool:
+    return any("\t" in ln[:len(ln) - len(ln.lstrip())] for ln in lines)
+
+
+def _yaml_change(path, sides: _Sides, full) -> ConfigChange | None:
+    keys, other, unknown = set(), False, False
+    counted = ([], [])                       # 算進去的改動:(變更前的行, 變更後的行)
+    aliases = bool(_YAML_ALIAS.search("\n".join(sides.old))
+                   or _YAML_ALIAS.search("\n".join(sides.new)))
     flow = ([], [])                          # 寫成一行 { } 的設定:(變更前, 變更後) 的「鍵, 值」
-    for side, (lines, changed) in enumerate(((old_lines, old_changed), (new_lines, new_changed))):
+    for side, (lines, changed) in enumerate(((sides.old, sides.old_changed),
+                                            (sides.new, sides.new_changed))):
+        tabbed = [i for i in sorted(changed) if _tab_indented([lines[i]])]
+        if tabbed:
+            unknown = True                   # YAML 不允許 tab 縮排,層級無法判斷
+            counted[side].append(tabbed[0])
         chains = _yaml_chains(lines)
         for idx in sorted(changed):
             chain = chains[idx]
-            if chain is None:
+            kind = _yaml_line(chain, lines[idx], full)
+            if kind is None:
+                if aliases and chain and not _inert(chain, full):
+                    unknown = True           # 改到的值可能被別名引用到 models 底下
+                    counted[side].append(idx)
                 continue
-            if full and (not chain or chain[0] not in _CONFIG_ROOTS):
-                continue
-            if any(k in _NOT_CONFIG for k in chain):
-                continue
-            # 只看這一行自己的鍵(清單項目、跨行的值則是它所屬的鍵);再往上是資料夾、model
-            # 名稱,不是設定。同一行用 { } 寫了好幾個設定時,前後逐項比較(見下方)
+            counted[side].append(idx)
+            # 同一行用 { } 寫了好幾個設定時,前後逐項比較(見下方)
             if "{" in lines[idx]:
                 flow[side].extend(_flow_pairs(lines[idx]))
-                if chain and chain[-1] != "config":      # 這一行自己的鍵(config 只是外層)
+                if chain[-1] != "config":                # 這一行自己的鍵(config 只是外層)
                     flow[side].append((chain[-1], _squash(lines[idx])))
                 continue
-            hit = {chain[-1]} & set(WATCHED) if chain else set()
-            keys |= hit
-            if not hit and ("config" in chain or _plus_key(lines[idx])):
+            if kind == "other":
                 other = True
+            elif kind == "unknown":
+                unknown = True
+            else:
+                keys.add(kind)
     if sorted(flow[0]) != sorted(flow[1]):
         diff = {k for k, _ in set(flow[0]) ^ set(flow[1])} or {k for k, _ in flow[0] + flow[1]}
         keys |= diff & set(WATCHED)
         other = other or bool(diff - set(WATCHED))
-    if not (keys or other):
+    if not (keys or other or unknown):
         return None
-    return ConfigChange(path, keys=tuple(k for k in WATCHED if k in keys), other=other)
+    return ConfigChange(path, keys=tuple(k for k in WATCHED if k in keys), other=other,
+                        unknown=unknown, line=_first_changed_line(sides, counted[1], counted[0]))
 
 
 def _flow_pairs(line: str) -> list[tuple[str, str]]:
@@ -363,13 +589,20 @@ def _flow_pairs(line: str) -> list[tuple[str, str]]:
     return pairs
 
 
+def _container(line: str) -> bool:
+    """「鍵:」後面沒有值(底下才是內容)的行。"""
+    m = _YAML_KEY.match(line)
+    return bool(m) and re.sub(r"(^|\s)#.*$", "", m["val"] or "").strip() == ""
+
+
 def _plus_key(line: str) -> bool:
     m = _YAML_KEY.match(line)
     return bool(m) and m["key"].startswith("+")
 
 
 def _yaml_chains(lines) -> list:
-    """每一行所在的鍵路徑(從最外層開始,寫法統一過);空行、註解、位在多行字串裡的行是 None。
+    """每一行所在的鍵路徑(從最外層開始,寫法統一過);空行、註解是 None。跨行的字串(上一層的
+    鍵已經有值,例如 `+post-hook: |` 底下)算它所屬的那個鍵。
     只依縮排判斷,不載入 YAML。一次走完(堆疊放還沒結束的上層鍵):逐行往上找會是平方時間,
     特製的大檔案可以拖住審查。"""
     chains, stack = [], []              # stack:(鍵所在的欄、鍵、能不能接下一層)
@@ -388,7 +621,7 @@ def _yaml_chains(lines) -> list:
         while stack and not (stack[-1][0] < limit or (stack[-1][0] == limit and same_ok)):
             stack.pop()
         if stack and not stack[-1][2]:
-            chains.append(None)             # 上一層的鍵已經有值:這行是多行字串的一部分
+            chains.append([key for _, key, _ in stack])    # 上一層的鍵已經有值:跨行的字串
             continue
         chain = [key for _, key, _ in stack]
         if m:

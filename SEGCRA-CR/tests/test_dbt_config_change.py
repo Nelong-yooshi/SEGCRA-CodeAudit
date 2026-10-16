@@ -186,7 +186,7 @@ def test_macro裡的config也算():
 
 def test_沒有樣板標記的SQL_不算():
     old = "SELECT dbo.config(materialized) FROM t;\n"
-    assert _changes("sql/a.sql", old, old.replace("materialized", "unique_key")) == []
+    assert _changes("models/a.sql", old, old.replace("materialized", "unique_key")) == []
 
 
 def test_行號是變更後第一個config的位置():
@@ -195,9 +195,16 @@ def test_行號是變更後第一個config的位置():
     assert [c.line for c in found] == [3]
 
 
-def test_新增或刪除整個檔案_不算():
-    assert _changes("models/m.sql", "", MODEL) == []
-    assert _changes("models/m.sql", MODEL, "") == []
+def test_新增的model_列出它設定的受關注項目():
+    [c] = _changes("models/m.sql", "", MODEL)
+    assert (c.added, c.keys, c.other, c.unknown, c.line) == (True, ("tags", "materialized", "unique_key"),
+                                                           False, False, 1)
+
+
+def test_新增的model沒有config_或刪除檔案():
+    assert _changes("models/m.sql", "", "select 1\n") == []
+    [c] = _changes("models/m.sql", MODEL, "")
+    assert c.deleted and not (c.keys or c.unknown)
 
 
 # ─────────────────── 沒有完整內容、diff 對不上 ───────────────────
@@ -235,7 +242,7 @@ def test_只有diff_改到一般SQL的行_不算():
 def test_diff與完整內容對不上_退回只看diff():
     f = _file("models/mrt_sample.sql", MODEL, MODEL.replace("'incremental'", "'table'"))
     f["full_content"] = "完全不同的內容\n" * 30
-    assert [(c.keys, c.line) for c in config_changes([f])] == [(("materialized",), 0)]
+    assert [(c.keys, c.line) for c in config_changes([f])] == [(("materialized",), 2)]
 
 
 def test_有取回的完整內容時_優先用它():
@@ -248,7 +255,7 @@ def test_有取回的完整內容時_優先用它():
 def test_內容太大_不反推_只看diff(monkeypatch):
     monkeypatch.setattr(dbt_config_change, "MAX_TEXT_CHARS", 10)
     found = _changes("models/mrt_sample.sql", MODEL, MODEL.replace("'incremental'", "'table'"))
-    assert [(c.keys, c.line) for c in found] == [(("materialized",), 0)]
+    assert [(c.keys, c.line) for c in found] == [(("materialized",), 2)]
 
 
 @pytest.mark.parametrize("diff", [None, "", "(generated)", "@@ 壞掉 @@\n+x", "@@ -1,5 +1,5 @@\n+x\n"])
@@ -277,7 +284,8 @@ def test_處理中出錯_算看不出改了什麼(monkeypatch):
     def boom(*a):
         raise RecursionError
     monkeypatch.setattr(dbt_config_change, "_file_change", boom)
-    assert config_changes([{"path": "models/m.sql"}]) == [ConfigChange("models/m.sql", unknown=True)]
+    assert config_changes([{"path": "models/m.sql"}]) == [
+        ConfigChange("models/m.sql", unknown=True, error="RecursionError")]
 
 
 def test_輸入不是清單或缺路徑_不出錯():
@@ -342,7 +350,7 @@ def test_不是dbt的yml_不算(full):
 def test_在dbt專案裡的yml_沒有models區段也看():
     """取回的專案裡的檔案(head_text 有內容)就是 dbt 的檔案,不必靠內容判斷。"""
     old = "snapshots:\n  sample:\n    +tags: ['daily']\n"
-    f = _file("snapshot_props.yml", old, old.replace("'daily'", "'weekly'"), full=False)
+    f = _file("snapshots/snapshot_props.yml", old, old.replace("'daily'", "'weekly'"), full=False)
     head = old.replace("'daily'", "'weekly'")
     assert [c.keys for c in config_changes([f], head_text=lambda p: head)] == [("tags",)]
 
@@ -426,6 +434,8 @@ def test_模型輸出同標題的info_蓋不掉major():
 def test_用取回的dbt專案內容比較():
     """真實 GitLab 模式的檔案沒有 full_content,完整內容來自取回的 dbt 專案。"""
     class _Ctx:
+        layout, prefix = None, ""
+
         @staticmethod
         def head_text(path):
             return new
@@ -484,3 +494,215 @@ def test_整條管線_只改config_有那條finding_不得自動放行(review, d
             if f["title"] == _DBT_CONFIG_TITLE] == [("models/mrt_sample.sql", "major")]
     if not dry_run:
         assert report["decision"] != "auto_approved"
+
+
+# ─────────────────── 看不懂的寫法不可以安靜漏掉 ───────────────────
+
+HOOKS = """models:
+  sample:
+    +post-hook: |
+      delete from {{ this }}
+      where dt < '2020-01-01'
+    +materialized: table
+"""
+
+
+@pytest.mark.parametrize("old, new, expect", [
+    # 跨行的 hook:改到中間那行(hook 裡的 SQL 哪裡都沒掃到)
+    (HOOKS, HOOKS.replace("'2020-01-01'", "'2099-01-01'"), (("post_hook",), False, False)),
+    # tab 縮排:YAML 不允許,層級無法判斷
+    ("models:\n  sample:\n    +materialized: view\n",
+     "models:\n  sample:\n\t+materialized: table\n", (("materialized",), False, True)),  # 刪掉的舊行
+    # merge key 指向的預設值被改
+    ("defaults: &d\n  materialized: view\nmodels:\n  sample:\n    <<: *d\n",
+     "defaults: &d\n  materialized: table\nmodels:\n  sample:\n    <<: *d\n", ((), False, True)),
+    # models 底下對不到已知的鍵(資料夾改名,設定套用的範圍就變了)
+    ("models:\n  sample:\n    staging:\n      +materialized: view\n",
+     "models:\n  sample:\n    stage:\n      +materialized: view\n", ((), False, True)),
+], ids=["多行hook", "tab縮排", "merge-key", "資料夾改名"])
+def test_yaml_看不懂或藏在多行裡的改動_不會安靜漏掉(old, new, expect):
+    assert _keys("dbt_project.yml", old, new) == [expect]
+
+
+def test_yaml_多行說明與欄位測試_仍然不報():
+    old = "models:\n  - name: m\n    description: |\n      第一行\n      第二行\n"
+    assert _changes("models/schema.yml", old, old.replace("第二行", "改過")) == []
+
+
+MULTI_SET = """{% set cfg = {
+    'materialized': 'incremental',
+    'unique_key': 'id'
+} %}
+{{ config(**cfg) }}
+select 1
+"""
+CONFIG_SET = """{% do config.set(
+    'materialized',
+    'incremental'
+) %}
+{{ config(tags=['daily']) }}
+select 1
+"""
+
+
+@pytest.mark.parametrize("old, new", [
+    (MULTI_SET, MULTI_SET.replace("'unique_key': 'id'", "'unique_key': 'dt'")),
+    (MULTI_SET.replace("**cfg", "tags=['daily']"),
+     MULTI_SET.replace("**cfg", "tags=['daily']").replace("'id'", "'dt'")),
+    (CONFIG_SET, CONFIG_SET.replace("    'incremental'", "    'table'")),
+], ids=["多行set被config用到", "多行set一律算", "多行config.set只改中間那行"])
+@pytest.mark.parametrize("full", [True, False])
+def test_sql_多行的set與config_set_只改中間那行_算看不出改了什麼(old, new, full):
+    assert [c.unknown for c in _changes("models/m.sql", old, new, full=full, context=1)] == [True]
+
+
+# ─────────────────── 用位置判斷是不是 dbt 檔 ───────────────────
+
+@pytest.mark.parametrize("path, old", [
+    ("docs/example/dbt_project.yml", PROJECT),
+    (".gitlab-ci.yml", "models:\n  sample:\n    +materialized: view\n"),
+    ("sql/templates/m.sql", MODEL),
+], ids=["說明文件裡的範例", "頂層有models的CI設定", "一般SQL範本"])
+def test_不在dbt目錄裡的檔案_不比較(path, old):
+    new = old.replace("view", "table").replace("'incremental'", "'table'")
+    assert _changes(path, old, new) == []
+
+
+def test_專案在子目錄時_照專案目錄判斷():
+    new = MODEL.replace("'incremental'", "'table'")
+    f = _file("dbt/models/m.sql", MODEL, new)
+    found = enforce_dbt_config_change({"findings": []}, _mr(f), None, {"project_dir": "dbt"})
+    assert [x["file"] for x in found["findings"]] == ["dbt/models/m.sql"]
+    root = enforce_dbt_config_change({"findings": []}, _mr(f), None, {"project_dir": ""})
+    assert root["findings"] == []
+
+
+def test_有取回的專案時_照它的目錄設定():
+    """model-paths 改成 transform/ 時,models/ 底下的檔案不是 dbt 讀的。"""
+    from orchestrator.dbt_context import DbtContext
+    from orchestrator.dbt_project import DbtLayout, DbtProject
+
+    project = DbtProject(ok=True, files={}, model_paths=("transform",), macro_paths=("macros",))
+    ctx = DbtContext(prefix="", project=project, layout=DbtLayout(("transform", "macros")))
+    new = MODEL.replace("'incremental'", "'table'")
+    files = [_file("transform/m.sql", MODEL, new), _file("models/m.sql", MODEL, new)]
+    found = enforce_dbt_config_change({"findings": []}, _mr(*files), ctx)["findings"]
+    assert [x["file"] for x in found] == ["transform/m.sql"]
+
+
+def test_副檔名大寫的sql_不是dbt的model():
+    """dbt 只讀小寫的 .sql;接線(dbt_context、dbt_impact)也是這樣判斷。"""
+    new = MODEL.replace("'incremental'", "'table'")
+    assert _changes("models/MODEL.SQL", MODEL, new) == []
+
+
+# ─────────────────── 新增、刪除整個檔案的 finding ───────────────────
+
+def _one(files, ctx=None):
+    [finding] = enforce_dbt_config_change({"findings": []}, _mr(*files), ctx)["findings"]
+    return finding
+
+
+@pytest.mark.parametrize("new, severity", [
+    ("{{ config(materialized='incremental', full_refresh=true) }}\nselect 1\n", "major"),
+    ("{{ config(materialized='table', post_hook='delete from x') }}\nselect 1\n", "major"),
+    ("{{ config(**cfg) }}\nselect 1\n", "major"),
+    ("{{ config(materialized='table') }}\nselect 1\n", "info"),
+], ids=["full_refresh", "hook", "看不懂", "一般設定"])
+def test_新增的model_高風險設定major_其他info(new, severity):
+    finding = _one([_file("models/m.sql", "", new)])
+    assert finding["severity"] == severity and finding["line"] == 1
+    assert finding["title"] == (pipeline._DBT_CONFIG_TITLE if severity == "major"
+                                else pipeline._DBT_CONFIG_ADDED_TITLE)
+    assert "delete from x" not in finding["detail"]
+
+
+def test_新增的屬性檔_列出設定():
+    new = "version: 2\nmodels:\n  - name: m\n    config:\n      tags: ['daily']\n"
+    finding = _one([_file("models/schema.yml", "", new)])
+    assert finding["severity"] == "info" and "tags" in finding["detail"] and finding["line"] == 5
+
+
+@pytest.mark.parametrize("path, old", [("models/m.sql", MODEL), ("models/schema.yml", PROPERTIES)])
+def test_刪除model或屬性檔_info(path, old):
+    finding = _one([_file(path, old, "", full=False)])
+    assert (finding["severity"], finding["title"]) == ("info", pipeline._DBT_CONFIG_DELETED_TITLE)
+
+
+# ─────────────────── 行號、出錯 ───────────────────
+
+def test_yaml的finding_帶第一個改到的設定行():
+    new = PROJECT.replace("+materialized: incremental", "+materialized: table")
+    finding = _one([_file("dbt_project.yml", PROJECT, new)])
+    assert finding["line"] == PROJECT.split("\n").index("      +materialized: incremental") + 1
+    removed = PROJECT.replace("        - daily\n", "")
+    assert _one([_file("dbt_project.yml", PROJECT, removed)])["line"] == 7     # 刪除處
+
+
+def test_處理中出錯_finding寫出例外類型(monkeypatch):
+    def boom(*a):
+        raise KeyError("x")
+    monkeypatch.setattr(dbt_config_change, "_file_change", boom)
+    finding = _one([_file("models/m.sql", MODEL, MODEL.replace("'incremental'", "'table'"))])
+    assert finding["severity"] == "major" and "非預期錯誤:KeyError" in finding["detail"]
+
+
+def test_內附的fixture都不會走到出錯的那條路():
+    """出錯時會記成「看不出改了什麼」;現有的 fixture 不該靠這條路得到結果。"""
+    import glob
+
+    from orchestrator.config import PKG_ROOT
+
+    seen = 0
+    for path in sorted(glob.glob(str(PKG_ROOT / "**" / "*.json"), recursive=True)):
+        if ".venv" in path or "testdata_cache" in path:
+            continue
+        try:
+            data = json.loads(open(path, encoding="utf-8").read())
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("files"), list):
+            seen += 1
+            assert [c.path for c in config_changes(data["files"]) if c.error] == [], path
+    assert seen >= 30
+
+
+def test_新增的屬性檔_一行寫的config也列出():
+    new = "version: 2\nmodels:\n  - name: m\n    config: {materialized: table, tags: ['daily']}\n"
+    [c] = _changes("models/schema.yml", "", new)
+    assert (c.added, c.keys, c.line) == (True, ("tags", "materialized"), 4)
+
+
+def test_特製的大量跨行set_不會拖住審查():
+    """改到的行與跨行的 {% set %} 兩兩比對會是平方時間。最壞的情況是改到的行都不在 set 裡
+    (每一行都要跟每一段比過才知道不在):1 萬行 × 1 萬段。"""
+    import time
+
+    n = 10_000                                  # 約 41 萬字元:在 MAX_TEXT_CHARS 之內,會完整反推
+    old = "{{ config(materialized='table') }}\n" + "".join(
+        f"{{% set v{i} = [\n  {i}\n] %}}\nselect {i}\n" for i in range(n))
+    new = old.replace("\nselect ", "\nselect 9")
+    # 直接組 diff(difflib 處理這麼大的檔案本身就很慢):每個 set 後面那一行 SQL 都改了
+    diff = "".join(f"@@ -{4 * i + 5} +{4 * i + 5} @@\n-select {i}\n+select 9{i}\n" for i in range(n))
+    started = time.monotonic()
+    found = config_changes([{"path": "models/m.sql", "diff": diff, "full_content": new}])
+    assert time.monotonic() - started < 5 and found == []          # 只改 SQL,設定沒變
+
+
+def test_hook的多行字串裡出現設定名稱_算hook():
+    """跨行字串裡長得像「鍵:」的行是字串的內容,不是設定。"""
+    old = HOOKS.replace("      where dt", "      materialized: x\n      where dt")
+    new = old.replace("materialized: x", "materialized: y")
+    assert _keys("dbt_project.yml", old, new) == [(("post_hook",), False, False)]
+
+
+def test_跨行的大括號設定_逐項看():
+    old = "version: 2\nmodels:\n  - name: m\n    config: {\n      materialized: incremental\n    }\n"
+    new = old.replace("incremental", "table")
+    assert _keys("models/schema.yml", old, new) == [(("materialized",), False, False)]
+
+
+def test_資料夾名稱剛好是設定名稱_底下改了設定_算底下那個():
+    old = "models:\n  sample:\n    schema:\n      +materialized: view\n"
+    assert _keys("dbt_project.yml", old, old.replace("view", "table")) == [
+        (("materialized",), False, False)]

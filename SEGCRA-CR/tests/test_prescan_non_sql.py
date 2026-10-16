@@ -1,11 +1,13 @@
-"""預掃只對 .sql 跑 SQL 規則與 lint;其他檔案不解析,只留規則層的嚴重命中。
+"""預掃只對 .sql 跑 SQL 規則與 lint;其他檔案只留規則層的嚴重命中(不帶原文)。
 
 以前每個變更檔都送進 sqlglot:MR 裡的說明文件、yml 也一樣,只會得到「預掃無法解析此檔的 SQL」
 的 major,錯誤訊息還帶著檔案內容,進到 prompt 與留言。現在:
 - 說明文件(.md / .markdown / .rst):補一條 info,不影響決策;
 - 其他非 SQL 檔(設定檔、程式碼、副檔名不認得的):補一條 major,不得自動放行——這些檔案以前
   因為「無法解析」被擋下,只給 info 的話,改 CI 設定或腳本的 MR 就可能被自動放行;
-- 兩種都照樣跑規則,只留 major 以上的命中(寫死的憑證最常出現在設定檔)。
+- 兩種都照樣送進規則層(解析錯誤丟掉不用),只留 major 以上的命中(寫死的憑證最常出現在
+  設定檔),而且只留規則代號、嚴重度與固定文字:命中的訊息含比對到的原文(例如整段密碼);
+- dbt 專案裡的屬性檔與 dbt_project.yml 不補「非 SQL 檔」,交給設定比對決定。
 """
 import asyncio
 import json
@@ -50,15 +52,25 @@ def _file(path, text):
 # ─────────────────── 怎麼分類 ───────────────────
 
 @pytest.mark.parametrize("path, kind", [
-    ("sql/rules/r001.sql", None), ("models/MODEL.SQL", None), ("a.md.sql", None),
+    ("sql/rules/r001.sql", None), ("a.md.sql", None),
+    ("models/MODEL.SQL", "other"), ("q.Sql", "other"),        # .sql 分大小寫(跟 dbt 與接線一樣)
     ("README.md", "doc"), ("docs/Guide.MD", "doc"), ("notes.markdown", "doc"), ("x.rst", "doc"),
     ("a.sql.md", "doc"),
     ("models/schema.yml", "other"), ("dbt_project.yaml", "other"), (".gitlab-ci.yml", "other"),
     ("scripts/run.py", "other"), ("proc/purge.prc", "other"), ("notes.txt", "other"),
     ("Makefile", "other"), ("", "other"), (None, "other"),
 ])
-def test_只看副檔名_不分大小寫(path, kind):
+def test_依副檔名分類_sql分大小寫(path, kind):
     assert _non_sql_kind(path) == kind
+
+
+@pytest.mark.parametrize("rel, kind", [
+    ("models/schema.yml", "dbt"), ("dbt_project.yml", "dbt"), ("snapshots/s.yaml", "dbt"),
+    ("packages.yml", "other"), ("selectors.yml", "other"), ("seeds/codes.csv", "other"),
+    ("models/notes.md", "doc"),
+])
+def test_dbt專案裡的屬性檔_另外分類(rel, kind):
+    assert _non_sql_kind(rel, rel) == kind
 
 
 # ─────────────────── 預掃 ───────────────────
@@ -216,3 +228,39 @@ def test_整條管線_CI設定檔的變更不得自動放行(review, dry_run):
     assert (".gitlab-ci.yml", "major", _NON_SQL_OTHER_TITLE) in _titles(report)
     if not dry_run:
         assert report["decision"] != "auto_approved"
+
+
+# ─────────────────── 命中的原文不可以帶出去 ───────────────────
+
+SECRET = "S3cr3t-P@ss"
+
+
+@pytest.mark.parametrize("path", ["profiles.yml", "scripts/load.py", "README.md"])
+def test_非SQL檔的命中_不帶訊息原文與語句(path):
+    pre, _ = _prescan([_file(path, f'target:\n  password: "{SECRET}"\n')])
+    assert pre[0]["rules"] and SECRET not in json.dumps(pre, ensure_ascii=False)
+    assert all(set(h) <= {"rule", "severity", "message", "line"} for h in pre[0]["rules"])
+    report = pipeline.enforce_rules({"findings": []}, pre)
+    assert report["findings"] and SECRET not in json.dumps(report, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_整條管線_設定檔裡的密碼不會出現在報告與prompt(review, dry_run):
+    secret_file = {"path": "profiles.yml", "diff": f'@@ -0,0 +1 @@\n+password: "{SECRET}"',
+                   "full_content": f'password: "{SECRET}"\n'}
+    report, capture = review([_sql_file(), secret_file], dry_run=dry_run)
+    assert SECRET not in json.dumps(report, ensure_ascii=False)
+    assert SECRET not in json.dumps(capture.get("prescan_final", []), ensure_ascii=False)
+
+
+# ─────────────────── dbt 專案裡的屬性檔 ───────────────────
+
+def test_dbt的屬性檔_不補非SQL檔的major():
+    pre, _ = _prescan([_file("models/schema.yml", "version: 2\nmodels:\n  - name: m\n")])
+    assert pre[0]["non_sql"] == "dbt"
+    assert enforce_non_sql({"findings": []}, pre)["findings"] == []
+
+
+def test_專案目錄外的yml_照樣是其他檔案():
+    pre, _ = _prescan([_file("docs/example/models/schema.yml", "version: 2\n")])
+    assert pre[0]["non_sql"] == "other"
