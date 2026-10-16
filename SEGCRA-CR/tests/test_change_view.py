@@ -330,3 +330,14 @@ def test_內容放得下但加了行號放不下時不放整份():
     assert change_view.estimate_tokens(text) <= 300
     block, used = file_view(PATH, text, None, 300)
     assert used <= 300 and "完整內容超出 context 預算" in block
+
+
+def test_段落裡以三個加減號開頭的行_是內容不是檔頭():
+    """刪掉一行 SQL 註解(`-- x`)在 diff 裡是 `--- x`;新增一行 `++x` 是 `+++x`。它們在段落裡是
+    內容,跳過的話後面的行號全部錯開。"""
+    text = "select 1\n++i\nfrom t\nwhere a = 1\n"
+    diff = "@@ -1,4 +1,4 @@\n select 1\n--- 舊的說明\n+++i\n from t\n-where a = 2\n+where a = 1\n"
+    assert changed_lines(diff, text) == {2, 4}
+    with_header = "--- a/x.sql\n+++ b/x.sql\n" + diff
+    assert changed_lines(with_header, text) == {2, 4}
+

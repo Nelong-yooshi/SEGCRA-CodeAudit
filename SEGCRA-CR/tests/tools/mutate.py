@@ -2428,6 +2428,9 @@ MUTANTS.update({
  "完整內容:沒有任何內容也放標題": ("change_view.py",
      '    if not parts:\n        return ""\n    return HEADER',
      '    return HEADER'),
+ '完整內容:段落裡的三個加減號開頭當成檔頭跳過': ('change_view.py',
+     '        if current is None or raw.startswith("\\\\"):',
+     '        if current is None or raw.startswith(("+++", "---", "\\\\")):'),
 })
 
 

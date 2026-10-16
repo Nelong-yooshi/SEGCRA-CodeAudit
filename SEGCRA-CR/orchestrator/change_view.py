@@ -46,7 +46,9 @@ def changed_lines(diff, text: str) -> set[int] | None:
         if m:
             current = int(m.group(1))
             continue
-        if current is None or raw.startswith(("+++", "---", "\\")):
+        # 第一段 @@ 之前的 ---/+++ 是檔頭;段落裡以 --- / +++ 開頭的是內容(刪掉的 SQL 註解
+        # `-- x`、新增的 `++x`),不能跳過,否則後面的行號全部錯開
+        if current is None or raw.startswith("\\"):
             continue
         if raw.startswith("+"):
             if not (1 <= current <= len(lines)) or lines[current - 1].rstrip() != raw[1:].rstrip():
