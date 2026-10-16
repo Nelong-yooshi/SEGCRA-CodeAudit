@@ -536,3 +536,121 @@ def test_放在報告最上面():
     report = pipeline.enforce_spec_change({"findings": [{"title": "a"}, {"title": "b"}]},
                                           _mr(SQL_FILE, SPEC_FILE))
     assert [f["title"] for f in report["findings"]] == [TITLE, "a", "b"]
+
+
+# ─────────────────── 特製的規格內容:時間與報告長度都有上限 ───────────────────
+
+@pytest.mark.parametrize("line, expected", [
+    ("## 條件 3", "條件 3"), ("   # x", "x"), ("    # x", None), ("####### x", None),
+    ("#x", None), ("# x ##", "x"), ("#", None), ("# ", None), ("plain", None), ("\t# x", "x"),
+])
+def test_標題的判定(line, expected):
+    assert pipeline._heading_text(line) == expected
+
+
+def test_特製的長標題行_不會拖住審查():
+    """標題用正規式比對時,`# a` + 大量空白 + `b` 會讓回溯變成三次方時間(2,000 字元約 8 秒)。"""
+    import time
+
+    line = "# a" + " " * 50_000 + "b"
+    started = time.monotonic()
+    assert pipeline._heading_text(line) == "a" + " " * 50_000 + "b"
+    full = "## 條件 1\n" + line + "\n門檻 100 元\n"
+    pipeline._spec_change_notes({"path": "specs/R-301.md", "full_content": full,
+                                 "diff": "@@ -3 +3 @@\n-門檻 200 元\n+門檻 100 元\n"})
+    assert time.monotonic() - started < 2
+
+
+def test_大量交錯的修改_不會拖住審查():
+    """每段修改都往前找標題、各存一份前面的內文:段數與行數都由 MR 決定,會是平方的時間與記憶體。"""
+    import time
+
+    n = 20_000
+    diff = (f"@@ -1,{2 * n} +1,{2 * n} @@\n"
+            + "".join(f" 內文 {i}\n-舊 {i + 1000}\n+新 {i + 1000}\n" for i in range(n)))
+    full = "".join(f"內文 {i}\n新 {i + 1000}\n" for i in range(n))
+    started = time.monotonic()
+    for f in ({"path": "specs/R-301.md", "diff": diff},
+              {"path": "specs/R-301.md", "diff": diff, "full_content": full}):
+        pipeline.enforce_spec_change({"findings": []}, _mr(f))
+    assert time.monotonic() - started < 10
+
+
+def test_同一個數字出現在很多行又改了很多次_不會拖住審查():
+    import time
+
+    n = 5_000
+    full = "門檻 4000 元\n" * n + "".join(f"新 {i}\n" for i in range(n))
+    diff = (f"@@ -{n + 1},{n} +{n + 1},{n} @@\n"
+            + "".join(f"-舊 4000\n+新 {i}\n" for i in range(n)))
+    started = time.monotonic()
+    _, stale = pipeline._spec_change_notes({"path": "specs/R-301.md", "diff": diff, "full_content": full})
+    assert time.monotonic() - started < 5
+    assert len(stale) == pipeline.MAX_STALE_PER_FILE + 1 and stale[-1] == "另有其他處"
+    assert stale[0] == "改掉的數字 4000 仍出現在第 1、2、3、4、5 等 行"
+
+
+def test_一段修改改了很多數字_只列前幾項():
+    old = " ".join(str(1000 + i) for i in range(20))
+    new = " ".join(str(2000 + i) for i in range(20))
+    notes, _ = _notes(f"@@ -10 +10 @@\n-{old}\n+{new}\n", full=None)
+    assert notes[0].count("數字") == pipeline.MAX_PARTS_PER_NOTE and notes[0].endswith("等共 20 項")
+
+
+def test_很長的數字只寫前面一段():
+    long = "1" * 500
+    full = FULL_SPEC.replace("40,000 元\n\n## 條件 2", f"{long} 元\n\n## 條件 2")   # 第 4 行還留著
+    notes, stale = _notes(f"@@ -10 +10 @@\n-門檻 {long} 元\n+門檻 2 元\n", full=full)
+    assert notes == [f"第 10 行:數字 {'1' * pipeline.MAX_TOKEN_CHARS}… → 2"]
+    assert stale == [f"改掉的數字 {'1' * pipeline.MAX_TOKEN_CHARS}… 仍出現在第 4 行"]
+    assert long not in "".join(notes + stale)
+
+
+def test_沒有完整內容時_用diff上下文裡的標題():
+    diff = "@@ -5,3 +5,3 @@\n ## 條件 4\n 說明\n-門檻 200 元\n+門檻 300 元\n"
+    assert _notes(diff, full=None)[0] == ["第 7 行(條件 4):數字 200 → 300"]
+    plain = "@@ -5,3 +5,3 @@\n ## 附註\n 說明\n-門檻 200 元\n+門檻 300 元\n"
+    assert _notes(plain, full=None)[0] == ["第 7 行:數字 200 → 300"]
+
+
+def test_規格檔很多時_只逐一列出前面幾個():
+    files = [{"path": f"specs/R-{i}.md", "diff": "@@ -1 +1 @@\n-a\n+b\n"} for i in range(25)]
+    detail = pipeline.enforce_spec_change({"findings": []}, _mr(*files))["findings"][0]["detail"]
+    assert "specs/R-19.md" in detail and "specs/R-20.md" not in detail
+    assert "另有 5 個規格檔沒有逐一列出" in detail
+
+
+def test_列出的名額用完時_不說成看不出修改():
+    many = "".join(f"@@ -{n} +{n} @@\n-第{n}行 {n}00 元\n+第{n}行 {n}01 元\n" for n in range(1, 40, 2))
+    detail = pipeline.enforce_spec_change({"findings": []}, _mr(
+        {"path": "specs/R-301.md", "diff": many},
+        {"path": "specs/R-302.md", "diff": "@@ -1 +1 @@\n-a\n+b\n"}))["findings"][0]["detail"]
+    assert "specs/R-302.md:有 1 處修改(超過逐一列出的上限)" in detail
+    assert "看不出修改的位置" not in detail
+
+
+def test_不在根目錄的規格檔_不說以修改後的規格為準():
+    """審查只讀 repo 根目錄的 specs/<代號>.md;其他位置的規格檔改了要交人工,但不能說審查用了它。"""
+    nested = {"path": "dbt/specs/mrt_x.md", "diff": "@@ -1 +1 @@\n-a\n+b\n", "full_content": "b\n"}
+    detail = pipeline.enforce_spec_change({"findings": []}, _mr(nested))["findings"][0]["detail"]
+    assert "以這個 MR 修改後的規格為準" not in detail
+    assert "有 1 個規格檔不在審查讀取規格的位置" in detail
+    both = pipeline.enforce_spec_change(
+        {"findings": []}, _mr({**SPEC_FILE, "full_content": MR_SPEC}, nested))["findings"][0]["detail"]
+    assert "以這個 MR 修改後的規格為準" in both and "有 1 個規格檔不在審查讀取規格的位置" in both
+
+
+@pytest.mark.parametrize("bad", ["x", None, 5, ["specs/R-1.md"]], ids=["字串", "null", "數字", "清單"])
+def test_變更清單有格式不對的項目_規格與完整內容的步驟都不中斷(bad):
+    mr = _mr(SQL_FILE, SPEC_FILE, bad)
+    assert pipeline._touches_specs(mr) is True
+    assert pipeline._touches_specs(_mr(SQL_FILE, bad)) is False
+    report = pipeline.enforce_spec_change({"findings": []}, mr)
+    assert report["findings"][0]["title"] == TITLE
+    code_files, section = pipeline._split_spec_changes(mr["files"], 3000)
+    assert SPEC_FILE not in code_files and HEADER in section
+    texts = pipeline._head_texts(mr["files"], None)
+    assert texts == {SQL_PATH: CLEAN_SQL}
+    from orchestrator.change_view import build_full_text_section
+    assert SQL_PATH in build_full_text_section(mr["files"], texts, 6000)
+    assert pipeline._mr_for_spec_exec(mr, None)["files"] == [SQL_FILE, bad]

@@ -1,4 +1,4 @@
-"""變更後的完整內容進 prompt(#38 第 1 點)。
+"""變更後的完整內容進 prompt。
 
 只給 diff 時,不在 hunk 上下文裡的條件會被模型報成「遺漏」。這裡驗排版本身(行號、改動的行
 的標記、超過預算時的縮小方式),以及它真的接進了 `review_mr` 送給模型的 prompt。
@@ -251,7 +251,7 @@ FILE = {"path": PATH, "diff": DIFF, "full_content": SQL}
 
 
 def test_prompt_有完整內容_離改動處很遠的條件也看得到(prompt):
-    """#38 的重現情境:只改兩行註解,規格要求的條件在 3 行以外。"""
+    """回報的重現情境:只改兩行註解,規格要求的條件在 3 行以外。"""
     user = prompt(_mr(FILE))
     diff_part, rest = user.split(HEADER)
     full_part = rest.split("## 確定性預掃結果")[0]

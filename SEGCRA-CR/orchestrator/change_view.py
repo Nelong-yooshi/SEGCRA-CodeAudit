@@ -1,4 +1,4 @@
-"""change_view — 把變更檔「變更後的完整內容」整理成 prompt 的一段(#38 第 1 點)。
+"""change_view — 把變更檔「變更後的完整內容」整理成 prompt 的一段。
 
 只給 diff 時,模型逐項核對規格對照的其實只有 diff 的那幾行:條件寫在離改動處超過幾行的
 地方,就會被報成「遺漏」。實測只改兩行註解的 MR 被報三條 major「缺少某某過濾」,而那三個
@@ -142,10 +142,11 @@ def build_full_text_section(files: list[dict], texts: dict, budget_tokens: int) 
         return ""
     parts, left = [], budget_tokens
     for f in files:
-        text = texts.get(f.get("path"))
+        path = f.get("path") if isinstance(f, dict) else None
+        text = texts.get(path) if isinstance(path, str) else None
         if not isinstance(text, str):
             continue
-        block, used = file_view(f["path"], text, f.get("diff"), left)
+        block, used = file_view(path, text, f.get("diff"), left)
         if block:
             parts.append(block)
         left = max(0, left - used)

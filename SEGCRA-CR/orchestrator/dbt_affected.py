@@ -14,7 +14,7 @@ macro 反查(dbt_context 準備好的 ImpactReport)只說「哪些 model 受影�
 
 這些 model 的內容不放進預掃結果、也不放進模型的 prompt:它們不在 diff 裡,放進預掃會讓
 每個檢核點(H 系列)各補一條「模型未回應」,放進 prompt 會佔掉預算並多一個注入的入口。
-它們對到的**規格**會放進 prompt(specs_by_priority;#38 第 2 點):規格是核定的內容,
+它們對到的**規格**會放進 prompt(specs_by_priority):規格是核定的內容,
 不是待審的程式。
 
 上限(都算「沒檢查完」,由後處理補 major,不可以當成沒有問題):
@@ -81,7 +81,7 @@ class SpecForModels:
 
 
 def specs_by_priority(check: AffectedCheck | None, diff_text: str) -> tuple[SpecForModels, ...]:
-    """受影響的 model 對到的規格,依「這次改到的值會影響到哪幾份」排序(#38 第 2 點)。
+    """受影響的 model 對到的規格,依「這次改到的值會影響到哪幾份」排序。
 
     排序只決定預算不夠時先放哪幾份,不影響判斷:
       1. 規格代號或 model 名稱出現在這次的 diff 裡(含上下文行)。共用的註冊表 macro 常以

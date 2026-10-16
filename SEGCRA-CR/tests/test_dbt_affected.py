@@ -1089,6 +1089,9 @@ def test_只改macro_用受影響model的規格來審_但不會被當成執行�
     report, state = review([{"path": "macros/act.sql", "diff": FRAGMENT}], loader)
     assert report["_spec_exec"]["spec_code"] == "BIG"
     assert "BIG 規格" in state["prompt"]                       # 模型拿到的是這份規格
+    # 受影響的 model 全部對到同一份:當成這個 MR 的規格,不走「對到多份規格」那一段
+    assert "### specs/BIG.md\n" in state["prompt"]
+    assert pipeline._AFFECTED_SPECS_HEADER.splitlines()[0] not in state["prompt"]
     assert state["generated"] == 0, "片段被送去生測資 / 執行了"
     assert report["_spec_exec"].get("dbt_template") is True and report["_spec_exec"]["passed"] is False
     assert report["decision"] == "needs_human"
@@ -1200,7 +1203,7 @@ def test_檢查時發生非預期錯誤_收斂成範圍不明_審查不中斷():
     assert "macros/act.sql" in fd["detail"]                  # 原本反查出來的資訊還在
 
 
-# ─────────────────── 11. 對到多份規格(#38 第 2 點) ───────────────────
+# ─────────────────── 11. 對到多份規格 ───────────────────
 
 from orchestrator.dbt_affected import SpecForModels, specs_by_priority     # noqa: E402
 
