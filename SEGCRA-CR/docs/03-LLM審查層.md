@@ -104,7 +104,7 @@
 
 **變更後的完整內容**(`orchestrator/change_view.py`:`build_full_text_section`;#38 第 1 點):接在 diff 之後、預掃結果之前。只給 diff 時,模型逐項核對規格對照的只有 diff 的那幾行,條件寫在離改動處超過幾行的地方就會被報成「遺漏」(實測:只改兩行註解的 MR 被報三條 major「缺少某某過濾」,那三個條件就在同一個 WHERE 裡)。
 
-- **內容來源**(`pipeline._head_texts`):mock 模式用 fixture 的 `full_content`;真實 GitLab 模式下,dbt 專案裡的檔案用取回的 head commit 內容。兩者都沒有的檔案不列,prompt 只有它的 diff(與之前相同)。規格檔不放(見 04「MR 改到規格檔」)。
+- **內容來源**(`pipeline._head_texts`):mock 模式用 fixture 的 `full_content`;真實 GitLab 模式下,dbt 專案裡的檔案用取回的 head commit 內容。兩者都沒有的檔案不列,prompt 只有它的 diff(與之前相同)。**只放 `.sql`**:真實模式會取回每個變更檔的完整內容,圖片的文字區塊、SVG 裡看不見的文字若也整份放進 prompt,藏在裡面的句子就直接進到審查模型;其他檔案(含規格檔,見 04「MR 改到規格檔」)只有 diff。
 - **排版**:每一行前面加行號,這次新增或修改的行以 `>` 標記(由 diff 的 hunk 算出新檔的行號)。diff 與內容對不上時(mock 的 fixture、佔位的 diff)不標記,並在檔名後註明——標錯行比不標更糟。每一行都是新增的(新檔)就不重複放。
 - **預算**(`budget.full_content`,預設 6000 tokens,所有檔案共用;`num_ctx` 含輸出,輸入最多約 24,500,其他段落最壞約 16,000,所以不設更大;**設成 0 就不放**,prompt 回到只有 diff):放不下時逐步縮小——完整內容 → 只放改動所在的語句(往前後找到以分號結尾的行;找不到就前後各留 15 行),略過的部分寫明行號範圍 → 只寫一行說明。repo 內的 fixture 與 golden set 最大的一段約 2,300 tokens。
 - **內容是不可信的文字**:每一行都以行號開頭,內容裡的 ``` 不會出現在行首、關不掉外層的程式碼區塊;完整內容本來就在注入掃描的範圍內。

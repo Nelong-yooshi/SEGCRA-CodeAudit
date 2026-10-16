@@ -585,10 +585,15 @@ def _spec_for_exec(spec_code, spec_text, affected_specs: tuple[SpecForModels, ..
 
 def _head_texts(files: list[dict], dbt_ctx: DbtContext | None) -> dict:
     """{路徑: 變更後的完整內容}。mock 模式的 fixture 自帶 full_content;真實模式下,dbt 專案
-    裡的檔案用取回的 head commit 內容。兩者都沒有的檔案不列(prompt 只有它的 diff)。"""
+    裡的檔案用取回的 head commit 內容。兩者都沒有的檔案不列(prompt 只有它的 diff)。
+
+    **只放 .sql**:完整內容是為了讓模型核對 SQL 的條件才加的。真實模式會取回每個變更檔的完整
+    內容,圖片的文字區塊、SVG 裡看不見的 <text> 這類檔案若也整份放進 prompt,藏在裡面的文字就
+    直接進到審查模型(換個說法的注入句,規則式的掃描器不一定掃得到)。其他檔案只有 diff。"""
     texts = {}
     for f in files:
-        if not (isinstance(f, dict) and isinstance(f.get("path"), str)):
+        if not (isinstance(f, dict) and isinstance(f.get("path"), str)
+                and f["path"].endswith(".sql")):
             continue
         text = f.get("full_content")
         if not (isinstance(text, str) and text) and dbt_ctx is not None:

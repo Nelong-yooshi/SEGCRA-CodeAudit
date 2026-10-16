@@ -2343,7 +2343,7 @@ MUTANTS.update({
      '        path = f.get("path") if isinstance(f, dict) else None',
      '        path = f.get("path")'),
  '完整內容:讀內容不檢查項目型別': ('pipeline.py',
-     '        if not (isinstance(f, dict) and isinstance(f.get("path"), str)):\n            continue\n        text = f.get("full_content")',
+     '        if not (isinstance(f, dict) and isinstance(f.get("path"), str)\n                and f["path"].endswith(".sql")):\n            continue\n        text = f.get("full_content")',
      '        text = f.get("full_content")'),
  '規格變更:同一個數字的不同寫法重複列出': ('pipeline.py',
      '                    or value in reported):',
@@ -2431,6 +2431,9 @@ MUTANTS.update({
  '完整內容:段落裡的三個加減號開頭當成檔頭跳過': ('change_view.py',
      '        if current is None or raw.startswith("\\\\"):',
      '        if current is None or raw.startswith(("+++", "---", "\\\\")):'),
+ '完整內容:非 SQL 檔也整份放進 prompt': ('pipeline.py',
+     '        if not (isinstance(f, dict) and isinstance(f.get("path"), str)\n                and f["path"].endswith(".sql")):',
+     '        if not (isinstance(f, dict) and isinstance(f.get("path"), str)):'),
 })
 
 
