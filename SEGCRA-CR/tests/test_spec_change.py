@@ -586,8 +586,17 @@ def test_同一個數字出現在很多行又改了很多次_不會拖住審查(
     started = time.monotonic()
     _, stale = pipeline._spec_change_notes({"path": "specs/R-301.md", "diff": diff, "full_content": full})
     assert time.monotonic() - started < 5
+    assert stale == ["改掉的數字 4000 仍出現在第 1、2、3、4、5 等 行"]       # 同一個數字只列一次
+
+
+def test_很多個不同的數字仍出現在別處_只列前幾個():
+    n = 20
+    full = "".join(f"門檻 {1000 + i} 元\n" for i in range(n)) + "".join(f"新 {i}\n" for i in range(n))
+    diff = (f"@@ -{n + 1},{n} +{n + 1},{n} @@\n"
+            + "".join(f"-舊 {1000 + i}\n+新 {i}\n" for i in range(n)))
+    _, stale = pipeline._spec_change_notes({"path": "specs/R-301.md", "diff": diff, "full_content": full})
     assert len(stale) == pipeline.MAX_STALE_PER_FILE + 1 and stale[-1] == "另有其他處"
-    assert stale[0] == "改掉的數字 4000 仍出現在第 1、2、3、4、5 等 行"
+    assert stale[0] == "改掉的數字 1000 仍出現在第 1 行"
 
 
 def test_一段修改改了很多數字_只列前幾項():
@@ -654,3 +663,13 @@ def test_變更清單有格式不對的項目_規格與完整內容的步驟都�
     from orchestrator.change_view import build_full_text_section
     assert SQL_PATH in build_full_text_section(mr["files"], texts, 6000)
     assert pipeline._mr_for_spec_exec(mr, None)["files"] == [SQL_FILE, bad]
+
+
+def test_同一個數字的兩種寫法_仍出現在只列一次():
+    """「40,000」與「40000」是同一個數字:改掉的那一行兩種寫法都有時,「仍出現在」不重複列。"""
+    full = "說明:超過 40,000 元\n\n3. 閾值:達 39,999 元以上(`>= 39999`)\n\n補充:超過 40,000\n"
+    diff = ("@@ -3 +3 @@\n-3. 閾值:超過 40,000 元(`> 40000`)\n"
+            "+3. 閾值:達 39,999 元以上(`>= 39999`)\n")
+    _, stale = pipeline._spec_change_notes({"path": "specs/R-1.md", "diff": diff, "full_content": full})
+    assert stale == ["改掉的數字 40,000 仍出現在第 1、5 行"]
+

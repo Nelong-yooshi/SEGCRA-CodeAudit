@@ -843,6 +843,7 @@ def _spec_change_notes(f: dict) -> tuple[list[str], list[str]]:
     full = f.get("full_content")
     new_lines = full.split("\n") if isinstance(full, str) and full else None
     notes, stale = [], []
+    reported: set[str] = set()      # 已經列過「仍出現在」的數字(千分位寫法不同算同一個)
     labels = _heading_labels(new_lines) if new_lines is not None else None
     # 數字 → 出現在哪幾行(一次建好、行號遞增:逐個數字整份掃,特製的大檔案會是平方時間)
     where_is = {}
@@ -866,7 +867,8 @@ def _spec_change_notes(f: dict) -> tuple[list[str], list[str]]:
         own = range(block["line"], block["line"] + len(block["added"]))
         for old, new in numbers:
             value = (old or "").replace(",", "")
-            if old is None or new is None or len(value.replace(".", "")) < 3:
+            if (old is None or new is None or len(value.replace(".", "")) < 3
+                    or value in reported):
                 continue
             # 只要前 6 個(多的寫「等」):同一個數字出現在很多行、又被改了很多次時,不逐一比對
             hits = []
@@ -876,6 +878,7 @@ def _spec_change_notes(f: dict) -> tuple[list[str], list[str]]:
                     if len(hits) > 5:
                         break
             if hits:
+                reported.add(value)
                 shown = old if len(old) <= MAX_TOKEN_CHARS else old[:MAX_TOKEN_CHARS] + "…"
                 stale.append(f"改掉的數字 {shown} 仍出現在第 "
                              + "、".join(map(str, hits[:5])) + (" 等" if len(hits) > 5 else "")

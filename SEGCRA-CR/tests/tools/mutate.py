@@ -2283,11 +2283,11 @@ MUTANTS.update({
      '    findings.insert(0, findings.pop())          # 放在報告最上面',
      '    pass'),
  '規格變更:不檢查前後一致': ('pipeline.py',
-     '            if hits:\n                shown = ',
-     '            if False:\n                shown = '),
- "規格變更:小數字也檢查前後一致": ("pipeline.py",
-     '            if old is None or new is None or len(value.replace(".", "")) < 3:',
-     '            if old is None or new is None:'),
+     '            if hits:\n                reported.add(value)',
+     '            if False:\n                reported.add(value)'),
+ '規格變更:小數字也檢查前後一致': ('pipeline.py',
+     '            if (old is None or new is None or len(value.replace(".", "")) < 3\n',
+     '            if (old is None or new is None\n'),
  '規格變更:這段自己的行也算前後不一致': ('pipeline.py',
      '                if n not in own and (not hits or hits[-1] != n):',
      '                if not hits or hits[-1] != n:'),
@@ -2345,6 +2345,9 @@ MUTANTS.update({
  '完整內容:讀內容不檢查項目型別': ('pipeline.py',
      '        if not (isinstance(f, dict) and isinstance(f.get("path"), str)):\n            continue\n        text = f.get("full_content")',
      '        text = f.get("full_content")'),
+ '規格變更:同一個數字的不同寫法重複列出': ('pipeline.py',
+     '                    or value in reported):',
+     '                    or False):'),
 })
 
 
