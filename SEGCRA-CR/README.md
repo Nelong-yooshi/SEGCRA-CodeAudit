@@ -238,7 +238,8 @@ dbt 專案不在 repo 根目錄時,另外在 `models.yaml` 的 `dbt` 底下設 `
 
 **先用內附的範例確認(不用 GitLab、不呼叫模型):**
 
-`examples/dbt_wiring/` 有一個合成的小專案與兩個 MR。把 `models.yaml` 的 `dbt.enabled` 暫時改成 `true`
+`examples/dbt_wiring/fixtures/` 有一個合成的小專案與兩個 MR:`mr_801.json` 只改 model、`mr_802.json`
+只改 macro(`--mr` 後面接的就是這個編號)。把 `models.yaml` 的 `dbt.enabled` 暫時改成 `true`
 (只在本機改,不要提交),然後:
 
 ```bash
@@ -247,8 +248,8 @@ export SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER FIXTURES_DIR=examples/dbt_wiring/fixt
 .venv/bin/python demo.py --mr 802 --dry-run    # 只改 macro:多一條 major「dbt 變更對其他 model 的影響」
 ```
 
-`--mr 802` 的那條 finding 會列出改到的 macro 檔與受影響的 `models/mrt_sample.sql[R003 major(展開後第 1 句)]`
-(macro 的變更讓它多出 `NOT IN` 子查詢)。把 `dbt.enabled` 改回 `false` 再跑,兩個 MR 都會變成「預掃無法解析」。
+只改 macro 的那個 MR 會多一條 major,列出受影響的 `models/mrt_sample.sql`:macro 的變更讓它展開後的
+第 1 句多出 `NOT IN` 子查詢(R003)。把 `dbt.enabled` 改回 `false` 再跑,兩個 MR 都會變成「預掃無法解析」。
 
 **關閉:**把 `dbt.enabled` 改回 `false` 即可,行為與沒有這個功能時相同(有測試鎖住)。`GITLAB_READ_TOKEN`
 不用時到 GitLab 撤銷。
