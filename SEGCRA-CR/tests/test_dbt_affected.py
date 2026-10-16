@@ -1239,3 +1239,25 @@ def test_變更清單有格式不對的項目_接線的每一步都不中斷(bad
     enforce_dbt_unexecuted(_passed(), mr, ctx, CFG)
     pipeline._mr_touches_dbt(mr, ctx, CFG)
 
+
+def test_查規格的背景執行緒_讀得到呼叫端的contextvars():
+    """這次審查釘住的 commit 存在 ContextVar 裡(toolbox.gitlab.review_ref);新開的執行緒
+    不會自動繼承,讀不到時真實模式的 get_file 會回「無法取得審查中的版本」。"""
+    from toolbox import gitlab
+
+    seen = {}
+
+    async def spec(hub, mr, *, by_path=False):
+        seen["ref"] = gitlab.review_ref()
+        return "A", "# 規格 A"
+
+    async def run():
+        gitlab.pin_review_ref("c" * 40)
+        try:
+            return await dbt_affected._wait_in_thread(lambda: spec(None, {}), 5)
+        finally:
+            gitlab.pin_review_ref(None)
+
+    assert asyncio.run(run()) == ("A", "# 規格 A")
+    assert seen["ref"] == "c" * 40
+

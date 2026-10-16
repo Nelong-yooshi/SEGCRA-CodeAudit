@@ -22,6 +22,7 @@ macro 反查(dbt_context 準備好的 ImpactReport)只說「哪些 model 受影�
     剩下的時間;時間到了還沒做完的 model 記成沒有檢查、沒查規格
 """
 import asyncio
+import contextvars
 import dataclasses
 import threading
 import time
@@ -167,7 +168,11 @@ async def _wait_in_thread(make_coroutine, seconds: float):
     逾時丟 asyncio.TimeoutError。
 
     不用 asyncio.to_thread:那會用預設的執行緒池,審查結束時 asyncio.run 會等池裡卡住的
-    執行緒跑完,時間上限就守不住。逾時後那條執行緒繼續跑到它自己的請求逾時為止,結果丟掉。"""
+    執行緒跑完,時間上限就守不住。逾時後那條執行緒繼續跑到它自己的請求逾時為止,結果丟掉。
+
+    呼叫端的 contextvars 要一起帶過去(asyncio.to_thread 也是這樣做):新開的執行緒不會繼承,
+    而這次審查釘住的 commit(toolbox.gitlab 的 review_ref)就存在 ContextVar 裡,讀不到時
+    get_file 會回「無法取得審查中的版本」,受影響的 model 就全部查不到規格。"""
     loop = asyncio.get_running_loop()
     done = loop.create_future()
 
@@ -185,7 +190,7 @@ async def _wait_in_thread(make_coroutine, seconds: float):
         except RuntimeError:
             pass                               # 原本的事件迴圈已經結束:沒有人在等了
 
-    threading.Thread(target=work, daemon=True).start()
+    threading.Thread(target=contextvars.copy_context().run, args=(work,), daemon=True).start()
     return await asyncio.wait_for(done, seconds)
 
 

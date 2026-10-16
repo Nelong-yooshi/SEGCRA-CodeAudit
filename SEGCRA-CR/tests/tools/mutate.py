@@ -1971,6 +1971,9 @@ MUTANTS.update({
  'dbt範圍:只改 model 的判斷不用資源目錄設定': ('dbt_context.py',
      '    if all(path_kind(rel, project.model_paths, project.macro_paths, project.resource_paths) == "model"',
      '    if all(path_kind(rel, project.model_paths, project.macro_paths) == "model"'),
+ '受影響:查規格的執行緒沒帶 contextvars': ('dbt_affected.py',
+     'threading.Thread(target=contextvars.copy_context().run, args=(work,), daemon=True)',
+     'threading.Thread(target=work, daemon=True)'),
 })
 
 
