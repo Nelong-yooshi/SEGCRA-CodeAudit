@@ -13,6 +13,16 @@ default_profile: review
 # - 出能力報告(看模型真實表現的分布):跑的時候用環境變數覆蓋 run_eval.py 的預設:
 #     LLM_TEMPERATURE=0.1 LLM_SEED= .venv/bin/python eval/run_eval.py ...
 #   (LLM_SEED 設空字串 = 取消固定 seed,恢復隨機)
+# reasoning_effort(#25):profile 可以設定,但**預設不送,而且測資生成不要關思考**。
+# gemma4 的思考 token 算在 max_output_tokens 裡、佔掉將近一半,所以直覺是關掉它
+# 把預算讓給真正要的輸出。2026-10-12 實測的結果是**不要這樣做**:
+#   RETAIL_M1_EVAL(23 個原子條件)關掉思考後,模型把條件 1 的七項子條件壓成「一個」
+#   條件,23 個變 7 個,14 個案例就「覆蓋完」,覆蓋檢查回報「只缺 1 個」——
+#   而實際上那七項子條件沒有各自驗過。思考開著時它是誠實地 3/3 截斷、0 個案例、
+#   交人工。**關掉之後失敗變得看不見,決策還可能自動放行,那是退步不是進步。**
+# 細節見 docs/05-執行驗證spec_exec.md「關掉思考救不了大規則」。
+# 這個欄位留著是為了換端點/換模型時可能用得上,不是給現在調的。
+#
 # num_ctx 目前是無效設定:orchestrator/agent.py 呼叫模型時根本沒有把這個欄位送出去,
 # 只是紀錄在 profile 上供人參考,實際的 context 長度由模型端點那邊的設定決定。真正的防線
 # 是 agent.py 用回應的 usage.prompt_tokens 檢查有沒有比預期少很多——那才是「超過 context
@@ -65,8 +75,10 @@ policy:
 #      規則看資料庫名,用假名不影響判斷。展開後的 SQL 片段會出現在審查結果裡,所以
 #      不放正式資料庫名。假名要固定不變(golden set 的標準答案才不會跟著變),
 #      改名時要同步更新 docs/09-dbt展開與反查.md。
-#      不要寫在這個檔案裡(維持由環境變數提供);沒設定時,用到 ref()/source() 的
-#      model 一律展開失敗(安全預設,但等於沒用)。下面的 database 只留空字串當後備。
+#      不要寫在這個檔案裡(維持由環境變數提供)。enabled: true 時,資料庫名必須
+#      完全等於約定值(orchestrator/config.py 的 DBT_DATABASE_PLACEHOLDER),未設定
+#      或拼錯都會在載入設定時報錯——拼錯的名稱只會默默產出錯的表名,不會自己報錯。
+#      下面的 database 只留空字串當後備。
 #   2. 目前還沒有列 GitLab 目錄的工具,所以這裡展開時**沒有 macro 目錄**——只有
 #      ref() / source() / var() / config() 會生效,呼叫到專案自訂 macro 的 model
 #      會展開失敗(StrictUndefined,fail closed),跟現在完全沒展開時一樣落到

@@ -240,7 +240,7 @@ def download_archive(sha: str, path: str = "", *, max_bytes: int) -> bytes:
 # --- mock mode helpers ---------------------------------------------------
 
 def _mock_mr(mr_id: str) -> dict:
-    f = FIXTURES_DIR / f"mr_{mr_id}.json"
+    f = FIXTURES_DIR / f"mr_{_check_mr_id(mr_id)}.json"
     if not f.exists():
         raise FileNotFoundError(f"fixture 不存在: {f.name};現有: "
                                 + ", ".join(p.name for p in FIXTURES_DIR.glob('mr_*.json')))
@@ -264,6 +264,18 @@ def _mock_output(mr_id: str, kind: str, payload: dict):
     f.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _check_mr_id(mr_id) -> str:
+    """MR 編號只接受 1–10 位的 ASCII 數字(GitLab 的 MR iid 本來就是整數)。
+
+    它會被接進 API 路徑(`/merge_requests/{mr_id}`)與 fixture 檔名,而 get_mr_diff /
+    get_file 是審查模型也能呼叫的工具(#17):`1/../../issues/5` 這類值可以讓同一把
+    token 去讀別的 API 端點或別的檔案。不用 isdigit() 單獨判斷:它也接受「²」等 Unicode 數字。"""
+    mr_id = str(mr_id)
+    if not (mr_id.isascii() and mr_id.isdigit() and len(mr_id) <= 10):
+        raise ValueError("MR 編號必須是數字")
+    return mr_id
+
+
 # --- tools ---------------------------------------------------------------
 
 def get_mr_diff(mr_id: str) -> str:
@@ -278,6 +290,7 @@ def get_mr_diff(mr_id: str) -> str:
     靜默當成「這個檔案沒問題」。`truncated=True` 代表 MR 的檔案數超過
     `MAX_DIFF_PAGES` 能取到的上限,同樣不得自動放行。
     """
+    mr_id = _check_mr_id(mr_id)
     if REAL_MODE:
         mr = _api("GET", f"/merge_requests/{mr_id}")
         changes, truncated = _api_pages(f"/merge_requests/{mr_id}/diffs")

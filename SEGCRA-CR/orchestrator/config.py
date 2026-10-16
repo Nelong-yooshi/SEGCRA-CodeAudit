@@ -6,6 +6,11 @@ import yaml
 
 PKG_ROOT = Path(__file__).resolve().parent.parent
 
+# dbt 展開用的資料庫名稱:約定的固定假名(#14 review)。只用來把 ref()/source() 拼成
+# 完整表名給規則層掃描,不連線;固定不變,golden set 的標準答案才不會跟著飄。
+# 改名時要同步更新 config/models.yaml 的註解與 docs/09(有測試確保三處一致)。
+DBT_DATABASE_PLACEHOLDER = "DBT_PLACEHOLDER"
+
 
 @dataclass
 class ModelProfile:
@@ -14,6 +19,14 @@ class ModelProfile:
     temperature: float
     max_output_tokens: int
     seed: int | None = None
+    # 思考的 token 也算在 max_output_tokens 裡,所以這個欄位實際上是在分配輸出預算:
+    # 實測 R-140 的測資生成,思考 5,054 字、JSON 本體 5,647 字——**將近一半的輸出
+    # 上限花在我們看不到也用不到的推理上**。None = 不送這個參數,用端點的預設值
+    # (會思考);設成 "none" 可以把整個上限讓給真正要的輸出。
+    #
+    # 不是所有端點都吃這個參數,所以預設不送:送了不支援的參數可能被整個請求退回,
+    # 那會比「多花一點 token」嚴重得多。
+    reasoning_effort: str | None = None
 
 
 def _env_float(name: str, lo: float, hi: float) -> float:
@@ -38,6 +51,30 @@ def _env_float(name: str, lo: float, hi: float) -> float:
             f"這種值端點可能自己夾住也可能照收,兩種都會讓這輪的數字量在"
             f"沒人知道的設定下,所以這裡直接擋下")
     return v
+
+
+# 端點接受的檔位。"none" 是「完全不要思考」,其餘是強度。
+# 空字串另外處理:代表「取消覆蓋,回到不送這個參數」,與「送 none」不同——
+# 前者用端點預設(會思考),後者明確要求不思考。
+_EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high")
+
+
+def _env_effort(name: str) -> str | None:
+    """讀 reasoning_effort 的環境變數覆蓋。
+
+    壞值要當場擋下來,理由跟 _env_float 一樣:這個變數是手打在跑批指令前面的,
+    而打錯的後果很安靜——端點收到不認得的值可能整個請求退回(那還好,會看到錯誤),
+    也可能默默忽略,於是你以為關掉了思考、實際上沒有,整輪的比較就白做了。
+    """
+    raw = os.environ[name].strip().lower()
+    if not raw:
+        return None
+    if raw not in _EFFORT_LEVELS:
+        raise ValueError(
+            f"環境變數 {name} 的值不在可用檔位裡:{os.environ[name]!r}。"
+            f"可用:{'、'.join(_EFFORT_LEVELS)};"
+            f"或設成空字串代表不送這個參數(用端點預設)")
+    return raw
 
 
 def _env_seed(name: str) -> int | None:
@@ -84,6 +121,10 @@ class Config:
             prof.temperature = _env_float("LLM_TEMPERATURE", 0.0, 2.0)
         if "LLM_SEED" in os.environ:
             prof.seed = _env_seed("LLM_SEED")
+        # 量「關掉思考會不會讓覆蓋度變好」時,要用**同一份程式碼**跑開與關兩次,
+        # 所以得有環境變數可以覆蓋,不能只靠改 yaml(改了 yaml 兩次跑的就不是同一版)。
+        if "LLM_REASONING_EFFORT" in os.environ:
+            prof.reasoning_effort = _env_effort("LLM_REASONING_EFFORT")
         return prof
 
     def role_profile(self, role: str) -> ModelProfile:
@@ -123,6 +164,13 @@ def _load_dbt_section(raw: dict) -> dict:
             raise ValueError(
                 "dbt 的資料庫名稱只接受英數與底線(會被拼進 SQL 識別字);"
                 "請檢查環境變數 SEGCRA_DBT_DATABASE。")
+    if enabled and database != DBT_DATABASE_PLACEHOLDER:
+        # 漏設或拼錯時展開不會報錯,只會產出錯的表名,報告看起來卻完全正常(#14
+        # review)——開啟時就擋下,不讓審查帶著錯的設定啟動。訊息不回顯實際的值:
+        # 填進來的可能正是不該外流的正式資料庫名。
+        raise ValueError(
+            f"dbt.enabled 開啟時,環境變數 SEGCRA_DBT_DATABASE 必須設為約定的假名 "
+            f"{DBT_DATABASE_PLACEHOLDER}(見 docs/09-dbt展開與反查.md);目前未設定或不符。")
     return {"enabled": enabled, "database": database}
 
 
