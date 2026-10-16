@@ -21,7 +21,11 @@
 1. `extract_rule_codes`:把 MR 的標題、描述、每個檔的路徑與內容(`full_content`,沒有就用 diff)串起來,用 regex `\bR-\d{2,4}\b` 抓規則碼,去重排序。
 2. `find_spec` 兩路:
    - **mock/本地路**:逐碼查本包 `specs/<code>.md`,存在即讀入回傳。
-   - **real 路**:本地沒有時,經 ToolHub 呼叫 `gitlab__get_file` 抓 GitLab repo 內的 `specs/<code>.md`(`toolbox/gitlab.py:get_file`,REST `repository/files/.../raw`);內容須以 `#` 開頭才算拿到(擋 404 佔位訊息)。
+   - **real 路**:**不讀本包的 `specs/`**,一律經 ToolHub 呼叫 `gitlab__get_file` 抓 GitLab repo 內的 `specs/<code>.md`(`toolbox/gitlab.py:get_file`,REST `repository/files/.../raw`);內容須以 `#` 開頭才算拿到(擋 404 佔位訊息)。不指定 `ref` → 讀**這次 MR 的版本**(pipeline 在取完 MR 之後釘住 head sha)。
+
+     > 本包的 `specs/` 是評測與離線開發用的樣本,不是正式環境的規格。real 模式若先讀它,MR 改了 `specs/R-093.md` 時執行驗證拿到的還是樣本那份,而報告上看不出用的是哪一份。
+     >
+     > 規格讀 MR 的版本是刻意的:規格與程式會在同一個 MR 裡一起修正,鎖在目標分支會讓「規格寫錯、跟程式一起修」的 MR 被拿舊規格判成不符。代價是一個 MR 可以同時改規格與程式,這一點由「讓審查的人看見規格被改了」處理(見 #38 第 3 點),不是靠鎖版本。
    - 都找不到 → 回 `(第一個規則碼|None, None)`。
 3. `run_spec_exec` 收到 `spec_text=None` 時,直接產出 **major「無規格可驗,無法執行驗證」**(`no_spec: True`、`passed: False`)並要求先補規格再送審;MR 完全抓不到規則碼也是同一條 major(措辭不同)。另一個早退:MR 還原不出 SQL(`_sql_from_diff` 只收 diff 的 `+` 行)→ major「MR 無可執行的 SQL」。
 

@@ -468,6 +468,26 @@ MUTANTS.update({
      "    report[\"findings\"].append(major)\n    return report\n\n\n# 引用來源裡指名的規則碼"),
 })
 
+# ---- 取回整份新檔的四道防線:唯讀 token、單檔上限、不退回舊版、取不到要交人工
+MUTANTS.update({
+ "完整檔:讀程式碼用有寫入權的 token": ("../toolbox/gitlab.py",
+     "    if not GITLAB_READ_TOKEN or GITLAB_READ_TOKEN == GITLAB_TOKEN:" + NL
+     + "        return None",
+     "    if False:" + NL
+     + "        return None"),
+ "完整檔:單檔沒有大小上限": ("../toolbox/gitlab.py",
+     "    if len(r.content) > MAX_FILE_BYTES:" + NL + "        return None",
+     "    if False:" + NL + "        return None"),
+ "完整檔:沒釘住版本時退回目標分支(= #22 的原始 bug)": ("../toolbox/gitlab.py",
+     '        ref = ref or review_ref() or ""',
+     '        ref = ref or review_ref() or "main"'),
+ "完整檔:取不到完整內容不交人工": ("pipeline.py",
+     '    no_full = [f["path"] for f in mr.get("files", [])' + NL
+     + '               if f.get("full_content_unavailable") and not f.get("unreviewable")]',
+     '    no_full = []'),
+})
+
+
 
 def copy_project(src: pathlib.Path, dst: pathlib.Path) -> None:
     """複製整個專案(除了下面明列的建置產物/快取/憑證),不是手動列出「測試會用到
@@ -608,11 +628,11 @@ MUTANTS.update({
      '        pre = await prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered)',
      '        pre = await prescan(hub, mr["files"], cfg.dbt, None, rendered)'),
  '專案接線:注入掃描不掃取回的完整內容': ('pipeline.py',
-     'injection_hits = scan_mr(_mr_with_head_text(mr, dbt_ctx, rendered))',
-     'injection_hits = scan_mr(_mr_with_head_text(mr, None, rendered))'),
- "專案接線:注入掃描只掃完整內容、漏掉原本的 diff": ("pipeline.py",
-     "    return {**mr, \"files\": [*mr[\"files\"], *extra]} if extra else mr",
-     "    return {**mr, \"files\": extra} if extra else mr"),
+     '        scan_target = _mr_with_head_text(mr, dbt_ctx, rendered)',
+     '        scan_target = _mr_with_head_text(mr, None, rendered)'),
+ '專案接線:注入掃描只掃完整內容、漏掉原本的 diff': ('pipeline.py',
+     '    out = {**mr, "files": [*mr["files"], *kept]}',
+     '    out = {**mr, "files": kept}'),
  "專案設定:project_dir 不檢查": ("config.py",
      "        project_dir = check_project_dir(section.get(\"project_dir\", \"\"))",
      "        project_dir = section.get(\"project_dir\", \"\")"),
@@ -1670,8 +1690,10 @@ MUTANTS.update({
 
 # ---- get_mr_diff 帶出 diff_refs 的三個 sha(#15 接線與 #22 共用)
 MUTANTS.update({
+ # #22 把 real 模式的 _diff_refs(mr) 先存成 refs(補 full_content 時要用 head_sha),
+ # 所以字面從 **_diff_refs(mr) 變成 **refs;突變本身不變,仍是「不帶出三個 sha」。
  "diff_refs:real 模式不帶出": ("../toolbox/gitlab.py",
-     '"sha": mr.get("sha", ""), **_diff_refs(mr), "files": files,',
+     '"sha": mr.get("sha", ""), **refs, "files": files,',
      '"sha": mr.get("sha", ""), "files": files,'),
  "diff_refs:mock 模式不帶出": ("../toolbox/gitlab.py",
      '"sha": mr.get("sha", f"mock-{mr_id}"), **_diff_refs(mr),',
@@ -1863,8 +1885,8 @@ MUTANTS.update({
      'if isinstance(f, dict) and (text := dbt_ctx.head_text(f.get("path"))) is not None]',
      'if (text := dbt_ctx.head_text(f.get("path"))) is not None]'),
  '專案接線:注入掃描不掃展開後的 SQL': ('pipeline.py',
-     'injection_hits = scan_mr(_mr_with_head_text(mr, dbt_ctx, rendered))',
-     'injection_hits = scan_mr(_mr_with_head_text(mr, dbt_ctx))'),
+     '        scan_target = _mr_with_head_text(mr, dbt_ctx, rendered)',
+     '        scan_target = _mr_with_head_text(mr, dbt_ctx)'),
  '專案接線:預掃不收集展開後的 SQL': ('pipeline.py',
      '            elif rendered is not None:\n                rendered.append(',
      '            elif False:\n                rendered.append('),
@@ -1949,6 +1971,21 @@ MUTANTS.update({
  'dbt範圍:只改 model 的判斷不用資源目錄設定': ('dbt_context.py',
      '    if all(path_kind(rel, project.model_paths, project.macro_paths, project.resource_paths) == "model"',
      '    if all(path_kind(rel, project.model_paths, project.macro_paths) == "model"'),
+ '受影響:查規格的執行緒沒帶 contextvars': ('dbt_affected.py',
+     'threading.Thread(target=contextvars.copy_context().run, args=(work,), daemon=True)',
+     'threading.Thread(target=work, daemon=True)'),
+ '專案接線:注入掃描不設總量上限': ('pipeline.py',
+     '        if used + size > MAX_EXTRA_SCAN_CHARS:\n            skipped += 1',
+     '        if False:\n            skipped += 1'),
+ '專案接線:沒掃的份數不記': ('pipeline.py',
+     '    if skipped:\n        out["_scan_skipped"] = skipped',
+     '    if False:\n        out["_scan_skipped"] = skipped'),
+ '專案接線:沒掃完不補 finding': ('pipeline.py',
+     '        report = enforce_scan_skipped(report, scan_target.get("_scan_skipped", 0))  # 內容太多沒掃完\n',
+     ''),
+ '專案接線:沒掃完只給 info': ('pipeline.py',
+     '"severity": "major", "title": _SCAN_SKIPPED_TITLE',
+     '"severity": "info", "title": _SCAN_SKIPPED_TITLE'),
 })
 
 

@@ -180,10 +180,16 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
 
    三個都設齊即切到 real 模式;缺任一則走 mock(fixtures/)。
 
-   **dbt macro 的打包下載另外需要一把唯讀 token**(#15):專案 → *Settings* → *Access tokens*
+   **真實模式必須有一把唯讀 token**:專案 → *Settings* → *Access tokens*
    建一把 **project access token**,角色 *Reporter*、scope 只勾 `read_api`、設定到期日,
-   設成 `GITLAB_READ_TOKEN`。它與上面有寫入權的 `GITLAB_TOKEN` 刻意分開:打包下載**不會**
-   退回用 `GITLAB_TOKEN`,兩把設成同一把也會拒絕;沒設時打包下載一律失敗、交人工。
+   設成 `GITLAB_READ_TOKEN`。兩件事都用它:
+
+   * **讀取受審檔案的完整內容**(預掃與執行驗證要的是整份新檔,不是 diff 那幾行)
+   * **dbt macro 的打包下載**
+
+   它與上面有寫入權的 `GITLAB_TOKEN` 刻意分開:**不會**退回用 `GITLAB_TOKEN`,
+   兩把設成同一把也會拒絕。**沒設定的話每個檔案都取不到完整內容,每個 MR 都會被
+   判定「需人工確認」**——真實模式等於跑不動,不是降級跑。
    打包下載只接受 https 的 `GITLAB_URL`(本機 localhost / 127.0.0.1 除外),且不經過
    `HTTP_PROXY` 等代理設定。
 
@@ -232,7 +238,8 @@ dbt 專案不在 repo 根目錄時,另外在 `models.yaml` 的 `dbt` 底下設 `
 
 **先用內附的範例確認(不用 GitLab、不呼叫模型):**
 
-`examples/dbt_wiring/` 有一個合成的小專案與兩個 MR。把 `models.yaml` 的 `dbt.enabled` 暫時改成 `true`
+`examples/dbt_wiring/fixtures/` 有一個合成的小專案與兩個 MR:`mr_801.json` 只改 model、`mr_802.json`
+只改 macro(`--mr` 後面接的就是這個編號)。把 `models.yaml` 的 `dbt.enabled` 暫時改成 `true`
 (只在本機改,不要提交),然後:
 
 ```bash
@@ -241,8 +248,8 @@ export SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER FIXTURES_DIR=examples/dbt_wiring/fixt
 .venv/bin/python demo.py --mr 802 --dry-run    # 只改 macro:多一條 major「dbt 變更對其他 model 的影響」
 ```
 
-`--mr 802` 的那條 finding 會列出改到的 macro 檔與受影響的 `models/mrt_sample.sql[R003 major(展開後第 1 句)]`
-(macro 的變更讓它多出 `NOT IN` 子查詢)。把 `dbt.enabled` 改回 `false` 再跑,兩個 MR 都會變成「預掃無法解析」。
+只改 macro 的那個 MR 會多一條 major,列出受影響的 `models/mrt_sample.sql`:macro 的變更讓它展開後的
+第 1 句多出 `NOT IN` 子查詢(R003)。把 `dbt.enabled` 改回 `false` 再跑,兩個 MR 都會變成「預掃無法解析」。
 
 **關閉:**把 `dbt.enabled` 改回 `false` 即可,行為與沒有這個功能時相同(有測試鎖住)。`GITLAB_READ_TOKEN`
 不用時到 GitLab 撤銷。
