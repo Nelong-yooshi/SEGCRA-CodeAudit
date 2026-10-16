@@ -79,7 +79,9 @@ def test_real模式原有欄位不變(monkeypatch):
                 changes=[{"new_path": "a.sql", "old_path": "a.sql", "diff": "+x", "too_large": True}])
     assert out["title"] == "標題" and out["description"] == "說明" and out["sha"] == HEAD
     assert out["truncated"] is False
+    # `deleted` 是後來加的:刪掉的檔在 head 上不存在,不該被當成「取不到完整內容」
     assert out["files"] == [{"path": "a.sql", "old_path": "a.sql", "diff": "+x",
+                             "deleted": False,
                              "unreviewable": True}]
     assert set(out) == {"title", "description", "sha", "files", "truncated", *KEYS}
 

@@ -24,13 +24,6 @@ REAL_MODE = bool(GITLAB_URL and GITLAB_TOKEN and GITLAB_PROJECT)
 # 專案層級的唯讀 token(read_api,角色 Reporter),只給打包下載用(#15 條件 1)
 GITLAB_READ_TOKEN = os.environ.get("GITLAB_READ_TOKEN", "")
 
-# 規格一律從這個 ref 讀,**不跟著 MR 走**(#22)。
-# 理由是安全性:規格是核定過的真值,如果它跟著 MR 的版本走,一個 MR 就能在同一次
-# 提交裡改掉自己的規格讓自己通過——那等於執行驗證整道防線自己把門打開。
-# 現行行為原本是靠「get_file 的 ref 預設是 main」意外達成的;#22 要把 get_file 的
-# 預設改成跟著 MR,所以這條規則必須改成寫死在呼叫處(見 spec_exec.find_spec),
-# 預設值怎麼變都不會破。
-SPEC_REF = os.environ.get("SPEC_REF", "main")
 
 
 # --- real mode helpers ---------------------------------------------------
@@ -106,9 +99,15 @@ MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(1024 * 1024)))
 
 
 def _read_token() -> str | None:
-    """讀程式碼用**唯讀** token。沒設定就回 None——呼叫端據此標成「取不到完整
-    內容」交人工,**不退回用有寫入權的 GITLAB_TOKEN**(#20/#22 留言的規矩)。"""
-    return GITLAB_READ_TOKEN or None
+    """讀程式碼用**唯讀** token。沒設定、或與有寫入權的那把相同,都回 None。
+
+    呼叫端據此標成「取不到完整內容」交人工,**不退回用有寫入權的 GITLAB_TOKEN**。
+    拒絕「兩把設成同一把」是因為那等於沒有唯讀隔離,只是看起來有設定——
+    打包下載(download_archive)本來就是這個規則,讀檔也照做才一致。
+    """
+    if not GITLAB_READ_TOKEN or GITLAB_READ_TOKEN == GITLAB_TOKEN:
+        return None
+    return GITLAB_READ_TOKEN
 
 
 def _file_at(path: str, ref: str) -> str | None:
@@ -305,6 +304,10 @@ def _check_mr_id(mr_id) -> str:
 
 # --- tools ---------------------------------------------------------------
 
+# **釘住版本的動作不在這裡**:這個函式在模型的工具清單裡。審 !7 時模型若被 MR
+# 描述引導去呼叫 get_mr_diff("8"),釘住的 sha 就會變成 !8 的,之後 get_file 看到的
+# 是別的 MR 的檔案,連補讀規格也會讀錯版本。改由 pipeline 在取完 MR 之後釘
+# (orchestrator/pipeline.py 的 review_mr),這個函式本身沒有副作用。
 def get_mr_diff(mr_id: str) -> str:
     """取得 MR 的標題、描述、head commit sha 與 diff(逐檔)。
 
@@ -323,26 +326,34 @@ def get_mr_diff(mr_id: str) -> str:
         changes, truncated = _api_pages(f"/merge_requests/{mr_id}/diffs")
         files = [{"path": c["new_path"], "old_path": c.get("old_path"),
                   "diff": c.get("diff") or "",
+                  "deleted": bool(c.get("deleted_file")),
                   "unreviewable": bool(c.get("too_large") or c.get("collapsed"))}
                  for c in changes]
         refs = _diff_refs(mr)
-        # **預掃與執行驗證要的是整份新檔,不是 diff 裡那幾行**(#22)。
-        # 大檔小改的 MR,從 diff 還原出來的 SQL 可能只剩一行,sqlglot 解析不了、
-        # 沙盒也沒東西可跑——而 golden case 都有 full_content,所以這條路在評測裡
-        # 永遠不會被走到,正式環境卻每次都走。
-        pin_review_ref(refs.get("head_sha"))
-        if refs.get("head_sha"):
-            for f in files:
-                if f["unreviewable"]:
-                    continue        # 本來就拿不到內容的,不用多打一次 API
-                content = _file_at(f["path"], refs["head_sha"])
-                if content is not None:
-                    f["full_content"] = content
-                else:
-                    # 取不到就讓它缺著:下游是 `full_content or _sql_from_diff(...)`,
-                    # 會退回只用 diff。**不要塞空字串**——那會讓下游以為
-                    # 「這個檔是空的」而不是「我們沒拿到」。
-                    f["full_content_unavailable"] = True
+        # **預掃與執行驗證要的是整份新檔,不是 diff 裡那幾行**。大檔小改的 MR,
+        # 從 diff 還原出來的 SQL 可能只剩一行,sqlglot 解析不了、沙盒也沒東西可跑
+        # ——而 golden case 都有 full_content,所以這條路在評測裡永遠不會被走到,
+        # 正式環境卻每次都走(#22)。
+        head = refs.get("head_sha")
+        for f in files:
+            if f["unreviewable"]:
+                continue            # 本來就拿不到內容的,不用多打一次 API
+            if f["deleted"]:
+                continue            # 刪掉的檔在 head 上不存在,沒有新版可抓,不是「取不到」
+            if not head:
+                # **沒有 head sha 時一樣要標**。GitLab 在 MR 剛建立、diff 還沒算好時
+                # `diff_refs` 是 null,而 webhook 往往就在這時候觸發;不標的話這些檔
+                # 只有 diff 那幾行進得了預掃與沙盒,卻沒有任何提示。
+                f["full_content_unavailable"] = True
+                continue
+            content = _file_at(f["path"], head)
+            if content is not None:
+                f["full_content"] = content
+            else:
+                # 取不到就讓它缺著:下游是 `full_content or _sql_from_diff(...)`,
+                # 會退回只用 diff。**不要塞空字串**——那會讓下游以為
+                # 「這個檔是空的」而不是「我們沒拿到」。
+                f["full_content_unavailable"] = True
         return json.dumps({"title": mr["title"], "description": mr.get("description", ""),
                            "sha": mr.get("sha", ""), **refs, "files": files,
                            "truncated": truncated}, ensure_ascii=False)
@@ -353,9 +364,9 @@ def get_mr_diff(mr_id: str) -> str:
 
 
 # 這個函式的 docstring 會**原樣送給模型**當工具說明(tool_hub.py 用 inspect.getdoc),
-# 所以它必須短、而且只講模型需要知道的事。開發用的說明一律寫成 # 註解(#31 review:
-# 上一版把 docstring 寫長,還叫模型「讀規格請傳 ref=SPEC_REF」——模型照做會送出
-# 字面的 "SPEC_REF",只會拿到 404)。
+# 所以它必須短、而且只講模型需要知道的事;開發用的說明一律寫成 # 註解。
+# 曾經把它寫長、還在裡面叫模型「讀規格請傳 ref=SPEC_REF」——模型照做會送出字面的
+# "SPEC_REF" 字串,只會拿到 404。
 #
 # 不指定 ref 時抓「正在審的那一版」(get_mr_diff 釘住的 head sha),而不是目標分支
 # 的現況:先前預設 main,模型看到的是**改之前**的內容,看起來正常、實際上在審錯的

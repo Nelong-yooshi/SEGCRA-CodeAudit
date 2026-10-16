@@ -8,7 +8,7 @@
 這裡驗三件事:
   1. real 模式依 head sha 補 full_content
   2. `get_file` 不指定 ref 時抓「正在審的那一版」,不是目標分支
-  3. **規格不跟 MR 走** —— 否則 MR 能改自己的規格讓自己過
+  3. **規格讀的也是正在審的那一版** —— 規格與程式會在同一個 MR 裡一起修正
 """
 import json
 import sys
@@ -40,16 +40,19 @@ def real(monkeypatch):
     monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", "ro")
     monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "1")
 
-    state = {"files": {}, "fetched": []}
+    state = {"files": {}, "fetched": [], "api_pages": None}
 
     def fake_api(method, path, **kw):
         return {"title": "T", "description": "D", "sha": SHA,
                 "diff_refs": {"base_sha": "b" * 40, "head_sha": SHA,
                               "start_sha": "c" * 40}}
 
+    # 預設只有一個檔;測試可以塞 state["api_pages"] 換掉(例如要測刪除的檔)
+    state["api_pages"] = ([{"new_path": "sql/big.sql", "old_path": "sql/big.sql",
+                            "diff": "@@\n+AND eod_balance < 1000\n"}], False)
+
     def fake_pages(path, params=None):
-        return [{"new_path": "sql/big.sql", "old_path": "sql/big.sql",
-                 "diff": "@@\n+AND eod_balance < 1000\n"}], False
+        return state["api_pages"]
 
     def fake_file_at(path, ref):
         state["fetched"].append((path, ref))
@@ -90,6 +93,10 @@ def test_拿不到_head_sha_就不抓(real, monkeypatch):
     f = json.loads(gitlab.get_mr_diff("7"))["files"][0]
     assert real["fetched"] == [], "拿不到 head sha 卻還是去抓了"
     assert "full_content" not in f
+    # **而且要標成取不到**,否則這些檔只有 diff 那幾行進得了預掃與沙盒,
+    # 卻沒有任何提示。GitLab 在 MR 剛建立、diff 還沒算好時 diff_refs 是 null,
+    # 而 webhook 往往就在這時候觸發。
+    assert f["full_content_unavailable"] is True
 
 
 def test_拿不到內容的檔案不用多打一次_API(real):
@@ -160,7 +167,7 @@ def test_明確指定的_ref_優先(real, seen_ref):
     assert seen_ref["ref"] == "main", "明確傳的 ref 被釘住的版本蓋掉了"
 
 
-# ─────────────────── 3. 規格不跟 MR 走(安全性) ───────────────────
+# ─────────────────── 3. 規格讀的是正在審的那一版 ───────────────────
 
 def test_規格讀的是正在審的那一版(monkeypatch):
     """規格與程式是我們自己整理的,會在同一個 MR 裡一起修正。
@@ -249,6 +256,27 @@ def _review_real(monkeypatch, tmp_path, *, serve_full: bool):
         [{"new_path": "sql/rules/r201.sql", "diff": _ONE_LINE_DIFF}], False))
     monkeypatch.setattr(gitlab, "_file_at",
                         lambda path, ref: _BIG_SQL if serve_full else None)
+
+    # real 模式**不讀**工具內建的 specs/(那份是評測與離線開發用的樣本),所以規格
+    # 也要從 GitLab 供。這同時釘住「規格讀的是正在審的那一版」:這裡回的規格
+    # 只有走 get_file 才拿得到。
+    spec_reads = []
+
+    def fake_get_file(path, ref="", mr_id=""):
+        spec_reads.append((path, ref))
+        if path.startswith("specs/"):
+            return "# R-201 單日 ATM 現金提領累計達 100000(含)通報\n\n規格內容。\n"
+        return _BIG_SQL if serve_full else f"(repo 內無 {path})"
+    monkeypatch.setattr(gitlab, "get_file", fake_get_file)
+    # tool_hub 在**模組載入時**就把函式物件放進 TOOL_GROUPS,所以只換 gitlab.get_file
+    # 不會影響模型(與 find_spec)實際呼叫到的那個。兩邊都要換。
+    from orchestrator import tool_hub
+    fake_get_file.__name__ = "get_file"
+    monkeypatch.setitem(
+        tool_hub.TOOL_GROUPS, "gitlab",
+        [fake_get_file if f is gitlab.__dict__.get("get_file") or
+         getattr(f, "__name__", "") == "get_file" else f
+         for f in tool_hub.TOOL_GROUPS["gitlab"]])
     # 回寫 GitLab 的動作在 real 模式會發 HTTP,這裡不是要驗那個
     for fn in ("post_inline_comment", "post_summary", "set_commit_status", "set_label"):
         monkeypatch.setattr(gitlab, fn, lambda *a, **k: "ok")
@@ -284,7 +312,7 @@ def _review_real(monkeypatch, tmp_path, *, serve_full: bool):
 
     captured: dict = {}
     report = asyncio.run(review_or_raise(pipeline, load_config(), captured))
-    return report, captured.get("prescan_raw") or [], sandbox_sql.get("sql")
+    return report, captured.get("prescan_raw") or [], sandbox_sql.get("sql"), spec_reads
 
 
 def review_or_raise(pipeline, cfg, captured):
@@ -298,7 +326,7 @@ def test_大檔只改一行_預掃要拿到整份檔而不是那一行(monkeypat
     SELECT 都看不到,解析失敗,AST 規則整組沒跑。而這個缺口 golden set 量不到,
     因為 golden case 都有 full_content。
     """
-    _, pre, _ = _review_real(monkeypatch, tmp_path, serve_full=True)
+    _, pre, _, _ = _review_real(monkeypatch, tmp_path, serve_full=True)
     assert pre, "沒有拿到預掃結果"
     entry = pre[0]
     assert "parse_error" not in entry, (
@@ -313,14 +341,15 @@ def test_拿不到完整檔時_預掃解析失敗而且會被揭露(monkeypatch,
     2. 釘住降級時的行為:拿不到完整檔**不可以靜默**——`enforce_parse` 要補一條
        finding,否則 MR 可能因為「沒有命中任何規則」而被自動放行
     """
-    report, pre, _ = _review_real(monkeypatch, tmp_path, serve_full=False)
+    report, pre, _, _ = _review_real(monkeypatch, tmp_path, serve_full=False)
     assert pre and "parse_error" in pre[0], "拿不到完整檔卻解析成功了?測試設計有問題"
     titles = [f.get("title") for f in report.get("findings", [])]
     assert any("預掃無法解析" in str(t) for t in titles), (
         f"解析失敗沒有被揭露,findings = {titles}")
 
 
-# ─────────────────── #31 review 補的四條 ───────────────────
+# ─────────── 取不到整份新檔的四種情況:唯讀 token、單檔上限、
+#             沒釘住版本、以及跨執行緒不可互相污染 ───────────
 
 def test_讀程式碼用唯讀token(real, seen_ref, monkeypatch):
     """依 #20／#22 留言的規矩:讀程式碼用唯讀的 GITLAB_READ_TOKEN。"""
@@ -427,7 +456,7 @@ def test_沙盒實際收到整份SQL(monkeypatch, tmp_path):
     原本的端到端測試把 `generate_cases` 換成回傳空結果,所以**沙盒那條路根本沒走到**
     ——「執行驗證也拿到整份檔」這件事沒有被驗過(#31 review)。
     """
-    _, _, sql = _review_real(monkeypatch, tmp_path, serve_full=True)
+    _, _, sql, _ = _review_real(monkeypatch, tmp_path, serve_full=True)
     assert sql, "執行驗證沒有跑到沙盒"
     assert "WITH base AS" in sql and "FROM transactions" in sql, (
         "沙盒收到的不是整份檔:" + repr(sql[:120]))
@@ -436,7 +465,7 @@ def test_沙盒實際收到整份SQL(monkeypatch, tmp_path):
 
 def test_拿不到完整檔時沙盒收到的只有diff那幾行(monkeypatch, tmp_path):
     """反面對照:證明上一條真的分得出差別,而不是恰好都綠。"""
-    _, _, sql = _review_real(monkeypatch, tmp_path, serve_full=False)
+    _, _, sql, _ = _review_real(monkeypatch, tmp_path, serve_full=False)
     assert sql is None or "WITH base AS" not in sql, (
         "拿不到完整檔卻送了整份 SQL 進沙盒?測試設計有問題")
 
@@ -472,3 +501,79 @@ def test_補full_content時也要受單檔上限限制(real, monkeypatch):
 
     monkeypatch.setattr(gitlab, "MAX_FILE_BYTES", 10000)
     assert gitlab._file_at("sql/big.sql", SHA) == big, "沒超過上限卻不回內容"
+
+
+def test_real模式的規格從GitLab讀而不是工具內建的那份(monkeypatch, tmp_path):
+    """工具內建的 `specs/` 是評測與離線開發用的樣本,不是正式環境的規格。
+
+    先讀本地的話,MR 改了 `specs/R-093.md` 時執行驗證拿到的還是內建那份 ——
+    與「規格讀正在審的那一版」的決定互相矛盾,而且報告上看不出用的是哪一份。
+    """
+    _, _, sql, spec_reads = _review_real(monkeypatch, tmp_path, serve_full=True)
+    assert any(p.startswith("specs/") for p, _ in spec_reads), (
+        f"沒有從 GitLab 讀規格(讀取紀錄:{spec_reads})——"
+        "real 模式讀到工具內建的那份了")
+    assert sql, "規格沒讀到的話執行驗證不會跑"
+
+
+def test_刪除的檔案不算取不到(real):
+    """刪掉的檔在 head 上本來就不存在,`_file_at` 會拿到 404。
+
+    當成「取不到完整內容」的話,**任何刪檔的 MR 都不會自動放行**,而且訊息是錯的
+    (會說「可能是拿不到被審的 commit」)。
+    """
+    real["api_pages"] = ([{"new_path": "sql/keep.sql", "old_path": "sql/keep.sql",
+                           "diff": "+x"},
+                          {"new_path": "sql/gone.sql", "old_path": "sql/gone.sql",
+                           "diff": "-y", "deleted_file": True}], False)
+    out = json.loads(gitlab.get_mr_diff("7"))
+    gone = [f for f in out["files"] if f["path"] == "sql/gone.sql"][0]
+    assert gone["deleted"] is True
+    assert "full_content_unavailable" not in gone, "刪除的檔被當成取不到了"
+    assert ("sql/gone.sql", SHA) not in real["fetched"], "去抓已刪除的檔了"
+
+
+def test_模型呼叫get_mr_diff不會換掉釘住的版本(real):
+    """`get_mr_diff` 在模型的工具清單裡。審 !7 時模型若被 MR 描述引導去呼叫
+    `get_mr_diff("8")`,釘住的 sha 若跟著換,之後 `get_file` 看到的就是別的 MR
+    的檔案,連補讀規格也會讀錯版本。釘版本的動作屬於 pipeline,不屬於這個工具。
+    """
+    gitlab.pin_review_ref("a" * 40)
+    gitlab.get_mr_diff("8")
+    assert gitlab.review_ref() == "a" * 40, "工具呼叫把釘住的版本換掉了"
+
+
+def test_只拿不到完整檔時不要說成完全沒審查():
+    """取不到完整新檔的檔案其實有被審(diff 那幾行進了預掃與模型),只是看不到
+    全貌。說成「沒有經過任何審查」會讓判讀的人誤判嚴重程度。"""
+    from orchestrator import pipeline
+    out = pipeline.enforce_unreviewable(
+        {"findings": []},
+        {"files": [{"path": "a.sql", "full_content_unavailable": True}]})
+    detail = out["findings"][0]["detail"]
+    assert "只看得到 diff 的片段" in detail
+    assert "沒有經過注入掃描" not in detail
+
+
+def test_完全拿不到內容時仍然要說沒經過審查():
+    from orchestrator import pipeline
+    out = pipeline.enforce_unreviewable(
+        {"findings": []}, {"files": [{"path": "a.sql", "unreviewable": True}]})
+    assert "沒有經過注入掃描" in out["findings"][0]["detail"]
+
+
+def test_兩把token設成同一把等於沒有唯讀隔離(real, monkeypatch):
+    """設成同一把只是看起來有設定:讀檔仍然帶著可以寫入的權限。
+
+    打包下載(download_archive)本來就拒絕這種設法,讀檔也照做才一致。
+    """
+    monkeypatch.setattr(gitlab, "GITLAB_TOKEN", "same")
+    monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", "same")
+    called = []
+    monkeypatch.setitem(sys.modules, "httpx",
+                        types.SimpleNamespace(get=lambda *a, **k: called.append(1)))
+    gitlab.pin_review_ref(SHA)
+    out = gitlab.get_file("sql/x.sql")
+    assert "GITLAB_READ_TOKEN" in out, out
+    assert not called, "兩把一樣卻還是用它發了請求"
+    assert gitlab._read_token() is None

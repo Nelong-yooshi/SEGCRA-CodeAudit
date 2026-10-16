@@ -468,17 +468,19 @@ MUTANTS.update({
      "    report[\"findings\"].append(major)\n    return report\n\n\n# 引用來源裡指名的規則碼"),
 })
 
-# ---- #31 review:取回完整檔案的四道(唯讀 token、單檔上限、不退回舊版、交人工)
+# ---- 取回整份新檔的四道防線:唯讀 token、單檔上限、不退回舊版、取不到要交人工
 MUTANTS.update({
  "完整檔:讀程式碼用有寫入權的 token": ("../toolbox/gitlab.py",
-     "    return GITLAB_READ_TOKEN or None",
-     "    return GITLAB_READ_TOKEN or GITLAB_TOKEN"),
+     "    if not GITLAB_READ_TOKEN or GITLAB_READ_TOKEN == GITLAB_TOKEN:" + NL
+     + "        return None",
+     "    if False:" + NL
+     + "        return None"),
  "完整檔:單檔沒有大小上限": ("../toolbox/gitlab.py",
      "    if len(r.content) > MAX_FILE_BYTES:" + NL + "        return None",
      "    if False:" + NL + "        return None"),
  "完整檔:沒釘住版本時退回目標分支(= #22 的原始 bug)": ("../toolbox/gitlab.py",
      '        ref = ref or review_ref() or ""',
-     '        ref = ref or review_ref() or SPEC_REF'),
+     '        ref = ref or review_ref() or "main"'),
  "完整檔:取不到完整內容不交人工": ("pipeline.py",
      '    no_full = [f["path"] for f in mr.get("files", [])' + NL
      + '               if f.get("full_content_unavailable") and not f.get("unreviewable")]',

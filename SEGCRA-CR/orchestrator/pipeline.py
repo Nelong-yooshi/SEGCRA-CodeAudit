@@ -415,6 +415,16 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         if not mr:
             raise RuntimeError(f"無法取得 MR {mr_id}")
 
+        # 把這次審查釘在 MR 的 head commit 上:之後 get_file 不指定 ref 時讀的就是
+        # 「正在審的那一版」,而不是目標分支的現況(目標分支讀到的是**改之前**的
+        # 內容,看起來正常、實際上在審錯的東西)。
+        #
+        # **釘在這裡而不是 get_mr_diff 裡**:那個函式在模型的工具清單上,模型若被
+        # MR 描述引導去呼叫別的 MR,釘住的版本就會被換掉,之後讀到的是別人的檔案。
+        # 拿不到 head sha 時釘 None——get_file 會明講取不到,不會退回舊版。
+        from toolbox import gitlab as _gitlab
+        _gitlab.pin_review_ref(mr.get("head_sha"))
+
         if baseline:
             # 裸模型 A/B 對照組 — 無 skills/memory/工具/預掃/執行驗證,不回寫 GitLab
             user = BASELINE_USER.format(
@@ -1136,7 +1146,12 @@ def enforce_unreviewable(report: dict, mr: dict) -> dict:
     report.setdefault("findings", []).insert(0, {
         "file": "(MR 內容)", "line": 0, "severity": "major",
         "title": "部分變更內容無法取得,未經審查",
-        "detail": "".join(parts) + "這些內容沒有經過注入掃描、規則預掃與模型審查,需人工確認。",
+        # 結尾那句只對「完全拿不到內容」的情況成立。取不到**完整新檔**的檔案
+        # 其實有被審(diff 那幾行進了預掃與模型),只是看不到全貌——說成
+        # 「沒有經過任何審查」會讓判讀的人誤判嚴重程度。
+        "detail": "".join(parts) + (
+            "這些內容沒有經過注入掃描、規則預掃與模型審查,需人工確認。"
+            if (bad or truncated) else "這些檔案只看得到 diff 的片段,需人工確認。"),
         "suggestion": "拆分 MR 讓每個檔案都能被完整取得;或人工審查上列檔案後再合併。",
         "citations": []})
     return report

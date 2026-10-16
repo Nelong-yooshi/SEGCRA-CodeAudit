@@ -50,9 +50,16 @@ def extract_rule_codes(mr: dict) -> list[str]:
     return sorted(set(_RULE_CODE.findall(text)))
 
 
+def _real_mode() -> bool:
+    """現在是不是真實 GitLab 模式。延遲匯入,不讓無關的呼叫端多背一個相依。"""
+    from toolbox import gitlab
+    return bool(gitlab.REAL_MODE)
+
+
 async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None, str | None]:
-    """回傳 (rule_code, spec_text)。mock 模式讀本地 specs/;real 模式用
-    gitlab get_file 抓 repo 內 specs/<code>.md。都找不到 → (code|None, None)。
+    """回傳 (rule_code, spec_text)。mock 模式讀本地 specs/;real 模式**只**用
+    gitlab get_file 抓 repo 內 specs/<code>.md(讀正在審的那一版)。
+    都找不到 → (code|None, None)。
 
     R 編號的比對邏輯不變(即使多個編號都對到既有規格,一律取第一個找到的)。
     by_path 為 True **且完全沒有** R 編號時,才改依 model 檔名對應規格:
@@ -62,10 +69,15 @@ async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None
         這種需要如實回報成「無規格」的情況
     """
     codes = extract_rule_codes(mr)
-    for code in codes:
-        local = SPECS_DIR / f"{code}.md"
-        if local.exists():
-            return code, local.read_text(encoding="utf-8")
+    # **real 模式不讀工具內建的 specs/**:那份是評測與離線開發用的樣本,不是
+    # 正式環境的規格。先讀本地的話,MR 改了 specs/R-093.md 時執行驗證拿到的
+    # 還是內建那份——與「規格讀正在審的那一版」的決定互相矛盾,而且報告上
+    # 看不出用的是哪一份。
+    if not _real_mode():
+        for code in codes:
+            local = SPECS_DIR / f"{code}.md"
+            if local.exists():
+                return code, local.read_text(encoding="utf-8")
     if hub is not None:
         for code in codes:
             try:
@@ -119,7 +131,6 @@ async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
 
     if hub is None:
         return None
-    from toolbox import gitlab   # 延遲匯入,同 find_spec
     for path in paths:
         for candidate in resolve_spec(path, ()).candidates:   # 只要候選路徑,不比對存在與否
             try:
