@@ -7,6 +7,7 @@
 打包下載(download_archive,#15)另外需要 GITLAB_READ_TOKEN(唯讀),見該函式說明。
 """
 import json
+import contextvars
 import os
 import re
 import time
@@ -22,6 +23,7 @@ GITLAB_PROJECT = os.environ.get("GITLAB_PROJECT", "")  # project id 或 URL-enco
 REAL_MODE = bool(GITLAB_URL and GITLAB_TOKEN and GITLAB_PROJECT)
 # 專案層級的唯讀 token(read_api,角色 Reporter),只給打包下載用(#15 條件 1)
 GITLAB_READ_TOKEN = os.environ.get("GITLAB_READ_TOKEN", "")
+
 
 
 # --- real mode helpers ---------------------------------------------------
@@ -63,6 +65,74 @@ def _api_pages(path: str, params: dict | None = None) -> tuple[list, bool]:
 
 # GitLab MR 的 diff_refs 三個欄位,名稱照 GitLab API 原樣(post_inline_comment 也用這組)
 _DIFF_REF_KEYS = ("base_sha", "head_sha", "start_sha")
+
+
+# 這次審查釘住的 commit。get_mr_diff 取到 head_sha 時設定,之後 get_file 沒指定
+# ref 就用它——**模型看到的要是被審的那一版,不是目標分支的現況**。
+# 釘住而不是用分支名,是因為分支在審查中途可能被推新 commit,那會變成「審了 A、
+# 驗了 B」而且完全沒有徵兆(同一個理由讓 _SHA 不接受分支名)。
+# **用 ContextVar 而不是模組層級的全域變數**:webhook 每個 MR 開一條執行緒同時審
+# (scripts/webhook_server.py 的 _trigger),全域變數會讓 A 的 get_file 讀到 B 的 sha
+# ——兩份 MR 的內容互相污染,而且報告上看不出來。
+# ContextVar 在每條執行緒(以及每個 async task)各有自己的值。
+_REVIEW_REF: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "segcra_review_ref", default=None)
+
+
+def pin_review_ref(sha: str | None) -> None:
+    """把這次審查釘在某個 commit 上;None = 解除。
+
+    由 get_mr_diff 自動呼叫。拿不到 head_sha 時會是 None——那時 get_file **不會**
+    退回目標分支,而是明講取不到(退回去拿到的是改之前的內容,那正是 #22 原本的
+    bug)。
+    """
+    _REVIEW_REF.set(sha)
+
+
+def review_ref() -> str | None:
+    return _REVIEW_REF.get()
+
+
+# 取回單一檔案的大小上限。超過就當成「取不到完整內容」交人工,不要讓一個超大的
+# 檔案拖住預掃、注入掃描與沙盒(與審查流程的時間上限同一個原則)。
+MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(1024 * 1024)))
+
+
+def _read_token() -> str | None:
+    """讀程式碼用**唯讀** token。沒設定、或與有寫入權的那把相同,都回 None。
+
+    呼叫端據此標成「取不到完整內容」交人工,**不退回用有寫入權的 GITLAB_TOKEN**。
+    拒絕「兩把設成同一把」是因為那等於沒有唯讀隔離,只是看起來有設定——
+    打包下載(download_archive)本來就是這個規則,讀檔也照做才一致。
+    """
+    if not GITLAB_READ_TOKEN or GITLAB_READ_TOKEN == GITLAB_TOKEN:
+        return None
+    return GITLAB_READ_TOKEN
+
+
+def _file_at(path: str, ref: str) -> str | None:
+    """取某個 commit 上的檔案完整內容;取不到回 None(不編造、不退回別的版本)。
+
+    回 None 的情況:沒有唯讀 token、HTTP 失敗、404、或超過 MAX_FILE_BYTES。
+    呼叫端一律把 None 當成「這個檔沒拿到」,不是「這個檔是空的」。
+    """
+    token = _read_token()
+    if not token:
+        return None
+    import urllib.parse
+    import httpx
+    try:
+        r = httpx.get(
+            f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}/repository/files/"
+            f"{urllib.parse.quote(path, safe='')}/raw",
+            headers={"PRIVATE-TOKEN": token}, params={"ref": ref}, timeout=30)
+    except Exception:
+        return None
+    if r.status_code != 200:
+        return None
+    if len(r.content) > MAX_FILE_BYTES:
+        return None
+    return r.text
 
 
 def _diff_refs(mr: dict) -> dict:
@@ -234,6 +304,10 @@ def _check_mr_id(mr_id) -> str:
 
 # --- tools ---------------------------------------------------------------
 
+# **釘住版本的動作不在這裡**:這個函式在模型的工具清單裡。審 !7 時模型若被 MR
+# 描述引導去呼叫 get_mr_diff("8"),釘住的 sha 就會變成 !8 的,之後 get_file 看到的
+# 是別的 MR 的檔案,連補讀規格也會讀錯版本。改由 pipeline 在取完 MR 之後釘
+# (orchestrator/pipeline.py 的 review_mr),這個函式本身沒有副作用。
 def get_mr_diff(mr_id: str) -> str:
     """取得 MR 的標題、描述、head commit sha 與 diff(逐檔)。
 
@@ -252,10 +326,36 @@ def get_mr_diff(mr_id: str) -> str:
         changes, truncated = _api_pages(f"/merge_requests/{mr_id}/diffs")
         files = [{"path": c["new_path"], "old_path": c.get("old_path"),
                   "diff": c.get("diff") or "",
+                  "deleted": bool(c.get("deleted_file")),
                   "unreviewable": bool(c.get("too_large") or c.get("collapsed"))}
                  for c in changes]
+        refs = _diff_refs(mr)
+        # **預掃與執行驗證要的是整份新檔,不是 diff 裡那幾行**。大檔小改的 MR,
+        # 從 diff 還原出來的 SQL 可能只剩一行,sqlglot 解析不了、沙盒也沒東西可跑
+        # ——而 golden case 都有 full_content,所以這條路在評測裡永遠不會被走到,
+        # 正式環境卻每次都走(#22)。
+        head = refs.get("head_sha")
+        for f in files:
+            if f["unreviewable"]:
+                continue            # 本來就拿不到內容的,不用多打一次 API
+            if f["deleted"]:
+                continue            # 刪掉的檔在 head 上不存在,沒有新版可抓,不是「取不到」
+            if not head:
+                # **沒有 head sha 時一樣要標**。GitLab 在 MR 剛建立、diff 還沒算好時
+                # `diff_refs` 是 null,而 webhook 往往就在這時候觸發;不標的話這些檔
+                # 只有 diff 那幾行進得了預掃與沙盒,卻沒有任何提示。
+                f["full_content_unavailable"] = True
+                continue
+            content = _file_at(f["path"], head)
+            if content is not None:
+                f["full_content"] = content
+            else:
+                # 取不到就讓它缺著:下游是 `full_content or _sql_from_diff(...)`,
+                # 會退回只用 diff。**不要塞空字串**——那會讓下游以為
+                # 「這個檔是空的」而不是「我們沒拿到」。
+                f["full_content_unavailable"] = True
         return json.dumps({"title": mr["title"], "description": mr.get("description", ""),
-                           "sha": mr.get("sha", ""), **_diff_refs(mr), "files": files,
+                           "sha": mr.get("sha", ""), **refs, "files": files,
                            "truncated": truncated}, ensure_ascii=False)
     mr = _mock_mr(mr_id)
     return json.dumps({"title": mr["title"], "description": mr.get("description", ""),
@@ -263,19 +363,40 @@ def get_mr_diff(mr_id: str) -> str:
                        "files": mr["files"]}, ensure_ascii=False)
 
 
-def get_file(path: str, ref: str = "main", mr_id: str = "") -> str:
-    """取得 repo 內檔案完整內容(如 specs/R-xxx.md;看 diff 不夠時也可用)。
-    mock 模式下 ref 無作用。"""
+# 這個函式的 docstring 會**原樣送給模型**當工具說明(tool_hub.py 用 inspect.getdoc),
+# 所以它必須短、而且只講模型需要知道的事;開發用的說明一律寫成 # 註解。
+# 曾經把它寫長、還在裡面叫模型「讀規格請傳 ref=SPEC_REF」——模型照做會送出字面的
+# "SPEC_REF" 字串,只會拿到 404。
+#
+# 不指定 ref 時抓「正在審的那一版」(get_mr_diff 釘住的 head sha),而不是目標分支
+# 的現況:先前預設 main,模型看到的是**改之前**的內容,看起來正常、實際上在審錯的
+# 東西(#22)。
+#
+# 拿不到釘住的版本時**不退回目標分支**,而是明講取不到——退回去就是 #22 原本的
+# bug,而且沒有任何徵兆。
+def get_file(path: str, ref: str = "", mr_id: str = "") -> str:
+    """取得 repo 內檔案的完整內容(看 diff 不夠時用)。"""
     if REAL_MODE:
         import urllib.parse
         import httpx
+        ref = ref or review_ref() or ""
+        if not ref:
+            return ("(無法取得審查中的版本:這次審查沒有釘住 commit。"
+                    "請依 diff 判斷,或交人工確認。)")
+        token = _read_token()
+        if not token:
+            return ("(無法讀取檔案:未設定唯讀的 GITLAB_READ_TOKEN。"
+                    "請依 diff 判斷,或交人工確認。)")
         r = httpx.get(
             f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}/repository/files/"
             f"{urllib.parse.quote(path, safe='')}/raw",
-            headers={"PRIVATE-TOKEN": GITLAB_TOKEN}, params={"ref": ref}, timeout=30)
+            headers={"PRIVATE-TOKEN": token}, params={"ref": ref}, timeout=30)
         if r.status_code == 404:
             return f"(repo 內無 {path})"
         r.raise_for_status()
+        if len(r.content) > MAX_FILE_BYTES:
+            return (f"({path} 超過單檔上限 {MAX_FILE_BYTES} bytes,未取回完整內容。"
+                    f"請依 diff 判斷,或交人工確認。)")
         return r.text
     mr = _mock_mr(mr_id) if mr_id else None
     if mr:
