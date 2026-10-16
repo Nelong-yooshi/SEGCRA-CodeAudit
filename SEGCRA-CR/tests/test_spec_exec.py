@@ -37,7 +37,10 @@ def _case(cid, cond, direction, flagged=True, table="transactions"):
             "expect_flagged": flagged, "note": f"{cid} 測試"}
 
 
-def _plan(cases, conditions=("C1",), ddl=("CREATE TABLE transactions (id INT);",)):
+# 資料列是 [表名, id, tx_time],所以表定義也要有對應的兩欄——不一致的話灌資料會
+# 失敗,而那正是 _rows_fit_ddl 要在生成階段就攔下來的事。
+def _plan(cases, conditions=("C1",),
+          ddl=("CREATE TABLE transactions (id INT, tx_time DATETIME);",)):
     return {"schema_ddl": list(ddl),
             "conditions": [{"id": c, "desc": f"條件 {c}"} for c in conditions],
             "cases": list(cases)}
@@ -926,7 +929,7 @@ def test_第一次截斷時改要骨架而不是精簡版的完整計畫(monkeyp
 
     骨架(只有 schema 與條件)的輸出小得多,拿到之後案例靠補缺一批一批補。
     """
-    skeleton = {"schema_ddl": ["CREATE TABLE t (a INT)"],
+    skeleton = {"schema_ddl": ["CREATE TABLE transactions (id INT, tx_time DATETIME)"],
                 "conditions": [{"id": "C1", "desc": "a > 0"}], "cases": []}
     _, users = _gen_meta(monkeypatch,
                          [_trunc_raw(), json.dumps(skeleton, ensure_ascii=False)],
@@ -937,7 +940,7 @@ def test_第一次截斷時改要骨架而不是精簡版的完整計畫(monkeyp
 
 def test_骨架可以成為補缺的起點(monkeypatch):
     """沒有這一條,大規則會停在「第一次截斷 → 沒有計畫 → 補缺永遠不啟動」。"""
-    skeleton = {"schema_ddl": ["CREATE TABLE t (a INT)"],
+    skeleton = {"schema_ddl": ["CREATE TABLE transactions (id INT, tx_time DATETIME)"],
                 "conditions": [{"id": "C1", "desc": "a > 0"}], "cases": []}
     both = {"cases": _shape_check(_plan(_all_dirs(("C1",)), conditions=("C1",)))[0]["cases"]}
     (plan, gaps, _), users = _gen_meta(
@@ -1002,7 +1005,7 @@ def test_補缺被截斷時縮小批量而不是退回整份重來(monkeypatch):
     ——重放模擬:補缺被截斷時退回整份,最後拿到 **0/46** 個案例(真實端點量到的
     正是 0 個案例、3/3 截斷);改成把批量減半重試則補滿 46/46。
     """
-    skeleton = {"schema_ddl": ["CREATE TABLE t (a INT)"],
+    skeleton = {"schema_ddl": ["CREATE TABLE transactions (id INT, tx_time DATETIME)"],
                 "conditions": [{"id": f"C{i}", "desc": "x"} for i in range(1, 21)],
                 "cases": []}
     ids = tuple(f"C{i}" for i in range(1, 21))   # 20 個條件 = 40 個「條件×方向」,
@@ -1025,7 +1028,7 @@ def test_補缺被截斷時縮小批量而不是退回整份重來(monkeypatch):
 def test_補缺被截斷且還沒有任何計畫時才要骨架(monkeypatch):
     """縮批量的前提是「手上已經有一份計畫(骨架)」。還沒有計畫就被截斷時,
     要的仍然是骨架——不要把兩種情況混在一起。"""
-    skeleton = {"schema_ddl": ["CREATE TABLE t (a INT)"],
+    skeleton = {"schema_ddl": ["CREATE TABLE transactions (id INT, tx_time DATETIME)"],
                 "conditions": [{"id": "C1", "desc": "x"}], "cases": []}
     _, users = _gen_meta(monkeypatch,
                          [_trunc_raw(), _trunc_raw(),
@@ -1040,12 +1043,13 @@ def test_補缺的輪數不佔整份生成的次數(monkeypatch):
 
     這裡:1 次截斷 + 1 次骨架 + 多輪補缺,總呼叫數要超過 max_attempts(3)。
     """
-    skeleton = {"schema_ddl": ["CREATE TABLE t (a INT)"],
+    skeleton = {"schema_ddl": ["CREATE TABLE transactions (id INT, tx_time DATETIME)"],
                 "conditions": [{"id": f"C{i}", "desc": "x"} for i in range(1, 6)],
                 "cases": []}
     # 每輪只補一個案例,所以要補很多輪才補得完 5 個條件 × 2 向 = 10 個
     one = {"cases": [{"case_id": "C1-T", "condition_id": "C1", "direction": "true",
-                      "note": "", "rows": [["t", 1]], "expect_flagged": True}]}
+                      "note": "", "rows": [["transactions", 1, "2026-06-01 10:00:00"]],
+                      "expect_flagged": True}]}
     (plan, _, _), users = _gen_meta(
         monkeypatch,
         [_trunc_raw(), json.dumps(skeleton, ensure_ascii=False),
@@ -1451,3 +1455,170 @@ def test_execute_cases_會把別支整個成立的案例判為未驗證(monkeypa
     assert r.get("other_branch_satisfied") == ["C2"], r
     assert r["label_ok"] is False, "別支整個成立 → 這個案例沒有有效驗證到任何東西"
     assert any("分支 C2 整個成立" in g for g in spec_exec._label_gaps([r]))
+
+
+# ─────────────────── 生成的資料要先對過資料表定義(#47 review 第 2 點) ───────────────────
+#
+# 老闆拿兩份黑盒規格跑生成,各花 50 分鐘和 14 分鐘,**兩份的每一列**都有欄位值超過
+# 宣告長度,結果在沙盒灌資料時失敗 → 補一條「需人工執行驗證」就結束,等於花了一小時
+# 什麼都沒驗到。schema_ddl 本來就在 prompt 裡,所以這件事不能靠模型遵守。
+
+_WIDE_DDL = ("CREATE TABLE tx (acct NVARCHAR(10) NOT NULL, code CHAR(2), "
+             "amount DECIMAL(18,2), cnt INT, tx_date DATE, flag BIT);",)
+
+
+def _wide_case(vals, cid="C1-T", cond="C1", direction="true", flagged=True):
+    return {"case_id": cid, "condition_id": cond, "direction": direction,
+            "rows": [["tx", *vals]], "expect_flagged": flagged, "note": ""}
+
+
+def _one_dropped(vals):
+    """把一列資料餵進形狀檢查,回傳 (留下的案例數, 被丟掉的原因)。"""
+    plan, _, dropped = _shape_check(
+        {"schema_ddl": list(_WIDE_DDL),
+         "conditions": [{"id": "C1", "desc": "條件 C1"}],
+         "cases": [_wide_case(vals)]})
+    return len(plan["cases"]), (dropped[0]["reason"] if dropped else "")
+
+
+_GOOD_ROW = ["A001", "OP", 1000.5, 3, "2026-06-01", 1]
+
+
+def test_合法的資料列照常收下():
+    """先確立對照組:下面每個「不合法」的測試都要跟這一列只差一處。"""
+    kept, why = _one_dropped(_GOOD_ROW)
+    assert (kept, why) == (1, "")
+
+
+@pytest.mark.parametrize("vals, 關鍵詞", [
+    (["A0012345678901", "OP", 1000.5, 3, "2026-06-01", 1], "NVARCHAR(10)"),
+    (["A001", "OPX", 1000.5, 3, "2026-06-01", 1], "CHAR(2)"),
+    (["A001", "OP", 1000.567, 3, "2026-06-01", 1], "四捨五入"),
+    (["A001", "OP", 10 ** 17 * 1.0, 3, "2026-06-01", 1], "整數部分"),
+    (["A001", "OP", 1000.5, 3.5, "2026-06-01", 1], "小數"),
+    (["A001", "OP", 1000.5, 9999999999, "2026-06-01", 1], "INT"),
+    (["A001", "OP", 1000.5, 3, "2026/06/01", 1], "日期"),
+    (["A001", "OP", 1000.5, 3, "2026-06-01", 7], "BIT"),
+    ([None, "OP", 1000.5, 3, "2026-06-01", 1], "NOT NULL"),
+    (["A001", "OP", 1000.5, 3, "2026-06-01"], "欄"),
+])
+def test_灌不進去的資料列當成形狀不合法(vals, 關鍵詞):
+    """被丟掉 = 走跟其他格式錯誤一樣的路:缺口裡看得到、補缺那一輪會重新生。"""
+    kept, why = _one_dropped(vals)
+    assert kept == 0
+    assert "資料與表定義不符" in why and 關鍵詞 in why, why
+
+
+def test_小數位數超過宣告也要攔():
+    """SQL Server 不會因為小數位數太多報錯,它會**四捨五入**——資料被悄悄改掉,
+    而預期值是照原本的數字算的,門檻邊界的案例會因此得到錯的預期。這種安靜的壞法
+    比灌不進去更危險,所以一樣攔。"""
+    _, why = _one_dropped(["A001", "OP", 999.999, 3, "2026-06-01", 1])
+    assert "四捨五入" in why
+
+
+def test_表名不在_schema_ddl_裡也算不符():
+    plan, _, dropped = _shape_check(
+        {"schema_ddl": list(_WIDE_DDL),
+         "conditions": [{"id": "C1", "desc": "條件 C1"}],
+         "cases": [{"case_id": "C1-T", "condition_id": "C1", "direction": "true",
+                    "rows": [["other_table", 1]], "expect_flagged": True, "note": ""}]})
+    assert plan["cases"] == []
+    assert "不在 schema_ddl 裡" in dropped[0]["reason"]
+
+
+def test_認不出來的型別與長度不檢查():
+    """只在限制明確時才判。誤判的代價是把好案例丟掉、覆蓋永遠補不滿,所以型別
+    認不出來(自訂型別、VARCHAR(MAX))就放行,交給沙盒。"""
+    ddl = ("CREATE TABLE tx (note VARCHAR(MAX), payload MY_CUSTOM_TYPE);",)
+    plan, _, dropped = _shape_check(
+        {"schema_ddl": list(ddl),
+         "conditions": [{"id": "C1", "desc": "條件 C1"}],
+         "cases": [{"case_id": "C1-T", "condition_id": "C1", "direction": "true",
+                    "rows": [["tx", "很長" * 500, "任何東西"]],
+                    "expect_flagged": True, "note": ""}]})
+    assert len(plan["cases"]) == 1 and dropped == []
+
+
+def test_DDL_解析不出來時不檢查資料():
+    """「無合法 schema_ddl」已經是一個缺口了,不必再把案例也全部丟掉——那會讓
+    一個 DDL 的小毛病連帶抹掉整份計畫,錯誤訊息還指向錯的地方。"""
+    plan, gaps, dropped = _shape_check(
+        {"schema_ddl": ["CREATE TABLE ((((" ],
+         "conditions": [{"id": "C1", "desc": "條件 C1"}],
+         "cases": [_wide_case(["太長的字串又長又長", "OPX", 1, 1, "x", 9])]})
+    assert len(plan["cases"]) == 1 and dropped == []
+
+
+def test_數字塞進字串欄位不算不符():
+    """SQL Server 會自己轉型,攔它只會把好案例丟掉。"""
+    kept, why = _one_dropped([123, "OP", 1000.5, 3, "2026-06-01", 1])
+    assert (kept, why) == (1, "")
+
+
+def test_字串形式的數字照樣檢查範圍():
+    """模型常把數字寫成字串。那不是不合法,但範圍還是要檢查。"""
+    assert _one_dropped(["A001", "OP", "1000.50", "3", "2026-06-01", "1"]) == (1, "")
+    _, why = _one_dropped(["A001", "OP", 1000.5, "9999999999", "2026-06-01", 1])
+    assert "INT" in why
+
+
+def test_可以為_NULL_的欄位給_NULL_沒問題():
+    assert _one_dropped(["A001", None, None, None, None, None]) == (1, "")
+
+
+def test_灌不進去的原因要回饋給模型(monkeypatch):
+    """schema_ddl 本來就附在每一次的 prompt 裡,模型看得到卻照樣寫超長(實測兩份
+    黑盒規格的每一列都超長)。所以重試時要指名**哪一列的哪一欄**放不進去,泛泛地
+    說「請符合表定義」等於再講一次它已經看過的東西。"""
+    bad = {"schema_ddl": list(_WIDE_DDL),
+           "conditions": [{"id": "C1", "desc": "條件 C1"}],
+           "cases": [_wide_case(["A0012345678901", "OP", 1, 1, "2026-06-01", 1])]}
+    good = {"schema_ddl": list(_WIDE_DDL),
+            "conditions": [{"id": "C1", "desc": "條件 C1"}],
+            "cases": [_wide_case(_GOOD_ROW),
+                      _wide_case(_GOOD_ROW, cid="C1-F", direction="false", flagged=False)]}
+    (plan, gaps, _), users = _gen_meta(
+        monkeypatch,
+        [json.dumps(bad, ensure_ascii=False), json.dumps(good, ensure_ascii=False)],
+        ["stop", "stop"])
+    assert len(users) >= 2, "灌不進去的案例被丟掉後應該要再問一次"
+    assert "灌不進" in users[1] and "NVARCHAR(10)" in users[1], users[1]
+    assert len(plan["cases"]) == 2
+
+
+def test_沒有灌不進去的案例時不加這段回饋(monkeypatch):
+    """每多一段文字就多佔輸出空間旁邊的輸入預算,沒事不要加。"""
+    partial = {"schema_ddl": list(_WIDE_DDL),
+               "conditions": [{"id": "C1", "desc": "條件 C1"}],
+               "cases": [_wide_case(_GOOD_ROW)]}      # 只有 true 向 → 會重試
+    _, users = _gen_meta(
+        monkeypatch,
+        [json.dumps(partial, ensure_ascii=False), json.dumps(partial, ensure_ascii=False)],
+        ["stop", "stop"])
+    assert len(users) >= 2
+    assert "灌不進" not in users[1]
+
+
+def test_測資生成的_system_prompt_沒有被動到():
+    """凍結檔用 TESTGEN_SYSTEM 的雜湊判斷「這份測資是不是用現在的 prompt 生的」。
+    把「值要放得進欄位」寫進 system prompt 會讓已經凍結的測資全部失效、必須重新
+    生成(大規格要幾十分鐘的 GPU),所以那段回饋只放在重試/補缺的 prompt 裡。
+    這條測試是提醒:要動 system prompt 的那天,記得一起處理凍結檔。"""
+    assert "灌不進" not in spec_exec.testgen_system()
+
+
+def test_每一列都要檢查():
+    """不是只看第一列:基準案例動輒五六列,壞的那一列常常在中間(例如只有「剛好
+    被排除」的那筆雜訊資料寫超長)。灌資料是一列一列灌的,中間那列失敗,整個案例
+    一樣廢掉。"""
+    case = {"case_id": "C1-T", "condition_id": "C1", "direction": "true",
+            "expect_flagged": True, "note": "",
+            "rows": [["tx", *_GOOD_ROW],
+                     ["tx", "A002", "OP", 2000.0, 1, "2026-06-01", 0],
+                     ["tx", "A0039999999999", "OP", 1.0, 1, "2026-06-01", 0]]}
+    plan, _, dropped = _shape_check(
+        {"schema_ddl": list(_WIDE_DDL),
+         "conditions": [{"id": "C1", "desc": "條件 C1"}], "cases": [case]})
+    assert plan["cases"] == []
+    assert "第 3 列" in dropped[0]["reason"], dropped[0]["reason"]

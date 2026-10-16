@@ -1700,8 +1700,42 @@ MUTANTS.update({
         "    return ({**base, \"cases\": [*base[\"cases\"], *added]}, len(added), dropped)",
         "    return ({**base, **addition, \"cases\": [*base[\"cases\"], *added]}, len(added), dropped)"),
     "測資:補缺失敗退回時用合併後的條件數(拆得少的提示永遠不出現)": (S,
-        "                attempted, _, _ = _shape_check(plan)",
-        "                attempted = cleaned"),
+        "                attempted, _, attempted_dropped = _shape_check(plan)",
+        "                attempted, attempted_dropped = cleaned, []"),
+    # 生成的資料要先對過資料表定義(#47 review 第 2 點)。兩份黑盒規格各花 50 分鐘和
+    # 14 分鐘生成,每一列都有欄位值超過宣告長度 → 沙盒灌資料失敗 → 整輪白跑。
+    "測資:資料不對表定義就收下": (S,
+        '            why = _rows_fit_ddl(c.get("rows") or [], cols_by_table)',
+        '            why = ""'),
+    "測資:只檢查第一列": (S,
+        "    for i, row in enumerate(rows, 1):",
+        "    for i, row in enumerate(rows[:1], 1):"),
+    "測資:不檢查欄位數": (S,
+        "        if len(vals) != len(cols):",
+        "        if False:"),
+    "測資:表名不在定義裡也放行": (S,
+        "        if cols is None:" + NL
+        + "            return f\"第 {i} 列的表名 {row[0]} 不在 schema_ddl 裡\"",
+        "        if cols is None:" + NL
+        + "            continue"),
+    "測資:字串長度只看超過一倍的": (S,
+        "        if limit is not None and len(v) > limit:",
+        "        if limit is not None and len(v) > limit * 2:"),
+    "測資:小數位數超過宣告也放行(悄悄四捨五入)": (S,
+        "        if len(frac) > scale:",
+        "        if False:"),
+    "測資:NOT NULL 給 null 也放行": (S,
+        '        return "" if col["nullable"] else f"{name} 宣告 NOT NULL,卻給了 NULL"',
+        '        return ""'),
+    "測資:日期格式不檢查": (S,
+        '        return f"{name} 是 {type_name},但值不是可辨識的日期時間({v[:30]})"',
+        '        return ""'),
+    "測資:整數欄位給小數也放行": (S,
+        '            return f"{name} 是整數欄位,但值有小數({v})"',
+        '            return ""'),
+    "測資:灌不進去的原因不回饋給模型": (S,
+        "    bad = [str(d.get(\"reason\", \"\")) for d in dropped if _DDL_FAIL_MARK in str(d.get(\"reason\", \"\"))]",
+        "    bad = []"),
     # #23 第 3 點:覆蓋檢查原本完全相信模型自己貼的條件編號與方向,
     # 「標籤對、資料卻沒測到」看起來跟正確的案例一模一樣。
     "測資:判斷式不驗形狀(任意 SQL 進沙盒)": (S,
@@ -1761,7 +1795,8 @@ MUTANTS.update({
     # 已經生好的案例丟掉重來——每次呼叫 11-16 分鐘,大規則一輪 151 分鐘。
     "測資:給了既有計畫仍重新生成整份": (S,
         "            filling = True" + NL
-        + "            user = _fill_gaps_prompt(spec_code, spec_text, seeded, missing, fill_batch)",
+        + "            user = _fill_gaps_prompt(spec_code, spec_text, seeded, missing, fill_batch," + NL
+        + "                                     seeded_dropped)",
         "            filling = False"),
     "測資:既有計畫已補滿仍再問模型": (S,
         "            if not missing:" + NL

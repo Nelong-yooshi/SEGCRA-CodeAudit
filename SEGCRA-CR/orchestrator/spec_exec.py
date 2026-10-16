@@ -27,6 +27,8 @@ import json
 import os
 import re
 import uuid
+from datetime import datetime
+from decimal import Decimal
 
 from .agent import extract_json, run_agent
 from .config import Config, PKG_ROOT
@@ -264,6 +266,159 @@ def _check_sql_ok(text) -> bool:
     return not _CHECK_SQL_FORBIDDEN.search(t)
 
 
+# ---- 生成的資料要先對過資料表定義 ----
+#
+# 為什麼要做這一關(#47 review 第 2 點):兩份黑盒規格各花了 50 分鐘和 14 分鐘生成,
+# 兩份的**每一列**都有欄位值超過宣告長度(例如 NVARCHAR(2) 的欄位塞了更長的字串),
+# 結果在沙盒灌資料時失敗。正式流程遇到灌資料失敗會補一條「需人工執行驗證」就結束
+# ——花掉一小時,一個條件都沒驗到。schema_ddl 本來就在 prompt 裡,模型看得到卻照樣
+# 寫超長,所以這件事不能靠它遵守,要在收下計畫之前自己算。
+#
+# 判定只往「看得懂才管」的方向做:型別或限制認不出來就不檢查。誤判的代價是把好案例
+# 丟掉重生(一輪補缺的呼叫),漏判的代價是整輪生成作廢,但**反過來把好案例判成壞的
+# 也會讓覆蓋永遠補不滿**,所以只在限制明確時才判。
+
+_CHAR_TYPES = {"CHAR", "NCHAR", "VARCHAR", "NVARCHAR"}
+_DATE_TYPES = {"DATE", "DATETIME", "DATETIME2", "SMALLDATETIME", "DATETIMEOFFSET"}
+_INT_LIMITS = {"TINYINT": (0, 255), "SMALLINT": (-32768, 32767),
+               "INT": (-2147483648, 2147483647), "BIGINT": (-2**63, 2**63 - 1)}
+
+
+def _ddl_columns(ddl: list[str]) -> dict[str, list[dict]]:
+    """{表名(小寫): [{name, type, limits, nullable}, ...]},照 CREATE TABLE 的欄位順序。
+
+    順序很重要:灌資料用的是 `INSERT INTO <表> VALUES (...)`(不指名欄位),所以
+    資料列的第 n 個值對到的就是定義的第 n 欄。"""
+    import sqlglot
+    from sqlglot import exp
+
+    from toolbox.sqltools import DIALECT
+    out: dict[str, list[dict]] = {}
+    for stmt in ddl:
+        try:
+            st = sqlglot.parse_one(stmt, dialect=DIALECT)
+        except Exception:        # noqa: BLE001 — 解析不了就不檢查這張表
+            continue
+        if not isinstance(st, exp.Create) or not isinstance(st.this, exp.Schema):
+            continue
+        table = st.this.this.name.lower()
+        cols = []
+        for cd in st.this.expressions:
+            if not isinstance(cd, exp.ColumnDef):
+                continue
+            kind = cd.args.get("kind")
+            type_name = kind.this.name.upper() if kind is not None else ""
+            limits = []
+            for p in (kind.expressions if kind is not None else []):
+                text = p.sql().strip().strip("'\"")
+                limits.append(int(text) if text.isdigit() else None)   # MAX → None
+            cols.append({"name": cd.name, "type": type_name, "limits": limits,
+                         "nullable": "NOT NULL" not in cd.sql().upper()})
+        if cols:
+            out[table] = cols
+    return out
+
+
+def _as_number(v):
+    """值轉成數字(字串形式的數字也算)。轉不出來回 None。"""
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, (int, float)):
+        return v
+    if isinstance(v, str):
+        try:
+            return float(v) if ("." in v or "e" in v.lower()) else int(v)
+        except ValueError:
+            return None
+    return None
+
+
+def _value_fits(col: dict, v) -> str:
+    """一個值放不放得進這一欄。放得進回空字串,放不進回原因。"""
+    name, type_name, limits = col["name"], col["type"], col["limits"]
+    if v is None:
+        return "" if col["nullable"] else f"{name} 宣告 NOT NULL,卻給了 NULL"
+    if type_name in _CHAR_TYPES:
+        if not isinstance(v, str):
+            return ""                      # 數字塞進字串欄位,SQL Server 會自己轉
+        limit = limits[0] if limits else None
+        if limit is not None and len(v) > limit:
+            return (f"{name} 是 {type_name}({limit}),但值有 {len(v)} 個字"
+                    f"({v[:limit]}…)")
+        return ""
+    if type_name in _DATE_TYPES:
+        if not isinstance(v, str):
+            return ""
+        text = v.strip().replace("T", " ")
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                datetime.strptime(text, fmt)
+                return ""
+            except ValueError:
+                continue
+        return f"{name} 是 {type_name},但值不是可辨識的日期時間({v[:30]})"
+    if type_name in _INT_LIMITS:
+        num = _as_number(v)
+        if num is None:
+            return f"{name} 是 {type_name},但值不是數字({str(v)[:30]})"
+        if num != int(num):
+            return f"{name} 是整數欄位,但值有小數({v})"
+        low, high = _INT_LIMITS[type_name]
+        if not low <= num <= high:
+            return f"{name} 是 {type_name}(範圍 {low}~{high}),但值是 {num}"
+        return ""
+    if type_name in ("DECIMAL", "NUMERIC") and len(limits) >= 1 and limits[0]:
+        num = _as_number(v)
+        if num is None:
+            return f"{name} 是 {type_name},但值不是數字({str(v)[:30]})"
+        precision = limits[0]
+        scale = limits[1] if len(limits) > 1 and limits[1] is not None else 0
+        text = f"{abs(Decimal(str(num))):f}"
+        whole, _, frac = text.partition(".")
+        frac = frac.rstrip("0")
+        if len(whole.lstrip("0")) > precision - scale:
+            return (f"{name} 是 {type_name}({precision},{scale}),整數部分只容得下 "
+                    f"{precision - scale} 位,但值是 {num}")
+        if len(frac) > scale:
+            # 小數位數超過宣告不會報錯,SQL Server 會**四捨五入**——資料被悄悄改掉,
+            # 預期值卻是照原本的數字算的,門檻邊界的案例會因此變成錯的預期。
+            return (f"{name} 是 {type_name}({precision},{scale}),小數只保留 {scale} 位,"
+                    f"但值是 {num}(灌進去會被四捨五入,預期值會跟著錯)")
+        return ""
+    if type_name == "BIT":
+        num = _as_number(v)
+        if num not in (0, 1):
+            return f"{name} 是 BIT,只能是 0 或 1,但值是 {str(v)[:30]}"
+    return ""
+
+
+def _rows_fit_ddl(rows, cols_by_table: dict[str, list[dict]]) -> str:
+    """整個案例的資料列對過資料表定義。第一個不符就回報(一次改一個比較好改)。
+
+    表名不在 schema_ddl 裡也算不符:那一列灌不進去,整個案例一樣會失敗。
+    沒有任何表定義時(DDL 解析不出來)不檢查——那種情況已經有「無合法 schema_ddl」
+    的缺口在講了,不必再把案例也全部丟掉。
+    """
+    if not cols_by_table:
+        return ""
+    for i, row in enumerate(rows, 1):
+        table = str(row[0]).strip().strip("[]").lower()
+        table = table.rsplit(".", 1)[-1].strip("[]")
+        cols = cols_by_table.get(table)
+        if cols is None:
+            return f"第 {i} 列的表名 {row[0]} 不在 schema_ddl 裡"
+        vals = row[1:]
+        if len(vals) != len(cols):
+            return (f"第 {i} 列給了 {len(vals)} 個值,但 {table} 定義了 "
+                    f"{len(cols)} 欄(灌資料不指名欄位,數量必須一致)")
+        for col, v in zip(cols, vals):
+            why = _value_fits(col, v)
+            if why:
+                return f"第 {i} 列:{why}"
+    return ""
+
+
 def _shape_check(plan: dict) -> tuple[dict, list[str], list[dict]]:
     """確定性檢查測資計畫:JSON 形狀 + 逐條件 true/false 覆蓋。
     回傳 (清洗後 plan, coverage_gaps, dropped_malformed)。"""
@@ -293,8 +448,16 @@ def _shape_check(plan: dict) -> tuple[dict, list[str], list[dict]]:
     new_shape = any(isinstance(c, dict) and c.get("kind") in ("base", "variant")
                     for c in plan.get("cases", []) or [])
     cases = []
+    cols_by_table = _ddl_columns(ddl)
     for c in plan.get("cases", []):
         ok, why = _case_ok(c, cond_ids, branches, new_shape)
+        if ok:
+            # 形狀對了還要灌得進去:超長字串、超出精度的金額、認不出來的日期,
+            # 都會讓沙盒在灌資料時失敗,而那時整輪生成已經花掉了(實測 14-70 分鐘)
+            why = _rows_fit_ddl(c.get("rows") or [], cols_by_table)
+            if why:
+                ok = False
+                why = f"資料與表定義不符({why})"
         if ok:
             cases.append(_normalize_case(c, new_shape))
         else:
@@ -553,8 +716,36 @@ def _base_rows_for(plan: dict, cond_id: str) -> tuple[str, list] | None:
     return None
 
 
+_DDL_FAIL_MARK = "資料與表定義不符"
+
+
+def _ddl_fail_note(dropped: list[dict]) -> str:
+    """上一輪有案例因為「值放不進欄位」被丟掉時,要把具體哪一個值講回去。
+
+    為什麼要具體:schema_ddl 本來就附在每一次的 prompt 裡,模型看得到卻照樣寫出
+    超長的字串(實測兩份黑盒規格的每一列都超長)。泛泛地說「請符合表定義」等於再
+    講一次它已經看過的東西;指名「第 2 列的 acct 是 NVARCHAR(10) 但給了 14 個字」
+    才改得到。
+
+    刻意只寫進重試/補缺的 prompt,**不動 TESTGEN_SYSTEM**:凍結檔用那份 system
+    prompt 的雜湊判斷「這份測資是不是用現在的 prompt 生的」,動它會讓已經凍結的
+    測資全部失效、必須重新生成(大規格要幾十分鐘的 GPU)。這段回饋只在重試時出現,
+    不改變第一次生成的條件,所以凍結檔仍然有效。
+    """
+    bad = [str(d.get("reason", "")) for d in dropped if _DDL_FAIL_MARK in str(d.get("reason", ""))]
+    if not bad:
+        return ""
+    return ("\n**上一輪有 %d 個案例的資料灌不進資料表,已經丟掉**(灌資料失敗會讓"
+            "整輪驗證作廢,所以寧可重生):\n" % len(bad)
+            + "\n".join(f"- {b}" for b in bad[:5])
+            + "\n每個值都必須放得進它那一欄的宣告:字串不可超過 NVARCHAR(n) 的 n 個字、"
+              "小數位數不可超過 DECIMAL(p,s) 的 s(超過會被四捨五入,預期值就跟著錯)、"
+              "整數欄位不可給小數、NOT NULL 的欄位不可給 null。\n")
+
+
 def _fill_gaps_prompt(spec_code: str, spec_text: str, plan: dict,
-                      missing: list[tuple[str, str]], batch: int) -> str:
+                      missing: list[tuple[str, str]], batch: int,
+                      dropped: list[dict] | None = None) -> str:
     """只要缺的那幾個案例,不要整份重來。
 
     為什麼不整份重來:大規則一次生不完(實測 RETAIL_M1 要 46 個案例,模型自己停在
@@ -595,8 +786,9 @@ def _fill_gaps_prompt(spec_code: str, spec_text: str, plan: dict,
         f"請只輸出 JSON 物件 `{{\"cases\": [...]}}`,裡面只放上面列出的那幾個案例。\n"
         f"**編號必須用上面給的,不要自己改名或新增條件**;\n"
         f"資料表與欄位沿用先前的 schema(不要重新定義):\n"
-        + "\n".join(plan["schema_ddl"]) + "\n\n"
-        f"規則 {spec_code} 規格:\n{spec_text}")
+        + "\n".join(plan["schema_ddl"]) + "\n"
+        + _ddl_fail_note(dropped or []) + "\n"
+        + f"規則 {spec_code} 規格:\n{spec_text}")
 
 
 def _merge_cases(base: dict, addition: dict) -> tuple[dict, int, list[dict]]:
@@ -653,7 +845,8 @@ def _merge_cases(base: dict, addition: dict) -> tuple[dict, int, list[dict]]:
 
 
 def _retry_prompt(spec_code: str, spec_text: str, gaps: list[str],
-                  n_conds: int, max_conds: int) -> str:
+                  n_conds: int, max_conds: int,
+                  dropped: list[dict] | None = None) -> str:
     """有合法案例但不夠好時的重試提示:講清楚上一次差在哪,讓每次重試的 prompt
     都不同(固定 seed 下同一個 prompt 只會得到同一份輸出)。仍要求輸出**完整**
     計畫,不是只補缺的部分——這裡收的是整份計畫,不做合併。"""
@@ -664,6 +857,7 @@ def _retry_prompt(spec_code: str, spec_text: str, gaps: list[str],
         issues.append(f"上一次只拆出 {n_conds} 個原子條件,先前的嘗試拆出過 {max_conds} 個;"
                       f"請依規格完整拆解,不要合併或省略條件。")
     return ("\n\n".join(issues)
+            + _ddl_fail_note(dropped or [])
             + "\n\n請重新輸出**完整的**測資計畫 JSON(包含已經有的案例),"
               "每個條件的 true/false 兩向都要有案例。\n\n"
             + f"規則 {spec_code} 規格:\n{spec_text}")
@@ -729,7 +923,8 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
             best = (seeded, seeded_gaps, seeded_dropped)
             max_conds = len(seeded["conditions"])
             filling = True
-            user = _fill_gaps_prompt(spec_code, spec_text, seeded, missing, fill_batch)
+            user = _fill_gaps_prompt(spec_code, spec_text, seeded, missing, fill_batch,
+                                     seeded_dropped)
     # 補缺的輪數不佔整份生成的次數:它們是不同性質的呼叫(小輸出 vs 整份計畫),
     # 混在同一個預算裡會讓大規則永遠補不完——補一輪就用掉一次整份生成的機會。
     for attempt in range(max_attempts + _FILL_ROUNDS):
@@ -781,8 +976,8 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
             # 所以併回去而不是拿去跑 _shape_check 當新計畫(那會把已經生好的
             # 部分整個丟掉——正是大規則一直生不完的原因)。
             merged, n_added, merge_dropped = _merge_cases(best[0], plan)
-            cleaned, gaps, _ = _shape_check(merged)
-            best = (cleaned, gaps, [*best[2], *merge_dropped])
+            cleaned, gaps, merge_shape_dropped = _shape_check(merged)
+            best = (cleaned, gaps, [*best[2], *merge_dropped, *merge_shape_dropped])
             filled_total += n_added
             if not gaps:
                 return best
@@ -793,13 +988,14 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
                 # 條件數要看**這次模型回的**那份,不是合併後的:合併後一定等於
                 # 先前的最佳值,那樣「你這次拆得比之前少」這個提示永遠不會出現,
                 # 而那正是補缺失敗最常見的原因之一(模型把條件重新合併了)。
-                attempted, _, _ = _shape_check(plan)
+                attempted, _, attempted_dropped = _shape_check(plan)
                 filling = False
                 user = _retry_prompt(spec_code, spec_text, gaps,
-                                     len(attempted["conditions"]), max_conds)
+                                     len(attempted["conditions"]), max_conds,
+                                     attempted_dropped)
                 continue
             user = _fill_gaps_prompt(spec_code, spec_text, cleaned,
-                                     _missing_pairs(cleaned), fill_batch)
+                                     _missing_pairs(cleaned), fill_batch, best[2])
             continue
         if plan:
             cleaned, gaps, dropped = _shape_check(plan)
@@ -810,7 +1006,7 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
                 max_conds = max(max_conds, len(cleaned["conditions"]))
                 filling = True
                 user = _fill_gaps_prompt(spec_code, spec_text, cleaned,
-                                         _missing_pairs(cleaned), fill_batch)
+                                         _missing_pairs(cleaned), fill_batch, dropped)
                 continue
             if cleaned["cases"]:
                 n_conds = len(cleaned["conditions"])
@@ -836,9 +1032,10 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
                 if missing and best is not None and cleaned is best[0]:
                     filling = True
                     user = _fill_gaps_prompt(spec_code, spec_text, cleaned,
-                                             missing, fill_batch)
+                                             missing, fill_batch, dropped)
                 else:
-                    user = _retry_prompt(spec_code, spec_text, gaps, n_conds, max_conds)
+                    user = _retry_prompt(spec_code, spec_text, gaps, n_conds, max_conds,
+                                         dropped)
                 continue
         user = (f"上一次輸出無法解析或沒有任何合法案例,"
                 f"請重新輸出**完整覆蓋每個條件 true/false 兩向**的 JSON。\n\n"
