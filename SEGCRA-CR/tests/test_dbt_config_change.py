@@ -55,8 +55,10 @@ models:
 
 
 def _diff(old, new, context=3):
-    lines = difflib.unified_diff(old.splitlines(True), new.splitlines(True), "a", "b", n=context)
-    return "".join(ln for ln in lines if not ln.startswith(("---", "+++")))
+    lines = list(difflib.unified_diff(old.splitlines(True), new.splitlines(True), "a", "b", n=context))
+    # 只去掉開頭的 --- / +++ 兩行檔頭:刪掉的 SQL 註解行(`-` + `-- x`)也以 --- 開頭
+    assert not lines or (lines[0].startswith("--- ") and lines[1].startswith("+++ "))
+    return "".join(lines[2:])
 
 
 def _file(path, old, new, full=True, context=3):
@@ -748,3 +750,13 @@ def test_改名搬出dbt目錄_等於刪除():
 def test_在dbt目錄裡改名_內容沒變_不算():
     f = {"path": "models/b.sql", "old_path": "models/a.sql", "diff": "", "full_content": FULL_REFRESH}
     assert config_changes([f]) == []
+
+
+def test_刪掉的SQL註解行_在diff裡以三個減號開頭_照樣比對():
+    """刪掉一行 `-- 說明` 在 diff 裡是 `--- 說明`;它是內容,不是檔頭。"""
+    old = "-- 舊的寫法\n" + MODEL
+    new = MODEL.replace("'incremental'", "'table'")
+    diff = _diff(old, new)
+    assert "\n--- 舊的寫法\n" in "\n" + diff
+    assert _keys("models/mrt_sample.sql", old, new) == [(("materialized",), False, False)]
+    assert _keys("models/mrt_sample.sql", old, new, full=False) == [(("materialized",), False, False)]
