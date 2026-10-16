@@ -104,13 +104,24 @@ def load(spec_code: str, spec_text: str, *, model: str) -> dict | None:
 
 
 def save(spec_code: str, spec_text: str, plan: dict, gaps: list[str],
-        *, profile: str, model: str, force: bool = False) -> None:
+        *, profile: str, model: str, force: bool = False,
+        cost: dict | None = None) -> None:
     """存檔前檢查覆蓋度:預設拒絕凍結一份有缺口的測資計畫——不然凍住的
     等於把一次不完整的取樣當成「這條規則以後每次 golden set 都只驗這幾個案例」,
     而且不會再重新抽到比較好的版本。`force=True` 才能覆蓋,明確承擔後果。
 
     0 缺口也不代表每個條件都驗到了(缺口只看「每個條件有沒有兩向案例」,不看
-    反向案例是不是真的只讓那一個條件不成立),存檔後仍要有人看過案例內容。"""
+    反向案例是不是真的只讓那一個條件不成立),存檔後仍要有人看過案例內容。
+
+    `cost` 記這一份**生出來花了多少**:幾次模型呼叫、幾秒、資料列幾列、沙盒跑一輪
+    幾秒。為什麼存進檔案而不是只印出來:
+      * 這些數字決定「哪些規格適合在線上現場生」「上限該訂多少」,不該每次要用時
+        都重跑一輪(大規格一輪 70 分鐘)
+      * 黑盒評測要「記下每份規格花多久、有沒有成功」(#45 的討論),凍結檔裡有就
+        不必另外維護一份紀錄
+      * 它也讓「案例數 vs 偵測能力 vs 時間」這個取捨有據可循——實測 R-140 從
+        19 個案例降到 8 個,突變偵測一樣 10/10
+    """
     if gaps and not force:
         raise ValueError(
             f"這份測資計畫有 {len(gaps)} 個覆蓋缺口,預設不凍結:{'; '.join(gaps)}\n"
@@ -125,6 +136,8 @@ def save(spec_code: str, spec_text: str, plan: dict, gaps: list[str],
         "model": model,
         "coverage_gaps": gaps,
         "case_count": len(plan["cases"]),
+        "row_count": sum(len(c.get("rows") or []) for c in plan["cases"]),
+        "cost": cost or {},
         "plan": plan,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 

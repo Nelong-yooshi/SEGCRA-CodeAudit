@@ -7,6 +7,14 @@
   "model": "gemma4:31b",
   "coverage_gaps": [],
   "case_count": 8,
+  "row_count": 48,
+  "cost": {
+    "llm_calls": null,
+    "generation_seconds": 1560.0,
+    "sandbox_seconds": 0.5,
+    "resumed_from": false,
+    "note": "2026-10-15 手動跑,當時尚無自動記錄;生成耗時取 gpu 使用權的取得與交回時間(19:49→20:15),呼叫次數未知(未開落檔)"
+  },
   "plan": {
     "schema_ddl": [
       "CREATE TABLE txn_log(account_id INT, tx_time DATETIME2, op_code NVARCHAR(10), amount DECIMAL(14,2), cash_flag NVARCHAR(10), rev_flag NVARCHAR(10), channel_name NVARCHAR(50));"
