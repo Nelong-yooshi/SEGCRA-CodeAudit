@@ -1,4 +1,4 @@
-"""mock 模式的 dbt 專案來源,與內附的範例 examples/dbt_wiring/(#15 接線)。
+"""mock 模式的 dbt 專案來源,與內附的範例 examples/dbt_wiring/。
 
 mock 模式沒有 GitLab 可以打包下載。fixture 目錄若放了某個 commit 的專案
 (`<FIXTURES_DIR>/dbt_archives/<commit 編號>/`),接線就從那裡取得——打包成 GitLab 的形狀後,
@@ -105,7 +105,7 @@ def test_範例_只改macro_整條dry_run補出受影響的model(example):
     assert pre[0].get("dbt_macro") is True and "parse_error" not in pre[0]
     (fd,) = [f for f in report["findings"] if f["title"] == IMPACT_TITLE]
     assert fd["severity"] == "major"
-    assert "macros/is_large.sql" in fd["detail"] and "models/mrt_sample.sql[R003 major]" in fd["detail"]
+    assert "macros/is_large.sql" in fd["detail"] and "models/mrt_sample.sql[R003 major(展開後第 1 句)]" in fd["detail"]
 
 
 def test_範例_反查的結果(example):

@@ -310,8 +310,9 @@ python tests/dbt_impact_reference/random_projects.py --dbt <dbt 執行檔>
 |---|---|---|
 | `toolbox/gitlab.py` 的 `download_archive()` | 下載 tar.gz | 只用唯讀的 `GITLAB_READ_TOKEN`(不退回、不可與 `GITLAB_TOKEN` 相同);只接受完整 commit 編號;本機以外必須 https;不讀代理設定;不跟隨轉址;不做傳輸層解壓;大小與時間上限;**不在模型可呼叫的工具清單內** |
 | `orchestrator/archive.py` 的 `extract_archive()` | 解開成 {路徑: 內容};另可只列指定目錄的檔名(不解出) | 邊解壓邊計數(壓縮炸彈);**所有成員**檢查單一頂層目錄、絕對路徑、`..`、`.` 或空段落、重複(要收內容的目錄內另含大小寫與 Unicode 正規化),指定目錄的上層不能是連結或檔案(否則目錄看起來是空的);**要收內容的目錄內**不能有連結或特殊檔;**會解出的檔案**另外檢查控制字元、反斜線、冒號、Windows 保留名稱——不解出的成員(目錄外,或 `.md`、`.csv`、`.py` 等)不讓整包失敗;只收 `.sql` / `.yml` / `.yaml`;`filter="data"`;權限 700 的暫存目錄、讀完即刪 |
-| `orchestrator/dbt_project.py` 的 `load_dbt_project()` | 讀 `dbt_project.yml` 的目錄設定(model / macro / seed / snapshot),取回這些目錄的內容、model / seed / snapshot 目錄的檔名清單,以及專案根目錄的 `packages.yml` / `dependencies.yml`(`root_files`,判斷有沒有用 dbt 套件);`extra_ref_names()` 從同一包算出 seed / Python model / snapshot 的名稱(看不懂就回 `None`) | 同一包讀設定與檔案(不另外用讀檔 API,那預設讀 main);目錄設定當不可信內容檢查;記憶體快取(以 commit 為鍵、有筆數與總量上限、只收成功結果、進出都複製) |
-| `orchestrator/dbt_mr_impact.py` 的 `analyze_mr_macro_impact()` | 把 MR(變更清單 + head / base commit)轉成 macro 反查的輸入並執行 | 路徑換成相對專案根目錄;新增檔以 head / base 兩個專案比對判斷(不依賴 GitLab 的旗標),改名與刪除的舊路徑一併列入;反查看得到 `dbt_project.yml` 的 hook;變更清單被截斷、路徑看不懂、取回失敗 → 全部 model 可能受影響;改到專案設定檔或兩邊目錄設定不同 → 全部 model 可能受影響;反查只追 model,有 macro 變更而專案有 snapshot 時交人工;反查一律在子行程 |
+| `orchestrator/dbt_project.py` 的 `load_dbt_project()` | 讀 `dbt_project.yml` 的目錄設定(model / macro / analysis / test / seed / snapshot),取回這些目錄的內容、model / seed / snapshot 目錄的檔名清單,以及專案根目錄的 `packages.yml` / `dependencies.yml`(`root_files`,判斷有沒有用 dbt 套件);`extra_ref_names()` 從同一包算出 seed / Python model / snapshot 的名稱(看不懂就回 `None`) | 同一包讀設定與檔案;目錄設定當不可信內容檢查(`read_layout()` 與取回專案共用同一套檢查);記憶體快取(以 commit 為鍵、有筆數與總量上限、只收成功結果、進出都複製) |
+| `orchestrator/dbt_mr_impact.py` 的 `analyze_mr_macro_impact()` | 把 MR(變更清單 + head / base commit)轉成 macro 反查的輸入並執行 | 路徑換成相對專案根目錄;新增檔以 head / base 兩個專案比對判斷(不依賴 GitLab 的旗標),改名與刪除的舊路徑一併列入;反查看得到 `dbt_project.yml` 的 hook;變更清單被截斷、路徑看不懂、取回失敗 → 全部 model 可能受影響;改到專案設定檔或兩邊目錄設定不同 → 全部 model 可能受影響;不在 dbt 目錄裡的檔案(CI 設定、一般的 SQL)不列入;seed / snapshot / analysis / test 目錄依專案的設定判斷(改名的目錄跟預設的 `seeds/` 等一樣處理,改到裡面的檔案交人工);snapshot 也交給反查(含 snapshot 目錄裡的屬性檔),呼叫到被改的 macro(直接或間接)、或看不懂時交人工;反查一律在子行程 |
+| `toolbox/gitlab.py` 的 `read_file_at()` | 讀某個 commit 的單一檔案(取回整個專案之前,先讀 `dbt_project.yml` 判斷哪些檔案屬於 dbt) | 與 `download_archive()` 同一套請求程式:只用唯讀 token、不跟隨轉址、不讀代理設定、大小與時間上限;指定 commit,不讀分支;**不在模型可呼叫的工具清單內** |
 
 任何一步失敗都是整包失敗(`ok=False`),**不會當成「專案沒有 macro」**。
 
@@ -349,7 +350,7 @@ macro);正式環境的主機**不連外網**,審查流程裡不能有任何執�
 - **dbt 套件的 macro 拿不到**:`packages.yml` 宣告的套件(例如 `dbt_utils`)由 `dbt deps`
   下載到 `dbt_packages/`,不在 repo 裡。呼叫套件 macro 的 model 仍會展開失敗(以展開失敗
   揭露,不會靜默放行)。正式專案沒有用套件(見上)
-- 反查只追 model,不追 snapshot:有 macro 變更、而專案有 snapshot 時一律交人工
+- 反查不展開 snapshot、不比較前後:snapshot 呼叫到被改的 macro(直接或間接)、或看不懂時交人工;沒有呼叫的不受影響
 - `ref()` / `source()` 的專案資訊(#19)只讀 model 目錄的屬性檔;seed / snapshot 目錄的屬性檔
   (可能設 alias)與 snapshot 區塊的 config 沒有讀,所以接線時 seed / snapshot / Python model
   一律標成無法確定。`extra_ref_names()` 與屬性檔的解析都在有逾時的子行程裡做(見「接進審查管線」)
@@ -358,19 +359,24 @@ macro);正式環境的主機**不連外網**,審查流程裡不能有任何執�
 
 ## 接進審查管線(#15)
 
-`dbt.enabled` 開啟、MR 改到 dbt 專案目錄(`dbt.project_dir`,預設 repo 根目錄)裡的 `.sql` / `.yml` /
-`.yaml`、而且拿得到專案時才會動作。專案的來源:真實 GitLab 模式是打包下載;mock 模式是 fixture 目錄裡
+`dbt.enabled` 開啟、MR 改到 dbt 的檔案、而且拿得到專案時才會動作。dbt 的檔案是 `dbt_project.yml` 設定的
+model / macro / analysis / test / seed / snapshot 目錄裡的檔案,與專案根目錄的設定檔(`dbt_project.yml`、
+`packages.yml`、`dependencies.yml`、`selectors.yml`);專案目錄(`dbt.project_dir`,預設 repo 根目錄)
+裡的其他檔案(CI 設定、一般的 SQL)不算。取回整個專案之前,先讀 head commit 的 `dbt_project.yml`
+判斷:只改到其他檔案的 MR 不下載專案。讀不到時退回「專案目錄裡的 `.sql` / `.yml` / `.yaml`」
+(接下來取回專案也會失敗、交人工);head 沒有 `dbt_project.yml` 而 MR 改到這些檔案時算取回失敗。專案的來源:真實 GitLab 模式是打包下載;mock 模式是 fixture 目錄裡
 放的專案(見下方「開啟前的條件」後的說明),沒有放就不適用。沒開 dbt 時行為與接線前相同;開了 dbt 而
 不適用(mock 模式沒有放專案、MR 沒改到專案裡的這些檔案)時,只有最後一步 `enforce_dbt_unexecuted` 仍會檢查。
 
 ```
 review_mr
  ├─ get_mr_diff            sha、base_sha / head_sha、變更清單、truncated
- ├─ prepare_dbt_context    依 head commit 取回專案;整理專案資訊(子行程);
+ ├─ prepare_dbt_context    先讀 head 的 dbt_project.yml 判斷哪些是 dbt 的檔案;依 head commit 取回專案;
+ │                         整理專案資訊(子行程);
  │                         MR 改到 model 以外的專案檔 → macro 反查 + 取回 base commit 的專案
  ├─ prescan                專案裡的樣板:用 head 的完整內容 + 專案的 macro + 專案資訊展開
  │                         專案的 macro 檔:不當成 model 展開,規則跑在改到的內容上
- ├─ 注入掃描               另外掃取回的完整內容
+ ├─ 注入掃描               另外掃取回的完整內容與展開後的 SQL
  ├─ find_spec              MR 自己對不到規格、而受影響的 model 都對到同一份 → 用那一份
  ├─ check_affected_models  受影響、但不在變更清單裡的 model:變更前後各展開一次,比較規則命中
  ├─ …模型審查…
@@ -403,20 +409,26 @@ alias 寫在 seed 目錄的屬性檔裡,都沒有讀,所以一律標成無法確
 
 - 不放進預掃、也不放進模型的 prompt:它們不在 diff 裡,放進預掃會讓每個檢核點各補一條
   「模型未回應」,放進 prompt 會佔掉預算並多一個注入的入口
-- 以變更前、變更後的專案各展開一次,**只回報變更後多出來的規則命中**。比較的單位是
-  「規則 + 嚴重度 + 命中所在的語句」:`DELETE FROM a` 改成 `DELETE FROM b`,規則代號與個數都沒變,
-  仍然算多出來的。原本就有的命中不重報(否則每個改到 macro 的 MR 都會被既有的寫法擋下)
+- 以變更前、變更後的專案各展開一次,**只回報變更後多出來的規則命中**。比較的是**每一句的規則命中數**
+  有沒有增加(依語句在檔案裡的順序對應),不比語句的文字:macro 只把一個值從 1 改成 2,同一句原本就有
+  的命中不能因為文字變了就當成新的。兩邊切出來的語句數量不同時,退回比較整個 model 同一條規則的
+  命中數;文字層的規則與對不到語句的命中只比個數。原本就有的命中不重報(否則每個改到 macro 的 MR 都會被既有的寫法擋下)。
+  命中寫出在展開後的第幾句
 - 整理成一條 finding(`enforce_dbt_impact`),嚴重度:
 
   | 嚴重度 | 條件 |
   |---|---|
-  | blocker | 與變更前比較過,多出 blocker 級的命中 |
-  | major | 範圍不確定(反查標為不確定、全部 model 可能受影響);有 model 沒檢查到;變更後展開失敗或無法解析;多出 major 級的命中;無法與變更前比較而有命中 |
+  | major | 範圍不確定(反查標為不確定、全部 model 可能受影響);有 model 沒檢查到或沒查規格;變更後展開失敗或無法解析;多出 blocker 或 major 級的命中;無法與變更前比較而有命中 |
   | minor | 只多出 minor 級的命中 |
   | info | 有受影響的 model 或沒人呼叫的 macro,檢查不出問題(清單給人看) |
 
+  由前後比較推論出來的結果最多給 major,不給 blocker:比較本身可能出錯(語句對不上、展開方式不同),
+  不拿它直接擋下 MR,交人工確認。多出的命中、展開失敗、沒有檢查、沒查規格的清單不截斷
+
 - 上限:每個 MR 最多檢查 50 個受影響的 model、整段最多 120 秒、規格最多查 20 個。超過的列為
-  「沒有檢查」→ major。反查判定全部 model 可能受影響時不逐一展開。時間上限與機器負載有關,同一個
+  「沒有檢查」或「沒有查規格」→ major。剩下的時間傳進每一次展開(逾時取 30 秒與剩下時間的較小者),
+  展開被剩下的時間截斷時記成沒有檢查(不是展開失敗);查規格(真實 GitLab 模式會發請求)放在背景
+  執行緒裡、只等剩下的時間。反查判定全部 model 可能受影響時不逐一展開。時間上限與機器負載有關,同一個
   MR 在忙碌時可能多出「沒有檢查」的項目;方向是保守的(major)
 - 規格:每個受影響的 model 依檔名對應規格並列在 finding 裡。MR 自己對不到規格(只改了 macro)、
   而受影響的 model **全部檢查過、全部對到同一份**時,用那一份給模型審查
@@ -463,6 +475,9 @@ model)與確定性補報。讀 MR 與打包下載各用一把 project access tok
 | 沒有設定 `GITLAB_READ_TOKEN` | 取回失敗;被改到的 macro 檔記成展開失敗;反查當成全部 model 可能受影響;兩條 major |
 | `GITLAB_READ_TOKEN` 與 `GITLAB_TOKEN` 是同一把 | 拒絕下載(不退回用另一把);三個 MR 都交人工 |
 
+以上是依 review 修正**之前**的版本(2026-10-12);修正之後改 macro 那一列不會再因為專案有 snapshot 就標
+不確定(snapshot 改由反查判斷有沒有呼叫到被改的 macro),其餘行為不變,尚未用修正後的版本重跑。
+
 另外確認:三個 MR 的 `base_sha` 都是目標分支的最新 commit;seed、snapshot、Python model 都列在
 `ref()` 找得到的名稱裡,並標成表名無法確定;專案資訊在子行程裡整理,正常完成;錯誤訊息不含 token
 或網址。實測沒有涵蓋:呼叫模型之後的步驟(模型審查、執行驗證、寫回 GitLab)、dbt 專案在子目錄
@@ -472,14 +487,15 @@ model)與確定性補報。讀 MR 與打包下載各用一把 project access tok
 
 - mock 模式而 fixture 沒有放專案時(預設的 `fixtures/`、golden set):macro 檔仍會被當成 model 展開
   (接線前的行為)。要在 mock 模式看到接線的效果,得照 `examples/dbt_wiring/` 的方式放專案
-- 沒被這個 MR 改到的 macro 不另外做注入掃描(已合併的既有程式);這個 MR 改到的檔案都會掃
+- 注入掃描涵蓋 MR、取回的完整內容與預掃展開後的 SQL(會以規則命中的語句、解析錯誤的片段進 prompt);
+  受影響 model 的展開結果不進 prompt(只有路徑、規則代號、語句序號),不另外掃
 - 審查途中 MR 被推了新 commit 偵測不到:取回的是 `sha` 那一版,審查結果也寫在那一版上;新的
   commit 沒有 commit status,要等它自己的審查
 - 被刪除的 model 檔沿用接線前的行為(拿到的是被刪掉的內容,展開失敗 → major)
-- 前後比較看的是規則命中;命中沒變、但邏輯變了的情況,靠人工與之後的執行驗證。命中所在的語句
-  只比規則層回傳的前 200 個字元,兩句的差異在那之後就看不出來
-- 專案裡沒被取回的目錄(`analyses/`、`tests/` 等)的檔案沒有完整內容,仍用 diff 的片段展開
+- 前後比較看的是每一句的規則命中數;命中數沒變、但邏輯變了的情況(例如同一句改刪另一張表),
+  靠人工與之後的執行驗證
 - 每個要展開的檔案開一次子行程;受影響的 model 每個開兩次
+- 改到 seed / snapshot / analysis / test 目錄裡的檔案(含 seed 的 `.csv` 資料檔)時,反查不分析它們的影響,一律標不確定(major,交人工)。seed 的資料會被 model 以 `ref()` 讀到,不能說沒有影響;analysis / test 不影響 model,但沿用反查原本對這些目錄的保守處理,沒有放寬
 
 ## 後續
 

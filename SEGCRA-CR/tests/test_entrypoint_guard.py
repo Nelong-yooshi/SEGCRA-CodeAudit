@@ -1,4 +1,4 @@
-"""進入點要有 `if __name__ == "__main__":` 保護(#14 review 列的 dbt.enabled 開啟前條件)。
+"""進入點要有 `if __name__ == "__main__":` 保護(review 列的 dbt.enabled 開啟前條件)。
 
 dbt 的展開、macro 反查、專案資訊整理都在子行程裡做(multiprocessing 的 spawn)。spawn 會在
 子行程重新匯入進入點的模組;進入點把「開始審查」寫在模組最外層的話,每個子行程都會把整支程式

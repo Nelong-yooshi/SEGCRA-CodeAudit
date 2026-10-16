@@ -223,6 +223,7 @@ dbt 專案不在 repo 根目錄時,另外在 `models.yaml` 的 `dbt` 底下設 `
 
 **開啟後的行為:**
 
+- 哪些檔案算 dbt 的:`dbt_project.yml` 設定的 model / macro / analysis / test / seed / snapshot 目錄,與根目錄的設定檔。先讀 MR 那個 commit 的 `dbt_project.yml` 判斷;只改到其他檔案(CI 設定、一般的 SQL)時不取回專案
 - MR 改到 dbt 專案裡的 model:用該 commit 的完整檔案與專案的 macro 展開,再跑規則
 - MR 改到 macro、屬性檔(yml)或 `dbt_project.yml`:反查受影響的 model,比較變更前後的規則命中,補一條
   「dbt 變更對其他 model 的影響」
@@ -240,10 +241,10 @@ export SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER FIXTURES_DIR=examples/dbt_wiring/fixt
 .venv/bin/python demo.py --mr 802 --dry-run    # 只改 macro:多一條 major「dbt 變更對其他 model 的影響」
 ```
 
-`--mr 802` 的那條 finding 會列出改到的 macro 檔與受影響的 `models/mrt_sample.sql[R003 major]`
+`--mr 802` 的那條 finding 會列出改到的 macro 檔與受影響的 `models/mrt_sample.sql[R003 major(展開後第 1 句)]`
 (macro 的變更讓它多出 `NOT IN` 子查詢)。把 `dbt.enabled` 改回 `false` 再跑,兩個 MR 都會變成「預掃無法解析」。
 
-**回復:**把 `dbt.enabled` 改回 `false` 即可,行為與沒有這個功能時相同(有測試鎖住)。`GITLAB_READ_TOKEN`
+**關閉:**把 `dbt.enabled` 改回 `false` 即可,行為與沒有這個功能時相同(有測試鎖住)。`GITLAB_READ_TOKEN`
 不用時到 GitLab 撤銷。
 
 ## 6. Webhook 自動觸發

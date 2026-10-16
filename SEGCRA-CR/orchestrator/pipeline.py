@@ -346,7 +346,7 @@ _DBT_FETCH_FAILED = "無法取回 dbt 專案:"
 
 
 def _dbt_head_source(f: dict, sql: str, dbt_ctx: DbtContext | None) -> tuple[str, str | None, bool]:
-    """dbt 專案裡的 .sql:改用 head commit 的完整內容(#15 接線)。
+    """dbt 專案裡的 .sql:改用 head commit 的完整內容。
     回傳 (要檢查的內容, 取回失敗的原因或 None, 檔案是否在 dbt 專案裡)。
 
     真實 GitLab 模式的 diff 只有新增的行;只改了幾行的 model,拿片段去展開沒有意義,
@@ -388,20 +388,23 @@ def _mr_for_spec_exec(mr: dict, dbt_ctx: DbtContext | None) -> dict:
     return {**mr, "files": files}
 
 
-def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None) -> dict:
-    """注入掃描用:把取回的完整內容也列進去掃。
+def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None, rendered=()) -> dict:
+    """注入掃描用:把取回的完整內容與展開後的 SQL 也列進去掃。
 
     預掃改用 head 的完整內容後,規則命中帶的 SQL 片段可能來自 diff 以外的行;那些行
-    以前不會進到審查流程,也就沒被掃過。原本的 diff 照舊保留。"""
-    if dbt_ctx is None or dbt_ctx.project is None:
-        return mr
-    extra = [{"path": f.get("path"), "full_content": text} for f in mr.get("files", [])
-             if (text := dbt_ctx.head_text(f.get("path"))) is not None]
+    以前不會進到審查流程,也就沒被掃過。展開還會把沒改到的 macro 與這次傳的參數組合在一起,
+    組出來的文字在 MR 與 macro 檔裡各自都沒有;展開後的語句(規則命中)與解析錯誤的片段會
+    進 prompt。已合併的 macro 也不能假設掃過(掃描器與規則會更新)。所以實際會送進模型的
+    內容一律再掃一次。rendered 是預掃收集的 [{path, full_content}]。原本的 diff 照舊保留。"""
+    extra = list(rendered)
+    if dbt_ctx is not None and dbt_ctx.project is not None:
+        extra += [{"path": f.get("path"), "full_content": text} for f in mr.get("files", [])
+                  if isinstance(f, dict) and (text := dbt_ctx.head_text(f.get("path"))) is not None]
     return {**mr, "files": [*mr["files"], *extra]} if extra else mr
 
 
 async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
-                  dbt_ctx: DbtContext | None = None) -> list[dict]:
+                  dbt_ctx: DbtContext | None = None, rendered: list | None = None) -> list[dict]:
     """對每個變更檔跑 rule-base + lint(不經 LLM)。
 
     dbt_cfg 給定且 enabled 時,含 dbt 樣板標記的檔案先展開成純 SQL 再交給規則層
@@ -411,6 +414,9 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
 
     dbt_ctx(prepare_dbt_context 的結果)給定時,dbt 專案裡的 .sql 改用 head commit 的完整
     內容與專案的 macro 展開;取回失敗則記成展開失敗交人工。沒開 dbt 時不看 dbt_ctx。
+
+    rendered 給定時,展開成功的檔案以 {path, full_content: 展開後的 SQL} 加進去,給注入掃描用
+    (見 _mr_with_head_text)。
     """
     dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True
     results = []
@@ -434,6 +440,8 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
                 f.get("path", ""), sql, dbt_cfg, dbt_ctx if in_project else None)
             if dbt_error is not None:
                 entry["dbt_render_error"] = dbt_error
+            elif rendered is not None:
+                rendered.append({"path": f.get("path"), "full_content": rule_sql})
             if dbt_notice is not None:
                 entry["dbt_render_notice"] = dbt_notice
         rules = await hub.call_json("sqltools__run_rules", {"sql": rule_sql})
@@ -517,11 +525,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             return report
 
         dbt_ctx = prepare_dbt_context(mr, cfg.dbt)   # 需要時取回 MR 那個 commit 的 dbt 專案
-        pre = await prescan(hub, mr["files"], cfg.dbt, dbt_ctx)
+        rendered: list[dict] = []          # 展開後的 SQL,給注入掃描用
+        pre = await prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered)
         if capture is not None:
             capture["mr"] = mr
             capture["prescan_raw"] = copy.deepcopy(pre)
-        injection_hits = scan_mr(_mr_with_head_text(mr, dbt_ctx))   # 確定性注入掃描(不經 LLM)
+        # 確定性注入掃描(不經 LLM):MR、取回的完整內容、展開後的 SQL
+        injection_hits = scan_mr(_mr_with_head_text(mr, dbt_ctx, rendered))
 
         # 找 spec(確定性;執行驗證與 prompt 的規格段共用)。依檔名對應與展開器
         # 同一個開關:關閉時行為與接線前完全相同。
@@ -855,7 +865,7 @@ def enforce_dbt_render_failure(report: dict, pre: list[dict]) -> dict:
 def enforce_dbt_impact(report: dict, affected: AffectedCheck | None,
                        dbt_ctx: DbtContext | None = None) -> dict:
     """MR 改到 macro、屬性檔或專案設定檔時,把「影響到哪些 model、檢查出什麼」補成一條 finding
-    (#15 接線;內容與嚴重度見 dbt_affected.impact_finding)。
+    (內容與嚴重度見 dbt_affected.impact_finding)。
 
     確定性補報,不看模型有沒有自己提到:只改 macro 的 MR,diff 裡看不到任何一個受影響的
     model。標題只能由程式產生(_put_program_finding)。排在 enforce_hints / enforce_style
