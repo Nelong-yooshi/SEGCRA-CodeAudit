@@ -61,7 +61,6 @@ async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None
       * 只在沒有 R 編號時才試,避免蓋掉「MR 提到了編號、但規格真的不存在」
         這種需要如實回報成「無規格」的情況
     """
-    from toolbox import gitlab   # 延遲匯入:只為了拿 SPEC_REF,不讓無關呼叫端多背相依
     codes = extract_rule_codes(mr)
     for code in codes:
         local = SPECS_DIR / f"{code}.md"
@@ -70,12 +69,16 @@ async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None
     if hub is not None:
         for code in codes:
             try:
-                # ref 明確指定,不吃預設值:#22 把 get_file 的預設改成「正在審的
-                # 那一版」之後,規格如果跟著走,MR 就能在同一次提交裡改掉自己的
-                # 規格讓自己過——執行驗證整道防線等於自己開門。
+                # 不指定 ref → 讀「正在審的那一版」。規格與程式是我們自己整理的,
+                # 會在同一個 MR 裡一起修正;鎖在目標分支的話,「規格寫錯、跟程式
+                # 一起修」的 MR 會被拿舊規格生測資,把正確的修正判成不符
+                # (#31 review 的決定)。
+                #
+                # 代價是一個 MR 可以同時改規格與程式、讓執行驗證拿改過的規格驗
+                # 自己。這一點改由**讓審查的人看見規格被改了**來處理(#38 第 3 點),
+                # 不是靠鎖版本——鎖版本會讓正常的修正無法通過。
                 txt = await hub.call("gitlab__get_file",
-                                     {"path": f"specs/{code}.md",
-                                      "ref": gitlab.SPEC_REF}, truncate=False)
+                                     {"path": f"specs/{code}.md"}, truncate=False)
             except Exception:
                 continue
             if txt and txt.lstrip().startswith("#"):
@@ -120,9 +123,9 @@ async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
     for path in paths:
         for candidate in resolve_spec(path, ()).candidates:   # 只要候選路徑,不比對存在與否
             try:
+                # 同上:不指定 ref,讀正在審的那一版(#31 review)
                 txt = await hub.call("gitlab__get_file",
-                                     {"path": candidate,
-                                      "ref": gitlab.SPEC_REF}, truncate=False)   # 同上:規格不跟 MR 走
+                                     {"path": candidate}, truncate=False)
             except Exception:
                 continue
             if txt and txt.lstrip().startswith("#"):

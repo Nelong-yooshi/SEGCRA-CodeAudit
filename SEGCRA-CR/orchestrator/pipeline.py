@@ -1115,12 +1115,22 @@ def enforce_unreviewable(report: dict, mr: dict) -> dict:
     """
     bad = [f["path"] for f in mr.get("files", []) if f.get("unreviewable")]
     truncated = bool(mr.get("truncated"))
-    if not bad and not truncated:
+    # 真實模式下取不到**整份新檔**的檔案(#22):拿不到 head sha、沒有唯讀 token、
+    # 超過單檔上限、或 API 失敗。這些檔案只有 diff 那幾行進得了預掃與沙盒,
+    # 大檔小改時還原出來可能只剩一行——等於沒被實質審查過,所以一律交人工
+    # (#31 review:這個標記原本沒有任何地方讀它)。
+    no_full = [f["path"] for f in mr.get("files", [])
+               if f.get("full_content_unavailable") and not f.get("unreviewable")]
+    if not bad and not truncated and not no_full:
         return report
     parts = []
     if bad:
         parts.append(f"以下檔案的 diff 過大或被摺疊,GitLab 未回傳內容:{', '.join(bad[:10])}"
                      + ("等" if len(bad) > 10 else "") + "。")
+    if no_full:
+        parts.append(f"以下檔案取不到完整的新版內容,只能依 diff 判斷:"
+                     f"{', '.join(no_full[:10])}" + ("等" if len(no_full) > 10 else "")
+                     + "(可能是拿不到被審的 commit、未設定唯讀 token、或超過單檔上限)。")
     if truncated:
         parts.append("MR 變更的檔案數超過可取得的分頁上限,部分檔案未能取得。")
     report.setdefault("findings", []).insert(0, {

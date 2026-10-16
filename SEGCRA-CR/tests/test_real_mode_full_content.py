@@ -11,6 +11,8 @@
   3. **規格不跟 MR 走** —— 否則 MR 能改自己的規格讓自己過
 """
 import json
+import sys
+import types
 
 import pytest
 
@@ -33,6 +35,9 @@ def real(monkeypatch):
     monkeypatch.setattr(gitlab, "REAL_MODE", True)
     monkeypatch.setattr(gitlab, "GITLAB_URL", "http://gl")
     monkeypatch.setattr(gitlab, "GITLAB_TOKEN", "t")
+    # 讀程式碼用唯讀 token(#31 review):沒設定時 get_file 直接回「讀不到」,
+    # 不退回有寫入權的那把。
+    monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", "ro")
     monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "1")
 
     state = {"files": {}, "fetched": []}
@@ -115,6 +120,7 @@ def seen_ref(monkeypatch):
     class _Resp:
         status_code = 200
         text = "content"
+        content = b"content"      # get_file 要看位元組長度(單檔上限,#31 review)
 
         def raise_for_status(self):
             pass
@@ -135,31 +141,36 @@ def test_不指定_ref_時抓正在審的那一版(real, seen_ref):
     assert seen_ref["ref"] == SHA
 
 
-def test_沒有釘住版本時退回目標分支(real, seen_ref):
-    """拿不到被審的版本是降級,不是正常狀況;但也不能因此就不給內容。"""
+def test_沒有釘住版本時不可以退回目標分支(real, seen_ref):
+    """**不退回**,明講取不到。
+
+    退回目標分支拿到的是**改之前**的內容,那正是 #22 原本的 bug,而且沒有任何
+    徵兆:報告看起來正常,實際上審的是舊版(#31 review)。
+    """
     gitlab.pin_review_ref(None)
-    gitlab.get_file("specs/R-1.md")
-    assert seen_ref["ref"] == gitlab.SPEC_REF
+    out = gitlab.get_file("sql/x.sql")
+    assert "無法取得審查中的版本" in out, out
+    assert "ref" not in seen_ref, "不該發出請求去抓別的版本"
 
 
 def test_明確指定的_ref_優先(real, seen_ref):
-    """規格就是靠這條路:find_spec 明確傳 SPEC_REF,不吃預設值。"""
+    """呼叫端明確傳的 ref 不可以被釘住的版本蓋掉(例如要比對改動前後時)。"""
     gitlab.pin_review_ref(SHA)
-    gitlab.get_file("specs/R-1.md", ref="main")
+    gitlab.get_file("sql/x.sql", ref="main")
     assert seen_ref["ref"] == "main", "明確傳的 ref 被釘住的版本蓋掉了"
 
 
 # ─────────────────── 3. 規格不跟 MR 走(安全性) ───────────────────
 
-def test_規格一律從目標分支讀(monkeypatch):
-    """**這一條是安全性,不是整潔。**
+def test_規格讀的是正在審的那一版(monkeypatch):
+    """規格與程式是我們自己整理的,會在同一個 MR 裡一起修正。
 
-    #22 把 `get_file` 的預設從 `main` 改成「正在審的那一版」。如果規格也跟著走,
-    一個 MR 就能在同一次提交裡改掉自己的規格,讓執行驗證拿改過的規格去生測資、
-    再拿那份測資驗自己——整道防線自己把門打開,而且報告上看起來完全正常。
+    鎖在目標分支的話,「規格寫錯、跟程式一起修」的 MR 會被拿**舊規格**生測資,
+    把正確的修正判成不符(#31 review 的決定)。
 
-    所以 `find_spec` 必須**明確**傳 `ref=SPEC_REF`,不能吃預設值。
-    這個測試釘住的是「有傳」,不是「預設剛好是對的」。
+    代價是一個 MR 可以同時改規格與程式、讓執行驗證拿改過的規格驗自己——那一點
+    改由「讓審查的人看見規格被改了」處理(#38 第 3 點),不是靠鎖版本:
+    鎖版本會讓正常的修正無法通過。
     """
     import asyncio
 
@@ -178,9 +189,9 @@ def test_規格一律從目標分支讀(monkeypatch):
 
     assert calls, "find_spec 沒有去抓規格"
     for p in calls:
-        assert p.get("ref") == gitlab.SPEC_REF, (
-            f"規格讀取沒有明確指定 ref(拿到 {p.get('ref')!r})——"
-            "吃預設值的話,get_file 的預設一改,MR 就能改自己的規格")
+        assert "ref" not in p, (
+            f"規格讀取指定了 ref={p.get('ref')!r}——應該吃 get_file 的預設"
+            "(正在審的那一版),否則規格跟程式一起修的 MR 會被拿舊規格驗")
 
 
 # ─────────────────── 4. 端到端:大檔只改一行(#22 的完成條件) ───────────────────
@@ -224,6 +235,9 @@ def _review_real(monkeypatch, tmp_path, *, serve_full: bool):
     monkeypatch.setattr(gitlab, "REAL_MODE", True)
     monkeypatch.setattr(gitlab, "GITLAB_URL", "http://gl")
     monkeypatch.setattr(gitlab, "GITLAB_TOKEN", "t")
+    # 讀程式碼用唯讀 token(#31 review):沒設定時 get_file 直接回「讀不到」,
+    # 不退回有寫入權的那把。
+    monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", "ro")
     monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "1")
     monkeypatch.setenv("REVIEW_OUTPUT", str(tmp_path))
     monkeypatch.setattr(gitlab, "OUTPUT_DIR", tmp_path)
@@ -244,13 +258,33 @@ def _review_real(monkeypatch, tmp_path, *, serve_full: bool):
         return '{"score": 90, "verdict": "approve", "summary": "相符。", "findings": []}'
     monkeypatch.setattr(pipeline, "run_agent", fake_agent)
 
-    async def no_cases(*a, **k):
-        return {"schema_ddl": [], "conditions": [], "cases": []}, ["測試中略過"], []
-    monkeypatch.setattr(spec_exec, "generate_cases", no_cases)
+    # **要真的走到沙盒**:回一個最小但合法的測資計畫,然後攔下 execute_cases
+    # 看它實際收到什麼 SQL(#31 review:原本回空結果,沙盒那條路根本沒被走到,
+    # 所以「執行驗證也拿到整份檔」這件事其實沒有被驗過)。
+    async def one_case(*a, **k):
+        return ({"schema_ddl": ["CREATE TABLE transactions (account_id INT, "
+                                "amount INT, tx_time DATETIME2, tx_type NVARCHAR(10), "
+                                "channel NVARCHAR(10), eod_balance INT)"],
+                 "conditions": [{"id": "C1", "desc": "提領累計達門檻"}],
+                 "cases": [{"case_id": "C1-T", "condition_id": "C1",
+                            "direction": "true", "expect_flagged": True, "note": "",
+                            "rows": [["transactions", 1, 100000,
+                                      "2026-06-01 10:00:00", "WITHDRAW", "ATM", 500]]}]},
+                [], [])
+    monkeypatch.setattr(spec_exec, "generate_cases", one_case)
+
+    sandbox_sql: dict = {}
+
+    def fake_execute(sql, plan):
+        sandbox_sql["sql"] = sql
+        return {"engine": "stub(不連資料庫)", "sandbox_error": None,
+                "testdata_error": None, "sql_error": None,
+                "case_results": [{"case_id": "C1-T"}], "mismatches": []}
+    monkeypatch.setattr(spec_exec, "execute_cases", fake_execute)
 
     captured: dict = {}
     report = asyncio.run(review_or_raise(pipeline, load_config(), captured))
-    return report, captured.get("prescan_raw") or []
+    return report, captured.get("prescan_raw") or [], sandbox_sql.get("sql")
 
 
 def review_or_raise(pipeline, cfg, captured):
@@ -264,7 +298,7 @@ def test_大檔只改一行_預掃要拿到整份檔而不是那一行(monkeypat
     SELECT 都看不到,解析失敗,AST 規則整組沒跑。而這個缺口 golden set 量不到,
     因為 golden case 都有 full_content。
     """
-    _, pre = _review_real(monkeypatch, tmp_path, serve_full=True)
+    _, pre, _ = _review_real(monkeypatch, tmp_path, serve_full=True)
     assert pre, "沒有拿到預掃結果"
     entry = pre[0]
     assert "parse_error" not in entry, (
@@ -279,8 +313,162 @@ def test_拿不到完整檔時_預掃解析失敗而且會被揭露(monkeypatch,
     2. 釘住降級時的行為:拿不到完整檔**不可以靜默**——`enforce_parse` 要補一條
        finding,否則 MR 可能因為「沒有命中任何規則」而被自動放行
     """
-    report, pre = _review_real(monkeypatch, tmp_path, serve_full=False)
+    report, pre, _ = _review_real(monkeypatch, tmp_path, serve_full=False)
     assert pre and "parse_error" in pre[0], "拿不到完整檔卻解析成功了?測試設計有問題"
     titles = [f.get("title") for f in report.get("findings", [])]
     assert any("預掃無法解析" in str(t) for t in titles), (
         f"解析失敗沒有被揭露,findings = {titles}")
+
+
+# ─────────────────── #31 review 補的四條 ───────────────────
+
+def test_讀程式碼用唯讀token(real, seen_ref, monkeypatch):
+    """依 #20／#22 留言的規矩:讀程式碼用唯讀的 GITLAB_READ_TOKEN。"""
+    sent = {}
+
+    def _get(url, **kw):
+        sent.update(kw.get("headers") or {})
+
+        class _R:
+            status_code = 200
+            text = "x"
+            content = b"x"
+
+            def raise_for_status(self):
+                pass
+        return _R()
+
+    monkeypatch.setitem(sys.modules, "httpx", types.SimpleNamespace(get=_get))
+    gitlab.pin_review_ref(SHA)
+    gitlab.get_file("sql/x.sql")
+    assert sent.get("PRIVATE-TOKEN") == "ro", "讀檔用了有寫入權的 token"
+
+
+def test_沒有唯讀token時不退回寫入用的那把(real, monkeypatch):
+    """沒設定就跟拿不到 head_sha 一樣:標成取不到、交人工,不要降級去用寫入 token。"""
+    monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", "")
+    called = []
+    monkeypatch.setitem(sys.modules, "httpx",
+                        types.SimpleNamespace(get=lambda *a, **k: called.append(1)))
+    gitlab.pin_review_ref(SHA)
+    out = gitlab.get_file("sql/x.sql")
+    assert "GITLAB_READ_TOKEN" in out, out
+    assert not called, "沒有唯讀 token 還是發了請求"
+
+
+def test_超過單檔上限就不回內容(real, monkeypatch):
+    """不要讓一個超大的檔案拖住預掃、注入掃描與沙盒(#31 review;同 #45 的時間上限)。"""
+    big = "x" * 200
+
+    def _get(url, **kw):
+        class _R:
+            status_code = 200
+            text = big
+            content = big.encode()
+
+            def raise_for_status(self):
+                pass
+        return _R()
+
+    monkeypatch.setitem(sys.modules, "httpx", types.SimpleNamespace(get=_get))
+    monkeypatch.setattr(gitlab, "MAX_FILE_BYTES", 100)
+    gitlab.pin_review_ref(SHA)
+    out = gitlab.get_file("sql/x.sql")
+    assert "超過單檔上限" in out and big not in out, out
+
+
+def test_釘住的版本不會跨執行緒污染():
+    """webhook 每個 MR 開一條執行緒同時審:模組層級的全域變數會讓 A 讀到 B 的 sha
+    ——兩份 MR 的內容互相污染,而且報告上看不出來(#31 review)。"""
+    import threading
+
+    seen = {}
+    start = threading.Barrier(2)
+
+    def worker(name, sha):
+        gitlab.pin_review_ref(sha)
+        start.wait(timeout=5)        # 兩條都設定完才讀,確保真的同時存在
+        seen[name] = gitlab.review_ref()
+
+    a = threading.Thread(target=worker, args=("A", "a" * 40))
+    b = threading.Thread(target=worker, args=("B", "b" * 40))
+    a.start(); b.start(); a.join(5); b.join(5)
+    assert seen == {"A": "a" * 40, "B": "b" * 40}, seen
+
+
+def test_取不到完整內容的檔案要交人工():
+    """`full_content_unavailable` 原本沒有任何地方讀它(#31 review)。
+
+    這些檔案只有 diff 那幾行進得了預掃與沙盒,大檔小改時還原出來可能只剩一行
+    ——等於沒被實質審查過,不可以就這樣放行。
+    """
+    from orchestrator import pipeline
+    mr = {"files": [{"path": "sql/big.sql", "full_content_unavailable": True},
+                    {"path": "sql/ok.sql", "full_content": "SELECT 1"}]}
+    out = pipeline.enforce_unreviewable({"findings": []}, mr)
+    assert out["findings"], "取不到完整內容卻沒有補 finding"
+    f = out["findings"][0]
+    assert f["severity"] == "major"
+    assert "sql/big.sql" in f["detail"] and "sql/ok.sql" not in f["detail"]
+
+
+def test_同時標了unreviewable的檔案不重複列():
+    """`unreviewable`(diff 都拿不到)比「只拿不到完整內容」更嚴重,列一次就好。"""
+    from orchestrator import pipeline
+    mr = {"files": [{"path": "a.sql", "unreviewable": True,
+                     "full_content_unavailable": True}]}
+    out = pipeline.enforce_unreviewable({"findings": []}, mr)
+    assert out["findings"][0]["detail"].count("a.sql") == 1
+
+
+def test_沙盒實際收到整份SQL(monkeypatch, tmp_path):
+    """#22 的完成條件第 3 項:執行驗證也要拿到整份檔。
+
+    原本的端到端測試把 `generate_cases` 換成回傳空結果,所以**沙盒那條路根本沒走到**
+    ——「執行驗證也拿到整份檔」這件事沒有被驗過(#31 review)。
+    """
+    _, _, sql = _review_real(monkeypatch, tmp_path, serve_full=True)
+    assert sql, "執行驗證沒有跑到沙盒"
+    assert "WITH base AS" in sql and "FROM transactions" in sql, (
+        "沙盒收到的不是整份檔:" + repr(sql[:120]))
+    assert sql.count("\n") > 5, "看起來只有 diff 那幾行"
+
+
+def test_拿不到完整檔時沙盒收到的只有diff那幾行(monkeypatch, tmp_path):
+    """反面對照:證明上一條真的分得出差別,而不是恰好都綠。"""
+    _, _, sql = _review_real(monkeypatch, tmp_path, serve_full=False)
+    assert sql is None or "WITH base AS" not in sql, (
+        "拿不到完整檔卻送了整份 SQL 進沙盒?測試設計有問題")
+
+
+def test_補full_content時也要受單檔上限限制(real, monkeypatch):
+    """`get_file`(模型用的)與 `_file_at`(補 full_content 用的)是兩條路,
+    兩條都要有上限。原本只有前者有,後者的突變在驗證時**存活**了。
+
+    超過上限就當成取不到 → `full_content_unavailable` → 交人工,不要讓一個
+    超大的檔案拖住預掃、注入掃描與沙盒(#31 review)。
+    """
+    big = "x" * 5000
+
+    def _get(url, **kw):
+        class _R:
+            status_code = 200
+            text = big
+            content = big.encode()
+
+            def raise_for_status(self):
+                pass
+        return _R()
+
+    # 這個測試要驗真正的 _file_at,所以不能用 real fixture 換掉的那個假的
+    monkeypatch.undo()
+    monkeypatch.setattr(gitlab, "REAL_MODE", True)
+    monkeypatch.setattr(gitlab, "GITLAB_URL", "http://gl")
+    monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", "ro")
+    monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "1")
+    monkeypatch.setattr(gitlab, "MAX_FILE_BYTES", 100)
+    monkeypatch.setitem(sys.modules, "httpx", types.SimpleNamespace(get=_get))
+    assert gitlab._file_at("sql/big.sql", SHA) is None, "超過上限卻回了內容"
+
+    monkeypatch.setattr(gitlab, "MAX_FILE_BYTES", 10000)
+    assert gitlab._file_at("sql/big.sql", SHA) == big, "沒超過上限卻不回內容"

@@ -7,6 +7,7 @@
 打包下載(download_archive,#15)另外需要 GITLAB_READ_TOKEN(唯讀),見該函式說明。
 """
 import json
+import contextvars
 import os
 import re
 import time
@@ -77,36 +78,62 @@ _DIFF_REF_KEYS = ("base_sha", "head_sha", "start_sha")
 # ref 就用它——**模型看到的要是被審的那一版,不是目標分支的現況**。
 # 釘住而不是用分支名,是因為分支在審查中途可能被推新 commit,那會變成「審了 A、
 # 驗了 B」而且完全沒有徵兆(同一個理由讓 _SHA 不接受分支名)。
-_REVIEW_REF: str | None = None
+# **用 ContextVar 而不是模組層級的全域變數**:webhook 每個 MR 開一條執行緒同時審
+# (scripts/webhook_server.py 的 _trigger),全域變數會讓 A 的 get_file 讀到 B 的 sha
+# ——兩份 MR 的內容互相污染,而且報告上看不出來(#31 review)。
+# ContextVar 在每條執行緒(以及每個 async task)各有自己的值。
+_REVIEW_REF: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "segcra_review_ref", default=None)
 
 
 def pin_review_ref(sha: str | None) -> None:
-    """把這次審查釘在某個 commit 上;None = 解除(回到 SPEC_REF)。
+    """把這次審查釘在某個 commit 上;None = 解除。
 
-    由 get_mr_diff 自動呼叫。拿不到 head_sha 時會是 None,那時 get_file 退回
-    目標分支——**那是「看不到被審版本」的降級,不是正常狀況**,呼叫端要知道
-    自己拿到的可能不是 MR 的內容。
+    由 get_mr_diff 自動呼叫。拿不到 head_sha 時會是 None——那時 get_file **不會**
+    退回目標分支,而是明講取不到(退回去拿到的是改之前的內容,那正是 #22 原本的
+    bug)。
     """
-    global _REVIEW_REF
-    _REVIEW_REF = sha
+    _REVIEW_REF.set(sha)
 
 
 def review_ref() -> str | None:
-    return _REVIEW_REF
+    return _REVIEW_REF.get()
+
+
+# 取回單一檔案的大小上限。超過就當成「取不到完整內容」交人工,不要讓一個超大的
+# 檔案拖住預掃、注入掃描與沙盒(#31 review;同 #45 的時間上限原則)。
+MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(1024 * 1024)))
+
+
+def _read_token() -> str | None:
+    """讀程式碼用**唯讀** token。沒設定就回 None——呼叫端據此標成「取不到完整
+    內容」交人工,**不退回用有寫入權的 GITLAB_TOKEN**(#20/#22 留言的規矩)。"""
+    return GITLAB_READ_TOKEN or None
 
 
 def _file_at(path: str, ref: str) -> str | None:
-    """取某個 commit 上的檔案完整內容;取不到回 None(不編造、不退回別的版本)。"""
+    """取某個 commit 上的檔案完整內容;取不到回 None(不編造、不退回別的版本)。
+
+    回 None 的情況:沒有唯讀 token、HTTP 失敗、404、或超過 MAX_FILE_BYTES。
+    呼叫端一律把 None 當成「這個檔沒拿到」,不是「這個檔是空的」。
+    """
+    token = _read_token()
+    if not token:
+        return None
     import urllib.parse
     import httpx
     try:
         r = httpx.get(
             f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}/repository/files/"
             f"{urllib.parse.quote(path, safe='')}/raw",
-            headers={"PRIVATE-TOKEN": GITLAB_TOKEN}, params={"ref": ref}, timeout=30)
+            headers={"PRIVATE-TOKEN": token}, params={"ref": ref}, timeout=30)
     except Exception:
         return None
-    return r.text if r.status_code == 200 else None
+    if r.status_code != 200:
+        return None
+    if len(r.content) > MAX_FILE_BYTES:
+        return None
+    return r.text
 
 
 def _diff_refs(mr: dict) -> dict:
@@ -325,28 +352,40 @@ def get_mr_diff(mr_id: str) -> str:
                        "files": mr["files"]}, ensure_ascii=False)
 
 
+# 這個函式的 docstring 會**原樣送給模型**當工具說明(tool_hub.py 用 inspect.getdoc),
+# 所以它必須短、而且只講模型需要知道的事。開發用的說明一律寫成 # 註解(#31 review:
+# 上一版把 docstring 寫長,還叫模型「讀規格請傳 ref=SPEC_REF」——模型照做會送出
+# 字面的 "SPEC_REF",只會拿到 404)。
+#
+# 不指定 ref 時抓「正在審的那一版」(get_mr_diff 釘住的 head sha),而不是目標分支
+# 的現況:先前預設 main,模型看到的是**改之前**的內容,看起來正常、實際上在審錯的
+# 東西(#22)。
+#
+# 拿不到釘住的版本時**不退回目標分支**,而是明講取不到——退回去就是 #22 原本的
+# bug,而且沒有任何徵兆(#31 review)。
 def get_file(path: str, ref: str = "", mr_id: str = "") -> str:
-    """取得 repo 內檔案完整內容(看 diff 不夠時用)。mock 模式下 ref 無作用。
-
-    **ref 不指定時抓「正在審的那一版」**(get_mr_diff 釘住的 head sha),不是目標
-    分支的現況(#22)。先前預設是 `main`,所以模型用這個工具去看檔案時拿到的是
-    **改之前**的內容——看起來正常、實際上在審錯的東西。
-
-    讀規格請明確傳 `ref=SPEC_REF`:規格是核定過的真值,不能跟著 MR 走,
-    否則一個 MR 就能在同一次提交裡改掉自己的規格讓自己過(見 SPEC_REF)。
-    """
+    """取得 repo 內檔案的完整內容(看 diff 不夠時用)。"""
     if REAL_MODE:
         import urllib.parse
         import httpx
-        # 釘住的版本 → 目標分支。兩者都沒有才用 SPEC_REF 當最後退路。
-        ref = ref or _REVIEW_REF or SPEC_REF
+        ref = ref or review_ref() or ""
+        if not ref:
+            return ("(無法取得審查中的版本:這次審查沒有釘住 commit。"
+                    "請依 diff 判斷,或交人工確認。)")
+        token = _read_token()
+        if not token:
+            return ("(無法讀取檔案:未設定唯讀的 GITLAB_READ_TOKEN。"
+                    "請依 diff 判斷,或交人工確認。)")
         r = httpx.get(
             f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}/repository/files/"
             f"{urllib.parse.quote(path, safe='')}/raw",
-            headers={"PRIVATE-TOKEN": GITLAB_TOKEN}, params={"ref": ref}, timeout=30)
+            headers={"PRIVATE-TOKEN": token}, params={"ref": ref}, timeout=30)
         if r.status_code == 404:
             return f"(repo 內無 {path})"
         r.raise_for_status()
+        if len(r.content) > MAX_FILE_BYTES:
+            return (f"({path} 超過單檔上限 {MAX_FILE_BYTES} bytes,未取回完整內容。"
+                    f"請依 diff 判斷,或交人工確認。)")
         return r.text
     mr = _mock_mr(mr_id) if mr_id else None
     if mr:
