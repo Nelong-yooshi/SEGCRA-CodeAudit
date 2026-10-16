@@ -401,6 +401,12 @@ def _mr_for_spec_exec(mr: dict, dbt_ctx: DbtContext | None) -> dict:
     return {**mr, "files": files}
 
 
+# 注入掃描額外加進去的內容(取回的完整內容、展開後的 SQL)合計最多幾個字元。展開可以把很短的
+# 樣板放大成幾百萬字元,掃描器對特製的內容(大量沒有結尾的 /*)是平方時間;超過的不掃,
+# 補 major 交人工(enforce_scan_skipped)。真實的 model 展開後遠小於此
+MAX_EXTRA_SCAN_CHARS = 200_000
+
+
 def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None, rendered=()) -> dict:
     """注入掃描用:把取回的完整內容與展開後的 SQL 也列進去掃。
 
@@ -408,12 +414,28 @@ def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None, rendered=()) -> dic
     以前不會進到審查流程,也就沒被掃過。展開還會把沒改到的 macro 與這次傳的參數組合在一起,
     組出來的文字在 MR 與 macro 檔裡各自都沒有;展開後的語句(規則命中)與解析錯誤的片段會
     進 prompt。已合併的 macro 也不能假設掃過(掃描器與規則會更新)。所以實際會送進模型的
-    內容一律再掃一次。rendered 是預掃收集的 [{path, full_content}]。原本的 diff 照舊保留。"""
+    內容一律再掃一次。rendered 是預掃收集的 [{path, full_content}]。原本的 diff 照舊保留。
+
+    加進去的內容合計超過 MAX_EXTRA_SCAN_CHARS 時,放不下的那幾份不掃,份數記在回傳值的
+    `_scan_skipped`(由 enforce_scan_skipped 補 major)。"""
     extra = list(rendered)
     if dbt_ctx is not None and dbt_ctx.project is not None:
         extra += [{"path": f.get("path"), "full_content": text} for f in mr.get("files", [])
                   if isinstance(f, dict) and (text := dbt_ctx.head_text(f.get("path"))) is not None]
-    return {**mr, "files": [*mr["files"], *extra]} if extra else mr
+    kept, skipped, used = [], 0, 0
+    for item in extra:
+        size = len(item.get("full_content") or "")
+        if used + size > MAX_EXTRA_SCAN_CHARS:
+            skipped += 1
+            continue
+        used += size
+        kept.append(item)
+    if not (kept or skipped):
+        return mr
+    out = {**mr, "files": [*mr["files"], *kept]}
+    if skipped:
+        out["_scan_skipped"] = skipped
+    return out
 
 
 async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
@@ -947,6 +969,16 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         if not mr:
             raise RuntimeError(f"無法取得 MR {mr_id}")
 
+        # 把這次審查釘在 MR 的 head commit 上:之後 get_file 不指定 ref 時讀的就是
+        # 「正在審的那一版」,而不是目標分支的現況(目標分支讀到的是**改之前**的
+        # 內容,看起來正常、實際上在審錯的東西)。
+        #
+        # **釘在這裡而不是 get_mr_diff 裡**:那個函式在模型的工具清單上,模型若被
+        # MR 描述引導去呼叫別的 MR,釘住的版本就會被換掉,之後讀到的是別人的檔案。
+        # 拿不到 head sha 時釘 None——get_file 會明講取不到,不會退回舊版。
+        from toolbox import gitlab as _gitlab
+        _gitlab.pin_review_ref(mr.get("head_sha"))
+
         if baseline:
             # 裸模型 A/B 對照組 — 無 skills/memory/工具/預掃/執行驗證,不回寫 GitLab
             user = BASELINE_USER.format(
@@ -967,7 +999,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             capture["mr"] = mr
             capture["prescan_raw"] = copy.deepcopy(pre)
         # 確定性注入掃描(不經 LLM):MR、取回的完整內容、展開後的 SQL
-        injection_hits = scan_mr(_mr_with_head_text(mr, dbt_ctx, rendered))
+        scan_target = _mr_with_head_text(mr, dbt_ctx, rendered)
+        injection_hits = scan_mr(scan_target)
 
         # 找 spec(確定性;執行驗證與 prompt 的規格段共用)。依檔名對應與展開器
         # 同一個開關:關閉時行為與接線前完全相同。
@@ -1088,6 +1121,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 放在 enforce_hints / enforce_style 之後:它們以關鍵詞判斷模型是否已回應,
         # 程式補的文字若先進報告,可能被誤當成模型的回應而吞掉檢核點
         report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述
+        report = enforce_scan_skipped(report, scan_target.get("_scan_skipped", 0))  # 內容太多沒掃完
         report = enforce_dbt_impact(report, affected, dbt_ctx)  # macro 等變更影響的其他 model
         report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
         report = enforce_format(report)        # 模型輸出有格式錯誤 → major;須在 sanitize 之後
@@ -1662,6 +1696,25 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     return report
 
 
+_SCAN_SKIPPED_TITLE = "部分內容超過注入掃描的上限,沒有掃描"
+
+
+def enforce_scan_skipped(report: dict, skipped: int) -> dict:
+    """取回的完整內容與展開後的 SQL 合計超過注入掃描的上限(MAX_EXTRA_SCAN_CHARS),有幾份沒有掃:
+    補一條 major,不得自動放行。沒掃的內容仍可能進到審查模型(規則命中的語句、解析錯誤的片段)。
+    標題只能由程式產生(見 _put_program_finding)。"""
+    if not skipped:
+        return report
+    _put_program_finding(report, {
+        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _SCAN_SKIPPED_TITLE,
+        "detail": (f"取回的完整內容與展開後的 SQL 合計超過 {MAX_EXTRA_SCAN_CHARS} 字元,其中 {skipped} 份"
+                   "沒有做注入掃描(避免掃描被特製的大量內容拖住)。這些內容可能進到審查模型,"
+                   "不得自動放行。"),
+        "suggestion": "人工確認展開後的內容;若 MR 確實需要這麼大的檔案,請拆小。",
+        "citations": []})
+    return report
+
+
 def enforce_injection(report: dict, hits: list[dict]) -> dict:
     """確定性注入防線:掃描器命中 → 一律加 blocker,不參考模型輸出。
 
@@ -1736,18 +1789,33 @@ def enforce_unreviewable(report: dict, mr: dict) -> dict:
     """
     bad = [f["path"] for f in mr.get("files", []) if f.get("unreviewable")]
     truncated = bool(mr.get("truncated"))
-    if not bad and not truncated:
+    # 真實模式下取不到**整份新檔**的檔案。四種情況:拿不到 head sha、沒有唯讀
+    # token、超過單檔上限、或 API 失敗(標記由 toolbox/gitlab.py 的 get_mr_diff 打)。
+    # 這些檔案只有 diff 那幾行進得了預掃與沙盒,大檔小改時還原出來可能只剩一行,
+    # 看不出整份程式在做什麼——所以一律交人工。
+    no_full = [f["path"] for f in mr.get("files", [])
+               if f.get("full_content_unavailable") and not f.get("unreviewable")]
+    if not bad and not truncated and not no_full:
         return report
     parts = []
     if bad:
         parts.append(f"以下檔案的 diff 過大或被摺疊,GitLab 未回傳內容:{', '.join(bad[:10])}"
                      + ("等" if len(bad) > 10 else "") + "。")
+    if no_full:
+        parts.append(f"以下檔案取不到完整的新版內容,只能依 diff 判斷:"
+                     f"{', '.join(no_full[:10])}" + ("等" if len(no_full) > 10 else "")
+                     + "(可能是拿不到被審的 commit、未設定唯讀 token、或超過單檔上限)。")
     if truncated:
         parts.append("MR 變更的檔案數超過可取得的分頁上限,部分檔案未能取得。")
     report.setdefault("findings", []).insert(0, {
         "file": "(MR 內容)", "line": 0, "severity": "major",
         "title": "部分變更內容無法取得,未經審查",
-        "detail": "".join(parts) + "這些內容沒有經過注入掃描、規則預掃與模型審查,需人工確認。",
+        # 結尾那句只對「完全拿不到內容」的情況成立。取不到**完整新檔**的檔案
+        # 其實有被審(diff 那幾行進了預掃與模型),只是看不到全貌——說成
+        # 「沒有經過任何審查」會讓判讀的人誤判嚴重程度。
+        "detail": "".join(parts) + (
+            "這些內容沒有經過注入掃描、規則預掃與模型審查,需人工確認。"
+            if (bad or truncated) else "這些檔案只看得到 diff 的片段,需人工確認。"),
         "suggestion": "拆分 MR 讓每個檔案都能被完整取得;或人工審查上列檔案後再合併。",
         "citations": []})
     return report

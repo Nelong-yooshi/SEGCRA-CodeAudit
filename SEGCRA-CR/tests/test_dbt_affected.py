@@ -1434,3 +1434,36 @@ def test_變更清單有格式不對的項目_接線的每一步都不中斷(bad
     assert ctx.touches_dbt(mr["files"])
     enforce_dbt_unexecuted(_passed(), mr, ctx, CFG)
     pipeline._mr_touches_dbt(mr, ctx, CFG)
+
+
+def test_查規格的背景執行緒_讀得到呼叫端的contextvars():
+    """這次審查釘住的 commit 存在 ContextVar 裡(toolbox.gitlab.review_ref);新開的執行緒
+    不會自動繼承,讀不到時真實模式的 get_file 會回「無法取得審查中的版本」。"""
+    from toolbox import gitlab
+
+    seen = {}
+
+    async def spec(hub, mr, *, by_path=False):
+        seen["ref"] = gitlab.review_ref()
+        return "A", "# 規格 A"
+
+    async def run():
+        gitlab.pin_review_ref("c" * 40)
+        try:
+            return await dbt_affected._wait_in_thread(lambda: spec(None, {}), 5)
+        finally:
+            gitlab.pin_review_ref(None)
+
+    assert asyncio.run(run()) == ("A", "# 規格 A")
+    assert seen["ref"] == "c" * 40
+
+
+def test_整條管線_展開後超過注入掃描上限_不會自動放行(review, monkeypatch):
+    """展開可以把短樣板放大成幾百萬字元;放不下的不掃,補 major 交人工。"""
+    monkeypatch.setattr(pipeline, "MAX_EXTRA_SCAN_CHARS", 10)
+    model = "SELECT id FROM dbo.t WHERE id > 1\n"
+    loader = _Loader(_project("SELECT 1 AS id", {"models/mrt_OTHER.sql": model}))
+    report, _ = review([{"path": "models/mrt_OTHER.sql", "diff": "@@ -1 +1 @@\n+" + model}], loader)
+    assert any(f["title"] == pipeline._SCAN_SKIPPED_TITLE and f["severity"] == "major"
+               for f in report["findings"])
+    assert report["decision"] != "auto_approved"
