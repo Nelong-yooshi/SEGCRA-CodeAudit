@@ -73,7 +73,7 @@ _DIFF_REF_KEYS = ("base_sha", "head_sha", "start_sha")
 # 驗了 B」而且完全沒有徵兆(同一個理由讓 _SHA 不接受分支名)。
 # **用 ContextVar 而不是模組層級的全域變數**:webhook 每個 MR 開一條執行緒同時審
 # (scripts/webhook_server.py 的 _trigger),全域變數會讓 A 的 get_file 讀到 B 的 sha
-# ——兩份 MR 的內容互相污染,而且報告上看不出來(#31 review)。
+# ——兩份 MR 的內容互相污染,而且報告上看不出來。
 # ContextVar 在每條執行緒(以及每個 async task)各有自己的值。
 _REVIEW_REF: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "segcra_review_ref", default=None)
@@ -94,7 +94,7 @@ def review_ref() -> str | None:
 
 
 # 取回單一檔案的大小上限。超過就當成「取不到完整內容」交人工,不要讓一個超大的
-# 檔案拖住預掃、注入掃描與沙盒(#31 review;同 #45 的時間上限原則)。
+# 檔案拖住預掃、注入掃描與沙盒(與審查流程的時間上限同一個原則)。
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(1024 * 1024)))
 
 
@@ -373,7 +373,7 @@ def get_mr_diff(mr_id: str) -> str:
 # 東西(#22)。
 #
 # 拿不到釘住的版本時**不退回目標分支**,而是明講取不到——退回去就是 #22 原本的
-# bug,而且沒有任何徵兆(#31 review)。
+# bug,而且沒有任何徵兆。
 def get_file(path: str, ref: str = "", mr_id: str = "") -> str:
     """取得 repo 內檔案的完整內容(看 diff 不夠時用)。"""
     if REAL_MODE:

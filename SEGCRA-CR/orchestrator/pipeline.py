@@ -1125,10 +1125,10 @@ def enforce_unreviewable(report: dict, mr: dict) -> dict:
     """
     bad = [f["path"] for f in mr.get("files", []) if f.get("unreviewable")]
     truncated = bool(mr.get("truncated"))
-    # 真實模式下取不到**整份新檔**的檔案(#22):拿不到 head sha、沒有唯讀 token、
-    # 超過單檔上限、或 API 失敗。這些檔案只有 diff 那幾行進得了預掃與沙盒,
-    # 大檔小改時還原出來可能只剩一行——等於沒被實質審查過,所以一律交人工
-    # (#31 review:這個標記原本沒有任何地方讀它)。
+    # 真實模式下取不到**整份新檔**的檔案。四種情況:拿不到 head sha、沒有唯讀
+    # token、超過單檔上限、或 API 失敗(標記由 toolbox/gitlab.py 的 get_mr_diff 打)。
+    # 這些檔案只有 diff 那幾行進得了預掃與沙盒,大檔小改時還原出來可能只剩一行,
+    # 看不出整份程式在做什麼——所以一律交人工。
     no_full = [f["path"] for f in mr.get("files", [])
                if f.get("full_content_unavailable") and not f.get("unreviewable")]
     if not bad and not truncated and not no_full:

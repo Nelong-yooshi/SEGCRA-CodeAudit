@@ -83,8 +83,7 @@ async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None
             try:
                 # 不指定 ref → 讀「正在審的那一版」。規格與程式是我們自己整理的,
                 # 會在同一個 MR 裡一起修正;鎖在目標分支的話,「規格寫錯、跟程式
-                # 一起修」的 MR 會被拿舊規格生測資,把正確的修正判成不符
-                # (#31 review 的決定)。
+                # 一起修」的 MR 會被拿舊規格生測資,把正確的修正判成不符。
                 #
                 # 代價是一個 MR 可以同時改規格與程式、讓執行驗證拿改過的規格驗
                 # 自己。這一點改由**讓審查的人看見規格被改了**來處理(#38 第 3 點),
@@ -134,7 +133,7 @@ async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
     for path in paths:
         for candidate in resolve_spec(path, ()).candidates:   # 只要候選路徑,不比對存在與否
             try:
-                # 同上:不指定 ref,讀正在審的那一版(#31 review)
+                # 同上:不指定 ref,讀正在審的那一版
                 txt = await hub.call("gitlab__get_file",
                                      {"path": candidate}, truncate=False)
             except Exception:

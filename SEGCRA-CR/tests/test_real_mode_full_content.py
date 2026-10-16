@@ -35,7 +35,7 @@ def real(monkeypatch):
     monkeypatch.setattr(gitlab, "REAL_MODE", True)
     monkeypatch.setattr(gitlab, "GITLAB_URL", "http://gl")
     monkeypatch.setattr(gitlab, "GITLAB_TOKEN", "t")
-    # 讀程式碼用唯讀 token(#31 review):沒設定時 get_file 直接回「讀不到」,
+    # 讀程式碼用唯讀 token:沒設定時 get_file 直接回「讀不到」,
     # 不退回有寫入權的那把。
     monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", "ro")
     monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "1")
@@ -127,7 +127,7 @@ def seen_ref(monkeypatch):
     class _Resp:
         status_code = 200
         text = "content"
-        content = b"content"      # get_file 要看位元組長度(單檔上限,#31 review)
+        content = b"content"      # get_file 要看位元組長度(單檔上限)
 
         def raise_for_status(self):
             pass
@@ -152,7 +152,7 @@ def test_沒有釘住版本時不可以退回目標分支(real, seen_ref):
     """**不退回**,明講取不到。
 
     退回目標分支拿到的是**改之前**的內容,那正是 #22 原本的 bug,而且沒有任何
-    徵兆:報告看起來正常,實際上審的是舊版(#31 review)。
+    徵兆:報告看起來正常,實際上審的是舊版。
     """
     gitlab.pin_review_ref(None)
     out = gitlab.get_file("sql/x.sql")
@@ -173,7 +173,7 @@ def test_規格讀的是正在審的那一版(monkeypatch):
     """規格與程式是我們自己整理的,會在同一個 MR 裡一起修正。
 
     鎖在目標分支的話,「規格寫錯、跟程式一起修」的 MR 會被拿**舊規格**生測資,
-    把正確的修正判成不符(#31 review 的決定)。
+    把正確的修正判成不符。
 
     代價是一個 MR 可以同時改規格與程式、讓執行驗證拿改過的規格驗自己——那一點
     改由「讓審查的人看見規格被改了」處理(#38 第 3 點),不是靠鎖版本:
@@ -242,7 +242,7 @@ def _review_real(monkeypatch, tmp_path, *, serve_full: bool):
     monkeypatch.setattr(gitlab, "REAL_MODE", True)
     monkeypatch.setattr(gitlab, "GITLAB_URL", "http://gl")
     monkeypatch.setattr(gitlab, "GITLAB_TOKEN", "t")
-    # 讀程式碼用唯讀 token(#31 review):沒設定時 get_file 直接回「讀不到」,
+    # 讀程式碼用唯讀 token:沒設定時 get_file 直接回「讀不到」,
     # 不退回有寫入權的那把。
     monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", "ro")
     monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "1")
@@ -287,7 +287,7 @@ def _review_real(monkeypatch, tmp_path, *, serve_full: bool):
     monkeypatch.setattr(pipeline, "run_agent", fake_agent)
 
     # **要真的走到沙盒**:回一個最小但合法的測資計畫,然後攔下 execute_cases
-    # 看它實際收到什麼 SQL(#31 review:原本回空結果,沙盒那條路根本沒被走到,
+    # 看它實際收到什麼 SQL(原本回空結果,沙盒那條路根本沒被走到,
     # 所以「執行驗證也拿到整份檔」這件事其實沒有被驗過)。
     async def one_case(*a, **k):
         return ({"schema_ddl": ["CREATE TABLE transactions (account_id INT, "
@@ -386,7 +386,7 @@ def test_沒有唯讀token時不退回寫入用的那把(real, monkeypatch):
 
 
 def test_超過單檔上限就不回內容(real, monkeypatch):
-    """不要讓一個超大的檔案拖住預掃、注入掃描與沙盒(#31 review;同 #45 的時間上限)。"""
+    """不要讓一個超大的檔案拖住預掃、注入掃描與沙盒(與審查流程的時間上限同一個原則)。"""
     big = "x" * 200
 
     def _get(url, **kw):
@@ -408,7 +408,7 @@ def test_超過單檔上限就不回內容(real, monkeypatch):
 
 def test_釘住的版本不會跨執行緒污染():
     """webhook 每個 MR 開一條執行緒同時審:模組層級的全域變數會讓 A 讀到 B 的 sha
-    ——兩份 MR 的內容互相污染,而且報告上看不出來(#31 review)。"""
+    ——兩份 MR 的內容互相污染,而且報告上看不出來。"""
     import threading
 
     seen = {}
@@ -426,7 +426,7 @@ def test_釘住的版本不會跨執行緒污染():
 
 
 def test_取不到完整內容的檔案要交人工():
-    """`full_content_unavailable` 原本沒有任何地方讀它(#31 review)。
+    """`full_content_unavailable` 原本沒有任何地方讀它。
 
     這些檔案只有 diff 那幾行進得了預掃與沙盒,大檔小改時還原出來可能只剩一行
     ——等於沒被實質審查過,不可以就這樣放行。
@@ -454,7 +454,7 @@ def test_沙盒實際收到整份SQL(monkeypatch, tmp_path):
     """#22 的完成條件第 3 項:執行驗證也要拿到整份檔。
 
     原本的端到端測試把 `generate_cases` 換成回傳空結果,所以**沙盒那條路根本沒走到**
-    ——「執行驗證也拿到整份檔」這件事沒有被驗過(#31 review)。
+    ——「執行驗證也拿到整份檔」這件事沒有被驗過。
     """
     _, _, sql, _ = _review_real(monkeypatch, tmp_path, serve_full=True)
     assert sql, "執行驗證沒有跑到沙盒"
@@ -475,7 +475,7 @@ def test_補full_content時也要受單檔上限限制(real, monkeypatch):
     兩條都要有上限。原本只有前者有,後者的突變在驗證時**存活**了。
 
     超過上限就當成取不到 → `full_content_unavailable` → 交人工,不要讓一個
-    超大的檔案拖住預掃、注入掃描與沙盒(#31 review)。
+    超大的檔案拖住預掃、注入掃描與沙盒。
     """
     big = "x" * 5000
 
