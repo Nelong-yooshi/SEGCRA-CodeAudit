@@ -351,7 +351,7 @@ def test_拿不到這次MR的完整規格時_沿用原本的版本並寫明(revi
     assert "ZZ_MR_VERSION" not in user and review.generated
     detail = _spec_findings(report)[0]["detail"]
     assert "有 1 個規格檔拿不到修改後的完整內容(specs/R-201.md" not in detail
-    assert "有 1 個規格檔拿不到修改後的完整內容(R-201),審查用的是原本的版本" in detail
+    assert "有 1 個規格檔拿不到修改後的完整內容(R-201),無法確認審查讀到的是不是修改後的版本" in detail
 
 
 def test_這次MR刪掉規格檔_當成沒有規格(review):
@@ -526,7 +526,7 @@ def test_特製的大規格檔_不會拖住審查():
 
 def test_拿不到完整內容時_不說以修改後的規格為準():
     detail = pipeline.enforce_spec_change({"findings": []}, _mr(SQL_FILE, SPEC_FILE))["findings"][0]["detail"]
-    assert "以這個 MR 修改後的規格為準" not in detail and "審查用的是原本的版本" in detail
+    assert "以這個 MR 修改後的規格為準" not in detail and "無法確認審查讀到的是不是修改後的版本" in detail
     with_full = pipeline.enforce_spec_change(
         {"findings": []}, _mr(SQL_FILE, {**SPEC_FILE, "full_content": MR_SPEC}))["findings"][0]["detail"]
     assert "以這個 MR 修改後的規格為準" in with_full and "原本的版本" not in with_full

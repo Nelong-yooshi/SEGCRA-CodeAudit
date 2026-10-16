@@ -629,8 +629,12 @@ def _spec_versions_in_mr(mr: dict) -> tuple[dict, set]:
 
     只認 find_spec 讀的位置(repo 根目錄的 specs/<代號>.md)。規格和程式由同一個部門整理,規格寫錯
     在同一個 MR 一起修正是正常流程,所以審查與執行驗證都用這次 MR 的版本;改了什麼由
-    enforce_spec_change 寫在報告最上面、交人工確認。真實 GitLab 模式拿不到完整內容時
-    (沒有 full_content),只能沿用 find_spec 找到的版本,並在那條 finding 裡寫明。"""
+    enforce_spec_change 寫在報告最上面、交人工確認。
+
+    拿不到完整內容(沒有 full_content)時無法換成這個 MR 的版本,審查用的是 find_spec 讀到的那一份:
+    真實 GitLab 模式下 find_spec 讀的是正在審的 commit(也就是修改後的版本;讀不到就當成沒有規格),
+    mock 模式讀工具內建的 specs/(修改前的版本)。兩種情況都不能說成「以修改後的規格為準」,
+    在那條 finding 裡寫明拿不到。"""
     versions, unavailable = {}, set()
     for f in mr.get("files", []):
         if not isinstance(f, dict):
@@ -919,7 +923,8 @@ def enforce_spec_change(report: dict, mr: dict) -> dict:
     if unavailable:
         names = sorted(filter(None, map(_safe_name, unavailable)))
         detail += (f"有 {len(unavailable)} 個規格檔拿不到修改後的完整內容"
-                   + (f"({'、'.join(names)})" if names else "") + ",審查用的是原本的版本;")
+                   + (f"({'、'.join(names)})" if names else "")
+                   + ",無法確認審查讀到的是不是修改後的版本,也沒有檢查規格前後是否一致;")
     elif versions:
         detail += "審查與執行驗證以這個 MR 修改後的規格為準;"
     elsewhere = sum(_root_spec_code(f.get("path")) is None for f in spec_files)
