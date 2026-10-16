@@ -1707,5 +1707,126 @@ MUTANTS.update({
 })
 
 
+# ---- 判斷校準:三道後處理都是「把模型的指控往下壓」,壓錯的代價是真缺陷
+# 從報告上消失。所以每個突變點問的都是同一件事:放寬之後,有沒有測試會紅。
+MUTANTS.update({
+ "校準:只驗一向也算驗過": ("pipeline.py",
+     '    return {True, False} <= {bool(r.get("expect_flagged")) for r in rs}',
+     "    return True"),
+ "校準:有覆蓋缺口也照樣降級": ("pipeline.py",
+     "    for gap in spec_exec.get(\"coverage_gaps\") or []:\n        if _names_id(cid, str(gap)):",
+     "    for gap in spec_exec.get(\"coverage_gaps\") or []:\n        if False:"),
+ "校準:條件編號用子字串比對(C10 的缺口算到 C1 身上)": ("pipeline.py",
+     '    return bool(re.search(rf"(?<![A-Za-z0-9_]){re.escape(cid)}(?![A-Za-z0-9_])", text))',
+     "    return cid in text"),
+ "校準:案例被仲裁剔除也算驗過": ("pipeline.py",
+     '    if not rs or any(r.get("dropped") for r in rs):',
+     "    if not rs:"),
+ "校準:案例結果不符預期也算驗過": ("pipeline.py",
+     '    if not all(r.get("ok") for r in rs):\n        return False',
+     "    if False:\n        return False"),
+ "校準:不取分支的基準案例(新格式只看變體)": ("pipeline.py",
+     "        elif rid.startswith(_BASE_CASE_PREFIX):",
+     "        elif False:"),
+ "校準:沒標分支的條件不取基準案例": ("pipeline.py",
+     '            if branch in (None, "", "*") or rid[len(_BASE_CASE_PREFIX):] == branch:',
+     "            if rid[len(_BASE_CASE_PREFIX):] == branch:"),
+ "校準:對不上任何條件也降級": ("pipeline.py",
+     "        if matched and all(_condition_verified(c, se) for c in matched):",
+     "        if all(_condition_verified(c, se) for c in matched):"),
+ "校準:命中一個泛用字眼就算對上": ("pipeline.py",
+     "    return bool(hits) and (strong or hits >= 2 or len(tokens) == 1)",
+     "    return bool(hits)"),
+ "校準:中文整串比對(不切二字)": ("pipeline.py",
+     "        out |= {word[i:i + 2] for i in range(len(word) - 1)}",
+     "        out.add(word)"),
+ "校準:沒有規格時不記要人看": ("pipeline.py",
+     '    if se.get("no_spec"):\n        _mark_needs_human(report, "無規格可對照,無法確認實作意圖")',
+     '    if se.get("no_spec"):\n        pass'),
+ "校準:程式補的 finding 也拿去對照": ("pipeline.py",
+     "        if _is_program_finding(f):\n"
+     "            continue\n"
+     "        text = _finding_text(f)\n"
+     "        if not _MISMATCH_CLAIM.search(text):",
+     "        if False:\n"
+     "            continue\n"
+     "        text = _finding_text(f)\n"
+     "        if not _MISMATCH_CLAIM.search(text):"),
+ "待補:程式補的 finding 也拿去壓": ("pipeline.py",
+     "        if _is_program_finding(f):\n"
+     "            continue\n"
+     "        text = _finding_text(f)\n"
+     "        low = text.lower()",
+     "        if False:\n"
+     "            continue\n"
+     "        text = _finding_text(f)\n"
+     "        low = text.lower()"),
+ "斷言:程式補的 finding 也拿去壓": ("pipeline.py",
+     "        if _is_program_finding(f):\n"
+     "            kept.append(f)\n"
+     "            continue",
+     "        if False:\n"
+     "            kept.append(f)\n"
+     "            continue"),
+ "斷言:只認執行驗證那幾條是程式補的(規則補報與預掃失敗會被壓)": ("pipeline.py",
+     '    return (title.startswith("[") or title in fixed\n'
+     '            or "執行驗證" in title or title.startswith("無規格可驗"))',
+     '    return "執行驗證" in title'),
+ "待補:只看標記那一行(標題底下的細項漏掉)": ("pipeline.py",
+     '            if lines[i].lstrip().startswith("#"):',
+     "            if False:"),
+ "待補:不是指控類也只要一個字眼就壓": ("pipeline.py",
+     "        elif len(hits) < 2:\n            continue",
+     "        elif False:\n            continue"),
+ "待補:壓了嚴重度但不改標題(報告上仍是指控)": ("pipeline.py",
+     '        if _MISMATCH_CLAIM.search(str(f.get("title") or "")):\n'
+     '            f["title"] = _PENDING_TITLE',
+     '        if False:\n'
+     '            f["title"] = _PENDING_TITLE'),
+ "待補:不記要人看(info 可被自動放行)": ("pipeline.py",
+     '        _mark_needs_human(report, f"規格未載明:{topic}")',
+     "        pass"),
+ "斷言:自述等價的不壓": ("pipeline.py",
+     "        if _EQUIVALENT_CLAIM.search(text):",
+     "        if False:"),
+ "斷言:語法斷言驗得過照樣報": ("pipeline.py",
+     "            if sql and _sql_parses(sql):",
+     "            if False:"),
+ "斷言:語法斷言驗不了也不壓": ("pipeline.py",
+     '            if _cap_severity(f, "minor", "(無法確定性驗證此寫法真的不能執行"',
+     '            if False and _cap_severity(f, "minor", "(無法確定性驗證此寫法真的不能執行"'),
+ "斷言:fan-out 不必指名 JOIN 鍵": ("pipeline.py",
+     "            named = any(k in low for k in _join_key_names(sql))",
+     "            named = True"),
+ "斷言:fan-out 不必說明會進到輸出": ("pipeline.py",
+     "            if not (named and _REACHES_OUTPUT.search(text)):",
+     "            if not named:"),
+ "斷言:沒有 full_content 時不從 diff 還原 SQL": ("pipeline.py",
+     '        sql = f.get("full_content") or _sql_from_diff(f.get("diff", ""))\n        if sql:',
+     '        sql = f.get("full_content")\n        if sql:'),
+ # ---- 接線:三道都在執行驗證之後、rubric 與決策之前
+ "校準:整步沒接進管線": ("pipeline.py",
+     "        report = calibrate_with_execution(report)",
+     "        pass"),
+ "待補:整步沒接進管線": ("pipeline.py",
+     "        report = enforce_spec_pending(report, spec_text)",
+     "        pass"),
+ "斷言:整步沒接進管線": ("pipeline.py",
+     "        report = enforce_claim_evidence(report, mr)",
+     "        pass"),
+ "校準:接在 rubric 之後(分數與決策看不到降級)": ("pipeline.py",
+     "        report = calibrate_with_execution(report)\n"
+     "        report = enforce_spec_pending(report, spec_text)\n"
+     "        report = enforce_claim_evidence(report, mr)\n\n"
+     "        report = apply_rubric(report)",
+     "        report = apply_rubric(report)\n"
+     "        report = calibrate_with_execution(report)\n"
+     "        report = enforce_spec_pending(report, spec_text)\n"
+     "        report = enforce_claim_evidence(report, mr)"),
+ "決策:不看「必須有人看」的理由": ("pipeline.py",
+     "          and not needs_human",
+     "          and True"),
+})
+
 if __name__ == "__main__":
     sys.exit(main())

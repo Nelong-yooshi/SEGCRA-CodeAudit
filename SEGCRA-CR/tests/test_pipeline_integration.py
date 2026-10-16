@@ -105,7 +105,8 @@ def run(monkeypatch, tmp_path):
         # ── spec_exec 的三個角色 ──
         plan = {
             "schema_ddl": ["CREATE TABLE transactions (id INT);"],
-            "conditions": [{"id": "C1", "desc": "條件 C1"}],
+            # desc 要有實際內容:判斷校準靠它把模型的「規格不符」指控對到條件上
+            "conditions": [{"id": "C1", "desc": "通道為 ATM 且單日累計提領達 100000"}],
             "cases": [
                 {"case_id": "C1-T", "condition_id": "C1", "direction": "true",
                  "rows": [["transactions", 1]], "expect_flagged": True},
@@ -124,7 +125,13 @@ def run(monkeypatch, tmp_path):
         def fake_execute(sql, plan_):
             return {"engine": "stub(不連資料庫)", "sandbox_error": None,
                     "testdata_error": None, "sql_error": None,
-                    "case_results": [{"case_id": "C1-T"}, {"case_id": "C1-F"}],
+                    # 欄位與真的 execute_cases 同形:判斷校準要從這裡讀出「兩向都
+                    # 驗過且符合預期」,少一個欄位就會退回「未覆蓋」
+                    "case_results": [
+                        {"case_id": "C1-T", "condition_id": "C1", "expect_flagged": True,
+                         "actual_flagged": True, "ok": not mismatches},
+                        {"case_id": "C1-F", "condition_id": "C1", "expect_flagged": False,
+                         "actual_flagged": False, "ok": True}],
                     "mismatches": mismatches}
 
         async def fake_arbitrate(cfg, spec_text, sql, mm, profile_name=None):
@@ -397,3 +404,56 @@ def test_預掃命中R005時secure_sql真的送進模型的system_prompt(run):
     run(_mr(CLEAN_SQL), mr_id="901")
     assert marker not in run.systems[-1], "沒有資安命中時不該注入(按需載入)"
 
+
+
+# ─────────────────── 判斷校準真的在管線裡跑(執行驗證之後、決策之前) ───────────────────
+
+def _claim(title, detail, severity="major", path="sql/maintenance/x.sql"):
+    return {**MODEL_REPORT, "findings": [{
+        "file": path, "line": 1, "severity": severity, "title": title,
+        "detail": detail, "suggestion": "", "citations": []}]}
+
+
+def test_執行驗證通過時模型的規格不符指控降成_info(run):
+    """單元測試證明校準函式自己會動,這裡證明它**接在對的位置**:要拿得到
+    `run_spec_exec` 的條件與案例結果(所以必須在它之後),而且降級要反映在分數與
+    決策上(所以必須在 rubric 與 apply_policy 之前)。接線漏掉時,報告會同時留著
+    「案例皆符合預期」和一條 major,決策照樣被擋在 needs_human。"""
+    report, _, _ = run(_mr(CLEAN_SQL),
+                       _claim("實作與核定規格不符:缺少 ATM 通道的過濾",
+                              "規格要求通道為 ATM 且單日累計達 100000,實作沒有限制通道"))
+    claim = [f for f in report["findings"] if "規格不符" in f["title"]][0]
+    assert claim["severity"] == "info"
+    assert "執行驗證未重現" in claim["detail"]
+    assert report["_calibration"]["downgraded"]
+    # 分數與決策都要看到降級後的嚴重度:校準排在 rubric 之後的話,這條 major 會先被
+    # 扣掉 15 分(85/needs_changes),報告上卻只剩一條 info——分數與 findings 自相矛盾
+    assert (report["score"], report["verdict"]) == (100, "approve")
+    assert report["decision"] == "auto_approved"
+
+
+def test_規格待補的指控在管線裡變成提問且不自動放行(run):
+    """用真的 specs/R-410.md(有「待補」段)跑:幣別未載明,指控要變成提問,
+    而且決策不得自動放行——後者靠 _needs_human,不靠嚴重度。"""
+    sql = CLEAN_SQL.replace("R-201", "R-410")
+    mr = {**_mr(sql), "title": "R-410 例行調整"}   # 標題留著 R-201 會先對到沒有待補段的那份
+    report, _, _ = run(mr, _claim("實作與核定規格不符:金額欄位未限制幣別",
+                                  "規格要求單一幣別,實作把不同幣別的金額直接相加"))
+    assert report["_spec_exec"]["spec_code"] == "R-410"
+    claim = [f for f in report["findings"] if "幣別" in f["detail"]][0]
+    assert claim["severity"] == "info"
+    assert claim["title"] == "規格未載明,請業務單位確認"
+    assert any("規格未載明" in r for r in report["_needs_human"])
+    assert report["decision"] == "needs_human"
+    assert report["_policy_signals"]["needs_human"]
+
+
+def test_解析得過的語法斷言在管線裡被移除(run):
+    """CLEAN_SQL 解析得過,「無法執行」的斷言被確定性否證 → 不得留在報告上
+    (blocker 進了決策就是直接擋下 MR)。"""
+    report, _, _ = run(_mr(CLEAN_SQL),
+                       _claim("語法錯誤:HAVING 不可使用聚合函式",
+                              "這段 SQL 無法執行", severity="blocker"))
+    assert not [f for f in report["findings"] if "語法錯誤" in f["title"]]
+    assert report["_calibration"]["dropped"][0]["by"] == "syntax-claim-verified-ok"
+    assert report["decision"] != "blocked"

@@ -114,6 +114,9 @@ python eval/run_eval.py --json out.json     # 另存機器可讀結果(給報告
 | `pending_hints` | `_policy_signals.pending_hints` | 有無待人工確認的檢核點 |
 | `arbiter_dropped` | `_spec_exec.dropped_cases[].by == "arbiter"` | 角色三仲裁判過「測資錯」並剔除案例 |
 | `spec_exec_sql_fault` | findings 含「執行驗證失敗」 | **執行驗證自己**抓到實作與規格不符(分得出不是靜態審查抓的) |
+| `needs_human_marked` | `_needs_human` | 判斷校準記下「必須有人看」的理由(無規格可對照、規格未載明)——這些 finding 刻意是 info,看 severity 分不出來 |
+| `calibration_downgraded` | `_calibration.downgraded` | 模型的「規格不符」指控被執行驗證的正反兩向案例否證,降成 info |
+| `calibration_dropped` | `_calibration.dropped` | 「語法錯誤/無法執行」的斷言被 sqlglot 解析否證,整條移除 |
 
 ## 為什麼要 `_golden`,`expected` 不夠嗎
 
@@ -240,6 +243,25 @@ id 依層分段:`1xx` 注入、`2xx` rule-base、`3xx` binding、`4xx` spec_exec
 | `mr_603` | 變更 35 行 > `max_diff_lines`(30):大但無害的變更,直接反映門檻合不合理 |
 
 每層刻意成對:**一個該抓的 + 一個不該吵的**,兩側都量得到才有意義。
+
+### 判斷校準(`8xx`,新增中)
+
+同一個發現該給什麼嚴重度、算不算數——這一層量的不是「抓不抓得到」,是**判斷有沒有
+校準**:嚴重度該跟「能不能證明會算錯」綁在一起,而不是跟「有沒有找到規格」或模型
+當下的語氣綁在一起。五個 case 成一組,兩側都量:**該升的不許降、沒依據的不許升**。
+
+| case | 驗什麼 |
+|---|---|
+| `mr_801` | **沒有規格但能由型別證明會算錯**:`DECIMAL(14,2)` 的金額被 `CAST` 成 `DECIMAL(10,0)`,角分被四捨五入掉。沒找到規格的意思是「無法確認意圖」→ needs_human + 標明無規格可對照,**不是**把缺陷降成 info |
+| `mr_802` | `mr_801` 的對照組:同樣沒有規格,但只有命名/風格可說 → 風格類的 finding 不得升到 major(「不確定就 info」只用在這種沒有任何依據的地方) |
+| `mr_803` | **執行驗證全過時的指控**:`HAVING NOT (SUM < 100000)` 與 `IN ('TWD')` 與規格等價但寫法迂迴,實測容易被報成「門檻與規格不符」。執行驗證對每個條件跑過正反兩向且全通過 → 不得並列「案例皆符合預期」與一條規格不符的 major |
+| `mr_804` | **規格「待補」段的事項**:`specs/R-520.md` 明寫「負數金額」未載明,程式自己決定濾掉 → info 提問 + needs_human,不得指控「實作與核定規格不符」 |
+| `mr_805` | **等價重構不是正確性問題**:反連接改寫(右表單列常數)、過濾在條件聚合裡、CTE 算出的欄位在外層 `WHERE` 使用。三種都曾被誤報(最後一個還被報成 blocker),與 `mr_408` 行為相同 → 不得有 major/blocker |
+
+> `mr_803` 與 `mr_805` 量的是**上限**(不得誤報):模型本來就沒誤報時它們也會通過,
+> 所以它們證明不了校準那一步真的被走到。校準自己的對照由
+> `tests/test_judgement_calibration.py`(函式層)與 `tests/test_pipeline_integration.py`
+> (接線層)守著,秒級、不用 GPU。
 
 ### 真實程式形狀(`7xx`,新增中)
 
