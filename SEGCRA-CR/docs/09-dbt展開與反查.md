@@ -488,7 +488,9 @@ model)與確定性補報。讀 MR 與打包下載各用一把 project access tok
 - mock 模式而 fixture 沒有放專案時(預設的 `fixtures/`、golden set):macro 檔仍會被當成 model 展開
   (接線前的行為)。要在 mock 模式看到接線的效果,得照 `examples/dbt_wiring/` 的方式放專案
 - 注入掃描涵蓋 MR、取回的完整內容與預掃展開後的 SQL(會以規則命中的語句、解析錯誤的片段進 prompt);
-  受影響 model 的展開結果不進 prompt(只有路徑、規則代號、語句序號),不另外掃
+  受影響 model 的展開結果不進 prompt(只有路徑、規則代號、語句序號),不另外掃。取回的完整內容與展開後的
+  SQL 合計最多掃 20 萬字元(`MAX_EXTRA_SCAN_CHARS`):展開可以把短樣板放大成幾百萬字元,而掃描器對特製的
+  內容(大量沒有結尾的 `/*`)是平方時間。超過的部分不掃,補 major「部分內容超過注入掃描的上限,沒有掃描」交人工
 - 審查途中 MR 被推了新 commit 偵測不到:取回的是 `sha` 那一版,審查結果也寫在那一版上;新的
   commit 沒有 commit status,要等它自己的審查
 - 被刪除的 model 檔沿用接線前的行為(拿到的是被刪掉的內容,展開失敗 → major)

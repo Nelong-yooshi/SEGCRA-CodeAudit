@@ -388,6 +388,12 @@ def _mr_for_spec_exec(mr: dict, dbt_ctx: DbtContext | None) -> dict:
     return {**mr, "files": files}
 
 
+# 注入掃描額外加進去的內容(取回的完整內容、展開後的 SQL)合計最多幾個字元。展開可以把很短的
+# 樣板放大成幾百萬字元,掃描器對特製的內容(大量沒有結尾的 /*)是平方時間;超過的不掃,
+# 補 major 交人工(enforce_scan_skipped)。真實的 model 展開後遠小於此
+MAX_EXTRA_SCAN_CHARS = 200_000
+
+
 def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None, rendered=()) -> dict:
     """注入掃描用:把取回的完整內容與展開後的 SQL 也列進去掃。
 
@@ -395,12 +401,28 @@ def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None, rendered=()) -> dic
     以前不會進到審查流程,也就沒被掃過。展開還會把沒改到的 macro 與這次傳的參數組合在一起,
     組出來的文字在 MR 與 macro 檔裡各自都沒有;展開後的語句(規則命中)與解析錯誤的片段會
     進 prompt。已合併的 macro 也不能假設掃過(掃描器與規則會更新)。所以實際會送進模型的
-    內容一律再掃一次。rendered 是預掃收集的 [{path, full_content}]。原本的 diff 照舊保留。"""
+    內容一律再掃一次。rendered 是預掃收集的 [{path, full_content}]。原本的 diff 照舊保留。
+
+    加進去的內容合計超過 MAX_EXTRA_SCAN_CHARS 時,放不下的那幾份不掃,份數記在回傳值的
+    `_scan_skipped`(由 enforce_scan_skipped 補 major)。"""
     extra = list(rendered)
     if dbt_ctx is not None and dbt_ctx.project is not None:
         extra += [{"path": f.get("path"), "full_content": text} for f in mr.get("files", [])
                   if isinstance(f, dict) and (text := dbt_ctx.head_text(f.get("path"))) is not None]
-    return {**mr, "files": [*mr["files"], *extra]} if extra else mr
+    kept, skipped, used = [], 0, 0
+    for item in extra:
+        size = len(item.get("full_content") or "")
+        if used + size > MAX_EXTRA_SCAN_CHARS:
+            skipped += 1
+            continue
+        used += size
+        kept.append(item)
+    if not (kept or skipped):
+        return mr
+    out = {**mr, "files": [*mr["files"], *kept]}
+    if skipped:
+        out["_scan_skipped"] = skipped
+    return out
 
 
 async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
@@ -541,7 +563,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             capture["mr"] = mr
             capture["prescan_raw"] = copy.deepcopy(pre)
         # 確定性注入掃描(不經 LLM):MR、取回的完整內容、展開後的 SQL
-        injection_hits = scan_mr(_mr_with_head_text(mr, dbt_ctx, rendered))
+        scan_target = _mr_with_head_text(mr, dbt_ctx, rendered)
+        injection_hits = scan_mr(scan_target)
 
         # 找 spec(確定性;執行驗證與 prompt 的規格段共用)。依檔名對應與展開器
         # 同一個開關:關閉時行為與接線前完全相同。
@@ -645,6 +668,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 放在 enforce_hints / enforce_style 之後:它們以關鍵詞判斷模型是否已回應,
         # 程式補的文字若先進報告,可能被誤當成模型的回應而吞掉檢核點
         report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述
+        report = enforce_scan_skipped(report, scan_target.get("_scan_skipped", 0))  # 內容太多沒掃完
         report = enforce_dbt_impact(report, affected, dbt_ctx)  # macro 等變更影響的其他 model
         report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
         report = enforce_format(report)        # 模型輸出有格式錯誤 → major;須在 sanitize 之後
@@ -1210,6 +1234,25 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
                                  "severities": sorted(severities),
                                  "pending_hints": pending_hints,
                                  "spec_exec_passed": spec_exec_ok}
+    return report
+
+
+_SCAN_SKIPPED_TITLE = "部分內容超過注入掃描的上限,沒有掃描"
+
+
+def enforce_scan_skipped(report: dict, skipped: int) -> dict:
+    """取回的完整內容與展開後的 SQL 合計超過注入掃描的上限(MAX_EXTRA_SCAN_CHARS),有幾份沒有掃:
+    補一條 major,不得自動放行。沒掃的內容仍可能進到審查模型(規則命中的語句、解析錯誤的片段)。
+    標題只能由程式產生(見 _put_program_finding)。"""
+    if not skipped:
+        return report
+    _put_program_finding(report, {
+        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _SCAN_SKIPPED_TITLE,
+        "detail": (f"取回的完整內容與展開後的 SQL 合計超過 {MAX_EXTRA_SCAN_CHARS} 字元,其中 {skipped} 份"
+                   "沒有做注入掃描(避免掃描被特製的大量內容拖住)。這些內容可能進到審查模型,"
+                   "不得自動放行。"),
+        "suggestion": "人工確認展開後的內容;若 MR 確實需要這麼大的檔案,請拆小。",
+        "citations": []})
     return report
 
 

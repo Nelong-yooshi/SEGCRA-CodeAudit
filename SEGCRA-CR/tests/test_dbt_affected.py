@@ -1261,3 +1261,13 @@ def test_查規格的背景執行緒_讀得到呼叫端的contextvars():
     assert asyncio.run(run()) == ("A", "# 規格 A")
     assert seen["ref"] == "c" * 40
 
+
+def test_整條管線_展開後超過注入掃描上限_不會自動放行(review, monkeypatch):
+    """展開可以把短樣板放大成幾百萬字元;放不下的不掃,補 major 交人工。"""
+    monkeypatch.setattr(pipeline, "MAX_EXTRA_SCAN_CHARS", 10)
+    model = "SELECT id FROM dbo.t WHERE id > 1\n"
+    loader = _Loader(_project("SELECT 1 AS id", {"models/mrt_OTHER.sql": model}))
+    report, _ = review([{"path": "models/mrt_OTHER.sql", "diff": "@@ -1 +1 @@\n+" + model}], loader)
+    assert any(f["title"] == pipeline._SCAN_SKIPPED_TITLE and f["severity"] == "major"
+               for f in report["findings"])
+    assert report["decision"] != "auto_approved"

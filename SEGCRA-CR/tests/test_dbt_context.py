@@ -850,3 +850,25 @@ def test_macro目錄叫snapshots_而snapshot目錄另外設定_仍算macro():
     ctx = _ctx(files, mr=_mr([_f("snapshots/m.sql")]))
     assert ctx.error is None and ctx.impact is not None
     assert ctx.is_macro("snapshots/m.sql")
+
+
+# ─────────────────── 注入掃描的總量上限 ───────────────────
+
+def test_展開後的內容超過掃描上限_放不下的不掃_其餘照掃(monkeypatch):
+    """展開可以把很短的樣板放大成幾百萬字元,掃描器對特製的內容是平方時間。"""
+    monkeypatch.setattr(pipeline, "MAX_EXTRA_SCAN_CHARS", 100)
+    mr = _mr([_f("models/a.sql")])
+    rendered = [{"path": "models/a.sql", "full_content": "x" * 60},
+                {"path": "models/b.sql", "full_content": "y" * 60},
+                {"path": "models/c.sql", "full_content": "z" * 30}]
+    out = pipeline._mr_with_head_text(mr, None, rendered)
+    assert [f["full_content"][0] for f in out["files"][1:]] == ["x", "z"]
+    assert out["_scan_skipped"] == 1
+    assert "_scan_skipped" not in pipeline._mr_with_head_text(mr, None, rendered[:1])
+
+
+def test_沒有掃完時補major():
+    report = pipeline.enforce_scan_skipped({"findings": []}, 2)
+    [fd] = report["findings"]
+    assert (fd["severity"], fd["title"]) == ("major", pipeline._SCAN_SKIPPED_TITLE)
+    assert pipeline.enforce_scan_skipped({"findings": []}, 0) == {"findings": []}
