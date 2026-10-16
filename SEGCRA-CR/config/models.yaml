@@ -81,8 +81,10 @@ policy:
 #      完全等於約定值(orchestrator/config.py 的 DBT_DATABASE_PLACEHOLDER),未設定
 #      或拼錯都會在載入設定時報錯——拼錯的名稱只會默默產出錯的表名,不會自己報錯。
 #      下面的 database 只留空字串當後備。
-#   2. 專案的 macro 與專案資訊來自 MR 那個 commit 的 dbt 專案(#15):真實 GitLab 模式下,
-#      MR 改到專案目錄裡的 .sql 時,以 GITLAB_READ_TOKEN(唯讀,read_api)打包下載取回。
+#   2. 專案的 macro 與專案資訊來自 MR 那個 commit 的 dbt 專案:真實 GitLab 模式下,MR 改到
+#      dbt 的檔案(dbt_project.yml 設定的 model / macro / analysis / test / seed / snapshot
+#      目錄,與專案根目錄的設定檔)時,以 GITLAB_READ_TOKEN(唯讀,read_api)先讀 head commit
+#      的 dbt_project.yml 判斷目錄設定,再打包下載取回。
 #      取不回來(token 未設、權限不足、GitLab 連不上、專案設定看不懂)時,專案裡被改到的
 #      .sql 一律記成展開失敗、交人工,不會退回「沒有 macro」繼續展開。
 #      mock 模式(demo、評測)沒有 GitLab 可以取回:fixture 目錄有放那個 commit 的專案才會用

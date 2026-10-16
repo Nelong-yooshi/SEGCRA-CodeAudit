@@ -1,4 +1,4 @@
-"""展開器從「記憶體裡的專案檔案」讀 macro(build_env / render_model 的 macro_files;#15 接線 W1)。
+"""展開器從「記憶體裡的專案檔案」讀 macro(build_env / render_model 的 macro_files)。
 
 從 GitLab 取回的 dbt 專案是 {路徑: 內容} 的字典,不在磁碟上。這裡驗證:
 1. 字典來源與磁碟來源的展開結果**完全相同**,而且都等於 dbt compile 的標準答案

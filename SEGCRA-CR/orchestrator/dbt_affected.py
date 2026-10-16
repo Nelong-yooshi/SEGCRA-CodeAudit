@@ -1,13 +1,16 @@
-"""dbt_affected — MR 改到 macro 時,檢查受影響的 model(#15 接線;#7 第 3 點)。
+"""dbt_affected — MR 改到 macro 時,檢查受影響的 model(接在 macro 反查之後)。
 
 macro 反查(dbt_context 準備好的 ImpactReport)只說「哪些 model 受影響」。這裡對那些
 **不在 MR 變更清單裡**的 model 做確定性的檢查,整理成一份結果給後處理補報:
 
   * 展開變更後的版本,跑規則;同一個 model 再用變更前的專案展開一次、跑規則,**只回報
     變更後多出來的規則命中**。不比較的話,受影響的 model 原本就有的問題(例如早就核准過的
-    寫法)會在每一個改到 macro 的 MR 上重報一次,其中若有 blocker 還會把無關的 MR 擋下
+    寫法)會在每一個改到 macro 的 MR 上重報一次,其中若有 blocker 還會把無關的 MR 擋下。
+    比較的是**每一句**(依語句在檔案裡的順序對應)的規則命中數有沒有增加,不是語句的文字:
+    macro 只把一個值從 1 改成 2,同一句原本就有的命中不能因為文字變了就當成新的。由前後比較
+    推論出來的結果最多給 major,不給 blocker
   * 變更後展開失敗、或展開後無法解析:macro 的變更可能把它弄壞了,要看得到
-  * 對應到的規格(依檔名;#7 驗收「只改 macro 的 MR,能對應到受影響的 model 與規格」)
+  * 對應到的規格(依檔名;只改 macro 的 MR,也要能對應到受影響的 model 與規格)
 
 這些 model 的內容不放進預掃結果、也不放進模型的 prompt:它們不在 diff 裡,放進預掃會讓
 每個檢核點(H 系列)各補一條「模型未回應」,放進 prompt 會佔掉預算並多一個注入的入口。
@@ -16,10 +19,14 @@ macro 反查(dbt_context 準備好的 ImpactReport)只說「哪些 model 受影�
 
 上限(都算「沒檢查完」,由後處理補 major,不可以當成沒有問題):
   * 每個 MR 最多檢查 MAX_CHECKED_MODELS 個受影響的 model(每個要開兩次子行程)
-  * 整段檢查最多 MAX_SECONDS 秒
+  * 最多查 MAX_SPEC_LOOKUPS 個 model 的規格;沒查的列出來
+  * 整段檢查最多 MAX_SECONDS 秒:剩下的時間傳進每一次展開(逾時取兩者較小的),查規格也只等
+    剩下的時間;時間到了還沒做完的 model 記成沒有檢查、沒查規格
 """
+import asyncio
 import dataclasses
 import re
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -27,7 +34,7 @@ from dataclasses import dataclass, field
 from .config import DBT_DATABASE_PLACEHOLDER
 from .dbt_context import DbtContext
 from .dbt_impact import ImpactReport
-from .dbt_render import render_model_isolated
+from .dbt_render import DEFAULT_ISOLATED_TIMEOUT_S, render_model_isolated
 
 MAX_CHECKED_MODELS = 50
 MAX_SPEC_LOOKUPS = 20          # 規格逐一向 GitLab 探測,數量另外設限
@@ -47,6 +54,8 @@ class CheckedModel:
     spec_looked_up: bool = False
     # 變更後多出來的規則命中 [(規則代號, 嚴重度)]
     new_hits: tuple[tuple[str, str], ...] = ()
+    # 與 new_hits 一一對應:命中在展開後的第幾句(從 1 起算);None = 文字層規則或對不到語句
+    new_hit_statements: tuple[int | None, ...] = ()
     new_hints: tuple[str, ...] = ()        # 變更後多出來的檢核點(規則代號)
     # 變更前的版本展不開 / 解析不了,無法比較:new_hits 是變更後的全部命中
     no_baseline: bool = False
@@ -124,6 +133,10 @@ async def check_affected_models(hub, mr: dict, dbt_cfg: dict, ctx: DbtContext | 
                 f"檢查受影響的 model 時發生非預期錯誤({type(e).__name__}),沒有完成檢查",)))
 
 
+class _OutOfTime(Exception):
+    """整段檢查的時間用完了。"""
+
+
 async def _check(hub, mr: dict, dbt_cfg: dict, ctx: DbtContext, find_spec, render,
                  clock) -> AffectedCheck:
     impact = ctx.impact
@@ -140,20 +153,32 @@ async def _check(hub, mr: dict, dbt_cfg: dict, ctx: DbtContext, find_spec, rende
     unchecked: list[str] = []
     specs: dict[str, str] = {}
     for index, model in enumerate(todo):
-        if index >= MAX_CHECKED_MODELS or clock() > deadline:
+        if index >= MAX_CHECKED_MODELS:
+            unchecked.append(model.path)
+            continue                          # 時間用完的由 _hits 判斷(展開前、展開被截斷)
+        try:
+            new, no_baseline, error = await _compare(hub, model.path, dbt_cfg, ctx, render,
+                                                     deadline, clock)
+        except _OutOfTime:
             unchecked.append(model.path)
             continue
-        new_hits, new_hints, no_baseline, error = await _compare(
-            hub, model.path, dbt_cfg, ctx, render)
         # 查規格在真實 GitLab 模式是逐一發請求,同樣受數量與時間上限約束;沒查到的不算
-        # 「沒有對應的規格」,而是沒查(下面不會採用規格)
-        spec, looked_up = None, index < MAX_SPEC_LOOKUPS and clock() <= deadline
-        if looked_up:
-            spec = await _spec_for(hub, ctx, model.path, find_spec, specs)
-        checked.append(CheckedModel(path=model.path, name=model.name, certain=model.certain,
-                                    chain=model.chain, spec=spec, spec_looked_up=looked_up,
-                                    new_hits=new_hits, new_hints=new_hints,
-                                    no_baseline=no_baseline, error=error))
+        # 「沒有對應的規格」,而是沒查(列出來、下面不會採用規格)
+        spec, looked_up = None, False
+        if index < MAX_SPEC_LOOKUPS and clock() < deadline:
+            try:
+                spec = await _spec_for(hub, ctx, model.path, find_spec, specs,
+                                       deadline - clock())
+                looked_up = True
+            except _OutOfTime:
+                pass
+        checked.append(CheckedModel(
+            path=model.path, name=model.name, certain=model.certain, chain=model.chain,
+            spec=spec, spec_looked_up=looked_up,
+            new_hits=tuple((rule, sev) for rule, sev, _ in new if sev in _COMPARED),
+            new_hit_statements=tuple(pos for _, sev, pos in new if sev in _COMPARED),
+            new_hints=tuple(rule for rule, sev, _ in new if sev not in _COMPARED),
+            no_baseline=no_baseline, error=error))
     # 規格只在「每個受影響的 model 都查過、而且都對到同一份」時才交給審查用;
     # 有的沒查、有的沒對到、或對到不同份,都不替審查挑一份
     # (沒查、沒對到的 spec 都是 None,會讓 codes 多一個 None 或只剩 None)
@@ -163,11 +188,18 @@ async def _check(hub, mr: dict, dbt_cfg: dict, ctx: DbtContext, find_spec, rende
                          spec=(code, specs[code]) if code else None, specs_found=specs)
 
 
-async def _spec_for(hub, ctx: DbtContext, rel: str, find_spec, specs: dict) -> str | None:
+async def _spec_for(hub, ctx: DbtContext, rel: str, find_spec, specs: dict,
+                    seconds: float) -> str | None:
+    """查一個 model 的規格,最多等 seconds 秒(逾時丟 _OutOfTime)。
+
+    查規格的工具呼叫是同步的(真實 GitLab 模式會發請求),在這個事件迴圈裡等就沒辦法中途
+    停下;放到另一條背景執行緒裡跑,這裡只等剩下的時間(見 _wait_in_thread)。"""
     repo_path = f"{ctx.prefix}/{rel}" if ctx.prefix else rel
+    target = {"title": "", "description": "", "files": [{"path": repo_path}]}
     try:
-        code, text = await find_spec(hub, {"title": "", "description": "",
-                                           "files": [{"path": repo_path}]}, by_path=True)
+        code, text = await _wait_in_thread(lambda: find_spec(hub, target, by_path=True), seconds)
+    except asyncio.TimeoutError:
+        raise _OutOfTime from None
     except Exception:                        # noqa: BLE001 — 找不到規格不該讓審查中斷
         return None
     if not code or not text:
@@ -176,19 +208,46 @@ async def _spec_for(hub, ctx: DbtContext, rel: str, find_spec, specs: dict) -> s
     return code
 
 
-async def _compare(hub, rel: str, dbt_cfg: dict, ctx: DbtContext, render):
-    """回傳 (變更後多出來的命中, 多出來的檢核點, 是否無法與變更前比較, 變更後的錯誤或 None)。
+async def _wait_in_thread(make_coroutine, seconds: float):
+    """在一條背景(daemon)執行緒裡用自己的事件迴圈跑 make_coroutine(),最多等 seconds 秒,
+    逾時丟 asyncio.TimeoutError。
 
-    比較的單位是「規則 + 嚴重度 + 命中所在的語句」,不是只數規則代號:macro 把
-    `DELETE FROM a` 改成 `DELETE FROM b` 時 R001 的個數沒變,但那是另一句會被執行的 SQL,
-    必須算成多出來的。文字層的規則沒有語句(空字串),就只比個數。"""
+    不用 asyncio.to_thread:那會用預設的執行緒池,審查結束時 asyncio.run 會等池裡卡住的
+    執行緒跑完,時間上限就守不住。逾時後那條執行緒繼續跑到它自己的請求逾時為止,結果丟掉。"""
+    loop = asyncio.get_running_loop()
+    done = loop.create_future()
+
+    def deliver(setter, value):
+        if not done.done():
+            setter(value)
+
+    def work():
+        try:
+            outcome = (done.set_result, asyncio.run(make_coroutine()))
+        except BaseException as e:            # noqa: BLE001 — 交回原本的事件迴圈處理
+            outcome = (done.set_exception, e)
+        try:
+            loop.call_soon_threadsafe(deliver, *outcome)
+        except RuntimeError:
+            pass                               # 原本的事件迴圈已經結束:沒有人在等了
+
+    threading.Thread(target=work, daemon=True).start()
+    return await asyncio.wait_for(done, seconds)
+
+
+async def _compare(hub, rel: str, dbt_cfg: dict, ctx: DbtContext, render, deadline, clock):
+    """回傳 (變更後多出來的命中 [(規則, 嚴重度, 第幾句)], 是否無法與變更前比較, 變更後的錯誤或 None)。
+
+    比較的單位是「每一句的規則命中數」:兩邊切出來的語句數量相同時,依語句的順序逐句比;否則
+    (macro 讓語句多了或少了一句、切不出語句)退回比較整個 model 同一條規則的命中數。兩種都只有
+    「變多」才算新增。文字層的規則與對不到語句的命中沒有位置,只比個數。"""
     head_text = ctx.project.files.get(rel)
     if head_text is None:
-        return (), (), False, "變更後的專案裡找不到這個 model 的內容"
+        return (), False, "變更後的專案裡找不到這個 model 的內容"
     head, head_error = await _hits(hub, rel, head_text, dbt_cfg, ctx.macro_files,
-                                   ctx.project.macro_paths, ctx.info, render)
+                                   ctx.project.macro_paths, ctx.info, render, deadline, clock)
     if head_error is not None:
-        return (), (), False, head_error
+        return (), False, head_error
     base, base_error = None, "沒有變更前的專案"
     if ctx.base_project is not None:
         base_text = ctx.base_project.files.get(rel)
@@ -196,20 +255,46 @@ async def _compare(hub, rel: str, dbt_cfg: dict, ctx: DbtContext, render):
             base_error = "變更前沒有這個 model"
         else:
             base, base_error = await _hits(hub, rel, base_text, dbt_cfg, ctx.base_macro_files,
-                                           ctx.base_project.macro_paths, ctx.base_info, render)
-    new = head if base_error is not None else head - base
-    hits = tuple(sorted((rule, sev) for rule, sev, _ in new.elements() if sev in _COMPARED))
-    hints = tuple(sorted(rule for rule, sev, _ in new.elements() if sev not in _COMPARED))
-    return hits, hints, base_error is not None, None
+                                           ctx.base_project.macro_paths, ctx.base_info, render,
+                                           deadline, clock)
+    if base_error is not None:
+        new = head.counts
+    elif head.statements is not None and head.statements == base.statements:
+        new = head.counts - base.counts
+    else:
+        new = _by_rule(head.counts) - _by_rule(base.counts)
+    found = sorted(new.elements(), key=lambda h: (h[0], h[1], -1 if h[2] is None else h[2]))
+    return (tuple((rule, sev, None if pos is None else pos + 1) for rule, sev, pos in found),
+            base_error is not None, None)
 
 
-async def _hits(hub, rel, text, dbt_cfg, macro_files, macro_dirs, info, render):
-    """展開一個 model 並跑規則。回傳 (Counter{(規則, 嚴重度, 語句)}, None) 或 (None, 錯誤原因)。"""
+def _by_rule(counts: Counter) -> Counter:
+    """不分語句:同一條規則、同一個嚴重度合計。"""
+    merged = Counter()
+    for (rule, sev, _), n in counts.items():
+        merged[(rule, sev, None)] += n
+    return merged
+
+
+@dataclass(frozen=True)
+class _Hits:
+    counts: Counter                 # {(規則, 嚴重度, 第幾句(從 0 起算)或 None): 次數}
+    statements: int | None          # 切出來幾句;切不出來時是 None(只能整個 model 合計比較)
+
+
+async def _hits(hub, rel, text, dbt_cfg, macro_files, macro_dirs, info, render, deadline, clock):
+    """展開一個 model 並跑規則。回傳 (_Hits, None) 或 (None, 錯誤原因);時間用完丟 _OutOfTime。"""
     if dbt_cfg.get("database") != DBT_DATABASE_PLACEHOLDER:
         return None, "dbt 的資料庫名稱設定不符,無法展開"
+    seconds = deadline - clock()
+    if seconds <= 0:
+        raise _OutOfTime
     rendered = render(rel, source=text, database=dbt_cfg["database"], macro_files=macro_files,
-                      macro_dirs=macro_dirs, project=info)
+                      macro_dirs=macro_dirs, project=info,
+                      timeout_s=min(DEFAULT_ISOLATED_TIMEOUT_S, seconds))
     if not rendered.ok:
+        if clock() >= deadline:
+            raise _OutOfTime                # 展開被剩下的時間截斷,不是 model 本身的問題
         return None, f"展開失敗:{rendered.error}"
     if rendered.macro_conflicts:
         return None, f"dbt 專案裡有 {len(rendered.macro_conflicts)} 組同名的 macro,無法確定展開結果"
@@ -220,13 +305,35 @@ async def _hits(hub, rel, text, dbt_cfg, macro_files, macro_dirs, info, render):
         rules = rules.get("hits")
     if not isinstance(rules, list):
         return None, "規則層回傳了非預期的資料"
-    hits = Counter()
+    keys = _statement_keys(rendered.sql)
+    counts, pos, taken = Counter(), 0, set()
     for hit in rules:
-        if (isinstance(hit, dict) and isinstance(hit.get("rule"), str)
+        if not (isinstance(hit, dict) and isinstance(hit.get("rule"), str)
                 and isinstance(hit.get("severity"), str)):
-            statement = hit.get("statement")
-            hits[(hit["rule"], hit["severity"], statement if isinstance(statement, str) else "")] += 1
-    return hits, None
+            continue
+        statement = hit.get("statement")
+        where = None
+        if isinstance(statement, str) and statement and keys is not None:
+            # 規則層逐句跑,命中依語句的順序排:從上一個命中的語句往後找。同一條規則在同一句只會
+            # 命中一次,兩句一模一樣時,第二個命中要對到下一句。對不到的(文字層規則、規則層的寫法
+            # 變了)記在「沒有語句」底下,兩邊一樣只比個數
+            where = next((i for i in range(pos, len(keys))
+                          if keys[i] == statement and (hit["rule"], i) not in taken), None)
+            if where is not None:
+                pos = where
+                taken.add((hit["rule"], where))
+        counts[(hit["rule"], hit["severity"], where)] += 1
+    return _Hits(counts, None if keys is None else len(keys)), None
+
+
+def _statement_keys(sql: str) -> list[str] | None:
+    """展開後 SQL 的每一句,文字寫法與規則命中的 statement 相同(規則層同一個函式產生)。
+    切不出來回 None。"""
+    from toolbox.sqltools import DIALECT, _parse
+    try:
+        return [st.sql(dialect=DIALECT)[:200] for st in _parse(sql) if st is not None]
+    except Exception:                        # noqa: BLE001 — 切不出來就只能整個 model 合計比較
+        return None
 
 
 # ------------------------------------------------------------------ 整理成一條 finding
@@ -241,6 +348,21 @@ def _clip(text) -> str:
     return text[:_MAX_REASON_CHARS]
 
 
+def _hits_text(m: CheckedModel) -> str:
+    """「R002 minor ×2(展開後第 1、3 句)」:同一條規則合在一起,寫出在展開後的第幾句。"""
+    grouped: dict[tuple[str, str], list] = {}
+    for (rule, sev), pos in zip(m.new_hits, m.new_hit_statements or (None,) * len(m.new_hits)):
+        grouped.setdefault((rule, sev), []).append(pos)
+    out = []
+    for (rule, sev), positions in sorted(grouped.items()):
+        text = f"{rule} {sev}" + (f" ×{len(positions)}" if len(positions) > 1 else "")
+        known = sorted({p for p in positions if p is not None})
+        if known:
+            text += "(展開後第 " + "、".join(map(str, known)) + " 句)"
+        out.append(text)
+    return "、".join(out)
+
+
 def _listed(items: list[str]) -> str:
     more = f" 等共 {len(items)} 個" if len(items) > _MAX_LISTED else ""
     return "、".join(items[:_MAX_LISTED]) + more
@@ -249,13 +371,13 @@ def _listed(items: list[str]) -> str:
 def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None:
     """把反查與檢查的結果整理成**一條** finding(逐個 model 各報一條會洗版)。沒有東西要說回 None。
 
-    嚴重度:
-      blocker  有 model 在變更後多出 blocker 級的規則命中(與變更前比較過)
-      major    範圍不確定(反查標為不確定、全部 model 可能受影響)、有 model 沒檢查到、
-               變更後展開失敗或無法解析、多出 major 級的命中、或無法與變更前比較而有命中
+    嚴重度(由前後比較推論出來的結果最多 major,不給 blocker):
+      major    範圍不確定(反查標為不確定、全部 model 可能受影響)、有 model 沒檢查到或沒查規格、
+               變更後展開失敗或無法解析、多出 blocker 或 major 級的命中、或無法與變更前比較而有命中
       minor    只多出 minor 級的命中
       info     有受影響的 model 或沒人呼叫的 macro,但檢查不出問題(清單給人看)
-    內容只有路徑、名稱、規則代號與本模組 / 反查模組的固定文字;路徑與名稱都已由反查過白名單。
+    內容只有路徑、名稱、規則代號、語句的序號與本模組 / 反查模組的固定文字;路徑與名稱都已由
+    反查過白名單。要人逐一處理的清單(多出的命中、展開失敗、沒有檢查、沒查規格)不截斷。
     """
     if check is None:
         return None
@@ -299,34 +421,33 @@ def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None
             raise_to("major")
             broken.append(f"{full(m.path)}({_clip(m.error)})")
         elif m.new_hits:
-            counts = Counter(m.new_hits)
-            text = "、".join(f"{rule} {sev}" + (f" ×{n}" if n > 1 else "")
-                            for (rule, sev), n in sorted(counts.items()))
+            text = _hits_text(m)
             worst = max((sev for _, sev in m.new_hits), key=_SEVERITY_RANK.get)
-            if m.no_baseline:
-                # 沒有變更前的結果可以比:不知道是不是這次變更造成的,不以 blocker 擋下
-                raise_to("major")
-                compared_blind.append(f"{full(m.path)}[{text}]")
-            else:
-                raise_to(worst)
-                new.append(f"{full(m.path)}[{text}]")
+            # 前後比較推論出來的:最多 major,不以 blocker 擋下(沒有變更前的結果可以比時一律 major)
+            raise_to("major" if m.no_baseline or worst == "blocker" else worst)
+            (compared_blind if m.no_baseline else new).append(f"{full(m.path)}[{text}]")
     if check.models:
         parts.append(f"已檢查 {len(check.models)} 個不在本次變更清單裡的受影響 model"
                      "(以變更前後的專案各展開一次,比較規則命中)。")
     if new:
-        parts.append("**變更後多出的規則命中**:" + _listed(new) + "。")
+        parts.append("**變更後多出的規則命中**:" + "、".join(new) + "。")
     if compared_blind:
         parts.append("變更前的版本無法展開、無法比較,以下是變更後的全部命中:"
-                     + _listed(compared_blind) + "。")
+                     + "、".join(compared_blind) + "。")
     if broken:
-        parts.append("**變更後展開失敗或無法解析**:" + _listed(broken) + "。")
+        parts.append("**變更後展開失敗或無法解析**:" + "、".join(broken) + "。")
     if hints:
         parts.append("變更後多出的檢核點(這些 model 不在 diff 裡,模型沒有回應過):"
                      + _listed(hints) + "。")
     if check.unchecked:
         raise_to("major")
         parts.append("超過數量或時間上限,**沒有檢查**的受影響 model:"
-                     + _listed([full(p) for p in check.unchecked]) + "。")
+                     + "、".join(full(p) for p in check.unchecked) + "。")
+    not_looked = [full(m.path) for m in check.models if not m.spec_looked_up]
+    if not_looked:
+        raise_to("major")
+        parts.append("超過查詢數量或時間上限,**沒有查規格**的受影響 model:"
+                     + "、".join(not_looked) + "。")
     mapped = [f"{full(m.path)} → {m.spec}" for m in check.models if m.spec]
     unmapped = [full(m.path) for m in check.models if m.spec_looked_up and not m.spec]
     if mapped:

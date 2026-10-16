@@ -651,8 +651,14 @@ class _Scanner:
 
 
 # ------------------------------------------------------------------ 二、macro 反查
-def _kind(path: str, model_dirs, macro_dirs) -> str:
-    is_resource = path.endswith(_CONFIG_SUFFIXES) or path.split("/", 1)[0] in _RESOURCE_DIRS
+def _kind(path: str, model_dirs, macro_dirs, resource_dirs=None) -> str:
+    """resource_dirs:專案設定的 seed / snapshot / analysis / test 目錄;None = 不知道,
+    用 dbt 的預設目錄名稱(_RESOURCE_DIRS)判斷。"""
+    if resource_dirs is None:
+        in_resource = path.split("/", 1)[0] in _RESOURCE_DIRS
+    else:
+        in_resource = _in_dirs(path, resource_dirs)
+    is_resource = path.endswith(_CONFIG_SUFFIXES) or in_resource
     if path.endswith(".sql") and not is_resource:
         # macro 先判:model 目錄設為專案根目錄時,macros/ 仍然要算 macro;
         # seeds / snapshots / analyses / tests 底下的 .sql 是別種資源,也不是 model
@@ -665,12 +671,12 @@ def _kind(path: str, model_dirs, macro_dirs) -> str:
     return "other"
 
 
-def path_kind(path: str, model_dirs, macro_dirs) -> str:
+def path_kind(path: str, model_dirs, macro_dirs, resource_dirs=None) -> str:
     """專案內的路徑屬於哪一類:macro / model / dbt_config / other。
 
     給接線(dbt_context)用:它要判斷變更檔是不是 macro、MR 是不是只改到 model,必須跟
-    反查用同一套規則,否則兩邊對同一個檔的看法會不一樣。"""
-    return _kind(path, model_dirs, macro_dirs)
+    反查用同一套規則,否則兩邊對同一個檔的看法會不一樣。resource_dirs 見 _kind。"""
+    return _kind(path, model_dirs, macro_dirs, resource_dirs)
 
 
 def _is_builtin_override(name: str) -> bool:
@@ -687,10 +693,11 @@ def _fail_closed(reason: str, model_paths=()) -> ImpactReport:
                         all_models_possibly_affected=True)
 
 
-def _walk(callers_of: dict, start, label):
+def _walk(callers_of: dict, start, label, snapshot_hits=None):
     """由 start 的 macro 反向走訪引用者。
 
     回傳 (model 命中 [(路徑, 呼叫鏈)], yml 命中 [(路徑, 呼叫鏈)], 有被引用的起點名稱)。
+    snapshot 的命中另外放進 snapshot_hits(有給的話)。
     以索引走訪佇列(不用 list.pop(0),避免大型專案變成平方時間)。
     """
     queue = [(name, (label(name),)) for name in sorted(start)]
@@ -709,6 +716,9 @@ def _walk(callers_of: dict, start, label):
                     queue.append((who, chain + (who,)))
             elif kind == "model":
                 model_hits.append((who, chain + (who,)))
+            elif kind == "snapshot":
+                if snapshot_hits is not None:
+                    snapshot_hits.append((who, chain + (who,)))
             else:
                 yml_hits.append((who, chain))
     return model_hits, yml_hits, referenced
@@ -716,7 +726,8 @@ def _walk(callers_of: dict, start, label):
 
 def analyze_macro_impact(files, changed_paths, *, base_files=None, added_paths=(),
                          model_dirs=DEFAULT_MODEL_DIRS,
-                         macro_dirs=DEFAULT_MACRO_DIRS) -> ImpactReport:
+                         macro_dirs=DEFAULT_MACRO_DIRS, snapshot_dirs=(),
+                         resource_dirs=None) -> ImpactReport:
     """反查 macro 變更影響到的 model。
 
     files          變更後的 dbt 專案檔案:相對於 dbt 專案根目錄的路徑 → 內容
@@ -727,12 +738,17 @@ def analyze_macro_impact(files, changed_paths, *, base_files=None, added_paths=(
                    裡、也不在這份清單裡的變更檔,一律視為「呼叫端漏傳變更前內容」
                    而保守處理——無法分辨「真的是新檔」與「漏傳」時不能猜
     model_dirs / macro_dirs  model 與 macro 所在目錄;`""` 或 `"."` 代表專案根目錄
+    snapshot_dirs  snapshot 所在目錄。snapshot 也是 .sql 樣板、也會呼叫 macro:呼叫到變更的
+                   macro(直接或間接)時標為不確定(這裡不展開 snapshot、不比較前後)
+    resource_dirs  專案設定的 seed / snapshot / analysis / test 目錄。這些目錄底下的變更檔是 dbt
+                   的資源檔,標為不確定;None = 不知道,用 dbt 的預設目錄名稱(seeds、snapshots、
+                   analyses、tests)判斷
 
     任何無法確定的情況都收斂成 needs_human,不丟例外。
     """
     try:
         return _Analysis(files, changed_paths, base_files, added_paths,
-                         model_dirs, macro_dirs).run()
+                         model_dirs, macro_dirs, snapshot_dirs, resource_dirs).run()
     except _LimitExceeded as e:
         return _fail_closed(f"超過資源上限({e}),無法完成分析,保守視為全部 model 可能受影響")
     except RecursionError:
@@ -740,7 +756,8 @@ def analyze_macro_impact(files, changed_paths, *, base_files=None, added_paths=(
 
 
 class _Analysis:
-    def __init__(self, files, changed_paths, base_files, added_paths, model_dirs, macro_dirs):
+    def __init__(self, files, changed_paths, base_files, added_paths, model_dirs, macro_dirs,
+                 snapshot_dirs=(), resource_dirs=None):
         self.raw_files = files
         self.raw_changed = [changed_paths] if isinstance(changed_paths, str) else list(changed_paths)
         self.raw_base = base_files
@@ -748,6 +765,13 @@ class _Analysis:
                       ([added_paths] if isinstance(added_paths, str) else added_paths)}
         self.raw_model_dirs = (model_dirs,) if isinstance(model_dirs, str) else tuple(model_dirs)
         self.raw_macro_dirs = (macro_dirs,) if isinstance(macro_dirs, str) else tuple(macro_dirs)
+        self.raw_snapshot_dirs = ((snapshot_dirs,) if isinstance(snapshot_dirs, str)
+                                  else tuple(snapshot_dirs))
+        self.snapshot_dirs: tuple = ()
+        self.raw_resource_dirs = (None if resource_dirs is None else
+                                  (resource_dirs,) if isinstance(resource_dirs, str)
+                                  else tuple(resource_dirs))
+        self.resource_dirs: tuple | None = None
         self.uncertain: list[str] = []
         self.all_reasons: list[str] = []
         self.rejected = 0
@@ -761,8 +785,16 @@ class _Analysis:
                 f"jinja2 {jinja2.__version__} 低於 {'.'.join(map(str, MIN_JINJA_VERSION))},拒絕分析")
         self.model_dirs = tuple(_normalize_dir(d) for d in self.raw_model_dirs)
         self.macro_dirs = tuple(_normalize_dir(d) for d in self.raw_macro_dirs)
+        self.snapshot_dirs = tuple(_normalize_dir(d) for d in self.raw_snapshot_dirs)
         if not self.model_dirs or not self.macro_dirs or None in self.model_dirs + self.macro_dirs:
             return _fail_closed("model / macro 目錄設定不合法,無法分析")
+        if None in self.snapshot_dirs or "" in self.snapshot_dirs:
+            return _fail_closed("snapshot 目錄設定不合法,無法分析")
+        if self.raw_resource_dirs is not None:
+            resource_dirs = tuple(_normalize_dir(d) for d in self.raw_resource_dirs)
+            if None in resource_dirs or "" in resource_dirs:
+                return _fail_closed("seed / analysis / test 目錄設定不合法,無法分析")
+            self.resource_dirs = resource_dirs
 
         rejected_project_files = self._load_files()
         base = self._load_base()
@@ -863,7 +895,9 @@ class _Analysis:
         return base
 
     def _kind(self, path: str) -> str:
-        return _kind(path, self.model_dirs, self.macro_dirs)
+        if path.endswith(".sql") and _in_dirs(path, self.snapshot_dirs):
+            return "snapshot"
+        return _kind(path, self.model_dirs, self.macro_dirs, self.resource_dirs)
 
     def _classify_changes(self) -> None:
         if len(self.raw_changed) > MAX_FILES:
@@ -886,7 +920,7 @@ class _Analysis:
                 models.add(path)
             else:
                 others.add(path)
-                if kind == "dbt_config":
+                if kind in ("dbt_config", "snapshot"):
                     self.uncertain.append(f"變更了 dbt 設定或資源檔 {path},本模組不分析其影響範圍")
         self.changed_macro_files = sorted(macro_files)
         self.changed_models = sorted(models)
@@ -899,13 +933,22 @@ class _Analysis:
         self.model_refs: dict[str, _Refs] = {}
         self.unparsable_macro_files: list[str] = []
         self.unparsable_models: list[str] = []
+        self.snapshot_refs: dict[str, _Refs] = {}
+        self.unparsable_snapshots: list[str] = []
         for path in sorted(self.project):
             kind = self._kind(path)
-            if kind not in ("macro", "model"):
+            if kind not in ("macro", "model", "snapshot"):
                 continue
             result = self.scanner.try_scan(self.project[path])
             if result is None:
-                (self.unparsable_macro_files if kind == "macro" else self.unparsable_models).append(path)
+                {"macro": self.unparsable_macro_files, "model": self.unparsable_models,
+                 "snapshot": self.unparsable_snapshots}[kind].append(path)
+                continue
+            if kind == "snapshot":
+                refs = _Refs()
+                for part in (result.top, *result.macros.values()):
+                    refs.merge(part)
+                self.snapshot_refs[path] = refs
                 continue
             if kind == "macro":
                 for name, refs in result.macros.items():
@@ -991,14 +1034,25 @@ class _Analysis:
                 callers_of.setdefault(target, set()).add(("model", path))
             if is_dynamic(refs):
                 dynamic_scopes.append(("model", path))
+        for path, refs in self.snapshot_refs.items():
+            for target in resolve(refs.names):
+                callers_of.setdefault(target, set()).add(("snapshot", path))
+            if is_dynamic(refs):
+                dynamic_scopes.append(("snapshot", path))
         for path in sorted(self.project):
-            if path.endswith(_CONFIG_SUFFIXES) and (
-                    path == "dbt_project.yml" or _in_dirs(path, self.model_dirs)):
-                refs = self.scanner.scan_yml(self.project[path])
-                for target in resolve(refs.names):
-                    callers_of.setdefault(target, set()).add(("yml", path))
-                if is_dynamic(refs):
-                    dynamic_scopes.append(("yml", path))
+            if not path.endswith(_CONFIG_SUFFIXES):
+                continue
+            if _in_dirs(path, self.snapshot_dirs):
+                kind = "snapshot"              # snapshot 的屬性檔(post_hook 等)呼叫的 macro
+            elif path == "dbt_project.yml" or _in_dirs(path, self.model_dirs):
+                kind = "yml"
+            else:
+                continue
+            refs = self.scanner.scan_yml(self.project[path])
+            for target in resolve(refs.names):
+                callers_of.setdefault(target, set()).add((kind, path))
+            if is_dynamic(refs):
+                dynamic_scopes.append((kind, path))
         return callers_of, dynamic_scopes
 
     def _apply_hits(self, model_hits, yml_hits, certain: bool) -> None:
@@ -1022,8 +1076,15 @@ class _Analysis:
             where = ", ".join(sorted(self.macro_files.get(name, set()))) or "已刪除"
             return f"{name}({where})"
 
-        model_hits, yml_hits, referenced = _walk(callers_of, changed_macros, label)
+        snapshot_hits: list = []
+        model_hits, yml_hits, referenced = _walk(callers_of, changed_macros, label, snapshot_hits)
         self._apply_hits(model_hits, yml_hits, certain=True)
+        # snapshot 呼叫到變更的 macro:這裡不展開、不比較 snapshot,看不出影響 → 交人工
+        for path, chain in snapshot_hits:
+            self.uncertain.append(
+                f"snapshot {path} 呼叫了變更的 macro({' → '.join(chain)}),反查不檢查 snapshot 的展開結果")
+        for path in self.unparsable_snapshots:
+            self.uncertain.append(f"snapshot {path} 無法解析,無法確認它呼叫了哪些 macro")
 
         unreferenced = []
         for name in sorted(changed_macros):
@@ -1044,12 +1105,19 @@ class _Analysis:
                 self._add_model(who, ("model 內有動態呼叫或無法解析的樣板字串",), False)
             elif kind == "yml":
                 dynamic_ymls.append((who, ("yml 內有動態呼叫、無法解析的樣板或跳脫字元",)))
+            elif kind == "snapshot":
+                self.uncertain.append(f"snapshot {who} 內有動態呼叫或無法解析的樣板字串,"
+                                      "可能呼叫到變更的 macro")
         self._apply_hits((), dynamic_ymls, certain=False)
         if dynamic_macros:
+            dynamic_snapshot_hits: list = []
             model_hits, yml_hits, _ = _walk(
                 callers_of, dynamic_macros,
-                lambda n: f"{n} 內有動態呼叫或無法解析的樣板字串,可能呼叫到變更的 macro")
+                lambda n: f"{n} 內有動態呼叫或無法解析的樣板字串,可能呼叫到變更的 macro",
+                dynamic_snapshot_hits)
             self._apply_hits(model_hits, yml_hits, certain=False)
+            for path, chain in dynamic_snapshot_hits:
+                self.uncertain.append(f"snapshot {path} 呼叫的 macro 有動態呼叫,可能呼叫到變更的 macro")
         if dynamic_scopes:
             self.uncertain.append("專案中有動態呼叫 macro 的寫法,靜態分析無法確定實際呼叫對象")
         return unreferenced

@@ -17,6 +17,6 @@ mock 模式下,審查管線會把那個目錄打包成 GitLab 打包下載的形
 (`orchestrator/dbt_context.py`)。目錄名必須是完整的 commit 編號(40 位小寫十六進位),與 MR 檔的
 `sha` / `diff_refs` 對應。
 
-怎麼跑、預期看到什麼:見上層 README 的「開啟 dbt 接線」。
+怎麼跑、預期看到什麼:見 `SEGCRA-CR/README.md` 的「開啟 dbt 接線」(`examples/` 底下沒有 README)。
 
 這些檔案刻意不放在預設的 `fixtures/`:那裡的 `mr_*.json` 編號會影響 mock 模式自動產生的 MR 編號。

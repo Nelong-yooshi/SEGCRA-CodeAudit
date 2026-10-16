@@ -140,28 +140,64 @@ def download_archive(sha: str, path: str = "", *, max_bytes: int) -> bytes:
     回傳內容仍是不可信的,必須交給 orchestrator/archive.py 的 extract_archive() 解。
     任何失敗都丟 ArchiveDownloadError,訊息不含 token、URL 或回應內容。
     """
-    if not (GITLAB_URL and GITLAB_PROJECT and GITLAB_READ_TOKEN):
-        raise ArchiveDownloadError(
-            "未設定 GITLAB_URL、GITLAB_PROJECT 或 GITLAB_READ_TOKEN,無法打包下載")
-    if GITLAB_READ_TOKEN == GITLAB_TOKEN:
-        raise ArchiveDownloadError(
-            "GITLAB_READ_TOKEN 與 GITLAB_TOKEN 是同一把;打包下載必須用另一把唯讀 token")
-    _check_archive_url(GITLAB_URL)
+    _check_read_access("打包下載")
     if not isinstance(sha, str) or not _SHA.fullmatch(sha):
         raise ArchiveDownloadError("sha 必須是完整的 commit 編號(40 或 64 位小寫十六進位)")
     if not isinstance(path, str) or (path and (
             not _ARCHIVE_PATH.fullmatch(path)
             or any(p in (".", "..") for p in path.split("/")))):
         raise ArchiveDownloadError("打包的子目錄名稱不合法")
+    params = {"sha": sha, **({"path": path} if path else {})}
+    data = _read_only_get("repository/archive.tar.gz", params, max_bytes, "壓縮檔")
+    if data is None:
+        raise ArchiveDownloadError(f"GitLab 回應 HTTP 404({_ARCHIVE_STATUS_HINTS[404]})")
+    return data
+
+
+def read_file_at(sha: str, path: str, *, max_bytes: int) -> str | None:
+    """讀某個 commit 的單一檔案(文字)。檔案不存在回 None。
+
+    **這不是給模型用的工具**(理由同 download_archive)。用途是在打包下載整個專案**之前**,
+    先讀 dbt_project.yml 知道哪些目錄屬於 dbt:專案就在 repo 根目錄時,MR 只改了 dbt 以外的
+    檔案就不必下載整個 repo。權限、連線、大小上限的規則與 download_archive 相同(只用唯讀
+    token、不跟隨轉址、不讀代理設定);任何失敗都丟 ArchiveDownloadError。"""
+    _check_read_access("讀取檔案")
+    if not (isinstance(sha, str) and _SHA.fullmatch(sha)):
+        raise ArchiveDownloadError("sha 必須是完整的 commit 編號(40 或 64 位小寫十六進位)")
+    if not isinstance(path, str) or not _ARCHIVE_PATH.fullmatch(path) or any(
+            p in (".", "..") for p in path.split("/")):
+        raise ArchiveDownloadError("檔案路徑不合法")
+    from urllib.parse import quote
+    data = _read_only_get(f"repository/files/{quote(path, safe='')}/raw", {"ref": sha},
+                          max_bytes, "檔案")
+    if data is None:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ArchiveDownloadError("檔案不是 UTF-8 文字") from None
+
+
+def _check_read_access(what: str) -> None:
+    if not (GITLAB_URL and GITLAB_PROJECT and GITLAB_READ_TOKEN):
+        raise ArchiveDownloadError(
+            f"未設定 GITLAB_URL、GITLAB_PROJECT 或 GITLAB_READ_TOKEN,無法{what}")
+    if GITLAB_READ_TOKEN == GITLAB_TOKEN:
+        raise ArchiveDownloadError(
+            f"GITLAB_READ_TOKEN 與 GITLAB_TOKEN 是同一把;{what}必須用另一把唯讀 token")
+    _check_archive_url(GITLAB_URL)
+
+
+def _read_only_get(endpoint: str, params: dict, max_bytes: int, what: str) -> bytes | None:
+    """以唯讀 token 對專案的 API 發 GET,回傳原始位元組;HTTP 404 回 None。"""
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
         raise ArchiveDownloadError("必須指定正整數的下載大小上限")
-    params = {"sha": sha, **({"path": path} if path else {})}
     import httpx
     buf = bytearray()
     deadline = time.monotonic() + ARCHIVE_DEADLINE_S
     try:
         with httpx.stream(
-                "GET", f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}/repository/archive.tar.gz",
+                "GET", f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}/{endpoint}",
                 params=params,
                 # 要求不做傳輸層壓縮:否則 httpx 會先自動解開,一個小封包可能在我們
                 # 計算大小之前就在記憶體裡膨脹(下面也只讀原始位元組)
@@ -170,6 +206,8 @@ def download_archive(sha: str, path: str = "", *, max_bytes: int) -> bytes:
                 follow_redirects=False,
                 # 不讀 HTTP_PROXY / HTTPS_PROXY / .netrc 等環境設定:token 不送往代理
                 trust_env=False, timeout=30) as r:
+            if r.status_code == 404:
+                return None
             if r.status_code != 200:
                 hint = _ARCHIVE_STATUS_HINTS.get(r.status_code)
                 raise ArchiveDownloadError(f"GitLab 回應 HTTP {r.status_code}"
@@ -178,11 +216,11 @@ def download_archive(sha: str, path: str = "", *, max_bytes: int) -> bytes:
                 raise ArchiveDownloadError("GitLab 回應使用了傳輸層壓縮,拒絕處理")
             declared = r.headers.get("Content-Length", "")
             if declared.isdigit() and int(declared) > max_bytes:
-                raise ArchiveDownloadError(f"壓縮檔超過 {max_bytes} 位元組上限")
+                raise ArchiveDownloadError(f"{what}超過 {max_bytes} 位元組上限")
             for chunk in r.iter_raw():
                 buf += chunk
                 if len(buf) > max_bytes:
-                    raise ArchiveDownloadError(f"壓縮檔超過 {max_bytes} 位元組上限")
+                    raise ArchiveDownloadError(f"{what}超過 {max_bytes} 位元組上限")
                 if time.monotonic() > deadline:
                     raise ArchiveDownloadError(f"下載超過 {ARCHIVE_DEADLINE_S} 秒上限")
     except ArchiveDownloadError:

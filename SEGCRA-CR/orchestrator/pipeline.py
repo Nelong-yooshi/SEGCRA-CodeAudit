@@ -97,6 +97,140 @@ def _norm(s: str) -> str:
     return re.sub(r"[《》()()\s]", "", (s or "")).lower()
 
 
+_FORMAT_TITLE = "模型輸出的格式不正確"
+_FORMAT_NO_TITLE = "(標題格式不正確)"
+
+
+def _as_text(value) -> tuple[str, bool]:
+    """把應該是文字的欄位轉成字串。回傳 (文字, 型別是否不對)。
+
+    缺漏或 null 視為空字串、不算格式錯誤(模型常把沒有的建議寫成 null;title 的 null 由
+    normalize_findings 另外算);字串清單接成一段,其餘型別轉成字串(巢狀太深、轉不出來的給
+    空字串)。"""
+    if value is None:
+        return "", False
+    if isinstance(value, str):
+        return value, False
+    if isinstance(value, list) and all(isinstance(v, str) for v in value):
+        return "\n".join(value), True
+    try:
+        return str(value), True
+    except RecursionError:
+        return "", True
+
+
+def _as_line(value) -> tuple[int, bool]:
+    """行號轉成整數。回傳 (行號, 是否無法轉換)。
+
+    整數、整數樣子的字串、有限的浮點數照舊接受(寫回留言時本來就會 int());其餘
+    (文字、清單、物件、NaN / Infinity)設成 0——寫回留言的迴圈不能因為一個行號中斷。"""
+    if value is None or value == "":
+        return 0, False
+    try:
+        if isinstance(value, (int, float, str)):
+            return int(value), False
+    except (ValueError, OverflowError):
+        pass
+    return 0, True
+
+
+def normalize_findings(report: dict) -> dict:
+    """後處理的第一步:把模型輸出整理成後面每一步都假設的形狀(#21)。
+
+    模型輸出的 JSON 解析得過、但欄位型別不對時(finding 是字串、severity 是清單、
+    title 是 null、line 是 "abc"…),後面的步驟會丟例外讓整次審查中斷:MR 收不到結果;
+    若是在寫回留言時才中斷,還會停在「留言貼了一半、沒有 label 也沒有 commit status」。
+    模型輸出不可信,這是可以預期的輸入。
+
+    原則:
+    - **原本不會出錯的輸入,行為不變**:欄位缺漏、或 detail / suggestion / file / line 是 null,
+      照舊當成空值;不合法的 severity 字串(模型常原樣抄預掃的 hint)照舊由 sanitize_findings
+      靜默丟棄。這些都不算格式錯誤。
+    - title 是 null(有這個鍵、值是 null)算格式錯誤,補「(標題格式不正確)」:以前後處理會在
+      這裡丟例外,沒有標題的 finding 也看不出在講什麼。標題缺漏不算(與以前相同)。
+      citations 是 null 以前也會丟例外;現在當成空清單,沒有內容遺失,不算格式錯誤。
+    - **能修就修,不輕易丟**:severity 是字串的 finding 一律保留(其他欄位修正)。丟掉一條
+      標題格式錯的 blocker,決策會從 blocked 變成 needs_human,後處理不可以讓決策變寬鬆。
+    - 只有「finding 不是物件」與「severity 不是字串」會丟掉:沒有可以依據的嚴重度。
+
+    修正與丟掉的數量記在 `_format_issues`,由 enforce_format 補一條 major(要排在
+    sanitize_findings 之後,見該函式)。這個欄位只由這裡寫:模型自己輸出的同名欄位會被移除。
+    """
+    report.pop("_format_issues", None)
+    summary, _ = _as_text(report.get("summary"))
+    report["summary"] = summary
+    raw = report.get("findings", [])
+    bad_container = not isinstance(raw, list)
+    fixed = dropped = 0
+    findings = []
+    for fd in ([] if bad_container else raw):
+        if not isinstance(fd, dict):
+            dropped += 1
+            continue
+        severity = fd.get("severity")
+        if severity is not None and not isinstance(severity, str):
+            dropped += 1
+            continue
+        wrong = False
+        null_title = "title" in fd and fd["title"] is None
+        for key in ("title", "detail", "suggestion"):
+            fd[key], bad = _as_text(fd.get(key))
+            if key == "title":
+                bad = bad or null_title
+            wrong |= bad
+            if bad and key == "title" and not fd[key].strip():
+                fd[key] = _FORMAT_NO_TITLE
+        file = fd.get("file")
+        if file is not None and not isinstance(file, str):
+            wrong = True
+        fd["file"] = file if isinstance(file, str) else ""
+        fd["line"], bad = _as_line(fd.get("line"))
+        wrong |= bad
+        cites = fd.get("citations")
+        if cites is None:
+            cites = []
+        elif not isinstance(cites, list):
+            cites, wrong = [], True
+        kept = [c for c in cites if isinstance(c, dict)
+                and isinstance(c.get("source", ""), (str, type(None)))]
+        wrong |= len(kept) != len(cites)
+        fd["citations"] = kept
+        fixed += wrong
+        findings.append(fd)
+    report["findings"] = findings
+    if bad_container or fixed or dropped:
+        report["_format_issues"] = {"fixed": fixed, "dropped": dropped,
+                                    "findings_not_a_list": bad_container}
+    return report
+
+
+def enforce_format(report: dict) -> dict:
+    """模型輸出有格式不正確的 finding → 補一條 major(確定性,不得自動放行)。
+
+    「模型輸出壞掉」本身要在報告裡看得到:被丟掉的 finding 可能正是該擋下 MR 的那一條。
+    只寫數量,**不回顯模型輸出的內容**(那是不可信的文字,會被貼回 MR 留言)。
+
+    必須排在 sanitize_findings 之後:它的近似標題去重會保留「建議較長」的那條,模型若
+    輸出一條標題**近似**(不必相同)的 info 並附上一段建議,去重時留下的會是模型那條,
+    程式的 major 就不見了。標題完全相同的則由 _put_program_finding 取代。"""
+    issues = report.get("_format_issues")
+    if not issues:
+        return report
+    parts = []
+    if issues["findings_not_a_list"]:
+        parts.append("findings 欄位不是清單,整份當作沒有 finding。")
+    if issues["fixed"] or issues["dropped"]:
+        parts.append(f"有 {issues['fixed'] + issues['dropped']} 條 finding 的格式不正確"
+                     f"(修正後保留 {issues['fixed']} 條、無法判讀而略過 {issues['dropped']} 條)。")
+    major = {
+        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _FORMAT_TITLE,
+        "detail": "".join(parts) + "被略過或修正的內容可能不完整,這次的審查結果需人工確認。",
+        "suggestion": "重新觸發審查;若持續發生,請檢查審查模型的輸出。",
+        "citations": []}
+    _put_program_finding(report, major)
+    return report
+
+
 # 引用來源裡指名的規則碼(_norm 已小寫化,所以只需比對小寫)
 _CITE_CODE = re.compile(r"r-?\d{2,4}")
 
@@ -217,7 +351,7 @@ _DBT_FETCH_FAILED = "無法取回 dbt 專案:"
 
 
 def _dbt_head_source(f: dict, sql: str, dbt_ctx: DbtContext | None) -> tuple[str, str | None, bool]:
-    """dbt 專案裡的 .sql:改用 head commit 的完整內容(#15 接線)。
+    """dbt 專案裡的 .sql:改用 head commit 的完整內容。
     回傳 (要檢查的內容, 取回失敗的原因或 None, 檔案是否在 dbt 專案裡)。
 
     真實 GitLab 模式的 diff 只有新增的行;只改了幾行的 model,拿片段去展開沒有意義,
@@ -267,20 +401,23 @@ def _mr_for_spec_exec(mr: dict, dbt_ctx: DbtContext | None) -> dict:
     return {**mr, "files": files}
 
 
-def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None) -> dict:
-    """注入掃描用:把取回的完整內容也列進去掃。
+def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None, rendered=()) -> dict:
+    """注入掃描用:把取回的完整內容與展開後的 SQL 也列進去掃。
 
     預掃改用 head 的完整內容後,規則命中帶的 SQL 片段可能來自 diff 以外的行;那些行
-    以前不會進到審查流程,也就沒被掃過。原本的 diff 照舊保留。"""
-    if dbt_ctx is None or dbt_ctx.project is None:
-        return mr
-    extra = [{"path": f.get("path"), "full_content": text} for f in mr.get("files", [])
-             if (text := dbt_ctx.head_text(f.get("path"))) is not None]
+    以前不會進到審查流程,也就沒被掃過。展開還會把沒改到的 macro 與這次傳的參數組合在一起,
+    組出來的文字在 MR 與 macro 檔裡各自都沒有;展開後的語句(規則命中)與解析錯誤的片段會
+    進 prompt。已合併的 macro 也不能假設掃過(掃描器與規則會更新)。所以實際會送進模型的
+    內容一律再掃一次。rendered 是預掃收集的 [{path, full_content}]。原本的 diff 照舊保留。"""
+    extra = list(rendered)
+    if dbt_ctx is not None and dbt_ctx.project is not None:
+        extra += [{"path": f.get("path"), "full_content": text} for f in mr.get("files", [])
+                  if isinstance(f, dict) and (text := dbt_ctx.head_text(f.get("path"))) is not None]
     return {**mr, "files": [*mr["files"], *extra]} if extra else mr
 
 
 async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
-                  dbt_ctx: DbtContext | None = None) -> list[dict]:
+                  dbt_ctx: DbtContext | None = None, rendered: list | None = None) -> list[dict]:
     """對每個變更檔跑 rule-base + lint(不經 LLM)。
 
     dbt_cfg 給定且 enabled 時,含 dbt 樣板標記的檔案先展開成純 SQL 再交給規則層
@@ -290,6 +427,9 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
 
     dbt_ctx(prepare_dbt_context 的結果)給定時,dbt 專案裡的 .sql 改用 head commit 的完整
     內容與專案的 macro 展開;取回失敗則記成展開失敗交人工。沒開 dbt 時不看 dbt_ctx。
+
+    rendered 給定時,展開成功的檔案以 {path, full_content: 展開後的 SQL} 加進去,給注入掃描用
+    (見 _mr_with_head_text)。
     """
     dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True
     results = []
@@ -318,6 +458,8 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
                 f.get("path", ""), sql, dbt_cfg, dbt_ctx if in_project else None)
             if dbt_error is not None:
                 entry["dbt_render_error"] = dbt_error
+            elif rendered is not None:
+                rendered.append({"path": f.get("path"), "full_content": rule_sql})
             if dbt_notice is not None:
                 entry["dbt_render_notice"] = dbt_notice
         rules = await hub.call_json("sqltools__run_rules", {"sql": rule_sql})
@@ -748,11 +890,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             return report
 
         dbt_ctx = prepare_dbt_context(mr, cfg.dbt)   # 需要時取回 MR 那個 commit 的 dbt 專案
-        pre = await prescan(hub, mr["files"], cfg.dbt, dbt_ctx)
+        rendered: list[dict] = []          # 展開後的 SQL,給注入掃描用
+        pre = await prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered)
         if capture is not None:
             capture["mr"] = mr
             capture["prescan_raw"] = copy.deepcopy(pre)
-        injection_hits = scan_mr(_mr_with_head_text(mr, dbt_ctx))   # 確定性注入掃描(不經 LLM)
+        # 確定性注入掃描(不經 LLM):MR、取回的完整內容、展開後的 SQL
+        injection_hits = scan_mr(_mr_with_head_text(mr, dbt_ctx, rendered))
 
         # 找 spec(確定性;執行驗證與 prompt 的規格段共用)。依檔名對應與展開器
         # 同一個開關:關閉時行為與接線前完全相同。
@@ -813,10 +957,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         if "anomaly-rules" in skills and any(
                 "rules" in f["path"] for f in mr["files"]):
             always_block += "\n\n" + skills["anomaly-rules"].body
-        # 內容觸發:預掃出資安命中(R004/H004)→ 強制載入 secure-sql,不賭模型主動載
-        if "secure-sql" in skills and any(
-                h.get("rule") in ("R004", "H004")
-                for e in pre for h in e.get("rules", [])):
+        # 內容觸發:預掃出資安命中 → 強制載入 secure-sql,不賭模型主動載
+        if "secure-sql" in skills and _needs_secure_sql(pre):
             always_block += "\n\n" + skills["secure-sql"].body
 
         system = SYSTEM_TEMPLATE.format(
@@ -863,6 +1005,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = extract_json(raw)
         if not report:
             raise RuntimeError(f"模型輸出無法解析為 JSON:\n{raw[:2000]}")
+        report = normalize_findings(report)    # 模型輸出的形狀不可信,先整理再往下走(#21)
         report = validate_citations(report, cited_codes)
         report = sanitize_findings(report)
         # 檢核點只認模型自己的回應:放在任何程式補報之前(enforce_rules 補的 R004 內文含
@@ -876,6 +1019,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述
         report = enforce_dbt_impact(report, affected, dbt_ctx)  # macro 等變更影響的其他 model
         report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
+        report = enforce_format(report)        # 模型輸出有格式錯誤 → major;須在 sanitize 之後
         report = enforce_injection(report, injection_hits)  # 確定性 blocker,不論模型是否被攻陷
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
         report = enforce_tool_refusals(report, hub.refused_calls)  # 模型要求了寫入工具
@@ -1018,12 +1162,23 @@ def enforce_hints(report: dict, pre: list[dict]) -> dict:
     return report
 
 
+# 預掃命中這些規則時,secure-sql skill 一律注入 system prompt(不賭模型主動載)
+_SECURE_SQL_RULES = ("R004", "R005", "H004")
+
+
+def _needs_secure_sql(pre: list[dict]) -> bool:
+    return any(h.get("rule") in _SECURE_SQL_RULES for e in pre for h in e.get("rules", []))
+
+
 # rule 命中 → 判定「模型已涵蓋」的關鍵詞(報告全文含任一即視為已報,避免重複)
 _RULE_KEYWORDS = {
     "R001": ["WHERE", "全表", "整表", "整張表", "purge"],
     "R002": ["SELECT *", "明列欄位", "star"],
     "R003": ["NOT IN", "NULL 陷阱", "NOT EXISTS"],
     "R004": ["憑證", "密碼", "金鑰", "硬編碼", "hardcode", "credential", "secret"],
+    # 「沙盒」刻意不列(#27 review 的建議):它的範圍太廣,同一個檔案裡模型的其他
+    # major 只要提到沙盒,R005 就會被當成已經報過而不補報。
+    "R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys."],
 }
 
 
@@ -1094,7 +1249,7 @@ def enforce_dbt_render_failure(report: dict, pre: list[dict]) -> dict:
 def enforce_dbt_impact(report: dict, affected: AffectedCheck | None,
                        dbt_ctx: DbtContext | None = None) -> dict:
     """MR 改到 macro、屬性檔或專案設定檔時,把「影響到哪些 model、檢查出什麼」補成一條 finding
-    (#15 接線;內容與嚴重度見 dbt_affected.impact_finding)。
+    (內容與嚴重度見 dbt_affected.impact_finding)。
 
     確定性補報,不看模型有沒有自己提到:只改 macro 的 MR,diff 裡看不到任何一個受影響的
     model。標題只能由程式產生(_put_program_finding)。排在 enforce_hints / enforce_style

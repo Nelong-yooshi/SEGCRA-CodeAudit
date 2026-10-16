@@ -315,9 +315,9 @@ MUTANTS.update({
     "不連結 dispatch 實作": (I,
         "                found |= suffix_index.get(ref, set())",
         "                pass"),
-    "不掃 yml 中的 hook": (I,
-        "                for target in resolve(refs.names):\n                    callers_of.setdefault(target, set()).add((\"yml\", path))",
-        "                for target in ():\n                    callers_of.setdefault(target, set()).add((\"yml\", path))"),
+    '不掃 yml 中的 hook': ('dbt_impact.py',
+     '            for target in resolve(refs.names):\n                callers_of.setdefault(target, set()).add((kind, path))',
+     '            for target in ():\n                callers_of.setdefault(target, set()).add((kind, path))'),
     "不判斷覆寫內建": (I,
         "            if _is_builtin_override(name):",
         "            if False:"),
@@ -381,6 +381,93 @@ MUTANTS.update({
         "    if isinstance(strip_prefixes, str):"),
 })
 
+# ---- 模型輸出格式不正確時不中斷審查(#21)
+MUTANTS.update({
+ "格式:不做正規化": ("pipeline.py",
+     "        report = normalize_findings(report)    # 模型輸出的形狀不可信,先整理再往下走(#21)\n", ""),
+ "格式:不補 major": ("pipeline.py",
+     "        report = enforce_format(report)        # 模型輸出有格式錯誤 → major;須在 sanitize 之後\n", ""),
+ "格式:major 排在 sanitize 之前(可被模型換掉)": ("pipeline.py",
+     "        report = sanitize_findings(report)\n",
+     "        report = enforce_format(report)\n        report = sanitize_findings(report)\n"
+     "        report.pop(\"_format_issues\", None)\n"),
+ "格式:補的是 minor": ("pipeline.py",
+     '"severity": "major", "title": _FORMAT_TITLE,',
+     '"severity": "minor", "title": _FORMAT_TITLE,'),
+ "格式:finding 不是物件不計數": ("pipeline.py",
+     "        if not isinstance(fd, dict):\n            dropped += 1\n            continue",
+     "        if not isinstance(fd, dict):\n            continue"),
+ "格式:severity 不是字串不計數": ("pipeline.py",
+     "        if severity is not None and not isinstance(severity, str):\n            dropped += 1\n",
+     "        if severity is not None and not isinstance(severity, str):\n"),
+ "格式:severity 不是字串照樣往下傳": ("pipeline.py",
+     "        if severity is not None and not isinstance(severity, str):\n            dropped += 1\n"
+     "            continue",
+     "        if False:\n            dropped += 1\n            continue"),
+ "格式:標題格式錯的 finding 直接丟掉(決策變寬鬆)": ("pipeline.py",
+     "        fixed += wrong\n        findings.append(fd)",
+     "        if wrong:\n            dropped += 1\n            continue\n        findings.append(fd)"),
+ "格式:空標題不補說明": ("pipeline.py",
+     "                fd[key] = _FORMAT_NO_TITLE", "                pass"),
+ "格式:標題缺漏也補說明(改變原本正常的輸入)": ("pipeline.py",
+     "            if bad and key == \"title\" and not fd[key].strip():",
+     "            if key == \"title\" and not fd[key].strip():"),
+ "格式:標題是 null 不算格式錯誤": ("pipeline.py",
+     '        null_title = "title" in fd and fd["title"] is None',
+     '        null_title = False'),
+ "格式:標題缺漏也算格式錯誤": ("pipeline.py",
+     '        null_title = "title" in fd and fd["title"] is None',
+     '        null_title = fd.get("title") is None'),
+ "格式:巢狀太深轉不出字串就丟例外": ("pipeline.py",
+     "    except RecursionError:\n        return \"\", True",
+     "    except ZeroDivisionError:\n        return \"\", True"),
+ "格式:null 也算格式錯誤(每個 MR 都多一條 major)": ("pipeline.py",
+     "    if value is None:\n        return \"\", False\n    if isinstance(value, str):",
+     "    if value is None:\n        return \"\", True\n    if isinstance(value, str):"),
+ "格式:文字欄位型別不對不計數": ("pipeline.py",
+     "        return str(value), True", "        return str(value), False"),
+ "格式:字串清單不計數": ("pipeline.py",
+     '        return "\\n".join(value), True', '        return "\\n".join(value), False'),
+ "格式:file 型別不對不計數": ("pipeline.py",
+     "        if file is not None and not isinstance(file, str):\n            wrong = True",
+     "        if file is not None and not isinstance(file, str):\n            pass"),
+ "格式:file 型別不對照樣往下傳": ("pipeline.py",
+     '        fd["file"] = file if isinstance(file, str) else ""',
+     '        fd["file"] = file if file is not None else ""'),
+ "格式:line 轉不了就丟例外": ("pipeline.py",
+     "    except (ValueError, OverflowError):\n        pass\n    return 0, True",
+     "    except ZeroDivisionError:\n        pass\n    return 0, True"),
+ "格式:line 轉不了不計數": ("pipeline.py",
+     "        pass\n    return 0, True", "        pass\n    return 0, False"),
+ "格式:line 是 null 也算格式錯誤": ("pipeline.py",
+     '    if value is None or value == "":\n        return 0, False',
+     '    if value is None or value == "":\n        return 0, True'),
+ "格式:citations 不是清單不計數": ("pipeline.py",
+     "            cites, wrong = [], True", "            cites = []"),
+ "格式:citations 的項目不檢查": ("pipeline.py",
+     "        kept = [c for c in cites if isinstance(c, dict)\n"
+     "                and isinstance(c.get(\"source\", \"\"), (str, type(None)))]",
+     "        kept = list(cites)"),
+ "格式:citation 的 source 型別不檢查": ("pipeline.py",
+     "        kept = [c for c in cites if isinstance(c, dict)\n"
+     "                and isinstance(c.get(\"source\", \"\"), (str, type(None)))]",
+     "        kept = [c for c in cites if isinstance(c, dict)]"),
+ "格式:丟掉 citation 不計數": ("pipeline.py",
+     "        wrong |= len(kept) != len(cites)\n", ""),
+ "格式:findings 不是清單不記錄": ("pipeline.py",
+     "    if bad_container or fixed or dropped:", "    if fixed or dropped:"),
+ "格式:summary 不轉成字串": ("pipeline.py",
+     '    report["summary"] = summary\n', ""),
+ "格式:採用模型自己輸出的 _format_issues": ("pipeline.py",
+     '    report.pop("_format_issues", None)\n', ""),
+ "格式:major 回顯模型輸出": ("pipeline.py",
+     '"被略過或修正的內容可能不完整,這次的審查結果需人工確認。",',
+     '"被略過或修正的內容可能不完整,這次的審查結果需人工確認。" + str(report.get("findings")),'),
+ "格式:major 用一般方式加入(同標題不取代)": ("pipeline.py",
+     "    _put_program_finding(report, major)\n    return report\n\n\n# 引用來源裡指名的規則碼",
+     "    report[\"findings\"].append(major)\n    return report\n\n\n# 引用來源裡指名的規則碼"),
+})
+
 
 def copy_project(src: pathlib.Path, dst: pathlib.Path) -> None:
     """複製整個專案(除了下面明列的建置產物/快取/憑證),不是手動列出「測試會用到
@@ -411,7 +498,7 @@ def copy_project(src: pathlib.Path, dst: pathlib.Path) -> None:
             shutil.copyfile(item, dst / item.name)
 
 
-# ---- 展開器從記憶體裡的專案檔案讀 macro(#15 接線:macro_files)
+# ---- 展開器從記憶體裡的專案檔案讀 macro(macro_files)
 MUTANTS.update({
  "字典來源:給了也不用": (
      "    if code_root is None and macro_files is None:", "    if code_root is None:"),
@@ -454,15 +541,15 @@ MUTANTS.update({
      "    files = list(dict(files).items())\n", ""),
 })
 
-# ---- 取回 MR 那個 commit 的 dbt 專案並接進預掃(#15 接線:dbt_context)
+# ---- 取回 MR 那個 commit 的 dbt 專案並接進預掃(dbt_context)
 MUTANTS.update({
  "專案準備:沒開 dbt 也取回": ("dbt_context.py",
      "    if not dbt_cfg or dbt_cfg.get(\"enabled\") is not True:", "    if not dbt_cfg:"),
  "專案準備:mock 模式也取回": ("dbt_context.py",
      "    if real_mode is not True:", "    if False:"),
  "專案準備:沒改到專案裡的 .sql 也取回": ("dbt_context.py",
-     "    if not isinstance(files, list) or not _needs_project(files, prefix):",
-     "    if not isinstance(files, list):"),
+     "    if not _needs_project(files, prefix, layout):\n        return None",
+     "    if False:\n        return None"),
  "專案準備:目錄前綴不含斜線(dbt_sub_other 誤判)": ("dbt_context.py",
      "    return path[len(prefix) + 1:] if path.startswith(prefix + \"/\") else None",
      "    return path[len(prefix) + 1:] if path.startswith(prefix) else None"),
@@ -478,8 +565,8 @@ MUTANTS.update({
      "                   and any(path.startswith(d + \"/\") for d in project.macro_paths)}",
      "                   }"),
  "專案準備:非預期例外回顯": ("dbt_context.py",
-     "_failed(prefix, f\"準備 dbt 專案時發生非預期錯誤({type(e).__name__})\")",
-     "_failed(prefix, f\"準備 dbt 專案時發生非預期錯誤({e})\")"),
+     "_failed(prefix, f\"準備 dbt 專案時發生非預期錯誤({type(e).__name__})\", layout)",
+     "_failed(prefix, f\"準備 dbt 專案時發生非預期錯誤({e})\", layout)"),
  "專案準備:不說根目錄設定檔已檢查(ref 找不到不敢判定)": ("dbt_context.py",
      "other_ref_names=extra, root_files_checked=True)",
      "other_ref_names=extra, root_files_checked=False)"),
@@ -517,11 +604,12 @@ MUTANTS.update({
      "        if not is_macro:"),
  "專案接線:review_mr 不取回專案": ("pipeline.py",
      "        dbt_ctx = prepare_dbt_context(mr, cfg.dbt)", "        dbt_ctx = None"),
- "專案接線:review_mr 沒把專案交給預掃": ("pipeline.py",
-     "        pre = await prescan(hub, mr[\"files\"], cfg.dbt, dbt_ctx)",
-     "        pre = await prescan(hub, mr[\"files\"], cfg.dbt)"),
- "專案接線:注入掃描不掃取回的完整內容": ("pipeline.py",
-     "injection_hits = scan_mr(_mr_with_head_text(mr, dbt_ctx))", "injection_hits = scan_mr(mr)"),
+ '專案接線:review_mr 沒把專案交給預掃': ('pipeline.py',
+     '        pre = await prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered)',
+     '        pre = await prescan(hub, mr["files"], cfg.dbt, None, rendered)'),
+ '專案接線:注入掃描不掃取回的完整內容': ('pipeline.py',
+     'injection_hits = scan_mr(_mr_with_head_text(mr, dbt_ctx, rendered))',
+     'injection_hits = scan_mr(_mr_with_head_text(mr, None, rendered))'),
  "專案接線:注入掃描只掃完整內容、漏掉原本的 diff": ("pipeline.py",
      "    return {**mr, \"files\": [*mr[\"files\"], *extra]} if extra else mr",
      "    return {**mr, \"files\": extra} if extra else mr"),
@@ -530,12 +618,13 @@ MUTANTS.update({
      "        project_dir = section.get(\"project_dir\", \"\")"),
 })
 
-# ---- MR 改到 macro 時檢查受影響的 model、dbt 的變更不可當成執行驗證通過(#15 接線 3/3)
+# ---- MR 改到 macro 時檢查受影響的 model、dbt 的變更不可當成執行驗證通過
 MUTANTS.update({
  "專案準備:macro 的判定不要求反查結果(不檢查也沒反查的空窗)": ("dbt_context.py",
      "and self.project is not None and self.impact is not None", "and self.project is not None"),
  "專案準備:只改到 model 也反查(多一次下載)": ("dbt_context.py",
-     "    if all(path_kind(rel, project.model_paths, project.macro_paths) == \"model\" for rel in changed):",
+     "    if all(path_kind(rel, project.model_paths, project.macro_paths, project.resource_paths) == \"model\"\n"
+     "           for rel in changed):",
      "    if False:"),
  "專案準備:不取變更前的專案(無從比較)": ("dbt_context.py",
      "    base = load(mr.get(\"base_sha\"), prefix) if impact.affected_models else None",
@@ -567,26 +656,25 @@ MUTANTS.update({
  "受影響:MR 自己改到的 model 重複檢查": ("dbt_affected.py",
      "    todo = sorted((m for m in impact.affected_models if m.path not in in_mr),",
      "    todo = sorted((m for m in impact.affected_models),"),
- "受影響:數量上限不生效": ("dbt_affected.py",
-     "        if index >= MAX_CHECKED_MODELS or clock() > deadline:",
-     "        if clock() > deadline:"),
- "受影響:時間上限不生效": ("dbt_affected.py",
-     "        if index >= MAX_CHECKED_MODELS or clock() > deadline:",
-     "        if index >= MAX_CHECKED_MODELS:"),
- "受影響:數量上限多檢查一個": ("dbt_affected.py",
-     "        if index >= MAX_CHECKED_MODELS or clock() > deadline:",
-     "        if index > MAX_CHECKED_MODELS or clock() > deadline:"),
- "受影響:查規格不受時間上限約束": ("dbt_affected.py",
-     "index < MAX_SPEC_LOOKUPS and clock() <= deadline", "index < MAX_SPEC_LOOKUPS"),
- "受影響:查規格不受數量上限約束": ("dbt_affected.py",
-     "index < MAX_SPEC_LOOKUPS and clock() <= deadline", "clock() <= deadline"),
+ '受影響:數量上限不生效': ('dbt_affected.py',
+     '        if index >= MAX_CHECKED_MODELS:\n            unchecked.append(model.path)',
+     '        if False:\n            unchecked.append(model.path)'),
+ '受影響:數量上限多檢查一個': ('dbt_affected.py',
+     '        if index >= MAX_CHECKED_MODELS:\n            unchecked.append(model.path)',
+     '        if index > MAX_CHECKED_MODELS:\n            unchecked.append(model.path)'),
+ '受影響:查規格不限時間(卡住就一直等)': ('dbt_affected.py',
+     '                spec = await _spec_for(hub, ctx, model.path, find_spec, specs,\n                                       deadline - clock())',
+     '                spec = await _spec_for(hub, ctx, model.path, find_spec, specs,\n                                       MAX_SECONDS)'),
+ '受影響:查規格不受數量上限約束': ('dbt_affected.py',
+     '        if index < MAX_SPEC_LOOKUPS and clock() < deadline:',
+     '        if clock() < deadline:'),
  "受影響:對到不同規格時挑一份": ("dbt_affected.py",
      "if len(codes) == 1 and not unchecked else None", "if len(codes) >= 1 and not unchecked else None"),
  "受影響:有 model 沒檢查到仍採用規格": ("dbt_affected.py",
      "if len(codes) == 1 and not unchecked else None", "if len(codes) == 1 else None"),
- "受影響:查規格不是依路徑": ("dbt_affected.py",
-     "\"files\": [{\"path\": repo_path}]}, by_path=True)",
-     "\"files\": [{\"path\": repo_path}]}, by_path=False)"),
+ '受影響:查規格不是依路徑': ('dbt_affected.py',
+     'lambda: find_spec(hub, target, by_path=True)',
+     'lambda: find_spec(hub, target, by_path=False)'),
  "受影響:查規格的路徑少了專案目錄": ("dbt_affected.py",
      "    repo_path = f\"{ctx.prefix}/{rel}\" if ctx.prefix else rel", "    repo_path = rel"),
  "受影響:查規格的例外往外丟": ("dbt_affected.py",
@@ -594,15 +682,18 @@ MUTANTS.update({
      "    except ZeroDivisionError:"),
  "受影響:規格沒有內容也算對到": ("dbt_affected.py",
      "    if not code or not text:", "    if not code:"),
- "受影響:只數規則個數、不比語句": ("dbt_affected.py",
-     "statement if isinstance(statement, str) else \"\")] += 1", "\"\")] += 1"),
- "受影響:不與變更前比較(原本就有的也重報)": ("dbt_affected.py",
-     "    new = head if base_error is not None else head - base", "    new = head"),
- "受影響:無法比較當成比較過(可能誤擋)": ("dbt_affected.py",
-     "    return hits, hints, base_error is not None, None", "    return hits, hints, False, None"),
- "受影響:變更後展開失敗當成沒事": ("dbt_affected.py",
-     "    if head_error is not None:\n        return (), (), False, head_error",
-     "    if head_error is not None:\n        return (), (), False, None"),
+ '受影響:只數規則個數、不比語句': ('dbt_affected.py',
+     '    elif head.statements is not None and head.statements == base.statements:',
+     '    elif False:'),
+ '受影響:不與變更前比較(原本就有的也重報)': ('dbt_affected.py',
+     '    if base_error is not None:\n        new = head.counts',
+     '    if True:\n        new = head.counts'),
+ '受影響:無法比較當成比較過(可能誤擋)': ('dbt_affected.py',
+     '            base_error is not None, None)',
+     '            False, None)'),
+ '受影響:變更後展開失敗當成沒事': ('dbt_affected.py',
+     '    if head_error is not None:\n        return (), False, head_error',
+     '    if head_error is not None:\n        return (), False, None'),
  "受影響:專案有同名 macro 仍採用展開結果": ("dbt_affected.py",
      "    if rendered.macro_conflicts:", "    if False:"),
  "受影響:展開後無法解析當成沒有命中": ("dbt_affected.py",
@@ -614,9 +705,9 @@ MUTANTS.update({
  "受影響:資料庫名稱不符仍展開": ("dbt_affected.py",
      "    if dbt_cfg.get(\"database\") != DBT_DATABASE_PLACEHOLDER:\n        return None, \"dbt 的資料庫名稱設定不符,無法展開\"",
      "    if False:\n        return None, \"dbt 的資料庫名稱設定不符,無法展開\""),
- "受影響:檢核點算成問題": ("dbt_affected.py",
-     "for rule, sev, _ in new.elements() if sev in _COMPARED))",
-     "for rule, sev, _ in new.elements()))"),
+ '受影響:檢核點算成問題': ('dbt_affected.py',
+     '            new_hits=tuple((rule, sev) for rule, sev, _ in new if sev in _COMPARED),',
+     '            new_hits=tuple((rule, sev) for rule, sev, _ in new),'),
  "受影響:沒有東西要說也補一條": ("dbt_affected.py",
      "            or check.models or check.unchecked):\n        return None",
      "            or check.models or check.unchecked):\n        pass"),
@@ -631,11 +722,12 @@ MUTANTS.update({
      "        if not m.certain:\n            raise_to(\"major\")", "        if not m.certain:\n            pass"),
  "受影響:展開失敗不提高嚴重度": ("dbt_affected.py",
      "            raise_to(\"major\")\n            broken.append(", "            broken.append("),
- "受影響:無法比較的 blocker 也擋下": ("dbt_affected.py",
-     "                raise_to(\"major\")\n                compared_blind.append(",
-     "                raise_to(worst)\n                compared_blind.append("),
- "受影響:多出的命中不提高嚴重度": ("dbt_affected.py",
-     "                raise_to(worst)\n                new.append(", "                new.append("),
+ '受影響:無法比較的 blocker 也擋下': ('dbt_affected.py',
+     '            raise_to("major" if m.no_baseline or worst == "blocker" else worst)',
+     '            raise_to("major" if worst == "blocker" else worst)'),
+ '受影響:多出的命中不提高嚴重度': ('dbt_affected.py',
+     '            raise_to("major" if m.no_baseline or worst == "blocker" else worst)',
+     '            pass'),
  "受影響:沒檢查到的 model 不提高嚴重度": ("dbt_affected.py",
      "    if check.unchecked:\n        raise_to(\"major\")", "    if check.unchecked:\n        pass"),
  "受影響:清單不截斷": ("dbt_affected.py",
@@ -706,22 +798,20 @@ MUTANTS.update({
      "\"severity\": \"major\", \"title\": _DBT_UNEXECUTED_TITLE,",
      "\"severity\": \"minor\", \"title\": _DBT_UNEXECUTED_TITLE,"),
  "專案準備:專案資訊整理失敗仍繼續(沒有專案資訊)": ("dbt_context.py",
-     "    if summary is None:\n        return _failed(prefix, \"dbt 專案的屬性檔解析逾時或失敗\")",
+     "    if summary is None:\n        return _failed(prefix, \"dbt 專案的屬性檔解析逾時或失敗\", project.layout)",
      "    if summary is None:\n        summary = (DbtProjectInfo(), {})"),
  "專案準備:專案資訊不在子行程裡整理": ("dbt_context.py",
-     "        return _prepare(mr, prefix, load, summarize or _summarize_isolated)",
-     "        return _prepare(mr, prefix, load, summarize or _summarize)"),
+     "        return _prepare(mr, prefix, load, summarize or _summarize_isolated, layout)",
+     "        return _prepare(mr, prefix, load, summarize or _summarize, layout)"),
  "專案準備:子行程回傳的形狀不檢查": ("dbt_context.py",
      "    if (isinstance(result, tuple) and len(result) == 2\n            and isinstance(result[0], DbtProjectInfo) and isinstance(result[1], dict)):",
      "    if result is not None:"),
- "專案準備:seed / snapshot 的表名當成確定": ("dbt_context.py",
-     "    if extra:\n", "    if False:\n"),
  "專案準備:變更前的專案資訊整理失敗仍拿來比較": ("dbt_context.py",
      "    base_summary = summarize(base) if isinstance(base, DbtProject) and base.ok else None",
      "    base_summary = (summarize(base) or (DbtProjectInfo(), {})) if isinstance(base, DbtProject) and base.ok else None"),
 })
 
-# ---- mock 模式的 dbt 專案來源(fixture 目錄;#15 接線)
+# ---- mock 模式的 dbt 專案來源(fixture 目錄)
 MUTANTS.update({
  "範例專案:fixture 有放專案也不用": ("dbt_context.py",
      "        if not isinstance(mr, dict) or _fixture_project_dir(mr.get(\"sha\")) is None:\n            return None",
@@ -798,8 +888,9 @@ MUTANTS.update({
  "yml:不解析樣板": (I, '        if "{{" in text or "{%" in text:' + NL + "            try:", "        if False:" + NL + "            try:"),
  "yml:解析失敗不標動態": (I, "                inner = self.scan(text, 1)" + NL + "            except (TemplateSyntaxError, RecursionError):" + NL + "                refs.dynamic = True",
                         "                inner = self.scan(text, 1)" + NL + "            except (TemplateSyntaxError, RecursionError):" + NL + "                pass"),
- "yml:動態不列入": (I, "                if is_dynamic(refs):" + NL + '                    dynamic_scopes.append(("yml", path))',
-                  "                if False:" + NL + '                    dynamic_scopes.append(("yml", path))'),
+ 'yml:動態不列入': ('dbt_impact.py',
+     '            if is_dynamic(refs):\n                dynamic_scopes.append((kind, path))',
+     '            if False:\n                dynamic_scopes.append((kind, path))'),
  "yml:動態範圍不套用": (I, "        self._apply_hits((), dynamic_ymls, certain=False)", "        pass"),
  "context['x']() 一律動態": (I, "        return False                    # context['x'](...)", "        return True                    # context['x'](...)"),
  "變更前總量不擋(再驗)": (I, '                raise _LimitExceeded(f"變更前的檔案合計超過 {MAX_TOTAL_CHARS} 字元")', "                pass"),
@@ -1415,8 +1506,8 @@ MUTANTS.update({
      '        if "{" in p or "}" in p:',
      "        if False:"),
  "專案:目錄數量不設上限": ("dbt_project.py",
-     "    if not isinstance(value, list) or not value or len(value) > MAX_PATHS:",
-     "    if not isinstance(value, list) or not value:"),
+     "    if not isinstance(value, list) or (not value and not allow_empty) or len(value) > MAX_PATHS:",
+     "    if not isinstance(value, list) or (not value and not allow_empty):"),
  "專案:source-paths 不支援": ("dbt_project.py",
      '    model_key = "model-paths" if "model-paths" in raw else "source-paths"',
      '    model_key = "model-paths"'),
@@ -1551,22 +1642,15 @@ MUTANTS.update({
  "MR反查:不比對 base 判斷新增": ("dbt_mr_impact.py",
      "    added = [p for p in paths if p in head_files and p not in base_files] if same_layout else []",
      "    added = []"),
- "MR反查:額外理由不標全部受影響": ("dbt_mr_impact.py",
-     "            all_models_possibly_affected=True)\n    if report.changed_macro_files",
-     "            all_models_possibly_affected=report.all_models_possibly_affected)\n"
-     "    if report.changed_macro_files"),
+ 'MR反查:額外理由不標全部受影響': ('dbt_mr_impact.py',
+     '            all_models_possibly_affected=True)\n    return report',
+     '            all_models_possibly_affected=report.all_models_possibly_affected)\n    return report'),
  "MR反查:反查看不到 dbt_project.yml 的 hook": ("dbt_mr_impact.py",
      '    if "dbt_project.yml" in project.root_files:',
      "    if False:"),
  "MR反查:snapshot / seed 的內容也交給反查": ("dbt_mr_impact.py",
      "    files = {p: c for p, c in project.files.items() if _in_dirs(p, dirs)}",
      "    files = dict(project.files)"),
- "MR反查:有 snapshot 也不標不確定": ("dbt_mr_impact.py",
-     "    if report.changed_macro_files and any(_in_dirs(p, head.snapshot_paths) for p in head.names):",
-     "    if False:"),
- "MR反查:沒改 macro 也因 snapshot 標不確定": ("dbt_mr_impact.py",
-     "    if report.changed_macro_files and any(_in_dirs(p, head.snapshot_paths) for p in head.names):",
-     "    if any(_in_dirs(p, head.snapshot_paths) for p in head.names):"),
  "MR反查:反查回傳值不檢查": ("dbt_mr_impact.py",
      "    if not isinstance(report, ImpactReport):\n        raise _Fail(",
      "    if False:\n        raise _Fail("),
@@ -1602,6 +1686,36 @@ MUTANTS.update({
  "diff_refs:少帶 start_sha": ("../toolbox/gitlab.py",
      '_DIFF_REF_KEYS = ("base_sha", "head_sha", "start_sha")',
      '_DIFF_REF_KEYS = ("base_sha", "head_sha")'),
+})
+
+# ---- R005 讀取執行環境(#26 第 7 項):規則層命中後,模型一定看得到 secure-sql 的說明
+MUTANTS.update({
+ "R005:命中時不強制載入 secure-sql": ("pipeline.py",
+     '_SECURE_SQL_RULES = ("R004", "R005", "H004")',
+     '_SECURE_SQL_RULES = ("R004", "H004")'),
+ "R005:強制載入的判斷寫死成不載": ("pipeline.py",
+     "        if \"secure-sql\" in skills and _needs_secure_sql(pre):",
+     "        if False:"),
+ # 以下四項是 #27 review 補齊的,各自對應一個真實的漏抓:
+ # 三段式名稱(master.sys.databases)、系統目錄只列幾個名字、夾在函式名與括號之間
+ # 的註解、不帶括號的身分函式。
+ "R005:系統目錄的 lookbehind 連點一起排除(三段式名稱漏抓)": ("../toolbox/sqltools.py",
+     r'r"(?i)(?<!\w)\[?sys\]?" + _GAP',
+     r'r"(?i)(?<![\w.])\[?sys\]?" + _GAP'),
+ "R005:系統目錄只認列舉的那幾個名字": ("../toolbox/sqltools.py",
+     r'+ _GAP + r"\." + _GAP + r"\[?\w+\]?"',
+     r'+ _GAP + r"\." + _GAP + r"\[?(databases|objects|tables)\]?"'),
+ "R005:函式名與括號之間只容許空白(夾註解就漏抓)": ("../toolbox/sqltools.py",
+     r'_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/))*\*/|--[^\n]*\n)*"',
+     r'_GAP = r"\s*"'),
+ "R005:不抓不帶括號的身分函式": ("../toolbox/sqltools.py",
+     r'(SYSTEM_USER|CURRENT_USER|SESSION_USER)\b"',
+     r'(SYSTEM_USER)\b"'),
+ # review 的小建議:「沙盒」範圍太廣,同一個檔案裡其他 major 提到沙盒就會讓 R005
+ # 被當成已經報過。
+ "R005:已報判定關鍵詞含「沙盒」(範圍過廣)": ("pipeline.py",
+     '"R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys."],',
+     '"R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys.", "沙盒"],'),
 })
 
 # ---- 確定性防線不能被模型關掉(#16 review):程式專用標題、規則命中不可被降級
@@ -1684,6 +1798,155 @@ MUTANTS.update({
      "        report = enforce_rules(report, pre)    # rule-base 命中不因模型省略而消失\n"
      "        report = enforce_parse(report, pre)    # 預掃解析失敗 = 確定性規則沒跑,必須看得見\n"
      "        report = enforce_hints(report, pre)\n"),
+})
+
+
+# ---- 依專案的目錄設定判斷 dbt 檔、snapshot 反查、逐句比較與時間上限、展開後的注入掃描
+MUTANTS.update({
+ 'dbt範圍:目錄設定不生效(專案目錄裡的檔案都算)': ('dbt_project.py',
+     '        return rel in LAYOUT_ROOT_FILES or _under(rel, self.dirs)',
+     '        return True'),
+ 'dbt範圍:selectors.yml 不算 dbt 的檔案': ('dbt_project.py',
+     'LAYOUT_ROOT_FILES = ROOT_FILES + ("selectors.yml",)',
+     'LAYOUT_ROOT_FILES = ROOT_FILES'),
+ 'dbt範圍:analyses / tests 不取回': ('dbt_project.py',
+     'for p in analysis_paths + test_paths +\n',
+     'for p in\n'),
+ 'dbt範圍:不讀 test-paths': ('dbt_project.py',
+     '            _path_list(raw, "test-paths", DEFAULT_TEST_PATHS, allow_empty=True),',
+     '            DEFAULT_TEST_PATHS,'),
+ 'dbt範圍:context 不依目錄設定判斷': ('dbt_context.py',
+     '        if rel is None or (self.layout is not None and not self.layout.contains(rel)):',
+     '        if rel is None:'),
+ 'dbt範圍:不先讀設定檔(只改 dbt 以外的檔也下載整個專案)': ('dbt_context.py',
+     '    if not _needs_project(files, prefix, layout):\n        return None',
+     '    if not _needs_project(files, prefix):\n        return None'),
+ 'dbt範圍:讀不到設定檔就當成沒有 dbt 專案': ('dbt_context.py',
+     '    except Exception:                       # noqa: BLE001 — 讀不到就退回原本的判斷\n        return None, False',
+     '    except Exception:                       # noqa: BLE001 — 讀不到就退回原本的判斷\n        return None, True'),
+ 'dbt範圍:沒有 dbt_project.yml 靜靜變成不適用': ('dbt_context.py',
+     '        return _failed(prefix, "head commit 讀不到 dbt_project.yml(專案目錄設定錯誤,或唯讀 token 看不到這個專案)")',
+     '        return None'),
+ 'dbt範圍:不合法的路徑當成不在專案裡': ('dbt_context.py',
+     '                found.append(_INVALID_PATH)\n                continue',
+     '                continue'),
+ 'dbt範圍:context 的專案資訊不帶目錄設定': ('dbt_context.py',
+     '    ctx = DbtContext(prefix=prefix, project=project, info=info, macro_files=macro_files,\n                     layout=project.layout)',
+     '    ctx = DbtContext(prefix=prefix, project=project, info=info, macro_files=macro_files)'),
+ 'dbt範圍:狀態不完整不補失敗原因': ('dbt_context.py',
+     '            object.__setattr__(self, "error", "dbt 專案的狀態不完整(沒有內容,也沒有失敗原因)")',
+     '            pass'),
+ 'dbt範圍:反查不過濾 dbt 以外的檔案': ('dbt_mr_impact.py',
+     '    changed = {p for p in changed if head.layout.contains(p) or base.layout.contains(p)}',
+     '    changed = set(changed)'),
+ '下載:讀單一檔案 404 也丟例外': ('../toolbox/gitlab.py',
+     '            if r.status_code == 404:\n                return None',
+     '            if False:\n                return None'),
+ '下載:讀單一檔案不檢查路徑': ('../toolbox/gitlab.py',
+     '    if not isinstance(path, str) or not _ARCHIVE_PATH.fullmatch(path) or any(',
+     '    if not isinstance(path, str) or any('),
+ '下載:讀單一檔案不檢查 commit 編號': ('../toolbox/gitlab.py',
+     '    if not (isinstance(sha, str) and _SHA.fullmatch(sha)):',
+     '    if not isinstance(sha, str):'),
+ '下載:讀單一檔案不檢查唯讀 token': ('../toolbox/gitlab.py',
+     '    _check_read_access("讀取檔案")',
+     '    pass'),
+ '範例專案:符號連結靜默跳過': ('dbt_context.py',
+     '    members = sorted(p for p in root.rglob("*") if p.is_file() or p.is_symlink())',
+     '    members = sorted(p for p in root.rglob("*") if p.is_file() and not p.is_symlink())'),
+ '範例專案:多層目錄的頂層名稱含斜線': ('dbt_context.py',
+     '(f"-{path.replace(\'/\', \'-\')}" if path else "")',
+     '(f"-{path}" if path else "")'),
+ '專案接線:注入掃描遇到非物件的項目就中斷': ('pipeline.py',
+     'if isinstance(f, dict) and (text := dbt_ctx.head_text(f.get("path"))) is not None]',
+     'if (text := dbt_ctx.head_text(f.get("path"))) is not None]'),
+ '專案接線:注入掃描不掃展開後的 SQL': ('pipeline.py',
+     'injection_hits = scan_mr(_mr_with_head_text(mr, dbt_ctx, rendered))',
+     'injection_hits = scan_mr(_mr_with_head_text(mr, dbt_ctx))'),
+ '專案接線:預掃不收集展開後的 SQL': ('pipeline.py',
+     '            elif rendered is not None:\n                rendered.append(',
+     '            elif False:\n                rendered.append('),
+ '受影響:推論出來的 blocker 照樣擋下': ('dbt_affected.py',
+     '            raise_to("major" if m.no_baseline or worst == "blocker" else worst)',
+     '            raise_to("major" if m.no_baseline else worst)'),
+ '受影響:語句數量不同仍逐句比': ('dbt_affected.py',
+     '    elif head.statements is not None and head.statements == base.statements:',
+     '    elif head.statements is not None:'),
+ '受影響:展開不傳剩下的時間': ('dbt_affected.py',
+     '                      timeout_s=min(DEFAULT_ISOLATED_TIMEOUT_S, seconds))',
+     '                      timeout_s=DEFAULT_ISOLATED_TIMEOUT_S)'),
+ '受影響:時間用完仍開始展開': ('dbt_affected.py',
+     '    if seconds <= 0:\n        raise _OutOfTime',
+     '    if False:\n        raise _OutOfTime'),
+ '受影響:展開被時間截斷當成展開失敗': ('dbt_affected.py',
+     '        if clock() >= deadline:\n            raise _OutOfTime',
+     '        if False:\n            raise _OutOfTime'),
+ '受影響:沒查規格的不列出、不升級': ('dbt_affected.py',
+     '    if not_looked:\n        raise_to("major")',
+     '    if False:\n        raise_to("major")'),
+ '受影響:沒查規格只列出、不升級': ('dbt_affected.py',
+     '    if not_looked:\n        raise_to("major")',
+     '    if not_looked:\n        pass'),
+ '受影響:展開失敗的清單又截斷': ('dbt_affected.py',
+     '"**變更後展開失敗或無法解析**:" + "、".join(broken)',
+     '"**變更後展開失敗或無法解析**:" + _listed(broken)'),
+ '受影響:多出的命中清單又截斷': ('dbt_affected.py',
+     '"**變更後多出的規則命中**:" + "、".join(new)',
+     '"**變更後多出的規則命中**:" + _listed(new)'),
+ '受影響:命中不寫第幾句': ('dbt_affected.py',
+     '        if known:\n            text +=',
+     '        if False:\n            text +='),
+ '受影響:查規格用預設的執行緒池(審查結束時被卡住的那條拖住)': ('dbt_affected.py',
+     '        code, text = await _wait_in_thread(lambda: find_spec(hub, target, by_path=True), seconds)',
+     '        code, text = await asyncio.wait_for(\n            asyncio.to_thread(asyncio.run, find_spec(hub, target, by_path=True)), seconds)'),
+ 'snapshot:呼叫被改的 macro 不標不確定': ('dbt_impact.py',
+     '        for path, chain in snapshot_hits:\n            self.uncertain.append(',
+     '        for path, chain in []:\n            self.uncertain.append('),
+ 'snapshot:看不懂的 snapshot 不標不確定': ('dbt_impact.py',
+     '        for path in self.unparsable_snapshots:\n            self.uncertain.append(',
+     '        for path in []:\n            self.uncertain.append('),
+ 'snapshot:不追 snapshot 的呼叫': ('dbt_impact.py',
+     '                callers_of.setdefault(target, set()).add(("snapshot", path))',
+     '                pass'),
+ 'snapshot:轉接層不給 snapshot 的內容': ('dbt_mr_impact.py',
+     '    dirs = project.model_paths + project.macro_paths + project.snapshot_paths',
+     '    dirs = project.model_paths + project.macro_paths'),
+ 'snapshot:自訂目錄的 snapshot 當成目錄外的 .sql': ('dbt_impact.py',
+     '        if path.endswith(".sql") and _in_dirs(path, self.snapshot_dirs):\n            return "snapshot"',
+     '        if False:\n            return "snapshot"'),
+ '受影響:相同的兩句命中都對到第一句': ('dbt_affected.py',
+     '                          if keys[i] == statement and (hit["rule"], i) not in taken), None)',
+     '                          if keys[i] == statement), None)'),
+ '專案:analysis / test 目錄不允許空清單': ('dbt_project.py',
+     '            _path_list(raw, "test-paths", DEFAULT_TEST_PATHS, allow_empty=True),',
+     '            _path_list(raw, "test-paths", DEFAULT_TEST_PATHS),'),
+ 'snapshot:snapshot 的屬性檔不追': ('dbt_impact.py',
+     '            if _in_dirs(path, self.snapshot_dirs):\n                kind = "snapshot"',
+     '            if False:\n                kind = "snapshot"'),
+ 'dbt範圍:資源目錄仍看預設名稱': ('dbt_impact.py',
+     '        in_resource = _in_dirs(path, resource_dirs)',
+     '        in_resource = path.split("/", 1)[0] in _RESOURCE_DIRS'),
+ 'dbt範圍:path_kind 不用資源目錄設定': ('dbt_impact.py',
+     '    return _kind(path, model_dirs, macro_dirs, resource_dirs)',
+     '    return _kind(path, model_dirs, macro_dirs)'),
+ 'dbt範圍:反查分類不用資源目錄設定': ('dbt_impact.py',
+     '        return _kind(path, self.model_dirs, self.macro_dirs, self.resource_dirs)',
+     '        return _kind(path, self.model_dirs, self.macro_dirs)'),
+ 'dbt範圍:資源目錄設定不檢查': ('dbt_impact.py',
+     '            if None in resource_dirs or "" in resource_dirs:',
+     '            if False:'),
+ 'dbt範圍:反查不給資源目錄設定': ('dbt_mr_impact.py',
+     '                     snapshot_dirs=head.snapshot_paths, resource_dirs=head.resource_paths)',
+     '                     snapshot_dirs=head.snapshot_paths)'),
+ 'dbt範圍:資源目錄漏了 test': ('dbt_project.py',
+     '        return self.seed_paths + self.snapshot_paths + self.analysis_paths + self.test_paths',
+     '        return self.seed_paths + self.snapshot_paths + self.analysis_paths'),
+ 'dbt範圍:判斷 macro 不用資源目錄設定': ('dbt_context.py',
+     '                and path_kind(rel, self.project.model_paths, self.project.macro_paths,\n                              self.project.resource_paths) == "macro")',
+     '                and path_kind(rel, self.project.model_paths, self.project.macro_paths) == "macro")'),
+ 'dbt範圍:只改 model 的判斷不用資源目錄設定': ('dbt_context.py',
+     '    if all(path_kind(rel, project.model_paths, project.macro_paths, project.resource_paths) == "model"',
+     '    if all(path_kind(rel, project.model_paths, project.macro_paths) == "model"'),
 })
 
 
@@ -1776,8 +2039,9 @@ def _effective_timeout(requested: int, baseline_seconds: float) -> int:
 def _run_mutant(src: pathlib.Path, mutant, python: str, timeout: int, env: dict):
     """在快照的複本上套用一個突變並跑測試套件。回傳 (判定, 說明)。
 
-    判定:"config"(突變點不是剛好出現一次)、"survived"(套件全過)、
-    "caught"(套件失敗或卡住逾時)。
+    判定:"config"(突變點不是剛好出現一次)、"survived"(套件全過)、"caught"(有測試失敗)、
+    "timeout"(套件卡住逾時)、"error"(匯入或收集錯誤)。後兩種**不算抓到**:逾時可能只是
+    機器慢,收集錯誤代表測試根本沒跑到,都不能證明測試守著這道防線,要另外列出來看。
     """
     module, old, new = mutant
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="sgc_mut_"))
@@ -1800,16 +2064,26 @@ def _run_mutant(src: pathlib.Path, mutant, python: str, timeout: int, env: dict)
                                   cwd=tmp, capture_output=True, text=True, env=env,
                                   encoding="utf-8", errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired:
-            return "caught", f"測試套件卡住超過 {timeout} 秒"
-        lines = proc.stdout.splitlines()
-        if proc.returncode == 0:
-            summary = next((l for l in reversed(lines)
-                            if "passed" in l or "failed" in l or "error" in l), proc.stdout[-160:])
-            return "survived", summary
-        first = next((l for l in lines if l.startswith(("FAILED", "ERROR"))), "")
-        return "caught", first.split(" - ")[0][:110]
+            return "timeout", f"測試套件卡住超過 {timeout} 秒"
+        return _verdict(proc.returncode, proc.stdout)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _verdict(returncode: int, stdout: str) -> tuple[str, str]:
+    """pytest 的結果 → (判定, 說明)。回傳碼 1 才是「有測試失敗」;收集錯誤(ERROR collecting)、
+    中斷或用法錯誤(2–5)都不算抓到。"""
+    lines = stdout.splitlines()
+    if returncode == 0:
+        summary = next((l for l in reversed(lines)
+                        if "passed" in l or "failed" in l or "error" in l), stdout[-160:])
+        return "survived", summary
+    if returncode != 1 or any(l.startswith("ERROR collecting") for l in lines):
+        first = next((l for l in lines if l.startswith("ERROR")), lines[-1] if lines else "")
+        return "error", f"回傳碼 {returncode}:{first[:110]}"
+    first = next((l for l in lines if l.startswith(("FAILED", "ERROR"))), "")
+    return "caught", first.split(" - ")[0][:110]
+
 
 
 def main() -> int:
@@ -1865,7 +2139,7 @@ def _mutate_all(args, src: pathlib.Path) -> int:
               "結果不可信,不繼續執行。", flush=True)
         return 1
 
-    survived, config_errors = [], []
+    survived, config_errors, timeouts, errors = [], [], [], []
     for label, entry in selected.items():
         mutant = entry if len(entry) == 3 else ("dbt_render.py", *entry)
         verdict, detail = _run_mutant(src, mutant, args.python, timeout, env)
@@ -1875,15 +2149,23 @@ def _mutate_all(args, src: pathlib.Path) -> int:
         elif verdict == "survived":
             print(f"[存活 ✗] {label}:{detail}", flush=True)
             survived.append(label)
+        elif verdict == "timeout":
+            print(f"[逾時 ?] {label}:{detail}", flush=True)
+            timeouts.append(label)
+        elif verdict == "error":
+            print(f"[收集錯誤 ?] {label}:{detail}", flush=True)
+            errors.append(label)
         else:
             print(f"[被抓 ✓] {label}:{detail}", flush=True)
     print()
-    print(f"共 {len(selected)} 個突變;存活 {len(survived)};設定錯誤 {len(config_errors)}")
-    if survived:
-        print("存活:", survived)
-    if config_errors:
-        print("設定錯誤:", config_errors)
-    return 1 if survived or config_errors else 0
+    caught = len(selected) - len(survived) - len(config_errors) - len(timeouts) - len(errors)
+    print(f"共 {len(selected)} 個突變;抓到 {caught};存活 {len(survived)};逾時 {len(timeouts)};"
+          f"收集錯誤 {len(errors)};設定錯誤 {len(config_errors)}")
+    for name, items in (("存活", survived), ("逾時(不算抓到)", timeouts),
+                        ("收集錯誤(不算抓到)", errors), ("設定錯誤", config_errors)):
+        if items:
+            print(f"{name}:", items)
+    return 1 if survived or config_errors or timeouts or errors else 0
 
 
 # ---- MR 改到規格檔(#38 第 3 點):規格的 diff 另外放、固定補 finding、不得自動放行
