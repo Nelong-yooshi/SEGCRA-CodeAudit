@@ -4,15 +4,17 @@
 dbt 專案都以 load_dbt_project() 取回,再交給 analyze_macro_impact_isolated():
 
   * 路徑換算:變更清單是相對 repo 根目錄,反查要相對 dbt 專案根目錄;專案目錄外的變更
-    與 dbt 無關,不列入
+    與 dbt 無關,不列入。專案目錄裡、但不在 dbt 會讀的目錄(dbt_project.yml 的 model-paths
+    等)也不是根目錄設定檔的檔案,也不列入:專案就在 repo 根目錄時,CI 設定、一般的 SQL 檔
+    不是 dbt 的檔案
   * 新增 / 刪除 / 改名:GitLab 的變更清單只有新舊路徑,不另外判斷——拿 head 與 base
     兩個專案比對:head 有、base 沒有 = 新增;改名與刪除則把舊路徑一併列為變更
   * 專案根目錄的設定檔(dbt_project.yml、packages.yml、dependencies.yml)被改:dispatch
     設定、變數、套件版本都可能改變 macro 的行為,無法逐一判斷 → 全部 model 可能受影響
   * head 與 base 的 model / macro 目錄設定不同:兩邊的檔案對不起來 → 不提供變更前內容
     (反查會標為不確定),並且全部 model 可能受影響
-  * 反查拿到 model / macro 目錄的內容與 dbt_project.yml(hook 可能呼叫被改的 macro)
-  * 反查只追 model:有 macro 變更、而專案有 snapshot 時,另外標為不確定(交人工)
+  * 反查拿到 model / macro / snapshot 目錄的內容與 dbt_project.yml(hook 可能呼叫被改的 macro)。
+    snapshot 呼叫到被改的 macro(直接或間接)時標為不確定(交人工);沒有呼叫的不受影響
 
 **任何一步失敗都收斂成「全部 model 可能受影響」**(needs_human),絕不回傳
 「沒有影響」(#15 條件 7)。本模組不連網(下載由 load 負責)、不寫檔、不渲染樣板。
@@ -66,6 +68,11 @@ def _analyze(mr_diff, base_sha, project_dir, load, analyze) -> ImpactReport:
         if not project.ok:
             raise _Fail(f"無法取回{label}的 dbt 專案({project.error})")
 
+    # 只留 dbt 會讀的檔案(變更前或變更後的目錄設定裡有它就算,改名時舊路徑看變更前的)
+    changed = {p for p in changed if head.layout.contains(p) or base.layout.contains(p)}
+    if not changed:
+        return ImpactReport()
+
     reasons = []
     root_changed = sorted(changed & set(ROOT_FILES))
     if root_changed:
@@ -82,27 +89,22 @@ def _analyze(mr_diff, base_sha, project_dir, load, analyze) -> ImpactReport:
     report = analyze(head_files, paths,
                      base_files=base_files if same_layout else None,
                      added_paths=added,
-                     model_dirs=head.model_paths, macro_dirs=head.macro_paths)
+                     model_dirs=head.model_paths, macro_dirs=head.macro_paths,
+                     snapshot_dirs=head.snapshot_paths, resource_dirs=head.resource_paths)
     if not isinstance(report, ImpactReport):
         raise _Fail("反查回傳了非預期的資料")
     if reasons:
         report = dataclasses.replace(
             report, uncertain=report.uncertain + tuple(_clip(r) for r in reasons),
             all_models_possibly_affected=True)
-    if report.changed_macro_files and any(_in_dirs(p, head.snapshot_paths) for p in head.names):
-        # 反查只追 model:snapshot 呼叫了被改的 macro 時看不出來。不能說「沒有影響」→ 交人工
-        # (不標「全部 model 可能受影響」:受影響的可能是 snapshot,不是 model)
-        report = dataclasses.replace(
-            report, uncertain=report.uncertain + (
-                "macro 有變更,但專案有 snapshot,反查只追 model,snapshot 是否受影響未分析",))
     return report
 
 
 def _for_analysis(project) -> dict[str, str]:
-    """交給反查的檔案:model / macro 目錄的內容,加上 dbt_project.yml(反查要看裡面的 hook
-    有沒有呼叫被改的 macro——有的話全部 model 都受影響)。snapshot / seed 目錄的內容不給:
-    反查不追它們,給了只會被當成目錄外的檔案。"""
-    dirs = project.model_paths + project.macro_paths
+    """交給反查的檔案:model / macro / snapshot 目錄的內容,加上 dbt_project.yml(反查要看裡面的
+    hook 有沒有呼叫被改的 macro——有的話全部 model 都受影響)。seed 目錄的內容不給:反查不追它,
+    給了只會被當成目錄外的檔案。"""
+    dirs = project.model_paths + project.macro_paths + project.snapshot_paths
     files = {p: c for p, c in project.files.items() if _in_dirs(p, dirs)}
     if "dbt_project.yml" in project.root_files:
         files["dbt_project.yml"] = project.root_files["dbt_project.yml"]

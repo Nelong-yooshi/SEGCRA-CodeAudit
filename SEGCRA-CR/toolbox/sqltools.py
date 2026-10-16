@@ -149,6 +149,52 @@ _MASKED_KEY_RE = re.compile(
     r"(?i)(SUBSTRING|SUBSTR|LEFT|RIGHT|MASK|REGEXP_REPLACE|OVERLAY|CONCAT)\s*\("
     r".{0,160}?\b(account_id|acct_id|account_no|acct_no)\b"
     r".{0,160}?\bAS\s+(account_id|acct_id|account_no)\b")
+# R005:讀取執行環境(資料庫名、主機、登入身分、系統表)。規則程式不需要知道自己跑在
+# 哪裡;會讀的話,就能在沙盒裡照規格跑、到正式環境才做別的事(例如
+# `AND DB_NAME() NOT LIKE 'segcra%'`)——執行驗證反而會通過,規則層與沙盒都擋不住。
+# 刻意**不排除註解裡的寫法**:去註解的 regex 會被字串裡的 `--` 騙(`'--' AND DB_NAME()`
+# 會連真正會執行的呼叫一起被當成註解去掉);寫在註解裡的誤報只是多一次人工確認。
+# 函式名與括號之間可以夾空白**或註解**:`DB_NAME/**/()` 在 T-SQL 是合法的,
+# 只容許空白就漏掉了(#27 review)。`--` 到行尾的註解同理。
+_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/))*\*/|--[^\n]*\n)*"
+# 需要括號的環境函式。分三類只是為了讀起來分得清,比對時三條都跑。
+_ENV_FUNC_RE = re.compile(
+    r"(?i)(?<![\w.@\[])("
+    # 資料庫 / 連線資訊
+    r"DB_NAME|DB_ID|ORIGINAL_DB_NAME|DATABASEPROPERTYEX|SESSION_CONTEXT|CONTEXT_INFO"
+    r"|CONNECTIONPROPERTY"
+    # 主機 / 伺服器
+    r"|HOST_NAME|HOST_ID|SERVERPROPERTY|APP_NAME"
+    # 登入身分 / 權限
+    r"|SUSER_NAME|SUSER_SNAME|SUSER_ID|SUSER_SID|ORIGINAL_LOGIN|USER_NAME|USER_ID"
+    r"|IS_MEMBER|IS_SRVROLEMEMBER|IS_ROLEMEMBER|HAS_PERMS_BY_NAME"
+    r")" + _GAP + r"\(")
+# 不帶括號的(niladic)環境函式與全域變數。這類沒有 `(` 可以當界線,所以兩邊都要
+# 卡字界:`CURRENT_USER_ID` 這種欄位名不會命中(底線是 word char,\b 不成立)。
+_ENV_VAR_RE = re.compile(r"(?i)@@(SERVERNAME|SERVICENAME|VERSION|SPID)\b"
+                         r"|(?<![\w.@\[])(SYSTEM_USER|CURRENT_USER|SESSION_USER)\b")
+# 系統目錄。`sys.` 開頭**一律**算:只列幾個名字會漏掉 sys.server_principals、
+# sys.configurations、sys.all_objects…(#27 review)。
+#
+# 前面的 lookbehind 只排除 word char(`mysys.objects` 不算),**不排除點**——
+# 原本寫 (?<![\w.]) 把 `master.sys.databases` 這種三段式名稱排除掉了,
+# 而 `[master].[sys].[databases]` 反而抓得到,行為不一致(#27 review 指出的 bug)。
+_ENV_CATALOG_RE = re.compile(
+    r"(?i)(?<!\w)\[?sys\]?" + _GAP + r"\." + _GAP + r"\[?\w+\]?"
+    # 舊式的系統表名(master..sysdatabases、master.dbo.sysobjects),沒有 sys. 前綴
+    r"|(?<!\w)\[?sys(databases|objects|columns|users|logins|processes|servers|indexes)\]?(?!\w)"
+    r"|(?<!\w)\[?INFORMATION_SCHEMA\]?" + _GAP + r"\.")
+
+
+def _env_probes(sql: str) -> list[str]:
+    """回傳 SQL 裡讀取執行環境的寫法(去重、保留出現順序)。"""
+    found = []
+    for rx in (_ENV_FUNC_RE, _ENV_VAR_RE, _ENV_CATALOG_RE):
+        for m in rx.finditer(sql):
+            token = " ".join(m.group(0).split()).rstrip("(").strip()
+            if token.upper() not in (t.upper() for t in found):
+                found.append(token)
+    return found
 
 
 def _text_rules(sql: str):
@@ -164,6 +210,12 @@ def _text_rules(sql: str):
     elif _CRED_COL_RE.search(sql):
         hits.append(("H004", "hint",
                      "查詢選取了憑證/密碼/卡號類敏感欄位:請確認此存取的正當性與最小必要"))
+    probes = _env_probes(sql)
+    if probes:
+        hits.append(("R005", "major",
+                     f"規則 SQL 讀取執行環境:{'、'.join(probes[:5])}——規則不需要知道自己跑在"
+                     f"哪個資料庫/主機/身分下;讀取環境的寫法可以讓規則在執行驗證的沙盒裡照規格跑、"
+                     f"到正式環境才做別的事,執行驗證會因此通過。請移除,或說明正當用途"))
     if _MASKED_KEY_RE.search(sql):
         hits.append(("H005", "hint",
                      "輸出的 account_id/主鍵疑似被遮罩:若規格要求明碼輸出(供下游部門"
@@ -193,7 +245,7 @@ def run_rules(sql: str) -> str:
             if msg:
                 hits.append({"rule": code, "severity": severity, "message": msg,
                              "statement": st.sql(dialect=DIALECT)[:200]})
-    # 文字層資安規則(R004 hardcode 憑證、H004 異常查詢)
+    # 文字層資安規則(R004 hardcode 憑證、R005 讀取執行環境、H004 異常查詢)
     for code, severity, msg in _text_rules(sql):
         hits.append({"rule": code, "severity": severity, "message": msg,
                      "statement": ""})
