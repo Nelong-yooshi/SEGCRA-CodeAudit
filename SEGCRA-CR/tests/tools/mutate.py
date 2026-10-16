@@ -1542,8 +1542,26 @@ MUTANTS.update({
         "                actual_conds = _eval_conditions(c, conds) if conds else None",
         "                actual_conds = _eval_conditions(c, conds)"),
     "測資:標籤不符不列入覆蓋缺口": (S,
-        "        if r.get(\"label_ok\") is False:",
-        "        if False:"),
+        "        if r.get(\"label_ok\") is not False:" + NL + "            continue",
+        "        if True:" + NL + "            continue"),
+    # 「其他分支整個成立」原本只寫在 prompt 裡靠模型遵守,實測造成 5 個預期錯誤
+    # (變體往上跨一格落進相鄰分支的區間)。改成用 check_sql 直接算。
+    "測資:不驗其他分支有沒有整個成立": (S,
+        "                if case.get(\"kind\") in (\"base\", \"variant\"):" + NL
+        + "                    others = _other_branch_satisfied(",
+        "                if False:" + NL
+        + "                    others = _other_branch_satisfied("),
+    "測資:其他分支整個成立時不算有效驗證": (S,
+        "                        r[\"label_ok\"] = False" + NL
+        + "                        r.setdefault(\"label_mismatch\", []).extend(",
+        "                        r[\"label_ok\"] = True" + NL
+        + "                        r.setdefault(\"label_mismatch\", []).extend("),
+    # 算不出來的條件(沒有 check_sql → None)不可以當成「成立」:那會把沒驗到的
+    # 說成驗過了。原本另外寫了一道 None 的守衛,但 `is True` 本來就排除 None,
+    # 守衛是死碼(突變它屬於等價突變、抓不到),所以拿掉守衛、改突變這個判斷。
+    "測資:算不出來的條件當成成立": (S,
+        "        if ids and all(actual.get(i) is True for i in ids):",
+        "        if ids and all(actual.get(i) is not False for i in ids):"),
     # #23 第 2 點的實際可用性:沒有這三道,補缺模式對大規則完全不會啟動——
     # 第一次就截斷 → 沒有計畫 → 永遠進不去補缺。實測 RETAIL_M1_EVAL 在正式設定下
     # 就是 3/3 次截斷、0 個案例。

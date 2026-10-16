@@ -226,9 +226,30 @@ def testgen_system() -> str:
 # 判斷式的形狀,而不是變成另一個可以執行任意語句的入口。沙盒本身的權限收斂
 # (目前用 sa、容器可對外連線)是 #26 第 2 點的工作,兩者互補。
 _CHECK_SQL_MAX = 600
+# `xp_`/`sp_` 是**前綴**,不是完整的字:寫成 `\bxp_\b` 時結尾的 \b 要求 `_` 後面
+# 是非英數字元,所以 `xp_cmdshell` 反而對不到(#27 review 指出;目前靠 exec 擋住)。
+# 它們單獨列一組、不加結尾的 \b。
 _CHECK_SQL_FORBIDDEN = re.compile(
     r"(?is)\b(insert|update|delete|drop|create|alter|truncate|merge|grant|revoke|"
-    r"exec|execute|xp_|sp_|backup|restore|shutdown|openrowset|opendatasource|bulk)\b")
+    r"exec|execute|backup|restore|shutdown|openrowset|opendatasource|bulk|"
+    r"commit|rollback|waitfor|begin|while|goto|declare|set)\b"
+    r"|\b(xp_|sp_)")
+
+
+def _wrap_check_sql(q: str) -> str:
+    """把判斷式包進子查詢再送進沙盒。
+
+    **為什麼**:`_check_sql_ok()` 的文字檢查擋不住「不用分號的第二個語句」——T-SQL
+    不需要分號就能接下一句,所以 `SELECT 1 COMMIT`、
+    `SELECT 1 WAITFOR DELAY '00:01:00'` 都會通過那道檢查(#27 review 指出)。
+    `COMMIT` 會讓這個案例灌的資料留下來,**後面的案例就不是從乾淨狀態開始**,
+    而每個案例互相獨立是執行驗證的前提。
+
+    包成子查詢之後,多出來的語句在語法上就不合法(`FROM (SELECT 1 COMMIT) AS q(v)`
+    會直接是語法錯誤),由資料庫擋掉,不必自己寫 SQL 剖析器。
+    `TOP 1` 是因為判斷式本來就該只回一列一欄。
+    """
+    return f"SELECT TOP 1 * FROM ({q}) AS q(v)"
 
 
 def _check_sql_ok(text) -> bool:
@@ -982,7 +1003,7 @@ def _eval_conditions(cursor, conds: list[dict]) -> dict[str, bool] | None:
         if not q:
             return None
         try:
-            cursor.execute(q)
+            cursor.execute(_wrap_check_sql(q))
             row = cursor.fetchone()
         except Exception:
             return None
@@ -1083,10 +1104,19 @@ def execute_cases(sql: str, plan: dict) -> dict:
                     # 模型的 note 寫「io_ratio = 95k/90k = 1.06」,資料列裡的指定
                     # 出帳卻只有 35,000 → 實際 0.39,落在規格要求的區間外。
                     r["label_mismatch"] = wrong
+                # 其他分支有沒有整個成立——**用程式算,不靠模型遵守 prompt**。
+                # 變體:別支成立 → 規則會命中 → 「不命中」的預期是錯的。
+                # 基準:別支也成立 → 命中可能是別支造成的,證明不了「這一支自己會命中」。
+                if case.get("kind") in ("base", "variant"):
+                    others = _other_branch_satisfied(
+                        conds, actual_conds, _case_branch(conds, case))
+                    if others:
+                        r["other_branch_satisfied"] = others
+                        r["label_ok"] = False
+                        r.setdefault("label_mismatch", []).extend(
+                            f"分支{b} 整個成立" for b in others)
                 # 其他條件只記錄、不判定:同時有幾條不成立,對 OR 結構的規格是
                 # 正常的(不同分支本來就互斥),對純 AND 的規格才是雜訊的來源。
-                # 要判定「有沒有隔離出那一條」得先知道 OR 分支的分組,
-                # 而計畫裡沒有這個結構(待補:要模型宣告分支)。
                 cofail = sorted(k for k, v in actual_conds.items()
                                 if v is False and k != case["condition_id"])
                 if cofail:
@@ -1161,6 +1191,45 @@ def _finding(path: str, severity: str, title: str, detail: str, suggestion: str 
             "detail": detail, "suggestion": suggestion, "citations": []}
 
 
+def _other_branch_satisfied(conds: list[dict], actual: dict[str, bool],
+                            own_branch: str) -> list[str]:
+    """除了自己這一支,還有哪些分支**整個成立**(全域條件 `*` 不算一支)。
+
+    為什麼要算這個(#47 review 第 1 點):
+      * **變體**的預期是「規則不命中」,前提是沒有別的分支成立。但「剛好跨過門檻
+        一格」常常會落進相鄰分支的區間——實測 `C1-1` 是「次數介於 2-3」,往上跨到 4,
+        而 `C3-1` 正好是「4-10」→ 規則反而命中,預期就錯了(造成 5 個預期錯誤)。
+      * **基準**的預期是「規則命中」,而我們想證明的是「**這一支自己**就會命中」。
+        如果別的分支也整個成立,那命中可能是別支造成的,基準就沒有證明到它該證明的事。
+
+    原本只寫在 prompt 裡要模型避開,但那是靠它遵守。每個條件都有 `check_sql`,
+    所以可以直接算。
+    """
+    by_branch: dict[str, list[str]] = {}
+    for c in conds:
+        b_id = str(c.get("branch", "") or "")
+        if b_id in (GLOBAL_BRANCH, own_branch):
+            continue
+        by_branch.setdefault(b_id, []).append(c["id"])
+    out = []
+    for b_id, ids in sorted(by_branch.items()):
+        # `is True` 而不是看真假值:算不出來的條件(沒有 check_sql → 這裡是 None)
+        # **不算成立**,所以那一支就不會被判定「整個成立」。寧可不報,不要報錯的
+        # ——把沒驗到的說成驗過了比漏報更糟。
+        if ids and all(actual.get(i) is True for i in ids):
+            out.append(b_id)
+    return out
+
+
+def _case_branch(conds: list[dict], case: dict) -> str:
+    """這個案例屬於哪一支(基準看 branch,變體看它要壞的那個條件所屬的分支)。"""
+    if case.get("kind") == "base":
+        return str(case.get("branch", "") or "")
+    target = case.get("condition_id")
+    return next((str(c.get("branch", "") or "") for c in conds
+                 if c["id"] == target), "")
+
+
 def _label_gaps(case_results: list[dict]) -> list[str]:
     """標籤與資料對不上的案例 = 該條件該向**沒有真的被驗到**(#23 第 3 點)。
 
@@ -1173,11 +1242,22 @@ def _label_gaps(case_results: list[dict]) -> list[str]:
     """
     gaps = []
     for r in case_results:
-        if r.get("label_ok") is False:
+        if r.get("label_ok") is not False:
+            continue
+        others = r.get("other_branch_satisfied")
+        if others:
+            # 這一種要分開講:不是「資料湊不出宣稱的那一條」,而是「同時讓別的分支
+            # 整個成立」——變體的預期會因此錯掉,基準則證明不了是自己這一支命中。
             gaps.append(
-                f"案例 {r['case_id']}(條件 {r['condition_id']} {r['direction']} 向)"
-                f"的資料與標籤不符:{'、'.join(r.get('label_mismatch') or [])} 的真假"
-                f"與這個標籤應有的不同,該向未經有效驗證")
+                f"案例 {r['case_id']}({r.get('kind', '?')})同時讓分支 "
+                f"{'、'.join(others)} 整個成立:"
+                f"{'變體的「不命中」預期不成立' if r.get('kind') == 'variant' else '無法證明是這一支自己命中'},"
+                f"該案例未經有效驗證")
+            continue
+        gaps.append(
+            f"案例 {r['case_id']}(條件 {r['condition_id']} {r['direction']} 向)"
+            f"的資料與標籤不符:{'、'.join(r.get('label_mismatch') or [])} 的真假"
+            f"與這個標籤應有的不同,該向未經有效驗證")
     return gaps
 
 

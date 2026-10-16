@@ -836,7 +836,9 @@ class _CondCursor(_FakeCursor):
 
     def execute(self, sql, params=None):
         super().execute(sql, params)
-        self._cond = self.answers.get(sql.strip())
+        # 判斷式送進沙盒前會被包成 SELECT TOP 1 * FROM (<check_sql>) AS q(v)
+        # (擋「不用分號的第二個語句」),所以這裡用子字串比對原本的判斷式。
+        self._cond = next((v for k, v in self.answers.items() if k in sql), None)
 
     def fetchone(self):
         if self._cond is None:
@@ -1320,3 +1322,102 @@ def test_全域條件的變體抄任一個分支的基準():
     plan["cases"][0]["rows"] = [["t", 555]]
     text = spec_exec._fill_gaps_prompt("R-1", "規格", plan, [("variant", "G-1")], 8)
     assert "555" in text, "全域條件的變體沒有基準可抄"
+
+
+# ── 其他分支不可以整個成立(#47 review 第 1 點):用程式算,不靠模型遵守 prompt ──
+
+def _2branch_conds():
+    """兩支相鄰的區間(2-3 與 4-10),加一個全域條件。往上跨一格就會落進另一支。"""
+    return [{"id": "C1-1", "desc": "cnt 介於 2-3", "branch": "C1",
+             "check_sql": "SELECT 1 WHERE C11"},
+            {"id": "C1-2", "desc": "amt 介於 50-100", "branch": "C1",
+             "check_sql": "SELECT 1 WHERE C12"},
+            {"id": "C2-1", "desc": "cnt 介於 4-10", "branch": "C2",
+             "check_sql": "SELECT 1 WHERE C21"},
+            {"id": "C2-2", "desc": "amt 介於 50-100", "branch": "C2",
+             "check_sql": "SELECT 1 WHERE C22"},
+            {"id": "G-1", "desc": "帳號非空白", "branch": "*",
+             "check_sql": "SELECT 1 WHERE G1"}]
+
+
+def test_變體讓別支整個成立時要算成未經有效驗證():
+    """實測的壞法:C1-1 是「介於 2-3」,變體往上跨一格到 4,而 C2-1 是「4-10」
+    → 規則反而命中 → 「不命中」的預期是錯的(造成 5 個預期錯誤)。"""
+    conds = _2branch_conds()
+    actual = {"C1-1": False, "C1-2": True,     # 自己這支壞了(預期如此)
+              "C2-1": True, "C2-2": True,      # 但另一支整個成立
+              "G-1": True}
+    others = spec_exec._other_branch_satisfied(conds, actual, "C1")
+    assert others == ["C2"], others
+
+
+def test_基準也要驗別支沒整個成立():
+    """基準要證明的是「**這一支自己**就會命中」。別支也成立的話,
+    命中可能是別支造成的。"""
+    conds = _2branch_conds()
+    actual = {"C1-1": True, "C1-2": True, "C2-1": True, "C2-2": True, "G-1": True}
+    assert spec_exec._other_branch_satisfied(conds, actual, "C1") == ["C2"]
+
+
+def test_全域條件不算一支():
+    conds = _2branch_conds()
+    actual = {"C1-1": True, "C1-2": True, "C2-1": False, "C2-2": True, "G-1": True}
+    assert spec_exec._other_branch_satisfied(conds, actual, "C1") == [], \
+        "C2 有一條不成立,不算整個成立;G-1 是全域條件,不是一支"
+
+
+def test_算不出來的條件不可以當成成立():
+    """沒有 check_sql 的條件算不出真假。把它當成立 = 把沒驗到的說成驗過了。"""
+    conds = _2branch_conds()
+    actual = {"C1-1": True, "C1-2": True, "C2-1": True, "G-1": True}   # 少 C2-2
+    assert spec_exec._other_branch_satisfied(conds, actual, "C1") == [], \
+        "C2-2 算不出來就不該斷言 C2 整個成立"
+
+
+def test_案例屬於哪一支():
+    conds = _2branch_conds()
+    assert spec_exec._case_branch(conds, {"kind": "base", "branch": "C2"}) == "C2"
+    assert spec_exec._case_branch(conds, {"kind": "variant",
+                                          "condition_id": "C2-1"}) == "C2"
+    assert spec_exec._case_branch(conds, {"kind": "variant",
+                                          "condition_id": "G-1"}) == "*"
+
+
+def test_別支整個成立的缺口描述要分得出是哪一種問題():
+    """「資料湊不出宣稱的那一條」與「同時讓別支整個成立」是兩種不同的壞法,
+    修法也不同(前者改資料、後者改跨越的方向)。"""
+    gaps = spec_exec._label_gaps([
+        {"case_id": "C1-1-v", "kind": "variant", "condition_id": "C1-1",
+         "direction": "false", "label_ok": False,
+         "other_branch_satisfied": ["C2"], "label_mismatch": ["分支C2 整個成立"]},
+        {"case_id": "C1-2-v", "kind": "variant", "condition_id": "C1-2",
+         "direction": "false", "label_ok": False, "label_mismatch": ["C1-2"]},
+    ])
+    assert any("分支 C2 整個成立" in g and "不命中" in g for g in gaps), gaps
+    assert any("資料與標籤不符" in g for g in gaps), gaps
+
+
+def test_execute_cases_會把別支整個成立的案例判為未驗證(monkeypatch):
+    """上面那幾個測試只直接呼叫 `_other_branch_satisfied`,所以把 `execute_cases`
+    裡的呼叫處拿掉也不會紅(突變驗證時那個突變點**存活**了)。這一條走真正的路徑。
+
+    情境就是實測踩到的:變體要壞掉 C1-1(介於 2-3),往上跨一格到 4,
+    而 C2-1 是「4-10」→ C2 整個成立 → 規則反而命中 → 「不命中」的預期是錯的。
+    """
+    _fake_sandbox(monkeypatch)
+    _CondCursor.answers = {"WHERE C11": False,   # 自己這支壞了(預期如此)
+                           "WHERE C12": True,
+                           "WHERE C21": True,    # 但另一支整個成立
+                           "WHERE C22": True,
+                           "WHERE G1": True}
+    monkeypatch.setattr(_FakeCon, "cursor", lambda self: _CondCursor())
+    plan = {"schema_ddl": ["CREATE TABLE t (id INT)"],
+            "conditions": _2branch_conds(),
+            "cases": [{"case_id": "C1-1-v", "kind": "variant", "condition_id": "C1-1",
+                       "direction": "false", "expect_flagged": False,
+                       "note": "", "rows": [["t", 4]]}]}
+    out = spec_exec.execute_cases("SELECT id FROM t", plan)
+    r = out["case_results"][0]
+    assert r.get("other_branch_satisfied") == ["C2"], r
+    assert r["label_ok"] is False, "別支整個成立 → 這個案例沒有有效驗證到任何東西"
+    assert any("分支 C2 整個成立" in g for g in spec_exec._label_gaps([r]))

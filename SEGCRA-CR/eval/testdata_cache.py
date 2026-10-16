@@ -63,6 +63,28 @@ def testgen_model(cfg, profile_name: str | None = None) -> str:
     return prof.model
 
 
+def stale_reason(spec_code: str, spec_text: str, *, model: str) -> str | None:
+    """凍結檔存在但對不上時,說明是哪一項對不上;對得上或根本沒凍結過回 None。
+
+    **為什麼要講出來**:對不上時呼叫端會靜靜地改成現場生成——變慢(大規則實測
+    54 分鐘)、而且每次結果不同(取樣會飄),但畫面上看不出跟「用凍結檔」有什麼差別。
+    改了 TESTGEN prompt 之後整批凍結檔都會對不上,那正是最需要被告知的時候。
+    """
+    p = _path(spec_code)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        return f"凍結檔讀不起來({type(e).__name__})"
+    for label, got, want in (("規格內容", data.get("spec_sha256"), _sha(spec_text)),
+                             ("TESTGEN prompt", data.get("prompt_sha256"), _prompt_hash()),
+                             ("模型", data.get("model"), model)):
+        if got != want:
+            return f"{label}對不上(凍結檔 {got} / 現在 {want})"
+    return None
+
+
 def load(spec_code: str, spec_text: str, *, model: str) -> dict | None:
     """規格、prompt、模型三者都對得上才回傳凍結的 plan(原樣,未經形狀檢查);
     任一對不上、沒凍結過或檔案壞掉都回 None(呼叫端接下來該照常呼叫真的
@@ -113,9 +135,17 @@ def wrap(generate_cases_fn):
     主動套用,例如 `spec_exec.generate_cases = testdata_cache.wrap(spec_exec.generate_cases)`
     ——不改 spec_exec.py 本身,正式審查(pipeline.py → run_spec_exec)不受影響。"""
     async def wrapped(cfg, spec_code, spec_text, profile_name=None, **kw):
-        cached = load(spec_code, spec_text, model=testgen_model(cfg, profile_name))
+        model = testgen_model(cfg, profile_name)
+        cached = load(spec_code, spec_text, model=model)
         if cached is not None:
             return spec_exec._shape_check(cached)
+        # 有凍結檔但對不上 → 說出來。靜靜地改成現場生成會讓人以為還在用凍結檔,
+        # 而兩者的耗時(大規則 54 分鐘 vs 幾秒)與可重現性完全不同。
+        why = stale_reason(spec_code, spec_text, model=model)
+        if why:
+            print(f"[testdata_cache] {spec_code} 的凍結檔不適用({why})"
+                  f"——改為現場生成,這次會變慢、而且結果每次不同。"
+                  f"要重新凍結:python eval/freeze_testdata.py {spec_code}", flush=True)
         return await generate_cases_fn(cfg, spec_code, spec_text,
                                        profile_name=profile_name, **kw)
     return wrapped

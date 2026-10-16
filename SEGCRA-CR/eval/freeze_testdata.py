@@ -45,20 +45,33 @@ def _reference_check(spec_code: str, plan: dict) -> str | None:
 
         from orchestrator.spec_exec import execute_cases
         if spec_code not in cft.REFERENCE:
+            # 跳過也要說一聲:直接回 None 看起來跟「驗過了」一樣。
+            print(f"[跳過正向對照] {spec_code} 沒有設定正向對照 SQL"
+                  f"(見 eval/check_frozen_testdata.py 的 REFERENCE),"
+                  f"**這份測資的預期值沒有被驗過**。")
             return None
         ex = execute_cases(cft.reference_sql(spec_code), plan)
-        if ex["sandbox_error"] or ex["sql_error"] or ex["testdata_error"]:
-            return None          # 環境問題不是測資的錯,不擋
+        env_err = ex["sandbox_error"] or ex["sql_error"] or ex["testdata_error"]
+        if env_err:
+            print(f"[跳過正向對照] 環境問題,不是測資的錯:{str(env_err)[:120]}"
+                  f"——**這份測資的預期值沒有被驗過**,有沙盒時請補跑 "
+                  f"python eval/check_frozen_testdata.py {spec_code}")
+            return None
         bad = [m.get("case_id") for m in ex["mismatches"]]
         if not bad:
+            print(f"[正向對照] {len(ex['case_results'])} 個案例全部符合"
+                  f"{cft.REFERENCE[spec_code]} 的行為。")
             return None
         return (f"正向對照({cft.REFERENCE[spec_code]})跑這份測資有 {len(bad)} "
                 f"個案例不符預期:{', '.join(str(b) for b in bad)}\n"
                 f"0 缺口不代表測資是對的——這些案例的 expect_flagged 與正確實作"
                 f"的行為不一致,凍結後 golden set 會一直拿錯的預期去跑。")
-    except Exception:
-        # 這道檢查壞掉不該讓凍結無法進行(它是加分的,不是必要路徑)。
-        # 真的壞掉時 check_frozen_testdata.py 仍然可以單獨跑,會明確報錯。
+    except Exception as e:
+        # 這道檢查壞掉不該讓凍結無法進行(它是加分的,不是必要路徑),
+        # 但一定要說出來——否則看起來跟「驗過了」一樣。
+        print(f"[跳過正向對照] 檢查本身出錯({type(e).__name__}: {str(e)[:100]})"
+              f"——**這份測資的預期值沒有被驗過**。"
+              f"請單獨跑 python eval/check_frozen_testdata.py {spec_code} 看詳細錯誤。")
         return None
 
 
