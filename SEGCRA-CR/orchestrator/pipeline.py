@@ -976,8 +976,8 @@ def enforce_dbt_config_change(report: dict, mr: dict, dbt_ctx: DbtContext | None
     for change in config_changes(mr.get("files", []), head_text, relative):
         parts = []
         if change.deleted:
-            parts.append("刪除了這個 dbt 檔案(model、macro、屬性檔等);請確認下游的 ref()、"
-                         "macro 呼叫與排程不再需要它。")
+            parts.append("刪除了這個 dbt 檔案,或把它改名搬出 dbt 的目錄(model、macro、屬性檔等);"
+                         "請確認下游的 ref()、macro 呼叫與排程不再需要它。")
         elif change.added and change.keys:
             parts.append(f"新增的檔案設定了:{'、'.join(change.keys)}。")
             risky = [k for k in change.keys if k in HIGH_RISK_NEW]

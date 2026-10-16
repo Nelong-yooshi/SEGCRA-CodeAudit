@@ -355,9 +355,20 @@ def test_在dbt專案裡的yml_沒有models區段也看():
     assert [c.keys for c in config_changes([f], head_text=lambda p: head)] == [("tags",)]
 
 
-def test_dbt_project_yml_models以外的區段_不算():
-    old = PROJECT + "vars:\n  tags: daily\n"
-    assert _changes("dbt_project.yml", old, old.replace("tags: daily", "tags: weekly")) == []
+@pytest.mark.parametrize("old, new", [
+    (PROJECT + "vars:\n  start: '2024-01-01'\n", PROJECT + "vars:\n  start: '2025-01-01'\n"),
+    (PROJECT + "on-run-end:\n  - \"delete from a\"\n", PROJECT + "on-run-end:\n  - \"delete from b\"\n"),
+    ("profile: dev\n" + PROJECT, "profile: prod\n" + PROJECT),
+], ids=["vars", "on-run-end", "profile"])
+def test_dbt_project_yml_models以外的區段_算看不出改了什麼(old, new):
+    """on-run-end 是會執行的 SQL、vars 會改變 var() 的值、profile 換了連線目標:都不能不報。"""
+    assert _keys("dbt_project.yml", old, new) == [((), False, True)]
+
+
+def test_屬性檔_models以外的區段_不算():
+    """屬性檔裡 sources 這類區段不影響 model 的物化與排程(dbt_project.yml 不一樣,見上一個測試)。"""
+    old = PROPERTIES + "sources:\n  - name: raw\n    loader: a\n"
+    assert _changes("models/schema.yml", old, old.replace("loader: a", "loader: b")) == []
 
 
 def test_dbt_project_yml_跨行的清單():
@@ -706,3 +717,34 @@ def test_資料夾名稱剛好是設定名稱_底下改了設定_算底下那個
     old = "models:\n  sample:\n    schema:\n      +materialized: view\n"
     assert _keys("dbt_project.yml", old, old.replace("view", "table")) == [
         (("materialized",), False, False)]
+
+
+
+# ─────────────────── 改名搬進 / 搬出 dbt 的目錄 ───────────────────
+
+FULL_REFRESH = "{{ config(materialized='incremental', full_refresh=true) }}\nselect 1\n"
+
+
+def test_從dbt目錄外改名搬進來_內容沒變_也算新增():
+    """內容沒變時 diff 是空的;不另外判斷,帶著 full_refresh 的 model 就會安靜進來。"""
+    f = {"path": "models/m.sql", "old_path": "scratch/m.sql", "diff": "", "full_content": FULL_REFRESH}
+    [c] = config_changes([f])
+    assert (c.added, c.keys) == (True, ("materialized", "full_refresh"))
+    finding = _one([f])
+    assert finding["severity"] == "major"
+
+
+def test_搬進來但看不到內容_算看不出():
+    f = {"path": "models/m.sql", "old_path": "scratch/m.sql", "diff": ""}
+    assert config_changes([f]) == [ConfigChange("models/m.sql", unknown=True, added=True)]
+
+
+def test_改名搬出dbt目錄_等於刪除():
+    f = {"path": "archive/m.sql", "old_path": "models/m.sql", "diff": ""}
+    finding = _one([f])
+    assert (finding["severity"], finding["title"]) == ("info", pipeline._DBT_CONFIG_DELETED_TITLE)
+
+
+def test_在dbt目錄裡改名_內容沒變_不算():
+    f = {"path": "models/b.sql", "old_path": "models/a.sql", "diff": "", "full_content": FULL_REFRESH}
+    assert config_changes([f]) == []

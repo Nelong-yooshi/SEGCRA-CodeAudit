@@ -147,22 +147,44 @@ class _Sides:
     old_at: list
 
 
+def _is_sql(rel: str) -> bool:
+    return rel.endswith(_SQL_SUFFIX)
+
+
+def _is_dbt_file(rel) -> bool:
+    return rel is not None and (_is_sql(rel) or is_dbt_yaml(rel))
+
+
 def _file_change(f: dict, head_text, relative) -> ConfigChange | None:
     path = f["path"]
     rel = relative(path)
-    if rel is None:
-        return None
-    is_sql, is_yaml = rel.endswith(_SQL_SUFFIX), is_dbt_yaml(rel)
-    if not (is_sql or is_yaml):
-        return None
-    hunks = _parse_hunks(f.get("diff"))
-    if not hunks:
-        return None
+    old_path = f.get("old_path")
+    old_rel = relative(old_path) if isinstance(old_path, str) and old_path != path else rel
+    if not _is_dbt_file(rel):
+        # 改名搬出 dbt 的目錄:對 dbt 來說等於刪掉了這個檔案
+        return ConfigChange(path, deleted=True) if _is_dbt_file(old_rel) else None
+    is_sql = _is_sql(rel)
     new_text = head_text(path) if head_text is not None else None
     if not isinstance(new_text, str):
         new_text = f.get("full_content")
+    hunks = _parse_hunks(f.get("diff"))
+    if not _is_dbt_file(old_rel):
+        # 從 dbt 的目錄外改名搬進來:對 dbt 來說是新增的檔案。內容沒變時 diff 是空的,
+        # 不另外判斷就會讓帶著設定的 model 安靜進來
+        if not (isinstance(new_text, str) and len(new_text) <= MAX_TEXT_CHARS):
+            if hunks and _whole_file(hunks):
+                new_text = "\n".join(text for tag, text in hunks[0][4] if tag == "+")
+            else:
+                return ConfigChange(path, unknown=True, added=True)    # 看不到內容
+        return _added_change(path, is_sql, new_text)
+    if not hunks:
+        return None
     if _whole_file(hunks):
-        return _whole_file_change(path, is_sql, hunks, new_text)
+        if hunks[0][3] == 0:
+            return ConfigChange(path, deleted=True)
+        if not (isinstance(new_text, str) and new_text and len(new_text) <= MAX_TEXT_CHARS):
+            new_text = "\n".join(text for tag, text in hunks[0][4] if tag == "+")
+        return _added_change(path, is_sql, new_text)
     sides = None
     if isinstance(new_text, str) and len(new_text) <= MAX_TEXT_CHARS:
         sides = _reverse(new_text, hunks)
@@ -171,7 +193,7 @@ def _file_change(f: dict, head_text, relative) -> ConfigChange | None:
         sides = _snippets(hunks)
     if is_sql:
         return _sql_change(path, sides, full)
-    return _yaml_change(path, sides, full)
+    return _yaml_change(path, sides, full, rel == "dbt_project.yml")
 
 
 # ─────────────────── diff ───────────────────
@@ -281,12 +303,8 @@ def _first_changed_line(sides: _Sides, counted_new, counted_old) -> int:
 
 # ─────────────────── 新增 / 刪除整個檔案 ───────────────────
 
-def _whole_file_change(path, is_sql, hunks, new_text) -> ConfigChange | None:
-    """刪除整個檔案:記下來(呼叫端給 info)。新增整個檔案:列出它設定的受關注項目。"""
-    if hunks[0][3] == 0:
-        return ConfigChange(path, deleted=True)
-    if not (isinstance(new_text, str) and new_text and len(new_text) <= MAX_TEXT_CHARS):
-        new_text = "\n".join(text for tag, text in hunks[0][4] if tag == "+")
+def _added_change(path, is_sql, new_text: str) -> ConfigChange | None:
+    """新增的檔案(或從 dbt 的目錄外搬進來的):列出它設定的受關注項目。"""
     lines = new_text.split("\n")
     if is_sql:
         if not (is_dbt_template(new_text) and _CONFIG_WORD.search(new_text)):
@@ -498,13 +516,16 @@ def _inert(chain, full) -> bool:
     return any(k in _NOT_CONFIG or k in inert for k in chain)
 
 
-def _yaml_line(chain, line: str, full) -> str | None:
+def _yaml_line(chain, line: str, full, project_file: bool = False) -> str | None:
     """一行改動算什麼:受關注設定的名稱、"other"(其他設定)、"unknown"(看不出改了什麼),
-    或 None(不算:空行、註解、models / snapshots / seeds 以外、欄位、測試、說明)。"""
+    或 None(不算:空行、註解、屬性檔的 models / snapshots / seeds 以外、欄位、測試、說明)。
+
+    dbt_project.yml 的其他區段一律算「看不出改了什麼」:on-run-start / on-run-end 是會執行的
+    SQL,vars 會改變 model 裡 var() 的值,profile、目錄設定、dispatch 會改變整個專案的行為。"""
     if not chain:
         return None
     if full and chain[0] not in _CONFIG_ROOTS:
-        return None
+        return "unknown" if project_file else None
     if _inert(chain, full):
         return None
     # 最靠近這一行的受關注鍵(hook 底下的清單、跨行的字串都算那個 hook)
@@ -520,7 +541,7 @@ def _tab_indented(lines) -> bool:
     return any("\t" in ln[:len(ln) - len(ln.lstrip())] for ln in lines)
 
 
-def _yaml_change(path, sides: _Sides, full) -> ConfigChange | None:
+def _yaml_change(path, sides: _Sides, full, project_file: bool = False) -> ConfigChange | None:
     keys, other, unknown = set(), False, False
     counted = ([], [])                       # 算進去的改動:(變更前的行, 變更後的行)
     aliases = bool(_YAML_ALIAS.search("\n".join(sides.old))
@@ -535,7 +556,7 @@ def _yaml_change(path, sides: _Sides, full) -> ConfigChange | None:
         chains = _yaml_chains(lines)
         for idx in sorted(changed):
             chain = chains[idx]
-            kind = _yaml_line(chain, lines[idx], full)
+            kind = _yaml_line(chain, lines[idx], full, project_file)
             if kind is None:
                 if aliases and chain and not _inert(chain, full):
                     unknown = True           # 改到的值可能被別名引用到 models 底下
