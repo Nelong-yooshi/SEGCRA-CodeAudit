@@ -381,6 +381,93 @@ MUTANTS.update({
         "    if isinstance(strip_prefixes, str):"),
 })
 
+# ---- 模型輸出格式不正確時不中斷審查(#21)
+MUTANTS.update({
+ "格式:不做正規化": ("pipeline.py",
+     "        report = normalize_findings(report)    # 模型輸出的形狀不可信,先整理再往下走(#21)\n", ""),
+ "格式:不補 major": ("pipeline.py",
+     "        report = enforce_format(report)        # 模型輸出有格式錯誤 → major;須在 sanitize 之後\n", ""),
+ "格式:major 排在 sanitize 之前(可被模型換掉)": ("pipeline.py",
+     "        report = sanitize_findings(report)\n",
+     "        report = enforce_format(report)\n        report = sanitize_findings(report)\n"
+     "        report.pop(\"_format_issues\", None)\n"),
+ "格式:補的是 minor": ("pipeline.py",
+     '"severity": "major", "title": _FORMAT_TITLE,',
+     '"severity": "minor", "title": _FORMAT_TITLE,'),
+ "格式:finding 不是物件不計數": ("pipeline.py",
+     "        if not isinstance(fd, dict):\n            dropped += 1\n            continue",
+     "        if not isinstance(fd, dict):\n            continue"),
+ "格式:severity 不是字串不計數": ("pipeline.py",
+     "        if severity is not None and not isinstance(severity, str):\n            dropped += 1\n",
+     "        if severity is not None and not isinstance(severity, str):\n"),
+ "格式:severity 不是字串照樣往下傳": ("pipeline.py",
+     "        if severity is not None and not isinstance(severity, str):\n            dropped += 1\n"
+     "            continue",
+     "        if False:\n            dropped += 1\n            continue"),
+ "格式:標題格式錯的 finding 直接丟掉(決策變寬鬆)": ("pipeline.py",
+     "        fixed += wrong\n        findings.append(fd)",
+     "        if wrong:\n            dropped += 1\n            continue\n        findings.append(fd)"),
+ "格式:空標題不補說明": ("pipeline.py",
+     "                fd[key] = _FORMAT_NO_TITLE", "                pass"),
+ "格式:標題缺漏也補說明(改變原本正常的輸入)": ("pipeline.py",
+     "            if bad and key == \"title\" and not fd[key].strip():",
+     "            if key == \"title\" and not fd[key].strip():"),
+ "格式:標題是 null 不算格式錯誤": ("pipeline.py",
+     '        null_title = "title" in fd and fd["title"] is None',
+     '        null_title = False'),
+ "格式:標題缺漏也算格式錯誤": ("pipeline.py",
+     '        null_title = "title" in fd and fd["title"] is None',
+     '        null_title = fd.get("title") is None'),
+ "格式:巢狀太深轉不出字串就丟例外": ("pipeline.py",
+     "    except RecursionError:\n        return \"\", True",
+     "    except ZeroDivisionError:\n        return \"\", True"),
+ "格式:null 也算格式錯誤(每個 MR 都多一條 major)": ("pipeline.py",
+     "    if value is None:\n        return \"\", False\n    if isinstance(value, str):",
+     "    if value is None:\n        return \"\", True\n    if isinstance(value, str):"),
+ "格式:文字欄位型別不對不計數": ("pipeline.py",
+     "        return str(value), True", "        return str(value), False"),
+ "格式:字串清單不計數": ("pipeline.py",
+     '        return "\\n".join(value), True', '        return "\\n".join(value), False'),
+ "格式:file 型別不對不計數": ("pipeline.py",
+     "        if file is not None and not isinstance(file, str):\n            wrong = True",
+     "        if file is not None and not isinstance(file, str):\n            pass"),
+ "格式:file 型別不對照樣往下傳": ("pipeline.py",
+     '        fd["file"] = file if isinstance(file, str) else ""',
+     '        fd["file"] = file if file is not None else ""'),
+ "格式:line 轉不了就丟例外": ("pipeline.py",
+     "    except (ValueError, OverflowError):\n        pass\n    return 0, True",
+     "    except ZeroDivisionError:\n        pass\n    return 0, True"),
+ "格式:line 轉不了不計數": ("pipeline.py",
+     "        pass\n    return 0, True", "        pass\n    return 0, False"),
+ "格式:line 是 null 也算格式錯誤": ("pipeline.py",
+     '    if value is None or value == "":\n        return 0, False',
+     '    if value is None or value == "":\n        return 0, True'),
+ "格式:citations 不是清單不計數": ("pipeline.py",
+     "            cites, wrong = [], True", "            cites = []"),
+ "格式:citations 的項目不檢查": ("pipeline.py",
+     "        kept = [c for c in cites if isinstance(c, dict)\n"
+     "                and isinstance(c.get(\"source\", \"\"), (str, type(None)))]",
+     "        kept = list(cites)"),
+ "格式:citation 的 source 型別不檢查": ("pipeline.py",
+     "        kept = [c for c in cites if isinstance(c, dict)\n"
+     "                and isinstance(c.get(\"source\", \"\"), (str, type(None)))]",
+     "        kept = [c for c in cites if isinstance(c, dict)]"),
+ "格式:丟掉 citation 不計數": ("pipeline.py",
+     "        wrong |= len(kept) != len(cites)\n", ""),
+ "格式:findings 不是清單不記錄": ("pipeline.py",
+     "    if bad_container or fixed or dropped:", "    if fixed or dropped:"),
+ "格式:summary 不轉成字串": ("pipeline.py",
+     '    report["summary"] = summary\n', ""),
+ "格式:採用模型自己輸出的 _format_issues": ("pipeline.py",
+     '    report.pop("_format_issues", None)\n', ""),
+ "格式:major 回顯模型輸出": ("pipeline.py",
+     '"被略過或修正的內容可能不完整,這次的審查結果需人工確認。",',
+     '"被略過或修正的內容可能不完整,這次的審查結果需人工確認。" + str(report.get("findings")),'),
+ "格式:major 用一般方式加入(同標題不取代)": ("pipeline.py",
+     "    _put_program_finding(report, major)\n    return report\n\n\n# 引用來源裡指名的規則碼",
+     "    report[\"findings\"].append(major)\n    return report\n\n\n# 引用來源裡指名的規則碼"),
+})
+
 
 def copy_project(src: pathlib.Path, dst: pathlib.Path) -> None:
     """複製整個專案(除了下面明列的建置產物/快取/憑證),不是手動列出「測試會用到
@@ -1604,6 +1691,36 @@ MUTANTS.update({
  "diff_refs:少帶 start_sha": ("../toolbox/gitlab.py",
      '_DIFF_REF_KEYS = ("base_sha", "head_sha", "start_sha")',
      '_DIFF_REF_KEYS = ("base_sha", "head_sha")'),
+})
+
+# ---- R005 讀取執行環境(#26 第 7 項):規則層命中後,模型一定看得到 secure-sql 的說明
+MUTANTS.update({
+ "R005:命中時不強制載入 secure-sql": ("pipeline.py",
+     '_SECURE_SQL_RULES = ("R004", "R005", "H004")',
+     '_SECURE_SQL_RULES = ("R004", "H004")'),
+ "R005:強制載入的判斷寫死成不載": ("pipeline.py",
+     "        if \"secure-sql\" in skills and _needs_secure_sql(pre):",
+     "        if False:"),
+ # 以下四項是 #27 review 補齊的,各自對應一個真實的漏抓:
+ # 三段式名稱(master.sys.databases)、系統目錄只列幾個名字、夾在函式名與括號之間
+ # 的註解、不帶括號的身分函式。
+ "R005:系統目錄的 lookbehind 連點一起排除(三段式名稱漏抓)": ("../toolbox/sqltools.py",
+     r'r"(?i)(?<!\w)\[?sys\]?" + _GAP',
+     r'r"(?i)(?<![\w.])\[?sys\]?" + _GAP'),
+ "R005:系統目錄只認列舉的那幾個名字": ("../toolbox/sqltools.py",
+     r'+ _GAP + r"\." + _GAP + r"\[?\w+\]?"',
+     r'+ _GAP + r"\." + _GAP + r"\[?(databases|objects|tables)\]?"'),
+ "R005:函式名與括號之間只容許空白(夾註解就漏抓)": ("../toolbox/sqltools.py",
+     r'_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/))*\*/|--[^\n]*\n)*"',
+     r'_GAP = r"\s*"'),
+ "R005:不抓不帶括號的身分函式": ("../toolbox/sqltools.py",
+     r'(SYSTEM_USER|CURRENT_USER|SESSION_USER)\b"',
+     r'(SYSTEM_USER)\b"'),
+ # review 的小建議:「沙盒」範圍太廣,同一個檔案裡其他 major 提到沙盒就會讓 R005
+ # 被當成已經報過。
+ "R005:已報判定關鍵詞含「沙盒」(範圍過廣)": ("pipeline.py",
+     '"R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys."],',
+     '"R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys.", "沙盒"],'),
 })
 
 # ---- 確定性防線不能被模型關掉(#16 review):程式專用標題、規則命中不可被降級
