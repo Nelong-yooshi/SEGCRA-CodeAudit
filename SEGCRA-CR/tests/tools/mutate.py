@@ -381,6 +381,26 @@ MUTANTS.update({
         "    if isinstance(strip_prefixes, str):"),
 })
 
+# ---- 環節隔離(#45):內層出事,外層要照常產出審查結果
+MUTANTS.update({
+ "隔離:環節丟例外時不補「審查未完整」": ("pipeline.py",
+     '                report.setdefault("findings", []).append(_incomplete_finding(stage, e))' + NL
+     + '                return report',
+     '                return report'),
+ "隔離:環節失敗記成 info(不影響決策)": ("pipeline.py",
+     '    return {"file": "", "line": 0, "severity": "major", "title": title,',
+     '    return {"file": "", "line": 0, "severity": "info", "title": title,'),
+ "隔離:把例外訊息寫進報告(可能回顯 MR 內容)": ("pipeline.py",
+     '        detail = (f"{stage} 執行時發生 {type(exc).__name__},已跳過。"',
+     '        detail = (f"{stage} 執行時發生 {exc},已跳過。"'),
+ "隔離:執行驗證不設時間上限": ("pipeline.py",
+     "            spec_result = await asyncio.wait_for(" + NL
+     + "                run_spec_exec(cfg, hub, mr, spec_code, spec_text)," + NL
+     + "                timeout=SPEC_EXEC_TIMEOUT_SECONDS)",
+     "            spec_result = await run_spec_exec(cfg, hub, mr, spec_code, spec_text)"),
+})
+
+
 
 def copy_project(src: pathlib.Path, dst: pathlib.Path) -> None:
     """複製整個專案(除了下面明列的建置產物/快取/憑證),不是手動列出「測試會用到

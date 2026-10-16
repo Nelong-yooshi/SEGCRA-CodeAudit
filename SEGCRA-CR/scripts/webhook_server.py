@@ -37,30 +37,94 @@ SECRET = os.environ.get("GITLAB_WEBHOOK_SECRET", "")
 PROFILE = os.environ.get("REVIEW_PROFILE", "review")
 TRIGGER_ACTIONS = {"open", "reopen", "update"}     # MR 這些動作觸發審查
 _cfg = load_config()
-_inflight: set = set()          # 進行中的 MR,避免同一 MR 短時間重複觸發(debounce)
+# 一份審查的總時間上限(#45)。超過就中止,並在 MR 上留言——**不能無聲無息**:
+# 正式環境裡「沒擋、沒放、也沒人知道」是最糟的失敗型態。
+# 執行驗證那一段自己另有上限(pipeline.SPEC_EXEC_TIMEOUT_SECONDS,預設 1200 秒),
+# 這裡是整份的天花板,要比它大。
+REVIEW_TIMEOUT_SECONDS = int(os.environ.get("REVIEW_TIMEOUT_SECONDS", "2400"))
+
+# 每個 MR 一份進行中的紀錄:{mr_iid: (event_loop, task)}。
+# 用它做兩件事:同一 MR 推新 commit 時取消舊的那次、以及知道誰還在跑。
+_inflight: dict = {}
 _lock = threading.Lock()
 
 
-def _run_review(mr_iid: int):
+def _notify_incomplete(mr_iid: int, reason: str) -> None:
+    """審查沒完成時在 MR 上留言。留言失敗只記 log,不能讓它變成另一個無聲失敗。"""
+    body = (f"審查未完成({reason}),請人工處理。\n\n"
+            f"這不是「沒問題」——是這次審查沒有跑完,沒有結論。")
     try:
-        report = asyncio.run(review_mr(_cfg, str(mr_iid), profile_name=PROFILE))
+        from toolbox import gitlab
+        gitlab.post_summary(str(mr_iid), body, 0, "審查未完成")
+        print(f"[webhook] MR !{mr_iid} 已留言告知審查未完成({reason})", flush=True)
+    except Exception as e:
+        print(f"[webhook] MR !{mr_iid} 連留言都失敗了:{type(e).__name__}: {e}", flush=True)
+
+
+def _run_review(mr_iid: int):
+    """在自己的執行緒與事件迴圈裡跑一份審查。
+
+    每個 MR 各一個執行緒 → 一個 MR 卡住或炸掉不影響其他 MR(#45)。
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    task = None
+    try:
+        task = loop.create_task(
+            asyncio.wait_for(review_mr(_cfg, str(mr_iid), profile_name=PROFILE),
+                             timeout=REVIEW_TIMEOUT_SECONDS))
+        with _lock:
+            _inflight[mr_iid] = (loop, task)
+        report = loop.run_until_complete(task)
         print(f"[webhook] MR !{mr_iid} 審完:決策={report.get('decision')} "
               f"分數={report.get('score')} findings={len(report.get('findings', []))} "
               f"執行驗證={'通過' if report.get('_spec_exec', {}).get('passed') else '未通過'}",
               flush=True)
+    except asyncio.TimeoutError:
+        print(f"[webhook] MR !{mr_iid} 審查逾時({REVIEW_TIMEOUT_SECONDS}s),中止", flush=True)
+        _notify_incomplete(mr_iid, f"超過 {REVIEW_TIMEOUT_SECONDS} 秒的時間上限")
+    except asyncio.CancelledError:
+        # 同一個 MR 推了新 commit → 舊的這次被取消。新的那次會給出結論,
+        # 所以這裡不留言(免得同一個 MR 洗版)。
+        print(f"[webhook] MR !{mr_iid} 舊審查被新的 commit 取代", flush=True)
     except Exception as e:
-        print(f"[webhook] MR !{mr_iid} 審查失敗:{e}", flush=True)
+        print(f"[webhook] MR !{mr_iid} 審查失敗:{type(e).__name__}: {e}", flush=True)
+        _notify_incomplete(mr_iid, f"審查程式發生 {type(e).__name__}")
     finally:
         with _lock:
-            _inflight.discard(mr_iid)
+            if _inflight.get(mr_iid, (None, None))[1] is task:
+                _inflight.pop(mr_iid, None)
+        try:
+            loop.close()
+        except Exception:
+            pass
+
+
+def _cancel(mr_iid: int) -> bool:
+    """取消某個 MR 進行中的審查。回傳有沒有真的取消到。
+
+    跨執行緒取消要透過 `call_soon_threadsafe`:task 屬於那個執行緒的迴圈,
+    直接呼叫 cancel() 不會被該迴圈看見。
+    """
+    with _lock:
+        entry = _inflight.get(mr_iid)
+    if not entry:
+        return False
+    loop, task = entry
+    try:
+        loop.call_soon_threadsafe(task.cancel)
+        return True
+    except Exception as e:
+        print(f"[webhook] MR !{mr_iid} 取消舊審查失敗:{type(e).__name__}: {e}", flush=True)
+        return False
 
 
 def _trigger(mr_iid: int) -> str:
-    with _lock:
-        if mr_iid in _inflight:
-            print(f"[webhook] MR !{mr_iid} 審查中,略過(debounce)", flush=True)
-            return "already running"
-        _inflight.add(mr_iid)
+    # 同一個 MR 推了新 commit:取消舊的那次,改審新的(#45)。
+    # 原本是 debounce(略過新的那次),但那會讓**新的 commit 不被審查**——
+    # 舊的那次審的是舊程式,結論貼到新的 commit 上是錯的。
+    if _cancel(mr_iid):
+        print(f"[webhook] MR !{mr_iid} 取消進行中的舊審查,改審新的", flush=True)
     print(f"[webhook] → 觸發審查 MR !{mr_iid}(profile={PROFILE})", flush=True)
     threading.Thread(target=_run_review, args=(mr_iid,), daemon=True).start()
     return f"review triggered for MR !{mr_iid}"
