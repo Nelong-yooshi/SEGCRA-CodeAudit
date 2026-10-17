@@ -1678,26 +1678,281 @@ def _mutate_all(args, src: pathlib.Path) -> int:
 S = "spec_exec.py"
 MUTANTS.update({
     "測資:有缺口也直接收下(回到舊行為)": (S,
-        "                if not gaps and n_conds >= max_conds:",
+        "                if not repaired and not gaps and n_conds >= max_conds:",
         "                if True:"),
     "測資:不留覆蓋最多的一版(只認最後一次)": (S,
-        "                if best is None or _covered(cleaned) > _covered(best[0]):\n"
-        "                    best = (cleaned, gaps, dropped)",
-        "                best = (cleaned, gaps, dropped)"),
+        "                if better:\n"
+        "                    best = (cleaned, gaps, dropped)\n"
+        "                    best_repaired = repaired",
+        "                best = (cleaned, gaps, dropped)\n"
+        "                best_repaired = repaired"),
     # review 第 4 點:缺口是對照模型自己拆的條件算的,拆得少的 0 缺口版本不能
     # 勝過拆得齊、只缺一點的版本;重試 prompt 不帶缺口,固定 seed 下等於白跑。
     "測資:0 缺口就提前結束,不看條件數有沒有變少": (S,
-        "                if not gaps and n_conds >= max_conds:",
-        "                if not gaps:"),
+        "                if not repaired and not gaps and n_conds >= max_conds:",
+        "                if not repaired and not gaps:"),
     "測資:最佳版本改回比缺口數": (S,
-        "                if best is None or _covered(cleaned) > _covered(best[0]):",
-        "                if best is None or len(gaps) < len(best[1]):"),
+        "                          and _covered(cleaned) > _covered(best[0])))",
+        "                          and len(gaps) < len(best[1])))"),
     "測資:重試 prompt 不帶上一次的缺口": (S,
         "        issues.append(\"上一次的測資計畫覆蓋不完整,缺:\\n\" + \"\\n\".join(f\"- {g}\" for g in gaps))",
         "        issues.append(\"上一次的測資計畫覆蓋不完整。\")"),
+    # #23 第 1 點:json-repair 不會失敗,它把壞掉的 JSON 修補成一個**合法但語意
+    # 錯誤**的物件。少了這三道,格式問題會被回報成「模型覆蓋不足」,而兩者的
+    # 修法完全不同(修 prompt / 限制輸出格式 vs 調 max_tokens、分批生成)。
+    "測資:修補過的輸出當成正常結果": (S,
+        "        repaired = bool(parse_meta.get(\"repaired\"))",
+        "        repaired = False"),
+    "測資:修補過的也能提前結束(假的 0 缺口被收下)": (S,
+        "                if not repaired and not gaps and n_conds >= max_conds:",
+        "                if not gaps and n_conds >= max_conds:"),
+    "測資:修補過的結果不在缺口裡說明(看的人會照著缺口去調 prompt)": (S,
+        "            return plan_, [_MALFORMED_GAP, *gaps_], dropped_",
+        "            return plan_, gaps_, dropped_"),
+    # #23 第 2 點:大規則一次生不完,每次整份重來等於每次重付已成功那部分的代價。
+    # 合併的三道防線少任何一道,補進來的案例都可能指向不存在的東西,而失敗會出現
+    # 在沙盒執行階段,離真正的原因很遠。
+    "測資:不走補缺模式(每次整份重來)": (S,
+        "        if filling and plan and best is not None and not repaired:",
+        "        if False:"),
+    "測資:補生成可以發明新條件(用假分母灌覆蓋率)": (S,
+        "        if not _known(c) or key in have:",
+        "        if False:"),
+    "測資:補生成的 schema 蓋掉先前的(已有案例跑不起來)": (S,
+        "    return ({**base, \"cases\": [*base[\"cases\"], *added]}, len(added), dropped)",
+        "    return ({**base, **addition, \"cases\": [*base[\"cases\"], *added]}, len(added), dropped)"),
+    "測資:補缺失敗退回時用合併後的條件數(拆得少的提示永遠不出現)": (S,
+        "                attempted, _, attempted_dropped = _shape_check(plan)",
+        "                attempted, attempted_dropped = cleaned, []"),
+    # 生成的資料要先對過資料表定義(#47 review 第 2 點)。兩份黑盒規格各花 50 分鐘和
+    # 14 分鐘生成,每一列都有欄位值超過宣告長度 → 沙盒灌資料失敗 → 整輪白跑。
+    "測資:資料不對表定義就收下": (S,
+        '            why = _rows_fit_ddl(c.get("rows") or [], cols_by_table)',
+        '            why = ""'),
+    "測資:只檢查第一列": (S,
+        "    for i, row in enumerate(rows, 1):",
+        "    for i, row in enumerate(rows[:1], 1):"),
+    "測資:不檢查欄位數": (S,
+        "        if len(vals) != len(cols):",
+        "        if False:"),
+    "測資:表名不在定義裡也放行": (S,
+        "        if cols is None:" + NL
+        + "            return f\"第 {i} 列的表名 {row[0]} 不在 schema_ddl 裡\"",
+        "        if cols is None:" + NL
+        + "            continue"),
+    "測資:字串長度只看超過一倍的": (S,
+        "        if limit is not None and len(v) > limit:",
+        "        if limit is not None and len(v) > limit * 2:"),
+    "測資:小數位數超過宣告也放行(悄悄四捨五入)": (S,
+        "        if len(frac) > scale:",
+        "        if False:"),
+    "測資:NOT NULL 給 null 也放行": (S,
+        '        return "" if col["nullable"] else f"{name} 宣告 NOT NULL,卻給了 NULL"',
+        '        return ""'),
+    "測資:日期格式不檢查": (S,
+        '        return f"{name} 是 {type_name},但值不是可辨識的日期時間({v[:30]})"',
+        '        return ""'),
+    "測資:整數欄位給小數也放行": (S,
+        '            return f"{name} 是整數欄位,但值有小數({v})"',
+        '            return ""'),
+    "測資:灌不進去的原因不回饋給模型": (S,
+        "    bad = [str(d.get(\"reason\", \"\")) for d in dropped if _DDL_FAIL_MARK in str(d.get(\"reason\", \"\"))]",
+        "    bad = []"),
+    # #23 第 3 點:覆蓋檢查原本完全相信模型自己貼的條件編號與方向,
+    # 「標籤對、資料卻沒測到」看起來跟正確的案例一模一樣。
+    "測資:判斷式不驗形狀(任意 SQL 進沙盒)": (S,
+        "        if \"check_sql\" in c and not _check_sql_ok(c.get(\"check_sql\")):",
+        "        if False:"),
+    # 對所有條件下判定 = OR 結構的規格 100% 誤報(實測:30 個案例 30 個被判不符,
+    # 含 22 個行為完全正確的)。互斥的條件不可能同時成立,判定本身就是錯的。
+    "測資:標籤對所有條件下判定(OR 結構的規格全盤誤報)": (S,
+        "    return {target: direction == \"true\"}",
+        "    return {c[\"id\"]: (direction == \"true\" or c[\"id\"] != target) for c in conds}"),
+    "測資:不記錄同時不成立的其他條件": (S,
+        "        if cofail:" + NL + "            r[\"label_cofail\"] = cofail",
+        "        if False:" + NL + "            r[\"label_cofail\"] = cofail"),
+    "測資:判斷式算不出來時回部分結果": (S,
+        "        except Exception as e:\n            return None, f\"條件 {c.get('id')} 的判斷式執行失敗:{str(e)[:120]}\"",
+        "        except Exception:\n            continue"),
+    # 基準＋變體(測資正確率的修法)。預期值由構造決定,不由模型判斷——實測
+    # 模型在 46 個案例裡填錯 12 個,其中 10 個是「只滿足一條卻說該命中」。
+    "測資:基準/變體的預期值照抄模型給的": (S,
+        "    out[\"expect_flagged\"] = (c.get(\"kind\") == \"base\")",
+        "    out[\"expect_flagged\"] = bool(c.get(\"expect_flagged\"))"),
+    "測資:非資料層面的條件也要求變體(永遠補不完)": (S,
+        "            if not _data_level(c0):",
+        "            if False:"),
+    # 變體要從基準改一處,所以補缺的 prompt 必須附上基準的資料列。少了它,
+    # 模型只能自己重新發明一組,那正是預期值出錯的來源。
+    "測資:要變體時不附基準的資料列": (S,
+        "                got = _base_rows_for(plan, target)" + NL
+        + "                if got:" + NL
+        + "                    bases_shown[got[0]] = got[1]",
+        "                got = None" + NL
+        + "                if got:" + NL
+        + "                    bases_shown[got[0]] = got[1]"),
+    # 全域條件(branch="*")不是一個分支:要求它有自己的基準 = 要求一份「只讓全域
+    # 條件成立」的資料,而那不會讓規則命中,預期必然錯。實測發生過(GLOBAL 分支)。
+    "測資:全域條件被當成一個需要基準的分支": (S,
+        "    out.discard(GLOBAL_BRANCH)",
+        "    pass"),
+    # 基準的隔離期望少了全域條件 = 沒驗到規則真正的前提。
+    "測資:基準的隔離期望不含全域條件": (S,
+        "                if str(c.get(\"branch\", \"\") or \"\") in (b_id, GLOBAL_BRANCH)}",
+        "                if str(c.get(\"branch\", \"\") or \"\") == b_id}"),
+    # 區間類的條件要兩個變體(下界、上界各一個);只認 condition_id 的話第二個會被
+    # 當成「已經有了」拒收,於是只驗得到一邊的門檻(實測漏掉 9 個突變)。
+    "測資:同一條件只收一個變體(只驗得到一邊門檻)": (S,
+        "            return (\"variant\", c[\"condition_id\"], c[\"case_id\"])",
+        "            return (\"variant\", c[\"condition_id\"])"),
+    # 基準的 condition_id 是我們補的 `__base__<分支>`、不在條件清單裡,所以
+    # 「已經有了/認不認得」的判斷要依形狀而異。一律用 condition_id 判斷的話,
+    # 補缺回來的基準會被整批拒收,補缺模式永遠拿不到基準(實測確認過)。
+    "測資:合併時一律用 condition_id 判斷(補缺拿不到基準)": (S,
+        "        if c.get(\"kind\") == \"base\":" + NL
+        + "            return str(c.get(\"branch\", \"\") or \"\") in branch_ids" + NL
+        + "        return c[\"condition_id\"] in cond_ids",
+        "        return c[\"condition_id\"] in cond_ids"),
+    # 接著上次的缺口補(--resume):給了 seed_plan 卻還是先問整份計畫,等於把
+    # 已經生好的案例丟掉重來——每次呼叫 11-16 分鐘,大規則一輪 151 分鐘。
+    "測資:給了既有計畫仍重新生成整份": (S,
+        "            filling = True" + NL
+        + "            user = _fill_gaps_prompt(spec_code, spec_text, seeded, missing, fill_batch," + NL
+        + "                                     seeded_dropped)",
+        "            filling = False"),
+    "測資:既有計畫已補滿仍再問模型": (S,
+        "            if not missing:" + NL
+        + "                return seeded, seeded_gaps, seeded_dropped   # 已經滿了,不用問模型",
+        "            if False:" + NL
+        + "                return seeded, seeded_gaps, seeded_dropped   # 已經滿了,不用問模型"),
+    # 沒有條件可比時若照樣下標籤結論,label_ok 會是 True——「標籤驗過了」的假訊號。
+    # 工具輪次用光時回傳的是最後一則工具結果(不是報告),而端點回 finish_reason="stop"
+    # ——呼叫端只能靠這個標記知道。少了它,工具結果會被當成審查報告收下(#26 第 1 點)。
+    "主審查:工具輪次用光不標記 exhausted": ("agent.py",
+        "    if meta is not None:" + NL + "        meta[\"exhausted\"] = True",
+        "    if meta is not None:" + NL + "        meta[\"exhausted\"] = False"),
+    "執行:沒有條件可比也下標籤結論": (S,
+        "    conds = plan.get(\"conditions\") or []" + NL
+        + "    if not conds:" + NL
+        + "        return",
+        "    conds = plan.get(\"conditions\") or []" + NL
+        + "    if False:" + NL
+        + "        return"),
+    # 標籤檢查沒跑成時,整個案例的標籤就靜靜地沒被驗,報告上跟「驗過沒問題」一樣
+    # (#47 review 的建議)。判斷式多包一層子查詢之後,帶 ORDER BY 或回多欄的會從
+    # 「能算」變成「算不出來」,那種退化不該默默發生。
+    "執行:標籤沒驗到不留痕跡": (S,
+        '                r["label_unverified"] = label_skip',
+        "                pass"),
+    "執行:放棄的原因不帶出來": (S,
+        '            return None, f"條件 {c.get(\'id\')} 沒有判斷式(check_sql)"',
+        '            return None, ""'),
+    "執行:通過的 finding 不提標籤沒驗到": (S,
+        '                                 + _unverified_note(ex["case_results"])))',
+        "                                 ))"),
+    "測資:標籤不符不列入覆蓋缺口": (S,
+        "        if r.get(\"label_ok\") is not False:" + NL + "            continue",
+        "        if True:" + NL + "            continue"),
+    # 凍結檔要記下「生出來花了多少」:這些數字決定上限怎麼訂,不該每次要用就
+    # 重跑一輪(大規格 70 分鐘)。少了它們,凍結檔看起來一樣、但判斷依據就沒了。
+    "凍結:不記錄生成成本": ("../eval/testdata_cache.py",
+        '        "cost": cost or {},',
+        '        "cost": {},'),
+    # 「其他分支整個成立」原本只寫在 prompt 裡靠模型遵守,實測造成 5 個預期錯誤
+    # (變體往上跨一格落進相鄰分支的區間)。改成用 check_sql 直接算。
+    "測資:不驗其他分支有沒有整個成立": (S,
+        "        if case.get(\"kind\") in (\"base\", \"variant\"):" + NL
+        + "            others = _other_branch_satisfied(",
+        "        if False:" + NL
+        + "            others = _other_branch_satisfied("),
+    # 全域條件不成立時任何一支都不會命中(#47 review 第 1 點)。漏了這個判斷,
+    # 全域條件的變體會被判成「別支整個成立」→ 有全域條件的規格永遠通不過。
+    "測資:別支判定不看全域條件有沒有成立": (S,
+        "    if not all(actual.get(i) is True for i in glob):" + NL
+        + "        return []",
+        "    if False:" + NL
+        + "        return []"),
+    "測資:算不出來的全域條件當成立": (S,
+        '    glob = [c["id"] for c in conds' + NL
+        + '            if str(c.get("branch", "") or "") == GLOBAL_BRANCH]' + NL
+        + "    if not all(actual.get(i) is True for i in glob):",
+        '    glob = [c["id"] for c in conds' + NL
+        + '            if str(c.get("branch", "") or "") == GLOBAL_BRANCH]' + NL
+        + "    if not all(actual.get(i) is not False for i in glob):"),
+    # 變體的標籤判準改成「跟基準比 + 差異歸因得到目標條件」。沙盒實測:舊判準把凍結
+    # R-140 的 5 個變體(測資設計正確、10/10 抓得到寫錯的 SQL)全判成資料與標籤不符
+    # → 轉成覆蓋缺口 → 「篩選+門檻」型的規則永遠通不過。三道判準各一個突變點。
+    "測資:變體回到固定的真假向量(不跟基準比)": (S,
+        '        if case.get("kind") == "variant":' + NL
+        + "            why = _variant_label_check(conds, cols_by_table, bases, case, actual)",
+        "        if False:" + NL
+        + "            why = _variant_label_check(conds, cols_by_table, bases, case, actual)"),
+    "測資:不收基準的真假向量(變體永遠沒有基準可比)": (S,
+        '        if case.get("kind") == "base" and vec is not None:',
+        "        if False:"),
+    "測資:變體不必真的弄壞東西": (S,
+        "    if not became_false:",
+        "    if False:"),
+    "測資:不是下游的條件也算歸因得到": (S,
+        "        stray = [i for i in became_false if i != target and i not in down]",
+        "        stray = []"),
+    "測資:下游不看述詞(每個條件都算下游)": (S,
+        '    return {c["id"] for c in conds' + NL
+        + '            if c.get("id") != target_id and pred in _norm_sql(c.get("check_sql"))}',
+        '    return {c["id"] for c in conds' + NL
+        + '            if c.get("id") != target_id}'),
+    "測資:述詞太短也算下游": (S,
+        "    if len(pred) < 8:",
+        "    if False:"),
+    "測資:不檢查改的欄位跟目標條件有不有關": (S,
+        '        elif not any(col in _norm_sql(tcond["check_sql"]) for col in changed):',
+        "        elif False:"),
+    "測資:資料與基準完全相同也算驗過": (S,
+        "        if not changed:" + NL
+        + '            why.append("變體的資料與基準完全相同,沒有改動任何東西")',
+        "        if False:" + NL
+        + '            why.append("變體的資料與基準完全相同,沒有改動任何東西")'),
+    "測資:條件從不成立變成成立也放行": (S,
+        "    if became_true:",
+        "    if False:"),
+    "測資:沒有基準可比時直接放行": (S,
+        '        return [] if actual.get(target) is False else [' + NL
+        + '            f"沒有分支 {b_id} 的基準可以比對,而 {target} 仍然成立"]',
+        "        return []"),
+    "測資:其他分支整個成立時不算有效驗證": (S,
+        "                r[\"label_ok\"] = False" + NL
+        + "                r.setdefault(\"label_mismatch\", []).extend(",
+        "                r[\"label_ok\"] = True" + NL
+        + "                r.setdefault(\"label_mismatch\", []).extend("),
+    # 算不出來的條件(沒有 check_sql → None)不可以當成「成立」:那會把沒驗到的
+    # 說成驗過了。原本另外寫了一道 None 的守衛,但 `is True` 本來就排除 None,
+    # 守衛是死碼(突變它屬於等價突變、抓不到),所以拿掉守衛、改突變這個判斷。
+    "測資:算不出來的條件當成成立": (S,
+        "        if ids and all(actual.get(i) is True for i in ids):",
+        "        if ids and all(actual.get(i) is not False for i in ids):"),
+    # #23 第 2 點的實際可用性:沒有這三道,補缺模式對大規則完全不會啟動——
+    # 第一次就截斷 → 沒有計畫 → 永遠進不去補缺。實測 RETAIL_M1_EVAL 在正式設定下
+    # 就是 3/3 次截斷、0 個案例。
+    "測資:截斷後不要骨架(大規則永遠裝不下)": (S,
+        "            user = _skeleton_prompt(spec_code, spec_text)" + NL
+        + "            continue",
+        "            user = _retry_prompt(spec_code, spec_text, [], 0, max_conds)" + NL
+        + "            continue"),
+    # 補缺被截斷時退回「整份重來」= 把已經拿到的骨架與案例丟掉,再走一次已知裝不下
+    # 的路。重放模擬:這樣改最後拿到 0/46 個案例(真實端點量到的就是 0 個、3/3 截斷),
+    # 減半重試則補滿 46/46。
+    "測資:補缺被截斷就退回整份重來(丟掉骨架)": (S,
+        "            if filling and best is not None:",
+        "            if False:"),
+    "測資:骨架不收(補缺永遠不啟動)": (S,
+        "            if not cleaned[\"cases\"] and cleaned[\"conditions\"] and cleaned[\"schema_ddl\"]:",
+        "            if False:"),
+    "測資:補缺佔用整份生成的預算(補一輪少一次機會)": (S,
+        "    for attempt in range(max_attempts + _FILL_ROUNDS):",
+        "    for attempt in range(max_attempts):"),
     "測資:重試用完就判失敗(丟掉已抽到的最佳版)": (S,
-        "    if best is not None:\n        return best",
-        "    if False:\n        return best"),
+        "    if best is not None:\n        if best_repaired:",
+        "    if False:\n        if best_repaired:"),
     # 執行中止後,沒跑到的案例必須列入覆蓋缺口。少了它,報告會顯示「跑了 N 個
     # 案例、零缺口」,讀起來像全覆蓋,實際上多數案例根本沒執行——而 coverage_gaps
     # 正是人用來判斷「這次到底驗了多少」的欄位。兩個早退點各一個突變點。
