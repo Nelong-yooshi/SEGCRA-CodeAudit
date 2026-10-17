@@ -570,21 +570,18 @@ def test_設定沒有project_dir這個鍵_當成repo根目錄():
     assert loader.calls == [(SHA, "")] and ctx.prefix == "" and ctx.error is None
 
 
-def test_取回失敗_專案裡不是sql的樣板也交人工_不退回沒有macro(monkeypatch):
-    """例如副檔名大寫的 MODEL.SQL、或含樣板的 yml:沒有專案就沒有 macro 可用。"""
+@pytest.mark.parametrize("failed", [True, False])
+def test_專案裡不是sql的檔案_不拿去展開(monkeypatch, failed):
+    """副檔名大寫的 MODEL.SQL:dbt 只讀小寫的 .sql,它不是 model,當成其他檔案(major、交人工)。
+    含樣板的屬性檔也不是 SQL:交給設定比對,不拿去展開。取回成功或失敗都一樣。"""
     def no_render(*a, **kw):
-        raise AssertionError("取回失敗時不應該展開")
+        raise AssertionError("不是 .sql 的檔案不應該展開")
     monkeypatch.setattr(pipeline, "render_model_isolated", no_render)
     files = [_f("models/MODEL.SQL", full_content=MODEL),
              _f("models/schema.yml", full_content="description: \"{{ doc('x') }}\"")]
-    pre, hub = _prescan(files, ctx=_failed_ctx())
-    assert all(e["dbt_render_error"].startswith(_DBT_FETCH_FAILED) for e in pre)
-
-
-def test_取回成功_專案裡不是sql的樣板_用專案的macro展開():
-    src = "SELECT 1 WHERE {{ is_big('x') }}"
-    pre, hub = _prescan([_f("models/MODEL.SQL", full_content=src)], ctx=_ctx())
-    assert hub.rules == ["SELECT 1 WHERE x >= 100000"] and "dbt_render_error" not in pre[0]
+    pre, hub = _prescan(files, ctx=_failed_ctx() if failed else _ctx())
+    assert [e["non_sql"] for e in pre] == ["other", "dbt"]
+    assert all("dbt_render_error" not in e for e in pre)
 
 
 def test_macro目錄互相包含_不會被當成同名macro():

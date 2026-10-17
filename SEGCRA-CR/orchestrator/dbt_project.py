@@ -102,6 +102,11 @@ def read_layout(text: str) -> DbtLayout:
     return DbtLayout(model + macro + analysis + test + seed + snapshot)
 
 
+# dbt 的預設目錄(dbt_project.yml 沒有另外設定時);沒有取回專案、不知道實際設定時用
+DEFAULT_LAYOUT = DbtLayout(DEFAULT_MODEL_PATHS + DEFAULT_MACRO_PATHS + DEFAULT_ANALYSIS_PATHS
+                           + DEFAULT_TEST_PATHS + DEFAULT_SEED_PATHS + DEFAULT_SNAPSHOT_PATHS)
+
+
 class DbtProjectError(Exception):
     """本模組判定的失敗;訊息是固定文字,不含下載內容。"""
 

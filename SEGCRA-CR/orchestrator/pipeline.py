@@ -15,6 +15,8 @@ from .config import DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, estimate_tokens
 from .dbt_affected import AffectedCheck, check_affected_models, impact_finding
 from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_render import is_dbt_template, render_model_isolated
+from .dbt_config_change import HIGH_RISK_NEW, config_changes, default_relative, is_dbt_yaml
+from .dbt_project import DbtProjectError, check_project_dir
 from .security import scan_mr
 from .skills_loader import always_skills, load_skills, skills_index
 from .spec_exec import find_spec, run_spec_exec
@@ -425,6 +427,76 @@ def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None, rendered=()) -> dic
     return out
 
 
+# 送進 SQL 規則與 lint 的只有 .sql(dbt 的 model、macro 也是 .sql)。其餘檔案裡,說明文件、
+# dbt 專案裡的屬性檔與 dbt_project.yml、其他檔案(設定檔、程式碼、副檔名不認得的)分開處理,
+# 見 enforce_non_sql。
+_DOC_SUFFIXES = (".md", ".markdown", ".rst")
+
+
+def _project_prefix(dbt_cfg) -> str:
+    try:
+        return check_project_dir((dbt_cfg or {}).get("project_dir", ""))
+    except DbtProjectError:
+        return ""                        # 設定載入時已檢查過;程式另外組的設定看不懂就當成根目錄
+
+
+def _dbt_relative(path, dbt_ctx: DbtContext | None, dbt_cfg: dict | None) -> str | None:
+    """變更檔是不是 dbt 會讀的檔:是的話回傳相對 dbt 專案根目錄的路徑,不是回 None。
+
+    看位置,不看檔名或內容:有取回專案時照 dbt_project.yml 的目錄設定(DbtContext.relative);
+    沒有(dbt 沒開、MR 沒改到專案的檔案、取不回專案)時,用設定檔的 dbt.project_dir 與 dbt 的
+    預設目錄。說明文件裡的範例 dbt_project.yml、CI 設定、一般 SQL 範本都不算。"""
+    if dbt_ctx is not None and dbt_ctx.layout is not None:
+        return dbt_ctx.relative(path)
+    prefix = dbt_ctx.prefix if dbt_ctx is not None else _project_prefix(dbt_cfg)
+    return default_relative(path, prefix)
+
+
+def _non_sql_kind(path, dbt_rel: str | None = None) -> str | None:
+    """.sql 回傳 None;dbt 專案裡的屬性檔與 dbt_project.yml 回傳 "dbt"(dbt_rel 是 _dbt_relative
+    的結果);說明文件回傳 "doc";其他檔案回傳 "other"。
+
+    .sql 分大小寫,跟 dbt 與接線(dbt_context、dbt_impact)用同一個判斷:dbt 只讀小寫的 .sql,
+    `MODEL.SQL` 不是 model,當成其他檔案(major、交人工)。"""
+    name = str(path or "")
+    if name.endswith(".sql"):
+        return None
+    if dbt_rel is not None and is_dbt_yaml(dbt_rel):
+        return "dbt"
+    return "doc" if name.lower().endswith(_DOC_SUFFIXES) else "other"
+
+
+_NON_SQL_HIT_MESSAGE = "規則 {rule} 在這個非 SQL 檔有命中;命中的原文不顯示(可能含憑證),請到檔案裡確認"
+
+
+async def _non_sql_entry(hub: ToolHub, text: str, kind: str) -> dict:
+    """非 SQL 檔的預掃結果:不跑 lint,規則層只留嚴重命中,而且**只留規則代號、嚴重度與固定文字**。
+
+    內容照樣送進規則層(sqltools__run_rules 會試著當成 SQL 解析,解析錯誤丟掉不用):寫死的憑證
+    不需要語法樹,而設定檔正是它最常出現的地方。只留 major 以上的命中;檢核點與 minor 不留
+    (說明文件提到規則編號,不代表要核對規格)。說明文件只留不需要語法樹的命中:文件裡的 SQL
+    範例(例如一句 DELETE)不會被執行。其他檔案語法樹規則有命中也留:副檔名不是 .sql 的檔案
+    仍可能是會被執行的 SQL。
+
+    命中的訊息與語句不留:R004 的訊息含比對到的原文(例如整段密碼),會進到 prompt 的預掃結果、
+    報告,並被貼回 MR 留言(留言會寄通知,事後改掉 commit 也刪不到)。"""
+    rules = await hub.call_json("sqltools__run_rules", {"sql": text})
+    hits = rules.get("hits") if isinstance(rules, dict) else rules
+    kept = []
+    for h in hits if isinstance(hits, list) else []:
+        if not (isinstance(h, dict) and isinstance(h.get("rule"), str)
+                and _SEVERITY_RANK.get(h.get("severity"), -1) >= _SEVERITY_RANK["major"]
+                and (kind != "doc" or not h.get("statement"))):
+            continue
+        rule = h["rule"] if re.fullmatch(r"[A-Z]{1,3}-?\d{1,4}", h["rule"]) else "(未知規則)"
+        item = {"rule": rule, "severity": h["severity"],
+                "message": _NON_SQL_HIT_MESSAGE.format(rule=rule)}
+        if isinstance(h.get("line"), int) and not isinstance(h.get("line"), bool):
+            item["line"] = h["line"]
+        kept.append(item)
+    return {"non_sql": kind, "rules": kept, "lint": []}
+
+
 async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
                   dbt_ctx: DbtContext | None = None, rendered: list | None = None) -> list[dict]:
     """對每個變更檔跑 rule-base + lint(不經 LLM)。
@@ -445,6 +517,11 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
     for f in files:
         sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or f.get("diff", "")
         entry = {"path": f["path"]}
+        kind = _non_sql_kind(f.get("path"), _dbt_relative(f.get("path"), dbt_ctx, dbt_cfg))
+        if kind is not None:
+            entry.update(await _non_sql_entry(hub, sql, kind))
+            results.append(entry)
+            continue
         dbt_error, in_project = None, False
         # 專案的 macro 檔不是 model:拿去當 model 展開只會得到幾乎空白的結果、規則 0 命中,
         # 看起來沒問題。它對 model 的影響由 macro 反查負責(enforce_dbt_impact);這裡仍對
@@ -610,7 +687,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
 
         if dry_run:
             return await _dry_run_report(hub, mr_id, mr, pre, spec_code, spec_text,
-                                         affected, dbt_ctx)
+                                         affected, dbt_ctx, cfg.dbt)
 
         # 路徑觸發的 skill 自動注入:異常交易規則檔一律載入領域知識,不賭模型主動載
         always_block = always_skills(skills)
@@ -670,6 +747,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述
         report = enforce_scan_skipped(report, scan_target.get("_scan_skipped", 0))  # 內容太多沒掃完
         report = enforce_dbt_impact(report, affected, dbt_ctx)  # macro 等變更影響的其他 model
+        report = enforce_non_sql(report, pre)  # 非 SQL 檔沒跑 SQL 規則:說明文件 info,其他 major
+        report = enforce_dbt_config_change(report, mr, dbt_ctx, cfg.dbt)  # 只改設定時展開結果不變
         report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
         report = enforce_format(report)        # 模型輸出有格式錯誤 → major;須在 sanitize 之後
         report = enforce_injection(report, injection_hits)  # 確定性 blocker,不論模型是否被攻陷
@@ -855,6 +934,116 @@ def enforce_parse(report: dict, pre: list[dict]) -> dict:
             continue
         if entry.get("parse_error"):
             _put_program_finding(report, _parse_fail_finding(entry))
+    return report
+
+
+_NON_SQL_DOC_TITLE = "說明文件,未做 SQL 規則檢查"
+_NON_SQL_OTHER_TITLE = "非 SQL 檔,未經 SQL 規則檢查,需人工確認"
+
+
+def enforce_non_sql(report: dict, pre: list[dict]) -> dict:
+    """非 SQL 檔沒有跑完整的 SQL 規則與 lint(見 _non_sql_entry):每個檔案補一條 finding,
+    讓報告看得到這個缺口。內容只有固定文字,不回顯檔案內容。
+
+    說明文件給 info,不影響決策。dbt 專案裡的屬性檔與 dbt_project.yml 不補:改了什麼由設定比對
+    決定(受關注的設定 major、其他設定 info、只改說明與測試不報,見 enforce_dbt_config_change)——
+    改欄位說明是最常見的 MR,每次都多一條 major 會讓人開始忽略 major。其他檔案(CI 設定、部署、
+    腳本、副檔名不認得的檔案)給 major、不得自動放行:這些檔案以前因為「無法解析」被擋下,
+    改成不跑 SQL 規則之後若只給 info,改了 CI 設定或腳本的 MR 就可能因為沒有任何檢查而被自動放行。
+    標題只能由程式產生(見 _put_program_finding)。"""
+    for entry in pre:
+        kind = entry.get("non_sql")
+        if kind is None or kind == "dbt":
+            continue
+        item = {"file": entry["path"], "line": 0, "citations": []}
+        if kind == "doc":
+            item.update(
+                severity="info", title=_NON_SQL_DOC_TITLE, suggestion="",
+                detail="這個檔案是說明文件,沒有做 SQL 規則檢查與 lint;"
+                       "不需要解析 SQL 的嚴重命中(例如寫死的憑證)仍會列出。")
+        else:
+            item.update(
+                severity="major", title=_NON_SQL_OTHER_TITLE,
+                detail="這個檔案不是 .sql(副檔名分大小寫),沒有做完整的 SQL 規則檢查與 lint"
+                       "(規則層的嚴重命中,例如寫死的憑證,仍會列出,但不顯示原文)。設定檔、腳本"
+                       "這類變更沒有確定性的檢查,不得自動放行。",
+                suggestion="人工確認這個檔案的變更;若它其實是要執行的 SQL,請改用 .sql 副檔名。")
+        _put_program_finding(report, item)
+    return report
+
+
+_DBT_CONFIG_TITLE = "改動了 dbt 物化 / 排程設定,沙盒無法驗證"
+_DBT_CONFIG_OTHER_TITLE = "改動了 dbt 的其他設定"
+_DBT_CONFIG_ADDED_TITLE = "新增的 dbt 檔案帶有設定,請確認"
+_DBT_CONFIG_DELETED_TITLE = "刪除了 dbt 的檔案,請確認"
+# 受關注的設定各自的風險說明(固定文字;同一句只寫一次)
+_DBT_CONFIG_RISKS = {
+    "tags": "這個 model 可能不再被排程選到,或多被選到",
+    "enabled": "這個 model 可能不再被排程選到,或多被選到",
+    "materialized": "可能改成每次全量重建、覆蓋歷史資料,或改變欄位變動時的處理方式",
+    "full_refresh": "可能改成每次全量重建、覆蓋歷史資料,或改變欄位變動時的處理方式",
+    "on_schema_change": "可能改成每次全量重建、覆蓋歷史資料,或改變欄位變動時的處理方式",
+    "unique_key": "重跑同一天時可能重複寫入,或覆蓋不該覆蓋的資料",
+    "incremental_strategy": "重跑同一天時可能重複寫入,或覆蓋不該覆蓋的資料",
+    "incremental_predicates": "重跑同一天時可能重複寫入,或覆蓋不該覆蓋的資料",
+    "pre_hook": "hook 裡的 SQL 不會出現在展開結果裡,規則層與沙盒都沒有檢查到",
+    "post_hook": "hook 裡的 SQL 不會出現在展開結果裡,規則層與沙盒都沒有檢查到",
+    "alias": "寫入的目標表會換到別的位置,原本的表與歷史資料不再更新",
+    "schema": "寫入的目標表會換到別的位置,原本的表與歷史資料不再更新",
+    "database": "寫入的目標表會換到別的位置,原本的表與歷史資料不再更新",
+}
+
+
+def enforce_dbt_config_change(report: dict, mr: dict, dbt_ctx: DbtContext | None = None,
+                              dbt_cfg: dict | None = None) -> dict:
+    """改到 dbt 的物化、排程或寫入相關設定(config()、dbt_project.yml、屬性檔)時,每個檔案補一條
+    finding(比較方式見 dbt_config_change)。哪些檔案是 dbt 的檔案看位置(_dbt_relative)。
+
+    這些設定不會改變展開出來的 SQL,規則層和沙盒都沒有著力點,只能請人確認對排程、重跑與
+    歷史資料的影響:受關注的設定有變、或看不出改了什麼時給 major;只改到其他設定時給 info。
+    新增整個檔案:列出它設定的受關注項目(info);設定了全量重建或 hook、或看不出設定了什麼時
+    給 major。刪除整個 model / 屬性檔給 info。
+    內容只有設定名稱(固定清單)、例外的類型名稱與固定文字,不回顯設定值。標題只能由程式產生
+    (見 _put_program_finding)。不看 dbt 開關:比較的是原文,不需要展開。"""
+    head_text = dbt_ctx.head_text if dbt_ctx is not None else None
+    relative = lambda path: _dbt_relative(path, dbt_ctx, dbt_cfg)     # noqa: E731
+    for change in config_changes(mr.get("files", []), head_text, relative):
+        parts = []
+        if change.deleted:
+            parts.append("刪除了這個 dbt 檔案,或把它改名搬出 dbt 的目錄(model、macro、屬性檔等);"
+                         "請確認下游的 ref()、macro 呼叫與排程不再需要它。")
+        elif change.added and change.keys:
+            parts.append(f"新增的檔案設定了:{'、'.join(change.keys)}。")
+            risky = [k for k in change.keys if k in HIGH_RISK_NEW]
+            if risky:
+                risks = dict.fromkeys(_DBT_CONFIG_RISKS[k] for k in risky)
+                parts.append("可能的影響:" + ";".join(risks) + "。")
+        elif change.keys:
+            parts.append(f"改到的設定:{'、'.join(change.keys)}。")
+            risks = dict.fromkeys(_DBT_CONFIG_RISKS[k] for k in change.keys)
+            parts.append("可能的影響:" + ";".join(risks) + "。")
+        if change.unknown:
+            parts.append(("新增的檔案有設定,但" if change.added else "設定有變更,但")
+                         + "寫法看不出" + ("設定了" if change.added else "改了") + "哪些項目,保守視為需要確認。")
+        if change.error:
+            parts.append(f"(檢查時發生非預期錯誤:{change.error})")
+        if change.other:
+            parts.append(("另外" if parts else "") + ("設定了" if change.added else "改到")
+                         + "受關注清單以外的設定。")
+        if change.added:
+            major = change.unknown or any(k in HIGH_RISK_NEW for k in change.keys)
+        else:
+            major = bool(change.keys or change.unknown)
+        if major:
+            parts.append("這些設定不會改變展開出來的 SQL,規則層與沙盒都無法驗證。")
+        item = {"file": change.path, "line": change.line, "citations": [],
+                "severity": "major" if major else "info",
+                "title": (_DBT_CONFIG_TITLE if major else _DBT_CONFIG_DELETED_TITLE if change.deleted
+                          else _DBT_CONFIG_ADDED_TITLE if change.added else _DBT_CONFIG_OTHER_TITLE),
+                "detail": "".join(parts),
+                "suggestion": ("請確認對排程、重跑與歷史資料的影響;必要時以 dbt ls --select 與 "
+                               "dbt compile 比對變更前後。" if major else "")}
+        _put_program_finding(report, item)
     return report
 
 
@@ -1391,7 +1580,7 @@ def _format_comment(fd: dict) -> str:
 
 async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                           spec_code, spec_text, affected: AffectedCheck | None = None,
-                          dbt_ctx: DbtContext | None = None) -> dict:
+                          dbt_ctx: DbtContext | None = None, dbt_cfg: dict | None = None) -> dict:
     """不經 LLM 的管線煙霧測試:預掃結果直接轉 findings,並驗證 memory/spec 可用。
     (執行驗證需要 LLM 生成測資,dry-run 不跑;只回報 spec 是否找得到。)"""
     mem_sample = await hub.call_json("memory__lookup_similar_reviews",
@@ -1416,6 +1605,8 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
               "_plumbing": {"memory_ok": mem_sample is not None,
                             "spec_found": bool(spec_text), "spec_code": spec_code,
                             "files_scanned": len(pre)}}
+    report = enforce_non_sql(report, pre)      # 與正式路徑一致
+    report = enforce_dbt_config_change(report, mr, dbt_ctx, dbt_cfg)
     report = enforce_dbt_notice(report, pre)   # 與正式路徑一致:表名未驗證的提醒不可少
     report = enforce_dbt_impact(report, affected, dbt_ctx)
     for fd in report["findings"]:
