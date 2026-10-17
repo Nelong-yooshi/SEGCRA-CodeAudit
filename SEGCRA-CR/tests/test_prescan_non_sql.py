@@ -81,7 +81,7 @@ def test_說明文件以前會被報成無法解析():
     assert isinstance(result, dict) and result.get("error")
 
 
-def test_說明文件不解析_不跑lint_不回顯內容():
+def test_說明文件不留解析錯誤_不跑lint_不回顯內容():
     pre, hub = _prescan([_file("README.md", README)])
     assert pre == [{"path": "README.md", "non_sql": "doc", "rules": [], "lint": []}]
     assert [name for name, _ in hub.calls] == ["sqltools__run_rules"]
