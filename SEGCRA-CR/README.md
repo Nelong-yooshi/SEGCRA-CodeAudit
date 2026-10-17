@@ -63,7 +63,7 @@ SEGCRA-CR/
 | `docs/04-後處理防線.md` | enforce 鏈逐道:防什麼、演算法、對 findings 的動作 |
 | `docs/05-執行驗證spec_exec.md` | 三角色最細一篇:測資契約、覆蓋檢查、MS SQL 沙盒執行、仲裁 |
 | `docs/06-決策與merge閘門.md` | 評分公式、三態全部條件、CE 閘門三件套 |
-| `docs/07-webhook自動化.md` | token 驗證、事件路由、debounce、已知限制 |
+| `docs/07-webhook自動化.md` | token 驗證、事件路由、取消舊審查、時間上限、已知限制 |
 | `docs/08-學習迴路autopin.md` | 判例入庫 → 分群起草 → binding MR 人閘全鏈 |
 | `docs/09-dbt展開與反查.md` | dbt 樣板展開成純 SQL、行號對回原始檔、macro 變更反查 model 與規格(尚未接進管線) |
 
@@ -234,7 +234,28 @@ GitLab 設定(逐步):
    - Trigger:勾 **Merge request events** 與 **Comments**
    - Add webhook 後按該 webhook 的 **Test → Merge request events** 驗證，webhook server 端應印出觸發紀錄(HTTP 200)。
 3. 之後 MR 開啟/更新即自動觸發審查;在 MR 討論串留言 **`/review`** 可隨時重審(bot 帳號與 root 的留言不觸發，避免迴圈)。
-4. **Debounce**:同一 MR 審查進行中再被觸發會直接略過(log 顯示 `審查中，略過`)，審完才接受下一次觸發。
+4. **同一 MR 推了新 commit**:取消進行中的那次、改審新的(舊的那次審的是舊程式,
+   結論貼到新 commit 上是錯的)。**只有真的推了新 commit 才會重審** —— GitLab 改
+   label、標題、描述、指派人都送 `action=update`(包括審查自己最後加 label 那一下),
+   這些一律忽略(靠 `object_attributes.oldrev` 分辨)。舊的那次若較晚走到回寫,
+   會比對 MR 目前的 head sha、發現已被取代就不回寫。
+
+### 時間上限(兩個環境變數)
+
+| 變數 | 預設 | 單位 | 管什麼 |
+|---|---|---|---|
+| `REVIEW_TIMEOUT_SECONDS` | 2400 | 秒 | 一份審查的總上限(webhook 這一層) |
+| `SPEC_EXEC_TIMEOUT_SECONDS` | 1200 | 秒 | 執行驗證整段(測資生成 + 沙盒執行 + 仲裁) |
+
+兩個都是**讀不懂就退回預設值並印一行警告**,不會讓伺服器起不來(填錯一個字就起不來
+的話,所有 MR 都收不到審查,那比用預設值跑糟得多);0 或負數也退回預設。
+
+要調的時候照 `_spec_exec.stage_seconds` 量到的各階段秒數訂,不要憑感覺 —— 實測大規格
+的測資生成要 26–70 分鐘,目前 1200 秒的預設在開發機上幾乎一定會逾時(詳見
+`docs/05-執行驗證spec_exec.md`)。
+
+審查沒跑完時,webhook 會留言**並把 `segcra/review` 的 commit status 設成失敗** ——
+擋合併的是 commit status,只留言擋不住。
 
 ## 7. Merge 閘門(CE 的作法)
 
@@ -352,7 +373,7 @@ ssh -L 8929:localhost:8929 <your-user>@<your-server>
 | LLM 請求逾時(`APITimeoutError`) | 單次 LLM 請求上限預設 3600 秒、不自動重試;硬體更慢時以環境變數 `LLM_TIMEOUT`(秒)調高。測資生成/仲裁的 LLM 失敗不會中斷管線——降級為 major「執行驗證無法完成」轉 needs_human |
 | webhook 回 401 | webhook 的 Secret token 與 `GITLAB_WEBHOOK_SECRET` 不一致，或啟動時忘了 export |
 | webhook 完全收不到(GitLab 端顯示錯誤) | ① Admin Area → Settings → Network → Outbound requests 沒勾 **Allow requests to the local network from webhooks**;② URL 要用 `http://172.17.0.1:8000/...`(容器內打 `localhost` 是打容器自己);③ webhook server 沒起來(`curl http://127.0.0.1:8000/health`) |
-| MR 觸發了但沒審 | webhook server 的 stdout:同 MR debounce 中、或 action 不在 open/reopen/update |
+| MR 觸發了但沒審 | webhook server 的 stdout:action 不在 open/reopen/update,或是 `update` 但沒帶 `oldrev`(= 只改了 label/標題/描述,不是推新 commit) |
 | 執行驗證報「無規格可驗」 | MR 的 SQL/標題/描述抓不到 `R-xxx` 規則碼，或 `specs/<code>.md` 不存在(real 模式看 GitLab repo 的 `specs/`;mock 模式看本地 `specs/`) |
 | SQL 無法在測資上執行 | 報告會帶 major「SQL 無法在測資上執行」與 SQL Server 的錯誤訊息。常見:不是 T-SQL 寫法(`= TRUE`、`EXTRACT(...)`、`:start_date` 這類其他資料庫的語法)、用了 spec 資料表定義沒有的欄位、含 dbt 樣板。時間參數用 `@start_date` / `@end_date` |
 | 執行驗證報「沙盒不可用」 | 沙盒沒啟動或連不上:`scripts/sandbox.sh status`;沒啟動就 `scripts/sandbox.sh start`。沙盒不可用時一律不自動放行 |

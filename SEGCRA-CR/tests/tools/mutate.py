@@ -482,9 +482,80 @@ MUTANTS.update({
      '        detail = (f"{stage} 執行時發生 {exc},已跳過。"'),
  "隔離:執行驗證不設時間上限": ("pipeline.py",
      "            spec_result = await asyncio.wait_for(" + NL
-     + "                run_spec_exec(cfg, hub, mr, spec_code, spec_text)," + NL
+     + "                run_spec_exec(cfg, hub, mr, spec_code, spec_text," + NL
+     + "                              progress=progress, deadline=deadline)," + NL
      + "                timeout=SPEC_EXEC_TIMEOUT_SECONDS)",
      "            spec_result = await run_spec_exec(cfg, hub, mr, spec_code, spec_text)"),
+})
+
+# ---- #53 review:時間上限要擋得住同步卡住的沙盒、未完成是硬條件、階段要分得出來
+MUTANTS.update({
+ # 第 1 點:execute_cases 是同步的 pymssql 呼叫,事件迴圈被它卡住,wait_for 插不進去。
+ # 老闆實測:上限 1 秒、沙盒卡 6 秒 → 跑了 6 秒、沒有逾時、結果照常回傳。
+ "逾時:沙盒不丟背景執行緒(事件迴圈被卡住)": ("spec_exec.py",
+     "        ex = await _in_thread(_execute, sql, plan, deadline)",
+     "        ex = _execute(sql, plan, deadline)"),
+ "逾時:背景執行緒不是 daemon(結束時會被拖住)": ("spec_exec.py",
+     '    threading.Thread(target=runner, name="spec-exec-sandbox", daemon=True).start()',
+     '    threading.Thread(target=runner, name="spec-exec-sandbox").start()'),
+ "逾時:背景執行緒不帶 contextvars(釘住的版本讀不到)": ("spec_exec.py",
+     "            out = ctx.run(fn, *args)",
+     "            out = fn(*args)"),
+ "逾時:沙盒不看截止時間(照跑完所有案例)": ("spec_exec.py",
+     "            if deadline is not None and time.monotonic() >= deadline:",
+     "            if False:"),
+ "逾時:沙盒中止不說是逾時": ("spec_exec.py",
+     '    if ex.get("timed_out"):',
+     "    if False:"),
+ # 第 5 點:沒跑完就至少交人工要寫死,不能只靠設定檔的 allowed_severities
+ "決策:未完成不是硬條件(設定一放寬就放行)": ("pipeline.py",
+     "          and not incomplete",
+     "          and True"),
+ "決策:注入命中不先寫進報告(注入防線丟例外就只剩 major)": ("pipeline.py",
+     "        if injection_hits:" + NL
+     + '            report["_injection_scan"] = injection_hits',
+     "        if False:" + NL
+     + '            report["_injection_scan"] = injection_hits'),
+ # 第 6、8 點:隔離清單改成裝飾器自己登記,呼叫處有沒有漏靠測試掃原始碼
+ "隔離:裝飾器不登記(掃原始碼的測試就失效)": ("pipeline.py",
+     "        _ISOLATED_STAGES[fn.__name__] = stage",
+     "        pass"),
+ "隔離:enforce_format 沒包進隔離(原本漏掉的那個)": ("pipeline.py",
+     '@_isolated_stage("輸出格式檢查")' + NL + "def enforce_format(report: dict) -> dict:",
+     "def enforce_format(report: dict) -> dict:"),
+ # 第 7 點:未完成的 finding 要標出階段,而且判斷要看欄位不是標題
+ "隔離:未完成的 finding 不標階段": ("pipeline.py",
+     '            "detail": detail, "stage": stage,',
+     '            "detail": detail,'),
+ "隔離:未完成的判斷改回比對標題開頭": ("pipeline.py",
+     '            if isinstance(f, dict) and f.get("stage")]',
+     '            if str(f.get("title", "")).startswith(INCOMPLETE_TITLE_PREFIX)]'),
+ "隔離:執行驗證逾時不說是哪個階段": ("pipeline.py",
+     "    stage = progress.get(\"stage\")" + NL
+     + '    return f"執行驗證/{stage}" if stage else "執行驗證"',
+     "    stage = None" + NL
+     + '    return f"執行驗證/{stage}" if stage else "執行驗證"'),
+ "隔離:各階段秒數不記進結果": ("spec_exec.py",
+     '        stage_seconds[stage] = round(time.monotonic() - t0, 1)',
+     "        pass"),
+ # 第 3 點:舊審查不得把結論貼上去
+ "回寫:不確認是不是最新的那次審查": ("pipeline.py",
+     '        if await _superseded(hub, mr_id, mr.get("head_sha") or mr.get("sha")):',
+     "        if False:"),
+ "回寫:問不出目前的 sha 就不回寫(變成另一種無聲失敗)": ("pipeline.py",
+     "    except Exception:                        # noqa: BLE001 — 問不出來就當作沒被取代" + NL
+     + "        return False",
+     "    except Exception:" + NL
+     + "        return True"),
+ # 第 9 點:參數讀不懂要退回預設值,不可以讓 webhook 起不來
+ "設定:秒數讀不懂就讓程式起不來": ("config.py",
+     "        print(f\"[config] 警告:環境變數 {name} 的值不是正整數秒數({raw!r}),\"" + NL
+     + '              f"改用預設 {default} 秒", flush=True)' + NL
+     + "        return default",
+     "        raise"),
+ "設定:0 或負數的秒數也照收": ("config.py",
+     "        if v <= 0:" + NL + "            raise ValueError",
+     "        if False:" + NL + "            raise ValueError"),
 })
 # ---- 取回整份新檔的四道防線:唯讀 token、單檔上限、不退回舊版、取不到要交人工
 MUTANTS.update({

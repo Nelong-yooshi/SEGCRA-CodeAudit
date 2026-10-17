@@ -39,7 +39,34 @@ STAGES = [
     ("enforce_tool_refusals", "工具拒絕揭露"),
     ("apply_rubric", "評分"),
     ("apply_policy", "決策閘門"),
+    ("normalize_findings", "輸出形狀整理"),
+    ("enforce_format", "輸出格式檢查"),
 ]
+
+
+def test_每個後處理呼叫都有被包到():
+    """掃 pipeline 的原始碼,確認每一個 `report = X(report, ...)` 的 X 都包過隔離。
+
+    為什麼要掃原始碼:清單靠人工維護就是會漏。原本是在檔案最後用 globals() 把函式
+    換掉,配一份人工清單,而 enforce_format(#32 加的)就這樣漏掉了——漏掉的那個
+    環節丟例外時,整份審查照舊中斷,而且是靜默的。現在改用裝飾器(看定義就知道包過),
+    這條測試再從另一邊確認沒有新的呼叫處被漏掉(#33 之後還會加 enforce_dbt_impact)。
+    """
+    import inspect
+    import re
+
+    src = inspect.getsource(pipeline)
+    called = set(re.findall(r"^\s*report = (\w+)\(report\b", src, re.M))
+    assert called, "連一個後處理呼叫都掃不到,這條測試自己壞了"
+    missing = sorted(n for n in called if n not in pipeline._ISOLATED_STAGES)
+    assert missing == [], f"這些後處理沒有包進環節隔離:{missing}"
+
+
+def test_登記簿與實際包裝一致():
+    """_ISOLATED_STAGES 是裝飾器自己登記的,不是人工清單——抽查它跟函式上的標記一致。"""
+    for name, stage in pipeline._ISOLATED_STAGES.items():
+        fn = getattr(pipeline, name)
+        assert getattr(fn, "__wrapped_stage__", None) == stage, name
 
 
 @pytest.mark.parametrize("fname,stage", STAGES)
@@ -63,7 +90,8 @@ def test_環節失敗的那條是major(fname, stage):
     """major 會讓 auto_approve 的條件不成立(allowed_severities 只許 info)。"""
     wrapped = pipeline._isolated(stage, lambda r, *a, **k: (_ for _ in ()).throw(ValueError()))
     out = wrapped(_report())
-    bad = [f for f in out["findings"] if f["title"].startswith("審查未完整")]
+    # 認的是 stage 欄位,不是標題開頭(標題是給人看的文字,改寫它不該讓判斷失效)
+    bad = [f for f in out["findings"] if f.get("stage")]
     assert bad and all(f["severity"] == "major" for f in bad)
 
 
@@ -216,3 +244,103 @@ def test_執行驗證逾時時沒有_spec_exec欄位(monkeypatch, tmp_path):
     """沒跑完就不該有結果欄位——有欄位會讓判讀的人以為跑過了。"""
     report = _review_with_hanging_spec_exec(monkeypatch, tmp_path, 1)
     assert "_spec_exec" not in report
+
+
+# ───────── 時間上限要擋得住**同步**卡住的沙盒(#53 review 第 1 點) ─────────
+#
+# 原本的測試是用 `await asyncio.sleep` 模擬卡住 —— 那種卡法 `wait_for` 中斷得了,
+# 所以測試會過,但真實的 `execute_cases` 是同步的 pymssql 呼叫:它在跑的時候事件迴圈
+# 整個卡住,`wait_for` 插不進去。老闆實測:上限 1 秒、沙盒卡 6 秒,結果跑了 6 秒、
+# 沒有逾時、結果照常回傳。所以這裡一律用 time.sleep 卡。
+
+def test_同步卡住的沙盒也要在上限內中止(monkeypatch):
+    """`execute_cases` 換成 time.sleep(3)、上限 1 秒:await 要在 1 秒多一點回來。"""
+    import time as _t
+    from orchestrator import spec_exec
+
+    monkeypatch.setattr(spec_exec, "execute_cases",
+                        lambda sql, plan, deadline=None: _t.sleep(3))
+
+    async def main():
+        t0 = _t.monotonic()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(spec_exec._in_thread(spec_exec.execute_cases,
+                                                        "SELECT 1", {}, None),
+                                   timeout=1)
+        return _t.monotonic() - t0
+
+    took = asyncio.run(main())
+    assert took < 2.5, f"同步卡住時 await 沒有準時回來(等了 {took:.1f} 秒)"
+
+
+def test_背景執行緒是daemon且不是預設執行緒池():
+    """不能用 asyncio.to_thread(預設執行緒池):`asyncio.run` 結束時會等池子裡的工作
+    做完,等於逾時又被拖回去(跟 #33 的 _wait_in_thread 同一個理由)。"""
+    import threading
+
+    from orchestrator import spec_exec
+
+    seen = {}
+
+    def slow(*a):
+        cur = threading.current_thread()
+        seen["daemon"] = cur.daemon
+        seen["name"] = cur.name
+        return "done"
+
+    assert asyncio.run(spec_exec._in_thread(slow, 1)) == "done"
+    assert seen["daemon"] is True, "非 daemon 的執行緒會讓程式結束時卡住等它"
+    assert seen["name"] != "MainThread"
+
+
+def test_背景執行緒帶得到contextvars():
+    """審查用的 ref 釘在 ContextVar 裡(#31):不把 context 帶進執行緒,背景那邊讀到的
+    是預設值,於是「依 commit 取回程式碼」會抓到別的版本。"""
+    from toolbox import gitlab
+
+    from orchestrator import spec_exec
+
+    gitlab.pin_review_ref("cafe1234")
+    try:
+        assert asyncio.run(spec_exec._in_thread(gitlab.review_ref)) == "cafe1234"
+    finally:
+        gitlab.pin_review_ref(None)
+
+
+# ───────── 未完成是硬條件、逾時要說是哪個階段(#53 review 第 5、7 點) ─────────
+
+POLICY_LOOSE = {"auto_approve": {"max_diff_lines": 999, "min_score": 0,
+                                 "allowed_severities": ["info", "minor", "major"],
+                                 "forbid_pending_hints": False},
+                "block": {"min_blockers": 1}}
+
+
+def test_有環節沒完成就不得自動放行_即使設定放寬():
+    """原本是靠設定檔的 allowed_severities 只許 info 擋著(未完成的那條是 major)。
+    設定一放寬,沒跑完的審查就會被當成「沒問題」自動放行——所以要寫死在程式裡。"""
+    mr = {"files": [{"path": "a.sql", "diff": "@@ -1 +1 @@\n+SELECT 1;",
+                     "full_content": "SELECT 1;"}]}
+    base = {"score": 100, "findings": [], "_spec_exec": {"passed": True}}
+    # 對照:什麼都沒缺的時候,這份寬鬆設定會放行
+    assert pipeline.apply_policy(dict(base), mr, POLICY_LOOSE)["decision"] == "auto_approved"
+
+    report = {**base, "findings": [pipeline._incomplete_finding("沙盒執行", timeout=1200)]}
+    out = pipeline.apply_policy(report, mr, POLICY_LOOSE)
+    assert out["decision"] == "needs_human"
+    assert out["_policy_signals"]["incomplete"], out["_policy_signals"]
+
+
+def test_逾時的階段名稱():
+    """整段只算一個環節時,報告上只寫「執行驗證未完成」,而測資生成/沙盒/仲裁的修法
+    完全不同。問不出來(例外發生在階段之間)就記整段,不要猜。"""
+    assert pipeline._spec_exec_stage({"stage": "沙盒執行"}) == "執行驗證/沙盒執行"
+    assert pipeline._spec_exec_stage({"stage": None}) == "執行驗證"
+    assert pipeline._spec_exec_stage({}) == "執行驗證"
+
+
+def test_逾時的finding要帶階段欄位與標題():
+    f = pipeline._incomplete_finding("執行驗證/測資生成", timeout=1200)
+    assert f["stage"] == "執行驗證/測資生成"
+    assert f["title"].startswith("[執行驗證/測資生成]") and "逾時" in f["title"]
+    assert f["severity"] == "major"
+    assert "1200" in f["detail"]
