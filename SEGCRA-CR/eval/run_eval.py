@@ -209,9 +209,21 @@ def read_signal(report: dict, key: str):
         # 執行驗證默默失效、靜態審查剛好補上時,測試仍是綠的,看不出防線已經退化。
         return any("執行驗證失敗" in f.get("title", "")
                    for f in report.get("findings", []))
+    if key == "needs_human_marked":
+        # 判斷校準記下了「必須有人看」的理由(無規格可對照、規格未載明)。
+        # 這些情況的 finding 刻意是 info,所以光看 severity 分不出來;決策是 needs_human
+        # 的原因有六七種,光看 decision 也分不出是哪一條在擋。
+        return bool(report.get("_needs_human"))
+    if key == "calibration_downgraded":
+        # 模型的「規格不符」指控被執行驗證的正反兩向案例否證 → 降成 info。
+        return bool((report.get("_calibration") or {}).get("downgraded"))
+    if key == "calibration_dropped":
+        # 「語法錯誤/無法執行」的斷言被 sqlglot 解析否證 → 整條移除。
+        return bool((report.get("_calibration") or {}).get("dropped"))
     raise KeyError(f"未知的訊號名稱: {key}(可用: injection_hit / spec_exec_passed / "
                    f"spec_found / citations_removed / pending_hints / "
-                   f"arbiter_dropped / spec_exec_sql_fault)")
+                   f"arbiter_dropped / spec_exec_sql_fault / needs_human_marked / "
+                   f"calibration_downgraded / calibration_dropped)")
 
 
 # ─────────────────────────── 斷言 ───────────────────────────
