@@ -180,10 +180,16 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
 
    三個都設齊即切到 real 模式;缺任一則走 mock(fixtures/)。
 
-   **dbt macro 的打包下載另外需要一把唯讀 token**(#15):專案 → *Settings* → *Access tokens*
+   **真實模式必須有一把唯讀 token**:專案 → *Settings* → *Access tokens*
    建一把 **project access token**,角色 *Reporter*、scope 只勾 `read_api`、設定到期日,
-   設成 `GITLAB_READ_TOKEN`。它與上面有寫入權的 `GITLAB_TOKEN` 刻意分開:打包下載**不會**
-   退回用 `GITLAB_TOKEN`,兩把設成同一把也會拒絕;沒設時打包下載一律失敗、交人工。
+   設成 `GITLAB_READ_TOKEN`。兩件事都用它:
+
+   * **讀取受審檔案的完整內容**(預掃與執行驗證要的是整份新檔,不是 diff 那幾行)
+   * **dbt macro 的打包下載**
+
+   它與上面有寫入權的 `GITLAB_TOKEN` 刻意分開:**不會**退回用 `GITLAB_TOKEN`,
+   兩把設成同一把也會拒絕。**沒設定的話每個檔案都取不到完整內容,每個 MR 都會被
+   判定「需人工確認」**——真實模式等於跑不動,不是降級跑。
    打包下載只接受 https 的 `GITLAB_URL`(本機 localhost / 127.0.0.1 除外),且不經過
    `HTTP_PROXY` 等代理設定。
 

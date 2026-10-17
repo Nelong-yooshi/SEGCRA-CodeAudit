@@ -420,6 +420,16 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         if not mr:
             raise RuntimeError(f"無法取得 MR {mr_id}")
 
+        # 把這次審查釘在 MR 的 head commit 上:之後 get_file 不指定 ref 時讀的就是
+        # 「正在審的那一版」,而不是目標分支的現況(目標分支讀到的是**改之前**的
+        # 內容,看起來正常、實際上在審錯的東西)。
+        #
+        # **釘在這裡而不是 get_mr_diff 裡**:那個函式在模型的工具清單上,模型若被
+        # MR 描述引導去呼叫別的 MR,釘住的版本就會被換掉,之後讀到的是別人的檔案。
+        # 拿不到 head sha 時釘 None——get_file 會明講取不到,不會退回舊版。
+        from toolbox import gitlab as _gitlab
+        _gitlab.pin_review_ref(mr.get("head_sha"))
+
         if baseline:
             # 裸模型 A/B 對照組 — 無 skills/memory/工具/預掃/執行驗證,不回寫 GitLab
             user = BASELINE_USER.format(
@@ -1539,18 +1549,33 @@ def enforce_unreviewable(report: dict, mr: dict) -> dict:
     """
     bad = [f["path"] for f in mr.get("files", []) if f.get("unreviewable")]
     truncated = bool(mr.get("truncated"))
-    if not bad and not truncated:
+    # 真實模式下取不到**整份新檔**的檔案。四種情況:拿不到 head sha、沒有唯讀
+    # token、超過單檔上限、或 API 失敗(標記由 toolbox/gitlab.py 的 get_mr_diff 打)。
+    # 這些檔案只有 diff 那幾行進得了預掃與沙盒,大檔小改時還原出來可能只剩一行,
+    # 看不出整份程式在做什麼——所以一律交人工。
+    no_full = [f["path"] for f in mr.get("files", [])
+               if f.get("full_content_unavailable") and not f.get("unreviewable")]
+    if not bad and not truncated and not no_full:
         return report
     parts = []
     if bad:
         parts.append(f"以下檔案的 diff 過大或被摺疊,GitLab 未回傳內容:{', '.join(bad[:10])}"
                      + ("等" if len(bad) > 10 else "") + "。")
+    if no_full:
+        parts.append(f"以下檔案取不到完整的新版內容,只能依 diff 判斷:"
+                     f"{', '.join(no_full[:10])}" + ("等" if len(no_full) > 10 else "")
+                     + "(可能是拿不到被審的 commit、未設定唯讀 token、或超過單檔上限)。")
     if truncated:
         parts.append("MR 變更的檔案數超過可取得的分頁上限,部分檔案未能取得。")
     report.setdefault("findings", []).insert(0, {
         "file": "(MR 內容)", "line": 0, "severity": "major",
         "title": _UNREVIEWABLE_TITLE,
-        "detail": "".join(parts) + "這些內容沒有經過注入掃描、規則預掃與模型審查,需人工確認。",
+        # 結尾那句只對「完全拿不到內容」的情況成立。取不到**完整新檔**的檔案
+        # 其實有被審(diff 那幾行進了預掃與模型),只是看不到全貌——說成
+        # 「沒有經過任何審查」會讓判讀的人誤判嚴重程度。
+        "detail": "".join(parts) + (
+            "這些內容沒有經過注入掃描、規則預掃與模型審查,需人工確認。"
+            if (bad or truncated) else "這些檔案只看得到 diff 的片段,需人工確認。"),
         "suggestion": "拆分 MR 讓每個檔案都能被完整取得;或人工審查上列檔案後再合併。",
         "citations": []})
     return report
