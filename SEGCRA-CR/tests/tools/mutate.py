@@ -1747,8 +1747,8 @@ MUTANTS.update({
         "    return {target: direction == \"true\"}",
         "    return {c[\"id\"]: (direction == \"true\" or c[\"id\"] != target) for c in conds}"),
     "測資:不記錄同時不成立的其他條件": (S,
-        "                if cofail:" + NL + "                    r[\"label_cofail\"] = cofail",
-        "                if False:" + NL + "                    r[\"label_cofail\"] = cofail"),
+        "        if cofail:" + NL + "            r[\"label_cofail\"] = cofail",
+        "        if False:" + NL + "            r[\"label_cofail\"] = cofail"),
     "測資:判斷式算不出來時回部分結果": (S,
         "        except Exception:\n            return None\n        if not row:\n            return None",
         "        except Exception:\n            continue\n        if not row:\n            continue"),
@@ -1776,8 +1776,8 @@ MUTANTS.update({
         "    pass"),
     # 基準的隔離期望少了全域條件 = 沒驗到規則真正的前提。
     "測資:基準的隔離期望不含全域條件": (S,
-        "                    if str(c.get(\"branch\", \"\") or \"\") in (b_id, GLOBAL_BRANCH)}",
-        "                    if str(c.get(\"branch\", \"\") or \"\") == b_id}"),
+        "                if str(c.get(\"branch\", \"\") or \"\") in (b_id, GLOBAL_BRANCH)}",
+        "                if str(c.get(\"branch\", \"\") or \"\") == b_id}"),
     # 區間類的條件要兩個變體(下界、上界各一個);只認 condition_id 的話第二個會被
     # 當成「已經有了」拒收,於是只驗得到一邊的門檻(實測漏掉 9 個突變)。
     "測資:同一條件只收一個變體(只驗得到一邊門檻)": (S,
@@ -1823,10 +1823,10 @@ MUTANTS.update({
     # 「其他分支整個成立」原本只寫在 prompt 裡靠模型遵守,實測造成 5 個預期錯誤
     # (變體往上跨一格落進相鄰分支的區間)。改成用 check_sql 直接算。
     "測資:不驗其他分支有沒有整個成立": (S,
-        "                if case.get(\"kind\") in (\"base\", \"variant\"):" + NL
-        + "                    others = _other_branch_satisfied(",
-        "                if False:" + NL
-        + "                    others = _other_branch_satisfied("),
+        "        if case.get(\"kind\") in (\"base\", \"variant\"):" + NL
+        + "            others = _other_branch_satisfied(",
+        "        if False:" + NL
+        + "            others = _other_branch_satisfied("),
     # 全域條件不成立時任何一支都不會命中(#47 review 第 1 點)。漏了這個判斷,
     # 全域條件的變體會被判成「別支整個成立」→ 有全域條件的規格永遠通不過。
     "測資:別支判定不看全域條件有沒有成立": (S,
@@ -1841,11 +1841,51 @@ MUTANTS.update({
         '    glob = [c["id"] for c in conds' + NL
         + '            if str(c.get("branch", "") or "") == GLOBAL_BRANCH]' + NL
         + "    if not all(actual.get(i) is not False for i in glob):"),
+    # 變體的標籤判準改成「跟基準比 + 差異歸因得到目標條件」。沙盒實測:舊判準把凍結
+    # R-140 的 5 個變體(測資設計正確、10/10 抓得到寫錯的 SQL)全判成資料與標籤不符
+    # → 轉成覆蓋缺口 → 「篩選+門檻」型的規則永遠通不過。三道判準各一個突變點。
+    "測資:變體回到固定的真假向量(不跟基準比)": (S,
+        '        if case.get("kind") == "variant":' + NL
+        + "            why = _variant_label_check(conds, cols_by_table, bases, case, actual)",
+        "        if False:" + NL
+        + "            why = _variant_label_check(conds, cols_by_table, bases, case, actual)"),
+    "測資:不收基準的真假向量(變體永遠沒有基準可比)": (S,
+        '        if case.get("kind") == "base" and vec is not None:',
+        "        if False:"),
+    "測資:變體不必真的弄壞東西": (S,
+        "    if not became_false:",
+        "    if False:"),
+    "測資:不是下游的條件也算歸因得到": (S,
+        "        stray = [i for i in became_false if i != target and i not in down]",
+        "        stray = []"),
+    "測資:下游不看述詞(每個條件都算下游)": (S,
+        '    return {c["id"] for c in conds' + NL
+        + '            if c.get("id") != target_id and pred in _norm_sql(c.get("check_sql"))}',
+        '    return {c["id"] for c in conds' + NL
+        + '            if c.get("id") != target_id}'),
+    "測資:述詞太短也算下游": (S,
+        "    if len(pred) < 8:",
+        "    if False:"),
+    "測資:不檢查改的欄位跟目標條件有不有關": (S,
+        '        elif not any(col in _norm_sql(tcond["check_sql"]) for col in changed):',
+        "        elif False:"),
+    "測資:資料與基準完全相同也算驗過": (S,
+        "        if not changed:" + NL
+        + '            why.append("變體的資料與基準完全相同,沒有改動任何東西")',
+        "        if False:" + NL
+        + '            why.append("變體的資料與基準完全相同,沒有改動任何東西")'),
+    "測資:條件從不成立變成成立也放行": (S,
+        "    if became_true:",
+        "    if False:"),
+    "測資:沒有基準可比時直接放行": (S,
+        '        return [] if actual.get(target) is False else [' + NL
+        + '            f"沒有分支 {b_id} 的基準可以比對,而 {target} 仍然成立"]',
+        "        return []"),
     "測資:其他分支整個成立時不算有效驗證": (S,
-        "                        r[\"label_ok\"] = False" + NL
-        + "                        r.setdefault(\"label_mismatch\", []).extend(",
-        "                        r[\"label_ok\"] = True" + NL
-        + "                        r.setdefault(\"label_mismatch\", []).extend("),
+        "                r[\"label_ok\"] = False" + NL
+        + "                r.setdefault(\"label_mismatch\", []).extend(",
+        "                r[\"label_ok\"] = True" + NL
+        + "                r.setdefault(\"label_mismatch\", []).extend("),
     # 算不出來的條件(沒有 check_sql → None)不可以當成「成立」:那會把沒驗到的
     # 說成驗過了。原本另外寫了一道 None 的守衛,但 `is True` 本來就排除 None,
     # 守衛是死碼(突變它屬於等價突變、抓不到),所以拿掉守衛、改突變這個判斷。

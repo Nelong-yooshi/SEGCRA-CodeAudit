@@ -1142,49 +1142,31 @@ def _drop_stale_sandbox_dbs(admin) -> None:
 
 
 def _label_expectation(conds: list[dict], case: dict) -> dict[str, bool]:
-    """這個案例**照它自己的標籤**,被標的那一條應該是真還是假。
+    """這個案例**照它自己的標籤**,哪些條件應該是真、哪些應該是假。
 
-    direction="true"  → 被標的那一條成立
-    direction="false" → 被標的那一條不成立
+    兩種案例走這裡:
+      * **基準**(分支 B):B 的每一條**加上全域條件**都要成立——全域條件屬於每一個
+        分支,少驗它們就等於沒驗到規則真正的前提。
+      * **舊形狀**(每條件 true/false 兩向):只驗被標的那一條,不對其他條件下任何
+        判定。原本的版本要求「direction=false 時只有被標的那一條不成立,其餘全部
+        成立」,那對純 AND 的規格成立,對「條件 1/2/3 任一成立」這種 OR 結構
+        **在數學上不可能成立**——實測 RETAIL_M1_EVAL:
 
-    **只驗被標的那一條,不對其他條件下任何判定。**原本的版本要求
-    「direction=false 時只有被標的那一條不成立,其餘全部成立」,用意是讓反向案例
-    能把失敗歸因到某一條。那個要求對純 AND 的規格成立,對「條件 1/2/3 任一成立」
-    這種 OR 結構**在數學上不可能成立**——實測 RETAIL_M1_EVAL:
+            C1-1:kiosk_outbound_cnt 介於 2–3
+            C3-1:kiosk_outbound_cnt 介於 4–10      ← 交集是空集合
 
-        C1-1:kiosk_outbound_cnt 介於 2–3
-        C3-1:kiosk_outbound_cnt 介於 4–10
+        所以每一個案例都會被判標籤不符(30 個案例 30 個,含 22 個行為完全正確的),
+        而 _label_gaps 會把它轉成覆蓋缺口 → 結果全盤報廢。
 
-    兩者交集是空集合,所以「所有條件同時成立」永遠不可能,於是每一個案例都會
-    被判標籤不符。真端點實測:30 個案例 **30 個**被判不符,含 22 個行為完全
-    正確的——而 _label_gaps 會把標籤不符轉成覆蓋缺口,等於只要規格是 OR 結構,
-    spec_exec 的結果就全盤報廢。100% 誤報。
-
-    「有沒有隔離出那一條」改成記錄(見 execute_cases 的 label_cofail),不判定:
-    要判定得先知道哪些條件屬於同一個 OR 分支,而計畫裡沒有這個結構。
+    **變體不走這裡**:它要跟自己那一支的基準比,而且差異要歸因得到目標條件
+    (見 _variant_label_check)。固定的真假向量對變體是錯的判準——判斷式是整表的
+    存在量化時,「只改一列」不會讓目標條件變假;而門檻條件本來就會跟著變假。
     """
     target, direction = case["condition_id"], case["direction"]
-    if case.get("kind") in ("base", "variant"):
-        # 基準＋變體的形狀下,「其他條件都成立」**在分支內是做得到的**
-        # (分支內是純 AND),所以隔離性可以回來判定:
-        #   基準(branch B)  → B 的每一條都要成立
-        #   變體(壞 T,在 B)→ T 不成立,B 的其他條件都要成立
-        # 這正是原本因為 OR 結構互斥而不得不拔掉的那道檢查。
-        if case["kind"] == "base":
-            # 基準要讓「該分支的條件」**加上全域條件**全部成立——全域條件屬於
-            # 每一個分支,少驗它們就等於沒驗到規則真正的前提。
-            b_id = str(case.get("branch", "") or "")
-            return {c["id"]: True for c in conds
-                    if str(c.get("branch", "") or "") in (b_id, GLOBAL_BRANCH)}
-        b_id = next((str(c.get("branch", "") or "") for c in conds
-                     if c["id"] == target), "")
-        if b_id == GLOBAL_BRANCH:
-            # 全域條件的變體是從某個分支的基準改出來的,但計畫沒記是哪一個,
-            # 所以只驗它自己有沒有被破壞,不對其他條件下判定。
-            return {target: False}
-        return {c["id"]: (c["id"] != target) for c in conds
-                if str(c.get("branch", "") or "") in (b_id, GLOBAL_BRANCH)
-                or c["id"] == target}
+    if case.get("kind") == "base":
+        b_id = str(case.get("branch", "") or "")
+        return {c["id"]: True for c in conds
+                if str(c.get("branch", "") or "") in (b_id, GLOBAL_BRANCH)}
     return {target: direction == "true"}
 
 
@@ -1221,6 +1203,7 @@ def execute_cases(sql: str, plan: dict) -> dict:
     params = _sandbox_params()
     prepared = prepare_sql(sql)
     results, mismatches = [], []
+    truth: dict[str, dict] = {}       # {case_id: 每個條件在這個案例裡的真假}
     out = {"case_results": results, "mismatches": mismatches, "sql_error": None,
            "testdata_error": None, "sandbox_error": None, "engine": None}
 
@@ -1292,35 +1275,13 @@ def execute_cases(sql: str, plan: dict) -> dict:
                  "actual_rows": [[str(v) for v in row] for row in rows[:5]],
                  "ok": actual == case["expect_flagged"]}
             if actual_conds is not None:
-                want = _label_expectation(conds, case)
-                wrong = sorted(k for k, v in want.items() if actual_conds.get(k) is not v)
-                r["label_ok"] = not wrong
-                if wrong:
-                    # 不改 ok(那是「行為符不符合預期」),另外記一欄:
-                    # 這個案例的資料湊不出它宣稱要測的那一條。實測抓到的就是這個:
-                    # 模型的 note 寫「io_ratio = 95k/90k = 1.06」,資料列裡的指定
-                    # 出帳卻只有 35,000 → 實際 0.39,落在規格要求的區間外。
-                    r["label_mismatch"] = wrong
-                # 其他分支有沒有整個成立——**用程式算,不靠模型遵守 prompt**。
-                # 變體:別支成立 → 規則會命中 → 「不命中」的預期是錯的。
-                # 基準:別支也成立 → 命中可能是別支造成的,證明不了「這一支自己會命中」。
-                if case.get("kind") in ("base", "variant"):
-                    others = _other_branch_satisfied(
-                        conds, actual_conds, _case_branch(conds, case))
-                    if others:
-                        r["other_branch_satisfied"] = others
-                        r["label_ok"] = False
-                        r.setdefault("label_mismatch", []).extend(
-                            f"分支{b} 整個成立" for b in others)
-                # 其他條件只記錄、不判定:同時有幾條不成立,對 OR 結構的規格是
-                # 正常的(不同分支本來就互斥),對純 AND 的規格才是雜訊的來源。
-                cofail = sorted(k for k, v in actual_conds.items()
-                                if v is False and k != case["condition_id"])
-                if cofail:
-                    r["label_cofail"] = cofail
+                # 結論留到全部跑完再下:變體要跟它那一支的基準比,而基準不一定
+                # 排在變體前面(見 _apply_label_checks)。
+                truth[case["case_id"]] = actual_conds
             results.append(r)
             if not r["ok"]:
                 mismatches.append({**r, "rows": case["rows"]})
+        _apply_label_checks(plan, results, truth)
         return out
     except Exception as e:
         out["sandbox_error"] = f"沙盒執行異常:{str(e)[:200]}"
@@ -1436,6 +1397,185 @@ def _case_branch(conds: list[dict], case: dict) -> str:
                  if c["id"] == target), "")
 
 
+# ---- 變體的標籤檢查:跟基準比,而且差異要歸因得到目標條件 ----
+#
+# 原本的判準是「變體只讓目標條件不成立,同分支其餘條件全部成立」。在沙盒上實測
+# 凍結的 R-140(10/10 抓得到寫錯的 SQL、測資設計正確)時,5 個變體全部被判不符:
+#
+#   C1-1-v: ['C1-1', 'C1-6']   C1-2-v: ['C1-2', 'C1-6']   …
+#
+# 兩個原因,而且都是結構性的,不是測資的錯:
+#
+#   1. **判斷式是整表的存在量化**:C1-1 是
+#      `EXISTS(... WHERE op_code IN ('OP01','OP02','OP03'))`。變體把其中一列改成
+#      OP99(那筆不計入、總額掉到門檻以下),但其他列還有 OP01 → 整表的 EXISTS
+#      仍然是真。「只改一列」本來就不會讓整表的存在量化變假。
+#   2. **門檻條件本來就該跟著變假**:C1-6 是「累計金額 >= 500,000」,而那個累計只算
+#      通過前面篩選的金額。拿掉一筆當然低於門檻——這是必然的連帶效果。
+#
+# 而 _label_gaps 會把標籤不符轉成覆蓋缺口、`passed` 又要求沒有覆蓋缺口,所以
+# 「篩選 → 累計 → 比門檻」這種形狀的規則(幾乎所有異常交易規則)執行驗證永遠通不過,
+# `passed=True` 這個狀態到不了。
+#
+# 改成問一個做得到、而且是我們真正在意的問題:**這個變體有沒有「因為目標條件」而讓
+# 規則不命中?** 三件事都要成立:
+#
+#   a. 跟基準相比,至少有一個條件從成立變成不成立(真的弄壞了東西);
+#   b. 變成不成立的條件,只能是目標條件本身、或目標條件的**下游**(判斷式裡含有
+#      目標條件的述詞的那些彙總/門檻條件);反之,沒有條件從不成立變成成立;
+#   c. 變體相對基準**改動的欄位**要出現在目標條件的判斷式裡——否則它改的是別的東西,
+#      宣稱測 C1-1、實際上靠改金額讓它不命中,那個條件並沒有被驗到(#23 第 3 點
+#      要防的就是這個)。
+#
+# (c) 是純資料比對,不碰沙盒;(a)(b) 用基準案例的真假向量當參照,所以標籤檢查改成
+# 全部案例跑完之後再做一次(基準不一定排在變體前面)。
+
+_PREDICATE = re.compile(r"\bWHERE\b(.*?)(?:\)\s*THEN\b|\bGROUP\s+BY\b|\bHAVING\b|$)",
+                        re.I | re.S)
+
+
+def _norm_sql(s: str) -> str:
+    return " ".join(str(s or "").split()).lower()
+
+
+def _predicate_of(cond: dict) -> str:
+    """條件判斷式裡的述詞(WHERE 之後那段)。拿來判斷「誰是誰的下游」。"""
+    m = _PREDICATE.search(str(cond.get("check_sql") or ""))
+    return _norm_sql(m.group(1)) if m else ""
+
+
+def _downstream_ids(conds: list[dict], target_id: str) -> set[str]:
+    """判斷式裡含有目標條件述詞的其他條件 = 目標的下游。
+
+    R-140 的 C1-6(`SUM(CASE WHEN op_code IN (...) AND cash_flag='Y' … THEN amount)
+    >= 500000`)把五個篩選條件的述詞逐字包在裡面,所以它是那五條的下游:弄壞任何
+    一條篩選,這個累計必然跟著變假。用文字含有關係判斷,是因為這層依賴本來就寫在
+    判斷式裡,不必另外請模型標。述詞太短的不算(避免「1=1」這種湊巧的包含)。
+    """
+    target = next((c for c in conds if c.get("id") == target_id), None)
+    pred = _predicate_of(target or {})
+    if len(pred) < 8:
+        return set()
+    return {c["id"] for c in conds
+            if c.get("id") != target_id and pred in _norm_sql(c.get("check_sql"))}
+
+
+def _changed_columns(base_rows, var_rows, cols_by_table: dict) -> set[str] | None:
+    """變體相對基準改了哪些欄位(欄位名小寫)。逐列對不起來時回 None(不下判定)。
+
+    回 None 的情況:列數不同(例如變體是靠少一列讓筆數不足)、表名不同、欄位數不同。
+    那些變體仍然可能是對的,只是不能用「改了哪一欄」來歸因,所以放過這一項。
+    """
+    if not base_rows or not var_rows or len(base_rows) != len(var_rows):
+        return None
+    changed = set()
+    for b, v in zip(base_rows, var_rows):
+        if not (isinstance(b, list) and isinstance(v, list)) or len(b) != len(v):
+            return None
+        if str(b[0]).lower() != str(v[0]).lower():
+            return None
+        cols = cols_by_table.get(str(b[0]).strip().strip("[]").lower().rsplit(".", 1)[-1])
+        for i, (x, y) in enumerate(zip(b[1:], v[1:])):
+            if x != y:
+                changed.add(cols[i]["name"].lower() if cols and i < len(cols)
+                            else f"第{i + 1}欄")
+    return changed
+
+
+def _variant_label_check(conds: list[dict], cols_by_table: dict,
+                         bases: dict, case: dict, actual: dict) -> list[str]:
+    """變體有沒有「因為目標條件」而讓規則不命中。回傳說不通的理由(空 = 通過)。"""
+    target = case.get("condition_id")
+    tcond = next((c for c in conds if c.get("id") == target), None)
+    b_id = str((tcond or {}).get("branch", "") or "")
+    if b_id == GLOBAL_BRANCH:
+        # 全域條件的變體是從某一支的基準改出來的,但計畫沒記是哪一支,
+        # 所以只驗它自己有沒有被破壞(全域條件通常就是整表的日期窗,改得動)。
+        return [] if actual.get(target) is False else [f"{target} 仍然成立,沒有被破壞"]
+    base = bases.get(b_id)
+    if base is None:
+        # 沒有基準可比(基準案例被丟掉或沒跑到)→ 退回舊判準:目標必須為假。
+        # 基準不見了本身已經是一個覆蓋缺口,不必在這裡再放寬。
+        return [] if actual.get(target) is False else [
+            f"沒有分支 {b_id} 的基準可以比對,而 {target} 仍然成立"]
+    base_vec, base_rows = base
+    members = [c["id"] for c in conds
+               if str(c.get("branch", "") or "") in (b_id, GLOBAL_BRANCH)]
+    became_false = [i for i in members
+                    if base_vec.get(i) is True and actual.get(i) is False]
+    became_true = [i for i in members
+                   if base_vec.get(i) is False and actual.get(i) is True]
+    down = _downstream_ids(conds, target)
+    why = []
+    if became_true:
+        why.append(f"{'、'.join(became_true)} 從不成立變成成立(變體只該弄壞東西)")
+    if not became_false:
+        why.append(f"與基準相比沒有任何條件變成不成立,這個變體沒有真的破壞 {target}")
+    else:
+        stray = [i for i in became_false if i != target and i not in down]
+        if stray:
+            why.append(f"{'、'.join(stray)} 也變成不成立,而它們不是 {target} 的下游"
+                       f"(規則不命中歸因不到 {target})")
+    changed = _changed_columns(base_rows, case.get("rows") or [], cols_by_table)
+    if changed is not None and tcond is not None and tcond.get("check_sql"):
+        if not changed:
+            why.append("變體的資料與基準完全相同,沒有改動任何東西")
+        elif not any(col in _norm_sql(tcond["check_sql"]) for col in changed):
+            why.append(f"變體改的欄位({'、'.join(sorted(changed))})沒有出現在 "
+                       f"{target} 的判斷式裡,改的不是這個條件")
+    return why
+
+
+def _apply_label_checks(plan: dict, results: list[dict], truth: dict) -> None:
+    """全部案例跑完之後統一下標籤結論(基準的真假向量要先齊全才比得了)。
+
+    `truth` = {case_id: 這個案例裡每個條件的真假};算不出來的案例不在裡面,
+    那種案例一律不下結論(沒有 label_ok 這一欄),不可以當成「驗過了」。
+    """
+    conds = plan.get("conditions") or []
+    if not conds:
+        return
+    cols_by_table = _ddl_columns(plan.get("schema_ddl") or [])
+    by_case = {c.get("case_id"): c for c in plan.get("cases") or []}
+    bases = {}
+    for r in results:
+        case = by_case.get(r["case_id"]) or {}
+        vec = truth.get(r["case_id"])
+        if case.get("kind") == "base" and vec is not None:
+            bases[str(case.get("branch", "") or "")] = (vec, case.get("rows") or [])
+    for r in results:
+        actual = truth.get(r["case_id"])
+        if actual is None:
+            continue
+        case = by_case.get(r["case_id"]) or {}
+        if case.get("kind") == "variant":
+            why = _variant_label_check(conds, cols_by_table, bases, case, actual)
+        else:
+            # 基準與舊形狀的案例:判準沒有變(基準要讓該分支加全域條件全部成立)
+            want = _label_expectation(conds, case)
+            why = [f"{k} 的真假與這個標籤應有的不同"
+                   for k, v in sorted(want.items()) if actual.get(k) is not v]
+        r["label_ok"] = not why
+        if why:
+            r["label_mismatch"] = why
+        # 其他分支有沒有整個成立——**用程式算,不靠模型遵守 prompt**。
+        # 變體:別支成立 → 規則會命中 → 「不命中」的預期是錯的。
+        # 基準:別支也成立 → 命中可能是別支造成的,證明不了「這一支自己會命中」。
+        if case.get("kind") in ("base", "variant"):
+            others = _other_branch_satisfied(conds, actual, _case_branch(conds, case))
+            if others:
+                r["other_branch_satisfied"] = others
+                r["label_ok"] = False
+                r.setdefault("label_mismatch", []).extend(
+                    f"分支{b} 整個成立" for b in others)
+        # 其他條件只記錄、不判定:同時有幾條不成立,對 OR 結構的規格是正常的
+        # (不同分支本來就互斥),對純 AND 的規格才是雜訊的來源。
+        cofail = sorted(k for k, v in actual.items()
+                        if v is False and k != r["condition_id"])
+        if cofail:
+            r["label_cofail"] = cofail
+
+
 def _label_gaps(case_results: list[dict]) -> list[str]:
     """標籤與資料對不上的案例 = 該條件該向**沒有真的被驗到**(#23 第 3 點)。
 
@@ -1462,8 +1602,8 @@ def _label_gaps(case_results: list[dict]) -> list[str]:
             continue
         gaps.append(
             f"案例 {r['case_id']}(條件 {r['condition_id']} {r['direction']} 向)"
-            f"的資料與標籤不符:{'、'.join(r.get('label_mismatch') or [])} 的真假"
-            f"與這個標籤應有的不同,該向未經有效驗證")
+            f"的資料與標籤不符:{';'.join(r.get('label_mismatch') or [])}"
+            f",該向未經有效驗證")
     return gaps
 
 

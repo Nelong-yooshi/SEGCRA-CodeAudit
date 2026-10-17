@@ -1135,21 +1135,17 @@ def test_舊形狀的計畫仍然讀得懂():
     assert all("kind" not in c for c in cleaned["cases"])
 
 
-def test_隔離性在分支內可以判定():
-    """原本因為 OR 分支互斥而不得不拔掉的判定,在基準＋變體的形狀下回來了:
+def test_基準的隔離性在分支內可以判定():
+    """原本因為 OR 分支互斥而不得不拔掉的判定,在基準的形狀下回來了:
     分支**內**是純 AND,「其他條件都成立」在數學上做得到。"""
     conds = [{"id": "C1", "desc": "a", "branch": "B1"},
              {"id": "C2", "desc": "b", "branch": "B1"},
              {"id": "C3", "desc": "c", "branch": "B2"}]
-    want = spec_exec._label_expectation(conds, {"condition_id": "C1",
-                                                "direction": "false",
-                                                "kind": "variant"})
-    assert want == {"C1": False, "C2": True}, "只管同分支,且只有被壞的那條為假"
     want_b = spec_exec._label_expectation(conds, {"kind": "base", "branch": "B1",
                                                   "condition_id": "__base__B1",
                                                   "direction": "true"})
     assert want_b == {"C1": True, "C2": True}, "基準:同分支全部成立"
-    assert "C3" not in want and "C3" not in want_b, "別的分支本來就互斥,不可判定"
+    assert "C3" not in want_b, "別的分支本來就互斥,不可判定"
 
 
 def test_不是資料層面的條件不要求變體():
@@ -1294,9 +1290,10 @@ def test_基準的隔離期望要含全域條件():
 def test_全域條件的變體只驗它自己():
     """它是從某個分支的基準改出來的,但計畫沒記是哪一個,所以不對其他條件下判定。"""
     conds = _gplan([])["conditions"]
-    want = spec_exec._label_expectation(conds, {"kind": "variant", "condition_id": "G-1",
-                                                "direction": "false"})
-    assert want == {"G-1": False}
+    case = {"kind": "variant", "condition_id": "G-1", "direction": "false"}
+    assert spec_exec._variant_label_check(conds, {}, {}, case, {"G-1": False}) == []
+    why = spec_exec._variant_label_check(conds, {}, {}, case, {"G-1": True})
+    assert why and "仍然成立" in why[0]
 
 
 def test_區間條件可以有兩個變體():
@@ -1622,3 +1619,209 @@ def test_每一列都要檢查():
          "conditions": [{"id": "C1", "desc": "條件 C1"}], "cases": [case]})
     assert plan["cases"] == []
     assert "第 3 列" in dropped[0]["reason"], dropped[0]["reason"]
+
+
+# ─────────────── 變體的標籤檢查:跟基準比 + 差異要歸因得到目標條件 ───────────────
+#
+# 沙盒實測凍結的 R-140(10/10 抓得到寫錯的 SQL、測資設計正確)時,舊判準把 5 個
+# 變體全部判成「資料與標籤不符」→ 轉成覆蓋缺口 → passed 永遠到不了。原因是結構性的:
+# 判斷式是整表的存在量化(改一列不會讓它變假),而門檻條件本來就會跟著變假。
+
+# R-140 的實際形狀:五個篩選條件 + 一個「只累計通過篩選的金額」的門檻條件。
+_FILTER_SQL = {
+    "C1-1": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log "
+            "WHERE op_code IN ('OP01','OP02','OP03')) THEN 1 ELSE 0 END",
+    "C1-2": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log "
+            "WHERE cash_flag = 'Y') THEN 1 ELSE 0 END",
+}
+_THRESHOLD_SQL = ("SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log GROUP BY account_id "
+                  "HAVING SUM(CASE WHEN op_code IN ('OP01','OP02','OP03') "
+                  "AND cash_flag = 'Y' THEN amount ELSE 0 END) >= 500000) THEN 1 ELSE 0 END")
+
+_R140_CONDS = [
+    {"id": "C*-1", "desc": "交易日在窗內", "branch": "*",
+     "check_sql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log "
+                  "WHERE tx_time >= '2026-06-01' AND tx_time < '2026-06-02') THEN 1 ELSE 0 END"},
+    {"id": "C1-1", "desc": "op_code 屬於清單", "branch": "C1", "check_sql": _FILTER_SQL["C1-1"]},
+    {"id": "C1-2", "desc": "cash_flag = Y", "branch": "C1", "check_sql": _FILTER_SQL["C1-2"]},
+    {"id": "C1-6", "desc": "累計金額 >= 500000", "branch": "C1", "check_sql": _THRESHOLD_SQL},
+]
+_R140_DDL = ["CREATE TABLE txn_log (account_id INT, tx_time DATETIME2, "
+             "op_code NVARCHAR(10), amount DECIMAL(14,2), cash_flag NVARCHAR(10));"]
+_BASE_ROWS = [["txn_log", 101, "2026-06-01 10:00:00", "OP01", 300000.0, "Y"],
+              ["txn_log", 101, "2026-06-01 11:00:00", "OP02", 250000.0, "Y"]]
+
+
+def _r140_cols():
+    return spec_exec._ddl_columns(_R140_DDL)
+
+
+def _r140_variant(target, rows):
+    return {"case_id": f"{target}-v", "kind": "variant", "condition_id": target,
+            "direction": "false", "expect_flagged": False, "note": "", "rows": rows}
+
+
+# 基準:分支與全域條件全部成立
+_BASE_VEC = {"C*-1": True, "C1-1": True, "C1-2": True, "C1-6": True}
+_BASES = {"C1": (_BASE_VEC, _BASE_ROWS)}
+
+
+def _check(case, actual):
+    return spec_exec._variant_label_check(_R140_CONDS, _r140_cols(), _BASES, case, actual)
+
+
+def test_整表存在量化的目標條件沒變假_但門檻跟著變假_算有效驗證():
+    """R-140 的實際情況:把一列的 OP01 改成 OP99,那筆不計入、總額掉到門檻以下
+    → 規則不命中。設計正確,但 C1-1 的判斷式是整表的 EXISTS,其他列還有 OP02,
+    所以 C1-1 仍然是真;真正變假的是它的下游 C1-6。舊判準把這判成測資有錯。"""
+    rows = [["txn_log", 101, "2026-06-01 10:00:00", "OP99", 300000.0, "Y"],
+            ["txn_log", 101, "2026-06-01 11:00:00", "OP02", 250000.0, "Y"]]
+    actual = {"C*-1": True, "C1-1": True, "C1-2": True, "C1-6": False}
+    assert _check(_r140_variant("C1-1", rows), actual) == []
+
+
+def test_目標條件自己變假也算有效驗證():
+    """單列的測資(或改掉所有列)會讓目標條件自己變假,那當然算。"""
+    rows = [["txn_log", 101, "2026-06-01 10:00:00", "OP99", 300000.0, "Y"],
+            ["txn_log", 101, "2026-06-01 11:00:00", "OP98", 250000.0, "Y"]]
+    actual = {"C*-1": True, "C1-1": False, "C1-2": True, "C1-6": False}
+    assert _check(_r140_variant("C1-1", rows), actual) == []
+
+
+def test_改的欄位跟目標條件無關_算沒驗到():
+    """#23 第 3 點要防的壞法:宣稱測 C1-1(op_code),實際上是把金額降到門檻以下
+    讓規則不命中 —— op_code 那一條根本沒被驗到。這一條不能被上面的放寬吃掉。"""
+    rows = [["txn_log", 101, "2026-06-01 10:00:00", "OP01", 1.0, "Y"],
+            ["txn_log", 101, "2026-06-01 11:00:00", "OP02", 1.0, "Y"]]
+    actual = {"C*-1": True, "C1-1": True, "C1-2": True, "C1-6": False}
+    why = _check(_r140_variant("C1-1", rows), actual)
+    assert why and "amount" in why[0] and "C1-1" in why[0], why
+
+
+def test_不是下游的條件也變假_算沒驗到():
+    """變體順手把全域條件(時間窗)也弄壞了 → 規則不命中歸因不到目標條件。"""
+    rows = [["txn_log", 101, "2026-06-05 10:00:00", "OP99", 300000.0, "Y"],
+            ["txn_log", 101, "2026-06-05 11:00:00", "OP02", 250000.0, "Y"]]
+    actual = {"C*-1": False, "C1-1": True, "C1-2": True, "C1-6": False}
+    why = _check(_r140_variant("C1-1", rows), actual)
+    assert any("C*-1" in w and "下游" in w for w in why), why
+
+
+def test_什麼都沒弄壞_算沒驗到():
+    actual = dict(_BASE_VEC)
+    why = _check(_r140_variant("C1-1", list(_BASE_ROWS)), actual)
+    assert any("沒有真的破壞" in w for w in why), why
+
+
+def test_資料與基準完全相同_算沒驗到():
+    """只改標籤、不改資料的「變體」必須抓到。"""
+    actual = {"C*-1": True, "C1-1": True, "C1-2": True, "C1-6": False}
+    why = _check(_r140_variant("C1-1", [list(r) for r in _BASE_ROWS]), actual)
+    assert any("完全相同" in w for w in why), why
+
+
+def test_從不成立變成成立_算沒驗到():
+    """變體只該弄壞東西。有條件反而變成立,代表資料被動到不該動的地方。"""
+    base_vec = {"C*-1": True, "C1-1": True, "C1-2": False, "C1-6": True}
+    rows = [["txn_log", 101, "2026-06-01 10:00:00", "OP99", 300000.0, "Y"],
+            ["txn_log", 101, "2026-06-01 11:00:00", "OP02", 250000.0, "Y"]]
+    why = spec_exec._variant_label_check(
+        _R140_CONDS, _r140_cols(), {"C1": (base_vec, _BASE_ROWS)},
+        _r140_variant("C1-1", rows), {"C*-1": True, "C1-1": True, "C1-2": True, "C1-6": False})
+    assert any("變成成立" in w for w in why), why
+
+
+def test_列數不同時不用欄位歸因():
+    """變體靠少一列讓筆數/總額不足是合理的做法,只是不能用「改了哪一欄」歸因。
+    條件真假的歸因(跟基準比)仍然要過。"""
+    rows = [["txn_log", 101, "2026-06-01 10:00:00", "OP01", 300000.0, "Y"]]
+    actual = {"C*-1": True, "C1-1": True, "C1-2": True, "C1-6": False}
+    assert _check(_r140_variant("C1-6", rows), actual) == []
+
+
+def test_沒有基準可比時退回舊判準():
+    """基準案例被丟掉或沒跑到 → 目標條件必須自己變假。基準不見了本身已經是一個
+    覆蓋缺口,不必在這裡再放寬。"""
+    rows = [["txn_log", 101, "2026-06-01 10:00:00", "OP99", 300000.0, "Y"]]
+    actual = {"C*-1": True, "C1-1": True, "C1-2": True, "C1-6": False}
+    why = spec_exec._variant_label_check(_R140_CONDS, _r140_cols(), {},
+                                         _r140_variant("C1-1", rows), actual)
+    assert any("沒有分支 C1 的基準" in w for w in why), why
+    actual2 = {**actual, "C1-1": False}
+    assert spec_exec._variant_label_check(_R140_CONDS, _r140_cols(), {},
+                                          _r140_variant("C1-1", rows), actual2) == []
+
+
+def test_下游條件的判定():
+    """「下游」= 判斷式裡逐字含有目標條件的述詞。R-140 的門檻條件把五個篩選條件的
+    述詞包在 SUM(CASE WHEN ...) 裡,所以它是那五條的下游。"""
+    assert spec_exec._downstream_ids(_R140_CONDS, "C1-1") == {"C1-6"}
+    assert spec_exec._downstream_ids(_R140_CONDS, "C1-2") == {"C1-6"}
+    assert spec_exec._downstream_ids(_R140_CONDS, "C1-6") == set(), "門檻條件沒有下游"
+    # 述詞太短的不算,避免「1=1」這種湊巧的包含
+    conds = [{"id": "A", "desc": "a", "check_sql": "SELECT 1 WHERE x=1"},
+             {"id": "B", "desc": "b", "check_sql": "SELECT 1 WHERE x=1 AND y=2"}]
+    assert spec_exec._downstream_ids(conds, "A") == set()
+
+
+def test_改了哪些欄位():
+    cols = _r140_cols()
+    same = spec_exec._changed_columns(_BASE_ROWS, [list(r) for r in _BASE_ROWS], cols)
+    assert same == set()
+    one = spec_exec._changed_columns(
+        _BASE_ROWS, [["txn_log", 101, "2026-06-01 10:00:00", "OP99", 300000.0, "Y"],
+                     ["txn_log", 101, "2026-06-01 11:00:00", "OP02", 250000.0, "Y"]], cols)
+    assert one == {"op_code"}
+    assert spec_exec._changed_columns(_BASE_ROWS, [_BASE_ROWS[0]], cols) is None, "列數不同"
+
+
+def test_execute_cases_的變體判定走完整路徑(monkeypatch):
+    """上面都是直接呼叫 _variant_label_check,所以 execute_cases 裡改成不呼叫它
+    也不會紅。這一條走真正的路徑,而且**基準排在變體後面**——變體要跟基準比,
+    結論就必須等全部案例跑完才下得了。"""
+    _fake_sandbox(monkeypatch)
+
+    class _R140Cursor(_FakeCursor):
+        """判斷式的答案由這個案例**實際灌進去的資料**決定——基準與變體的真假向量
+        才會不同(用固定答案的話兩邊一樣,就測不到「跟基準比」這件事)。"""
+
+        def __init__(self):
+            self._seen = []
+            self._cond = None
+
+        def execute(self, sql, params=None):
+            super().execute(sql, params)
+            if params:
+                self._seen.append(params)
+            has_op99 = any("OP99" in str(v) for row in self._seen for v in row)
+            self._cond = None
+            # 門檻那條要先判:它的判斷式裡面也含有篩選條件的述詞(那正是「下游」的
+            # 意思),順序寫反就會被篩選條件那一支攔走
+            if "HAVING SUM" in sql:
+                self._cond = not has_op99  # 那筆不計入 → 總額掉到門檻以下
+            elif "op_code IN" in sql:
+                self._cond = True          # 另一列的 OP02 還在清單裡 → 整表 EXISTS 仍為真
+            elif "cash_flag" in sql:
+                self._cond = True
+            elif "tx_time >=" in sql:
+                self._cond = True
+
+        def fetchone(self):
+            if self._cond is None:
+                return ("16.0.1000.6", "Developer Edition")
+            return (1 if self._cond else 0,)
+
+    monkeypatch.setattr(_FakeCon, "cursor", lambda self: _R140Cursor())
+    plan = {"schema_ddl": _R140_DDL, "conditions": _R140_CONDS,
+            "cases": [_r140_variant("C1-1", [["txn_log", 101, "2026-06-01 10:00:00",
+                                         "OP99", 300000.0, "Y"],
+                                        ["txn_log", 101, "2026-06-01 11:00:00",
+                                         "OP02", 250000.0, "Y"]]),
+                      {"case_id": "C1-base", "kind": "base", "branch": "C1",
+                       "condition_id": "__base__C1", "direction": "true",
+                       "expect_flagged": True, "note": "", "rows": _BASE_ROWS}]}
+    out = spec_exec.execute_cases("SELECT account_id FROM txn_log", plan)
+    assert not out["sandbox_error"], out["sandbox_error"]
+    var = next(r for r in out["case_results"] if r["case_id"] == "C1-1-v")
+    assert var["label_ok"] is True, var.get("label_mismatch")
+    assert spec_exec._label_gaps(out["case_results"]) == []
