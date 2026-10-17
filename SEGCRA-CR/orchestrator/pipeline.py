@@ -4,14 +4,18 @@ MR → 確定性前處理(注入掃描‖rule-base 預掃‖分層記憶/binding
    → 確定性後處理(enforce 鏈 → 執行驗證 spec_exec → rubric → 決策三態)
    → 回寫 GitLab(留言/分數/label/commit status)。
 """
+import asyncio
 import json
+import os
 import re
+import time
 from collections import Counter
 
 from pathlib import Path
 
 from .agent import extract_json, run_agent
-from .config import DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, estimate_tokens
+from .config import (DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, env_seconds,
+                     estimate_tokens)
 from .dbt_render import is_dbt_template, render_model_isolated
 from .security import scan_mr
 from .skills_loader import always_skills, load_skills, skills_index
@@ -129,6 +133,128 @@ def _as_line(value) -> tuple[int, bool]:
     return 0, True
 
 
+# ───────────────────────── 環節隔離(#45) ─────────────────────────
+#
+# 原則:**外層不能因為內層出事而跟著出事**。review_mr 的任一環節(預掃、dbt 展開、
+# 後處理的每一步、執行驗證)丟例外或逾時,整份審查原本會中斷——MR 收不到任何結果:
+# 沒擋、沒放、也沒人知道。那是最糟的失敗型態。
+#
+# 所以每個環節各自捕捉:失敗就補一條 major「審查未完整:<環節>」,**後面的環節照跑**,
+# 報告照常產出。major 會讓 apply_policy 的 auto_approve 條件不成立
+# (allowed_severities 只許 info),所以「沒跑完」不會被當成「沒問題」放行。
+#
+# detail 只寫環節名稱與例外類型:例外訊息可能帶著模型輸出或 MR 內容,
+# 而報告會貼回 GitLab(#45 明訂不得回顯)。
+INCOMPLETE_TITLE_PREFIX = "審查未完整"
+# 執行驗證整段的上限。它包含測資生成(實測大規則 54-151 分鐘)、沙盒執行與仲裁;
+# 沙盒的單一查詢有 120 秒上限,但整段原本沒有,黑盒實測一題光在沙盒就 38 分鐘。
+SPEC_EXEC_TIMEOUT_SECONDS = env_seconds("SPEC_EXEC_TIMEOUT_SECONDS", 1200)
+
+
+def _incomplete_finding(stage: str, exc: BaseException | None = None,
+                        timeout: int | None = None) -> dict:
+    """「這個環節沒完成」的 finding。不回顯例外訊息,只寫類型。
+
+    `stage` 另外存成一個欄位:判斷「有沒有環節沒完成」要看欄位,不是比對標題開頭
+    (標題是給人看的,會改寫;決策與測試靠它判斷就會跟著壞)。
+    """
+    if timeout is not None:
+        detail = f"{stage} 超過時間上限 {timeout} 秒,已中止。這一環節的結果不在本報告內。"
+        title = f"[{stage}] {INCOMPLETE_TITLE_PREFIX}(逾時)"
+    else:
+        detail = (f"{stage} 執行時發生 {type(exc).__name__},已跳過。"
+                  f"這一環節的結果不在本報告內。")
+        title = f"[{stage}] {INCOMPLETE_TITLE_PREFIX}"
+    return {"file": "", "line": 0, "severity": "major", "title": title,
+            "detail": detail, "stage": stage,
+            "suggestion": "請人工確認這一環節原本要檢查的內容;其餘環節的結果仍然有效。",
+            "citations": []}
+
+
+# 哪些環節包過隔離:{函式名: 環節名稱}。由 @_isolated_stage 自己登記,不是人工維護的
+# 清單——人工清單漏過一個(enforce_format),而且看函式定義看不出它被包過。
+_ISOLATED_STAGES: dict[str, str] = {}
+
+
+async def _superseded(hub, mr_id: str, reviewed_sha: str | None) -> bool:
+    """這次審查的 commit 是不是已經被新的取代了?
+
+    問不出來(API 失敗、拿不到 sha)時回 False —— 往「照常回寫」倒:這道檢查的目的是
+    避免舊結論蓋掉新結論,但「因為問不到就不回寫」會變成另一種無聲失敗(MR 上什麼都
+    沒有),那更糟。
+    """
+    if not reviewed_sha:
+        return False
+    try:
+        now = await hub.call_json("gitlab__get_mr_diff", {"mr_id": mr_id})
+        current = (now or {}).get("head_sha") or (now or {}).get("sha")
+    except Exception:                        # noqa: BLE001 — 問不出來就當作沒被取代
+        return False
+    return bool(current) and current != reviewed_sha
+
+
+def _spec_exec_stage(progress: dict) -> str:
+    """執行驗證失敗/逾時的時候,是哪一個階段?
+
+    `run_spec_exec` 會把現在在跑哪一段寫進 progress。整段只算一個環節時,報告上
+    只寫「執行驗證未完成」,而這三件事的修法完全不同:測資生成要調 prompt 或換做法、
+    沙盒要看環境、仲裁是另一次模型呼叫。問不出來(例外發生在階段之外)就記整段。
+    """
+    stage = progress.get("stage")
+    return f"執行驗證/{stage}" if stage else "執行驗證"
+
+
+def _isolated_stage(stage: str):
+    """在定義上標註環節名稱,就自動包上隔離。
+
+    呼叫處一字不動(後處理鏈那一段同時有好幾支 PR 在插行,而且有測試與突變點是對
+    **呼叫的原文** `report = enforce_hints(report, pre)` 做斷言的)。原本是在模組
+    最後用 globals() 換掉函式,效果一樣,但看定義看不出它被包過,清單還要另外維護
+    ——實際上就漏了 enforce_format。寫在定義上面就不會漏。
+    """
+    def deco(fn):
+        _ISOLATED_STAGES[fn.__name__] = stage
+        return _isolated(stage, fn)
+    return deco
+
+
+def _isolated(stage: str, fn):
+    """把一個「吃 report、回 report」的環節包成不會往外丟例外的版本。"""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapped(report, *args, **kwargs):
+        try:
+            return fn(report, *args, **kwargs)
+        except Exception as e:
+            if isinstance(report, dict):
+                report.setdefault("findings", []).append(_incomplete_finding(stage, e))
+                return report
+            raise
+    wrapped.__wrapped_stage__ = stage
+    return wrapped
+
+
+async def _astep(report: dict, stage: str, coro, default):
+    """跑一個非同步環節。失敗就記一條並回傳 default,讓後面的環節照跑。"""
+    try:
+        return await coro
+    except Exception as e:
+        report.setdefault("findings", []).append(_incomplete_finding(stage, e))
+        return default
+
+
+def review_incomplete(report: dict) -> list[str]:
+    """哪些環節沒完成(供決策與測試判讀)。回傳那幾條 finding 的標題。
+
+    **判斷靠 `stage` 欄位,不是比對標題開頭**:標題是給人看的文字(現在是
+    「[沙盒執行] 審查未完整(逾時)」),改寫它不該讓決策的硬條件跟著失效。
+    """
+    return [str(f.get("title", "")) for f in report.get("findings", [])
+            if isinstance(f, dict) and f.get("stage")]
+
+
+@_isolated_stage("輸出形狀整理")
 def normalize_findings(report: dict) -> dict:
     """後處理的第一步:把模型輸出整理成後面每一步都假設的形狀(#21)。
 
@@ -199,6 +325,7 @@ def normalize_findings(report: dict) -> dict:
     return report
 
 
+@_isolated_stage("輸出格式檢查")
 def enforce_format(report: dict) -> dict:
     """模型輸出有格式不正確的 finding → 補一條 major(確定性,不得自動放行)。
 
@@ -230,6 +357,7 @@ def enforce_format(report: dict) -> dict:
 _CITE_CODE = re.compile(r"r-?\d{2,4}")
 
 
+@_isolated_stage("引用白名單")
 def validate_citations(report: dict, spec_code: str | None) -> dict:
     """引用白名單驗證(簡化版):引用只允許「spec 檔 / 團隊慣例」來源。
     - spec:source 含規則碼(且該規格確實附上);或不指名規則碼的泛稱 + 含「規格/spec」
@@ -438,7 +566,11 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             report["_mode"] = "baseline"
             return report
 
-        pre = await prescan(hub, mr["files"], cfg.dbt)
+        # 預掃失敗不該讓整份審查消失:規則層與 dbt 展開都在裡面,壞了就記一條、
+        # 用空的預掃往下走(模型仍然看得到 diff 與規格)。
+        report_stub: dict = {"findings": []}
+        pre = await _astep(report_stub, "預掃(規則層/dbt 展開)",
+                           prescan(hub, mr["files"], cfg.dbt), [])
         if capture is not None:
             capture["mr"] = mr
             capture["prescan_raw"] = copy.deepcopy(pre)
@@ -529,6 +661,10 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         if not report:
             raise RuntimeError(f"模型輸出無法解析為 JSON:\n{raw[:2000]}")
         report = normalize_findings(report)    # 模型輸出的形狀不可信,先整理再往下走(#21)
+        # 預掃階段若失敗,那條 finding 先併進來(它在 report 存在之前就產生了)。
+        # 放在 normalize_findings 之後:那一步整理的是**模型**輸出的形狀,
+        # 我們自己補的 finding 形狀本來就是對的,不需要也不該被它改寫。
+        report.setdefault("findings", []).extend(report_stub["findings"])
         report = validate_citations(report, spec_code)
         report = sanitize_findings(report)
         # 檢核點只認模型自己的回應:放在任何程式補報之前(enforce_rules 補的 R004 內文含
@@ -542,17 +678,67 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述
         report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
         report = enforce_format(report)        # 模型輸出有格式錯誤 → major;須在 sanitize 之後
+        # 注入掃描的命中先寫進報告,再走 enforce_injection:那一步自己丟例外時,
+        # 隔離只補一條 major(= needs_human),而 apply_policy 的硬條件看的是
+        # _injection_scan——沒有它,注入命中就只會變成 needs_human 而不是 blocked。
+        if injection_hits:
+            report["_injection_scan"] = injection_hits
         report = enforce_injection(report, injection_hits)  # 確定性 blocker,不論模型是否被攻陷
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
         report = enforce_tool_refusals(report, hub.refused_calls)  # 模型要求了寫入工具
 
         # 執行驗證(必跑;測資生成 → 沙盒執行 → 仲裁)——在 rubric 之前
-        spec_result = await run_spec_exec(cfg, hub, mr, spec_code, spec_text)
-        report.setdefault("findings", []).extend(spec_result["findings"])
-        report["_spec_exec"] = {k: v for k, v in spec_result.items() if k != "findings"}
+        # **整段有時間上限**:沙盒的單一查詢有 120 秒上限,但整段原本沒有,
+        # 而測資生成實測大規則要 54-151 分鐘(黑盒量到一題光在沙盒就 38 分鐘)。
+        #
+        # 失敗或逾時要看得出是哪一個階段:run_spec_exec 把現在在跑哪一段寫進
+        # progress,逾時是外層丟的、它看不到裡面,所以只能這樣問。沙盒階段另外收
+        # 一個截止時間——它是同步呼叫,wait_for 插不進去(見 spec_exec._in_thread)。
+        progress: dict = {}
+        deadline = time.monotonic() + SPEC_EXEC_TIMEOUT_SECONDS
+        try:
+            spec_result = await asyncio.wait_for(
+                run_spec_exec(cfg, hub, mr, spec_code, spec_text,
+                              progress=progress, deadline=deadline),
+                timeout=SPEC_EXEC_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            report.setdefault("findings", []).append(_incomplete_finding(
+                _spec_exec_stage(progress), timeout=SPEC_EXEC_TIMEOUT_SECONDS))
+            spec_result = None
+        except Exception as e:
+            report.setdefault("findings", []).append(
+                _incomplete_finding(_spec_exec_stage(progress), e))
+            spec_result = None
+        if spec_result is not None:
+            report.setdefault("findings", []).extend(spec_result["findings"])
+            report["_spec_exec"] = {k: v for k, v in spec_result.items()
+                                    if k != "findings"}
+        else:
+            # 沒有結果也要留下各階段花了多少秒:時間上限要照這些數字訂,
+            # 而「逾時那次」正是最需要知道時間花在哪裡的一次。
+            report["_spec_exec_stage_seconds"] = progress.get("seconds", {})
 
         report = apply_rubric(report)
         report = apply_policy(report, mr, cfg.policy)
+        if not report.get("decision"):
+            # 決策閘門自己壞掉時沒有決策可用——不能留空(呼叫端會以為沒問題)。
+            report["decision"] = "needs_human"
+            report.setdefault("decision_reason", "決策閘門未完成,一律交人工")
+
+        # 回寫之前先確認這次審查還是最新的那次(#53 review 第 3 點)。
+        #
+        # 取消只會在下一個真正的等待點生效,而貼留言、加 label、設狀態都是同步的工具
+        # 呼叫——所以舊的那次有機會一路走到這裡。它較晚結束時,MR 上的 label 與總結
+        # 會變成**舊 commit 的結論**(commit status 是跟 sha 走的,那個本來就沒問題)。
+        # 比對 MR 目前的 head sha:不一樣就不貼,報告照樣回傳給呼叫端(給 eval 與
+        # 測試用),只是不寫回 GitLab。
+        # head_sha 是 real 模式帶的;mock 模式(eval / 測試)只有 sha,一樣拿來比
+        if await _superseded(hub, mr_id, mr.get("head_sha") or mr.get("sha")):
+            report["writeback_skipped"] = "已有更新的 commit,這次審查的結論不再回寫"
+            print(f"[pipeline] MR !{mr_id} 已有更新的 commit,略過回寫", flush=True)
+            if capture is not None:
+                capture["report"] = report
+            return report
 
         for fd in report.get("findings", []):
             await hub.call("gitlab__post_inline_comment", {
@@ -625,6 +811,7 @@ def _title_grams(s: str):
     return {s[i:i + 2] for i in range(len(s) - 1)}
 
 
+@_isolated_stage("輸出清理")
 def sanitize_findings(report: dict) -> dict:
     """清理模型輸出:(1) 丟棄非法 severity(hint 是預掃內部代碼,模型有時原樣 echo);
     (2) 同檔內近重複標題去重,保留資訊較完整者(有 citation/suggestion)。
@@ -648,6 +835,7 @@ def sanitize_findings(report: dict) -> dict:
     return report
 
 
+@_isolated_stage("檢核點補報")
 def enforce_hints(report: dict, pre: list[dict]) -> dict:
     """hint 檢核點的強制執行:模型沒回應的 hint,管線自動補成 info finding。
     實測模型會不定期漏掉 hint——demo 與生產都不能靠模型自律。
@@ -713,6 +901,7 @@ def _parse_fail_finding(entry: dict) -> dict:
             "citations": []}
 
 
+@_isolated_stage("解析失敗揭露")
 def enforce_parse(report: dict, pre: list[dict]) -> dict:
     """預掃解析失敗的強制揭露。解析失敗時 AST 規則整組沒跑,若不補一條 finding,
     這個缺口不會出現在報告任何地方,MR 還可能因「沒有命中」而被自動放行。
@@ -743,6 +932,7 @@ def _render_fail_finding(entry: dict) -> dict:
             "citations": []}
 
 
+@_isolated_stage("dbt 展開失敗揭露")
 def enforce_dbt_render_failure(report: dict, pre: list[dict]) -> dict:
     """dbt 展開失敗的強制揭露(#16 review)——**不看標記出現在哪裡,一律報**。
 
@@ -767,6 +957,7 @@ def enforce_dbt_render_failure(report: dict, pre: list[dict]) -> dict:
 _DBT_NOTICE_TITLE = "展開後的表名未經驗證"
 
 
+@_isolated_stage("dbt 表名提醒")
 def enforce_dbt_notice(report: dict, pre: list[dict]) -> dict:
     """dbt 展開成功但用到 ref()/source() 時,一律補一條 info finding——不靠模型轉述。
 
@@ -938,6 +1129,7 @@ def _attach_statement_lines(pre: list[dict], files: list[dict]) -> None:
             used[key] += 1
 
 
+@_isolated_stage("規則命中補報")
 def enforce_rules(report: dict, pre: list[dict]) -> dict:
     """rule-base 命中的強制執行:預掃的 R 規則命中(blocker/major/minor)若模型
     未在報告中涵蓋,管線確定性補進 findings。
@@ -976,6 +1168,7 @@ def enforce_rules(report: dict, pre: list[dict]) -> dict:
     return report
 
 
+@_isolated_stage("風格補報")
 def enforce_style(report: dict, pre: list[dict]) -> dict:
     """已學會的風格檢查(S- 系列)強制執行:預掃命中若模型未報,確定性補成 info。
     這讓「從範例學到的團隊風格」有牙齒,不必賭模型會不會主動遵循。"""
@@ -994,6 +1187,7 @@ def enforce_style(report: dict, pre: list[dict]) -> dict:
     return report
 
 
+@_isolated_stage("決策閘門")
 def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     """決策閘門(確定性):auto_approved / needs_human / blocked。
     刻意不用「模型自信分數」當依據——實測會漂移;改用客觀訊號:
@@ -1029,6 +1223,10 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
         for f in mr.get("files", []))
     # 執行驗證(spec_exec)是硬條件:沒 spec、測資建不起來、案例不符 → 不得自動放行
     spec_exec_ok = report.get("_spec_exec", {}).get("passed") is True
+    # 有環節沒完成 → 至少 needs_human,**寫死在程式裡**。原本是靠設定檔的
+    # allowed_severities 只許 info 擋著(未完成的那條是 major),設定一放寬,
+    # 沒跑完的審查就會被當成「沒問題」自動放行。跟執行驗證一樣不可由設定關閉。
+    incomplete = review_incomplete(report)
 
     blk = policy.get("block", {})
     if sum(s == "blocker" for s in
@@ -1040,6 +1238,7 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     ok = (diff_lines <= aa.get("max_diff_lines", 0)
           and not new_rule
           and spec_exec_ok
+          and not incomplete
           and report.get("score", 0) >= aa.get("min_score", 101)
           and severities <= set(aa.get("allowed_severities", []))
           and not (aa.get("forbid_pending_hints", True) and pending_hints))
@@ -1047,10 +1246,12 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     report["_policy_signals"] = {"change_lines": diff_lines, "new_rule": new_rule,
                                  "severities": sorted(severities),
                                  "pending_hints": pending_hints,
-                                 "spec_exec_passed": spec_exec_ok}
+                                 "spec_exec_passed": spec_exec_ok,
+                                 "incomplete": incomplete}
     return report
 
 
+@_isolated_stage("注入防線")
 def enforce_injection(report: dict, hits: list[dict]) -> dict:
     """確定性注入防線:掃描器命中 → 一律加 blocker,不參考模型輸出。
 
@@ -1085,6 +1286,7 @@ def enforce_injection(report: dict, hits: list[dict]) -> dict:
 _TOOL_REFUSAL_TITLE = "審查模型嘗試呼叫未開放的寫入工具"
 
 
+@_isolated_stage("工具拒絕揭露")
 def enforce_tool_refusals(report: dict, refused: list[str]) -> dict:
     """審查模型要求了它拿不到的寫入工具(#17)→ 補一條 major,不得自動放行。
 
@@ -1108,6 +1310,7 @@ def enforce_tool_refusals(report: dict, refused: list[str]) -> dict:
     return report
 
 
+@_isolated_stage("未審查內容揭露")
 def enforce_unreviewable(report: dict, mr: dict) -> dict:
     """有內容沒被審查到時,不得自動放行(PR #10 review 第 2 點,嚴重)。
 
@@ -1157,6 +1360,7 @@ def enforce_unreviewable(report: dict, mr: dict) -> dict:
     return report
 
 
+@_isolated_stage("評分")
 def apply_rubric(report: dict) -> dict:
     """評分與 verdict 由管線按 rubric 從 severity 確定性計算——
     實測同一 MR 模型自評分數逐輪漂移(50 vs 10),裁決權不交給模型。"""
@@ -1219,3 +1423,5 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                    {"mr_id": mr_id, "body": report["summary"],
                     "score": report["score"], "verdict": "dry_run"})
     return report
+
+
