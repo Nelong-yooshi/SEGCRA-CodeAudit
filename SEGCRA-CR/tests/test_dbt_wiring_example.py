@@ -299,3 +299,22 @@ def test_base的專案不在fixture裡_反查保守處理(example):
     mr["base_sha"] = "d3" * 20
     ctx = prepare_dbt_context(mr, CFG)
     assert ctx.error is None and ctx.impact.all_models_possibly_affected and ctx.base_project is None
+
+
+def test_golden_mr_802的標準答案_不會被程式補的finding命中():
+    """執行驗證遇到 dbt 樣板時,會在被改的 macro 檔上補一條 major(行號 0)。標準答案若不限行號,
+    模型沒抓到缺陷 recall 也會算命中。"""
+    import sys
+
+    sys.path.insert(0, str(PKG_ROOT / "eval"))      # 與 tests/test_eval_scoring.py 相同的載入方式
+    from run_eval import match_expected
+
+    case = json.loads((PKG_ROOT / "eval" / "golden" / "mr_802.json").read_text(encoding="utf-8"))
+    [expected] = case["expected"]
+    program = {"file": "macros/alert_threshold.sql", "line": 0, "severity": "major",
+               "title": "執行驗證無法進行:dbt 樣板尚未支援執行驗證"}
+    model = {"file": "macros/alert_threshold.sql", "line": 3, "severity": "major",
+             "title": "門檻 60000 與規格 SHARED_A_EVAL 的 50,000 不符"}
+    assert not match_expected(expected, [program])
+    assert match_expected(expected, [model])
+

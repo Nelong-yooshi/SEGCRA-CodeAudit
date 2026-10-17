@@ -16,7 +16,11 @@
   ],
   "expected": [
     {
-      "file": "macros/alert_threshold.sql"
+      "file": "macros/alert_threshold.sql",
+      "line_range": [
+        3,
+        3
+      ]
     }
   ],
   "_golden": {
