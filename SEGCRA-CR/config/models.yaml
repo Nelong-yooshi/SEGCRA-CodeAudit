@@ -47,6 +47,8 @@ roles:
 # context budget(tokens)
 budget:
   diff: 8000
+  full_content: 6000    # 變更檔「變更後的完整內容」;設成 0 就不放(prompt 只有 diff)。
+                        # num_ctx 含輸出:輸入最多約 24,500,其他段落最壞約 16,000,留一點餘裕
   spec: 3000
   memory: 2000
   tool_result_max_chars: 6000   # 單次工具回傳超過即截斷

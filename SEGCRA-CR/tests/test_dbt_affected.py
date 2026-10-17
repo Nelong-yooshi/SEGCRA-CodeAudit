@@ -1089,6 +1089,9 @@ def test_只改macro_用受影響model的規格來審_但不會被當成執行�
     report, state = review([{"path": "macros/act.sql", "diff": FRAGMENT}], loader)
     assert report["_spec_exec"]["spec_code"] == "BIG"
     assert "BIG 規格" in state["prompt"]                       # 模型拿到的是這份規格
+    # 受影響的 model 全部對到同一份:當成這個 MR 的規格,不走「對到多份規格」那一段
+    assert "### specs/BIG.md\n" in state["prompt"]
+    assert pipeline._AFFECTED_SPECS_HEADER.splitlines()[0] not in state["prompt"]
     assert state["generated"] == 0, "片段被送去生測資 / 執行了"
     assert report["_spec_exec"].get("dbt_template") is True and report["_spec_exec"]["passed"] is False
     assert report["decision"] == "needs_human"
@@ -1198,6 +1201,199 @@ def test_檢查時發生非預期錯誤_收斂成範圍不明_審查不中斷():
     fd = impact_finding(check)
     assert fd["severity"] == "major" and "RuntimeError" in fd["detail"] and "SECRET" not in fd["detail"]
     assert "macros/act.sql" in fd["detail"]                  # 原本反查出來的資訊還在
+
+
+# ─────────────────── 11. 對到多份規格 ───────────────────
+
+from orchestrator.dbt_affected import SpecForModels, specs_by_priority     # noqa: E402
+
+
+def _mapped(path, spec, chain=("act",), looked=True):
+    name = path.rsplit("/", 1)[-1][:-4]
+    return CheckedModel(path=path, name=name, certain=True, chain=chain, spec=spec,
+                        spec_looked_up=looked)
+
+
+def _affected(models, specs, unchecked=()):
+    return AffectedCheck(impact=_macro_ctx().impact, models=tuple(models), unchecked=tuple(unchecked),
+                         specs_found=dict(specs))
+
+
+TWO_SPECS = {"R-201": "# R-201\n門檻:累計達 100000 通報。", "R-305": "# R-305\n門檻:單筆超過 5000 通報。"}
+
+
+def test_排序_diff_提到的規格在前():
+    check = _affected([_mapped("models/a_first.sql", "R-201"), _mapped("models/z_last.sql", "R-305")],
+                      TWO_SPECS)
+    diff = "@@ -3,3 +3,3 @@\n     'R-305': {\n-        'threshold': 5000,\n+        'threshold': 3000,"
+    specs = specs_by_priority(check, diff)
+    assert [s.code for s in specs] == ["R-305", "R-201"]
+    assert specs[0].mentioned and not specs[1].mentioned
+
+
+def test_排序_沒提到時直接呼叫的在前_再照路徑():
+    check = _affected([_mapped("models/a.sql", "R-201", chain=("act", "mid", "a")),
+                       _mapped("models/b.sql", "R-305", chain=("act",))], TWO_SPECS)
+    assert [s.code for s in specs_by_priority(check, "")] == ["R-305", "R-201"]
+    same = _affected([_mapped("models/b.sql", "R-305"), _mapped("models/a.sql", "R-201")], TWO_SPECS)
+    assert [s.code for s in specs_by_priority(same, "")] == ["R-201", "R-305"]
+
+
+def test_model_名稱也算提到_但短名稱不會因為出現在別的字裡就算():
+    check = _affected([_mapped("models/mrt_alpha.sql", "R-201"), _mapped("models/b.sql", "R-305")], TWO_SPECS)
+    # 「mrt_alpha_v2」不算提到 mrt_alpha:兩份都沒提到,照路徑(models/b.sql 在前)
+    assert [(s.code, s.mentioned) for s in specs_by_priority(check, "+ {{ mrt_alpha_v2 }}")] == [
+        ("R-305", False), ("R-201", False)]
+    first = specs_by_priority(check, "+ ref('mrt_alpha')")[0]
+    assert first.code == "R-201" and first.mentioned
+    short = _affected([_mapped("models/a.sql", "R-201"), _mapped("models/b.sql", "R-305")], TWO_SPECS)
+    assert not any(s.mentioned for s in specs_by_priority(short, "+ select abc, bar from t"))
+
+
+def test_同一份規格對到多個_model_合成一份():
+    check = _affected([_mapped("models/b.sql", "R-201"), _mapped("models/a.sql", "R-201"),
+                       _mapped("models/c.sql", "R-305")], TWO_SPECS)
+    specs = specs_by_priority(check, "")
+    assert [(s.code, s.models) for s in specs] == [("R-201", ("models/a.sql", "models/b.sql")),
+                                                  ("R-305", ("models/c.sql",))]
+
+
+def test_沒對到_沒查_或內容沒取到的不算():
+    check = _affected([_mapped("models/a.sql", None), _mapped("models/b.sql", None, looked=False),
+                       _mapped("models/c.sql", "R-999")], TWO_SPECS)
+    assert specs_by_priority(check, "") == ()
+    assert specs_by_priority(None, "") == ()
+
+
+# ── prompt 的規格段
+
+def _section(specs, affected, prefix="", budget=10_000):
+    return pipeline._affected_spec_section(specs, affected, prefix, budget)
+
+
+def test_規格段_每份標明對應的_model_並列出沒有規格的():
+    affected = _affected([_mapped("models/a.sql", "R-201"), _mapped("models/b.sql", "R-305"),
+                          _mapped("models/c.sql", None), _mapped("models/d.sql", None, looked=False)],
+                         TWO_SPECS, unchecked=("models/e.sql",))
+    text, codes = _section(specs_by_priority(affected, ""), affected, prefix="dbt")
+    assert codes == ("R-201", "R-305")
+    assert "### specs/R-201.md(受影響的 model:dbt/models/a.sql)\n# R-201" in text
+    assert "### specs/R-305.md(受影響的 model:dbt/models/b.sql)\n# R-305" in text
+    assert "- 沒有對應到規格的 model:dbt/models/c.sql" in text
+    assert "- 沒有查規格的 model(超過查詢上限):dbt/models/d.sql" in text
+    assert "- 沒有檢查的 model(超過數量或時間上限):dbt/models/e.sql" in text
+    assert "它自己的" in text and "不要自行推測" in text
+
+
+def test_規格段_放不下的列為沒有附上_不截斷():
+    affected = _affected([_mapped("models/a.sql", "R-201"), _mapped("models/b.sql", "R-305")], TWO_SPECS)
+    specs = specs_by_priority(affected, "")
+    budget = len(TWO_SPECS["R-201"]) + 5
+    text, codes = _section(specs, affected, budget=budget)
+    assert codes == ("R-201",) and "# R-305" not in text
+    assert "- 超出預算、沒有附上的規格:specs/R-305.md(models/b.sql)" in text
+
+
+def test_規格段_第一份就放不下時截斷著放_至少給一份():
+    affected = _affected([_mapped("models/a.sql", "R-201")], TWO_SPECS)
+    text, codes = _section(specs_by_priority(affected, ""), affected, budget=6)
+    assert codes == ("R-201",) and "\n# R-20" in text and "累計" not in text
+
+
+def test_規格段_都對到時沒有缺漏清單():
+    affected = _affected([_mapped("models/a.sql", "R-201"), _mapped("models/b.sql", "R-305")], TWO_SPECS)
+    text, _ = _section(specs_by_priority(affected, ""), affected)
+    assert "沒有附上規格的受影響 model" not in text
+
+
+# ── 引用白名單
+
+def _cite(source):
+    return {"findings": [{"title": "x", "citations": [{"source": source, "article": ""}]}]}
+
+
+@pytest.mark.parametrize("source, kept", [
+    ("specs/R-201.md", True), ("specs/R-305.md 第 2 條", True), ("specs/R-999.md", False),
+    ("核定規格", True), ("團隊慣例", True), ("某某法規", False),
+])
+def test_引用白名單接受附上的每一份(source, kept):
+    report = pipeline.validate_citations(_cite(source), ("R-201", "R-305"))
+    assert bool(report["findings"][0]["citations"]) is kept
+
+
+@pytest.mark.parametrize("codes", ["R-201", ("R-201",), ["R-201"]])
+def test_引用白名單只給一個代號時行為不變(codes):
+    assert pipeline.validate_citations(_cite("specs/R-201.md"), codes)["findings"][0]["citations"]
+    assert not pipeline.validate_citations(_cite("specs/R-305.md"), codes)["findings"][0]["citations"]
+
+
+@pytest.mark.parametrize("codes", [None, (), "", [None, 3]])
+def test_引用白名單沒有附上規格時只認慣例(codes):
+    assert not pipeline.validate_citations(_cite("核定規格"), codes)["findings"][0]["citations"]
+    assert pipeline.validate_citations(_cite("團隊慣例"), codes)["findings"][0]["citations"]
+
+
+# ── 交給執行驗證的規格
+
+SPECS = (SpecForModels("R-201", "# R-201", ("models/a.sql",)),
+         SpecForModels("R-305", "# R-305", ("models/b.sql",)))
+TEMPLATE_MR = {"files": [{"path": "macros/act.sql", "full_content": "{% macro x() %}1{% endmacro %}"}]}
+
+
+def test_執行驗證_全部是樣板時拿第一優先的那份():
+    assert pipeline._spec_for_exec(None, None, SPECS, TEMPLATE_MR) == ("R-201", "# R-201")
+
+
+@pytest.mark.parametrize("mr", [
+    {"files": [{"path": "macros/act.sql", "full_content": "{% macro x() %}1{% endmacro %}"},
+               {"path": "sql/plain.sql", "full_content": "SELECT 1"}]},
+    {"files": [{"path": "sql/plain.sql", "diff": "@@ -1 +1 @@\n+SELECT 1"}]},
+    {"files": []},
+])
+def test_執行驗證_有不是樣板的檔案時不拿(mr):
+    assert pipeline._spec_for_exec(None, None, SPECS, mr) == (None, None)
+
+
+def test_執行驗證_MR_自己有規格或沒有多份規格時照舊():
+    assert pipeline._spec_for_exec("R-1", "# 1", SPECS, TEMPLATE_MR) == ("R-1", "# 1")
+    assert pipeline._spec_for_exec("R-1", None, (), TEMPLATE_MR) == ("R-1", None)
+
+
+# ── 整條 review_mr
+
+def _two_model_project(threshold="1000"):
+    """共用的註冊表 macro 被兩個 model 用到,兩個 model 各自對到不同的規格。"""
+    registry = ("{% macro limits() %}{{ return({'R-201': " + threshold + ", 'R-305': 5000}) }}"
+                "{% endmacro %}")
+    return {"dbt_project.yml": "name: sample\n",
+            "macros/registry.sql": registry,
+            "models/mrt_a.sql": "SELECT {{ limits()['R-201'] }} AS limit_value\n",
+            "models/mrt_b.sql": "SELECT {{ limits()['R-305'] }} AS limit_value\n"}
+
+
+TWO_MODEL_SPECS = {"models/mrt_a.sql": "R-201", "models/mrt_b.sql": "R-305"}
+
+
+def test_只改共用設定_受影響的_model_對到兩份規格_兩份都附上(review, monkeypatch):
+    async def find(hub, mr, *, by_path=False):
+        code = TWO_MODEL_SPECS.get(mr["files"][0]["path"]) if by_path else None
+        return (code, f"# {code} 規格\n門檻依核定。") if code else (None, None)
+
+    monkeypatch.setattr(pipeline, "find_spec", find)
+    diff = "@@ -1 +1 @@\n-{{ return({'R-201': 1000, 'R-305': 5000}) }}\n+{{ return({'R-201': 900, 'R-305': 5000}) }}"
+    loader = _Loader(_two_model_project("900"), _two_model_project("1000"))
+    report, state = review([{"path": "macros/registry.sql", "diff": diff}], loader)
+    prompt = state["prompt"]
+    spec_part = prompt.split("## 核定規格")[1]
+    assert "### specs/R-201.md(受影響的 model:models/mrt_a.sql)\n# R-201 規格" in spec_part
+    assert "### specs/R-305.md(受影響的 model:models/mrt_b.sql)\n# R-305 規格" in spec_part
+    assert "未找到對應規格檔" not in spec_part
+    # 執行驗證:改到的只有樣板(macro),照實回報樣板尚未支援,不是「無規格可驗」
+    titles = [f["title"] for f in report["findings"]]
+    assert "執行驗證無法進行:dbt 樣板尚未支援執行驗證" in titles
+    assert "無規格可驗,無法執行驗證" not in titles
+    assert report["_spec_exec"]["spec_code"] == "R-201"
+    assert report["decision"] != "auto_approved"
 
 
 def test_展開後才組出來的注入文字_整條管線擋下(review):

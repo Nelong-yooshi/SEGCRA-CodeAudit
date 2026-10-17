@@ -1,0 +1,39 @@
+{
+  "title": "R-803 門檻依業務單位調整",
+  "description": "R-803 的門檻改為達 39,999 以上,規格與程式一起修改。",
+  "sha": "b803000000000000000000000000000000000803",
+  "files": [
+    {
+      "path": "sql/rules/r803_daily_outbound.sql",
+      "diff": "@@ -1,4 +1,4 @@\n--- R-803: 當日轉出累計超過 40000 通報(合成資料,僅供評測)\n+-- R-803: 當日轉出累計達 39999 以上通報(合成資料,僅供評測)\n SELECT\n     t.account_id,\n     SUM(t.amount) AS total_amount\n@@ -6,4 +6,4 @@\n WHERE t.op_code IN ('OP21', 'OP22', 'OP23')\n   AND t.tx_time >= @start_date AND t.tx_time < @end_date\n GROUP BY t.account_id\n-HAVING SUM(t.amount) > 40000;\n+HAVING SUM(t.amount) >= 39999;\n",
+      "full_content": "-- R-803: 當日轉出累計達 39999 以上通報(合成資料,僅供評測)\nSELECT\n    t.account_id,\n    SUM(t.amount) AS total_amount\nFROM txn_log t\nWHERE t.op_code IN ('OP21', 'OP22', 'OP23')\n  AND t.tx_time >= @start_date AND t.tx_time < @end_date\nGROUP BY t.account_id\nHAVING SUM(t.amount) >= 39999;\n"
+    },
+    {
+      "path": "specs/R-803.md",
+      "diff": "@@ -30,3 +30,3 @@\n 2. **聚合方式**:單日轉出累計金額(每帳戶,`SUM(amount)`)\n-3. **閾值**:累計金額超過 40,000 元(`> 40000`,恰 40,000 不通報)\n+3. **閾值**:累計金額達 39,999 元以上(`>= 39999`)\n 4. **時間窗**:交易日整日,採半開區間(`tx_time >= @start_date AND tx_time < @end_date`)\n",
+      "full_content": "# R-803 單日大額轉出監控(評測用)\n\n> 格式依 `examples/sample/RETAIL_M1_spec.md` 的骨架整理,並補上執行驗證所需的\n> **資料表定義**段。\n>\n> ⚠️ 合成資料:表名、欄位、代碼、金額門檻皆為虛構,僅供評測使用(golden case `mr_803`)。\n\n## 基本資料\n\n| 欄位 | 值 |\n|---|---|\n| 序號 / 程式名稱 | EVAL803 / R-803 |\n| 資料取用 | txn_log |\n| 程式負責人 | 資料工程團隊 |\n\n## 說明\n\n計算單一帳戶當日**轉出**累計金額;超過 40,000 元者列入異常清單。\n\n## 資料表定義(釘死 schema;執行驗證以此建表)\n\n```sql\nCREATE TABLE txn_log(\n  account_id INT, tx_time DATETIME2, op_code NVARCHAR(10), amount DECIMAL(14,2));\n```\n\n## 篩選條件(逐條可對測資判 true/false)\n\n1. **交易範圍**:`op_code IN ('OP21','OP22','OP23')`\n2. **聚合方式**:單日轉出累計金額(每帳戶,`SUM(amount)`)\n3. **閾值**:累計金額達 39,999 元以上(`>= 39999`)\n4. **時間窗**:交易日整日,採半開區間(`tx_time >= @start_date AND tx_time < @end_date`)\n5. **通報粒度**:每帳戶每交易日至多輸出 1 筆\n6. **輸出欄位**:`account_id`、當日轉出累計金額(`total_amount`)\n\n## 補充\n\n- 閾值經核定為「超過」40,000;邊界案例(恰 40,000)**不**通報。\n"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "model-input",
+    "needs_llm": true,
+    "intent": "同時改規格與程式(#38 第 3 點,依 review 更正後的要求):MR 把 specs/R-803.md 條件 3 的門檻從「超過 40,000」改成「達 39,999 以上」,程式跟著改成 >= 39999,兩者一致;但規格的「說明」與「補充」兩段還寫著 40,000,規格本身前後不一致。規格以這次 MR 的版本為準,報告最上面要有一條「本次 MR 修改了規格」,寫出改了哪一條、40,000 → 39,999,並指出改掉的數字仍出現在規格的其他行;決策 needs_human(硬條件,不靠那條 finding 的嚴重度)。程式與修改後的規格一致,不應被要求照修改前的規格改。",
+    "expect_decision": "needs_human",
+    "expect_signals": {
+      "spec_found": true
+    },
+    "expect_findings": [
+      {
+        "severity": "info",
+        "title_contains": "本次 MR 修改了規格"
+      },
+      {
+        "title_contains": "40,000 → 39,999"
+      },
+      {
+        "title_contains": "仍出現在"
+      }
+    ]
+  }
+}

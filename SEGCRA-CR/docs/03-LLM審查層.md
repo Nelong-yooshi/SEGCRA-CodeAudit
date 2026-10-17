@@ -98,9 +98,17 @@
 6. `# 工具使用原則`:預掃已命中的不重複報、hint 逐一處理、spec 逐項核對(達/以上=`>=`、超過=`>`)、每條 finding 先 `memory__lookup_similar_reviews` 查判例、citations 白名單、產出前必須 `load_skill("mr-comment-format")`。
 7. `# 最終輸出`:直接輸出報告 JSON,不要圍欄與多餘文字。
 
-**user prompt**(`USER_TEMPLATE`)段落:MR 資訊(title/description)→ 變更內容 diff → 確定性預掃結果(rule-base + lint 的 JSON,已在前處理跑完)→ 核定規格(`find_spec` 找到的 `specs/<code>.md`,截到 `budget.spec * 3` 字元;找不到則明寫「(未找到對應規格檔;執行驗證將以『無規格可驗』處理)」)。
+**user prompt**(`USER_TEMPLATE`)段落:MR 資訊(title/description)→ 變更內容 diff(之後接變更後的完整內容)→ 確定性預掃結果(rule-base + lint 的 JSON,已在前處理跑完)→ 核定規格(`find_spec` 找到的 `specs/<code>.md`,截到 `budget.spec * 3` 字元;找不到則明寫「(未找到對應規格檔;執行驗證將以『無規格可驗』處理)」)。
 
 **diff 預算截斷**(`build_diff_section`):逐檔累計 `estimate_tokens`(粗估 `len/3`,`orchestrator/config.py`),超過 `budget.diff`(現值 8000 tokens)的檔不放 diff、改放佔位「(超出 context 預算,已略過 — 需分批審查)」——骨架版,map-reduce 分批審查為 TODO。
+
+**變更後的完整內容**(`orchestrator/change_view.py`:`build_full_text_section`;#38 第 1 點):接在 diff 之後、預掃結果之前。只給 diff 時,模型逐項核對規格對照的只有 diff 的那幾行,條件寫在離改動處超過幾行的地方就會被報成「遺漏」(實測:只改兩行註解的 MR 被報三條 major「缺少某某過濾」,那三個條件就在同一個 WHERE 裡)。
+
+- **內容來源**(`pipeline._head_texts`):mock 模式用 fixture 的 `full_content`;真實 GitLab 模式下,dbt 專案裡的檔案用取回的 head commit 內容。兩者都沒有的檔案不列,prompt 只有它的 diff(與之前相同)。**只放 `.sql`**:真實模式會取回每個變更檔的完整內容,圖片的文字區塊、SVG 裡看不見的文字若也整份放進 prompt,藏在裡面的句子就直接進到審查模型;其他檔案(含規格檔,見 04「MR 改到規格檔」)只有 diff。
+- **排版**:每一行前面加行號,這次新增或修改的行以 `>` 標記(由 diff 的 hunk 算出新檔的行號)。diff 與內容對不上時(mock 的 fixture、佔位的 diff)不標記,並在檔名後註明——標錯行比不標更糟。每一行都是新增的(新檔)就不重複放。
+- **預算**(`budget.full_content`,預設 6000 tokens,所有檔案共用;`num_ctx` 含輸出,輸入最多約 24,500,其他段落最壞約 16,000,所以不設更大;**設成 0 就不放**,prompt 回到只有 diff):放不下時逐步縮小——完整內容 → 只放改動所在的語句(往前後找到以分號結尾的行;找不到就前後各留 15 行),略過的部分寫明行號範圍 → 只寫一行說明。repo 內的 fixture 與 golden set 最大的一段約 2,300 tokens。
+- **內容是不可信的文字**:每一行都以行號開頭,內容裡的 ``` 不會出現在行首、關不掉外層的程式碼區塊;完整內容本來就在注入掃描的範圍內。
+- **還沒做**:#38 要求「遺漏某條件」類的 finding 必須引用完整內容的行號、引用不到的降成 info。這會改變嚴重度,要有評測數字才能定規則,而且與 #39(判斷校準)重疊,所以這次只在 prompt 裡要求模型先確認、用這裡的行號,沒有加後處理。
 
 另有 **baseline 模板**(`BASELINE_SYSTEM`/`BASELINE_USER`):裸模型 A/B 對照組,無 skills/memory/工具/預掃/執行驗證,`use_tools=False`,不回寫 GitLab——用來對照展示管線防線的價值。
 

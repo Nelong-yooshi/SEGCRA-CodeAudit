@@ -1,0 +1,45 @@
+{
+  "title": "共用門檻表調整",
+  "description": "例行維護:調整共用門檻表的設定值。",
+  "sha": "c802000000000000000000000000000000000802",
+  "diff_refs": {
+    "base_sha": "a802000000000000000000000000000000000802",
+    "head_sha": "c802000000000000000000000000000000000802",
+    "start_sha": "a802000000000000000000000000000000000802"
+  },
+  "files": [
+    {
+      "path": "macros/alert_threshold.sql",
+      "old_path": "macros/alert_threshold.sql",
+      "diff": "@@ -1,6 +1,6 @@\n {% macro alert_threshold(rule_code) -%}\n     {%- set thresholds = {\n-        'SHARED_A_EVAL': 50000,\n+        'SHARED_A_EVAL': 60000,\n         'SHARED_B_EVAL': 100000,\n     } -%}\n     {{- thresholds[rule_code] -}}\n"
+    }
+  ],
+  "expected": [
+    {
+      "file": "macros/alert_threshold.sql",
+      "line_range": [
+        3,
+        3
+      ]
+    }
+  ],
+  "_golden": {
+    "layer": "model-input",
+    "needs_llm": true,
+    "intent": "只改共用的門檻表、影響兩個各有規格的 model(#38 第 2 點):macros/alert_threshold.sql 被 mrt_SHARED_A_EVAL 與 mrt_SHARED_B_EVAL 用到,兩個 model 依檔名各自對到 specs/SHARED_A_EVAL.md(50,000)與 specs/SHARED_B_EVAL.md(100,000)。這次把 A 的門檻從 50000 改成 60000,違反 A 的規格(B 沒變)。以前受影響的 model 對到不同規格時一份都不附,審查只會得到「無規格可驗」;現在兩份都附上、標明對應哪個 model,審查應指出 A 的門檻與規格不符。dbt 專案放在 eval/golden/dbt_archives/<commit>/(base 與 head 各一份),MR 只有 diff,跟真實 GitLab 模式一樣。執行驗證拿到的是第一優先的那份規格,樣板不會被執行,所以照實回報「dbt 樣板尚未支援執行驗證」、決策 needs_human。",
+    "dbt_enabled": true,
+    "expect_decision": "needs_human",
+    "expect_signals": {
+      "spec_found": true,
+      "spec_exec_passed": false
+    },
+    "expect_findings": [
+      {
+        "title_contains_any": [
+          "60000",
+          "60,000"
+        ]
+      }
+    ]
+  }
+}

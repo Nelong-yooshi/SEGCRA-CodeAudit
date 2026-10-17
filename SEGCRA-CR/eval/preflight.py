@@ -82,6 +82,9 @@ INCOMPARABLE = [
     # **直接取代**測資生成的產出,就是拿去驗 SQL 的那批案例——比 specs 更直接地
     # 就是「受測內容本身」。換了凍結檔,執行驗證驗的案例就不同了。
     ("testset", "frozen", "凍結的測資計畫改了(--frozen-testdata 驗的就是這批案例)"),
+    # golden case 用的 dbt 專案(eval/golden/dbt_archives/<commit>/)也是受測內容:macro 的門檻
+    # 改了,同一個 case 審的就是另一份程式,但 mr_*.json 一個字都沒變
+    ("testset", "dbt", "golden case 用的 dbt 專案改了(eval/golden/dbt_archives/,受測的程式不同了)"),
 ]
 
 
@@ -130,12 +133,15 @@ def _dir_digest(d: Path, pattern: str) -> tuple[str, int]:
 
     用**內容**而不是 mtime:同一份檔案重新 checkout 會換 mtime 但內容沒變,
     那不該讓兩份 baseline 變成不可比。
+
+    pattern 可以是遞迴的(`**/*`):只算檔案,雜湊裡放相對 d 的路徑——不同子目錄裡的同名檔案
+    (例如每個 commit 底下都有 dbt_project.yml)才分得開。不遞迴時相對路徑就是檔名,雜湊與以前相同。
     """
     import hashlib
     h = hashlib.sha256()
     n = 0
-    for f in sorted(d.glob(pattern)):
-        h.update(f.name.encode())
+    for f in sorted(p for p in d.glob(pattern) if p.is_file()):
+        h.update(f.relative_to(d).as_posix().encode())
         h.update(f.read_bytes())
         n += 1
     return h.hexdigest()[:12], n
@@ -148,6 +154,9 @@ def check_testset() -> Check:
     `code.sha` 刻意不列入不可比;但 golden set 與 `specs/` 是**受測內容本身**,
     改了它們,兩份 baseline 量的就不是同一把尺,數字不該相減。
 
+    `eval/golden/dbt_archives/` 是 golden case 用的 dbt 專案(mock 模式從這裡取回 MR 那個
+    commit 的專案),同樣是受測內容:macro 改了,mr_*.json 不變、受測的程式卻不同了。
+
     `eval/testdata_cache/` 的凍結測資計畫同理,而且更直接:`--frozen-testdata`
     模式下它**取代**測資生成的產出,就是拿去驗 SQL 的那批案例。沒凍結任何規格時
     數量為 0、雜湊固定,不影響既有 baseline 的可比性。
@@ -157,15 +166,18 @@ def check_testset() -> Check:
     g_hash, g_n = _dir_digest(PKG_ROOT / "eval" / "golden", "mr_*.json")
     s_hash, s_n = _dir_digest(PKG_ROOT / "specs", "*.md")
     f_hash, f_n = _dir_digest(PKG_ROOT / "eval" / "testdata_cache", "*.json")
+    d_hash, d_n = _dir_digest(PKG_ROOT / "eval" / "golden" / "dbt_archives", "**/*")
     data = {"golden": g_hash, "golden_count": g_n,
             "specs": s_hash, "specs_count": s_n,
-            "frozen": f_hash, "frozen_count": f_n}
+            "frozen": f_hash, "frozen_count": f_n,
+            "dbt": d_hash, "dbt_count": d_n}
     frozen_desc = f"、凍結測資 {f_n} 份({f_hash})" if f_n else ""
     if not g_n:
         return Check("測資集", "warn", "golden set 是空的", data)
+    dbt_desc = f"、dbt 專案檔案 {d_n} 個({d_hash})" if d_n else ""
     return Check("測資集", "ok",
                  f"golden set {g_n} 個 case({g_hash})、規格 {s_n} 份({s_hash})"
-                 + frozen_desc, data)
+                 + dbt_desc + frozen_desc, data)
 
 
 def check_code() -> Check:
