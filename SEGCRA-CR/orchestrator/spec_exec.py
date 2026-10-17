@@ -1170,26 +1170,31 @@ def _label_expectation(conds: list[dict], case: dict) -> dict[str, bool]:
     return {target: direction == "true"}
 
 
-def _eval_conditions(cursor, conds: list[dict]) -> dict[str, bool] | None:
-    """在目前的交易裡逐條算出判斷式的真假;任何一條算不出來就整個放棄(回 None)。
+def _eval_conditions(cursor, conds: list[dict]) -> tuple[dict[str, bool] | None, str]:
+    """在目前的交易裡逐條算出判斷式的真假。回傳 (真假向量, 放棄的原因)。
 
-    放棄而不是部分回報:少算一條就可能把「兩條同時不成立」看成「只有一條不成立」,
-    那正是這道檢查要抓的東西,半套的結果比沒有更危險。
+    任何一條算不出來就整個放棄(回 None):少算一條就可能把「兩條同時不成立」看成
+    「只有一條不成立」,那正是這道檢查要抓的東西,半套的結果比沒有更危險。
+
+    **放棄的原因要帶出來**:這道檢查沒跑成的時候,整個案例的標籤就靜靜地沒有被驗,
+    報告上看起來跟「驗過而且沒問題」一模一樣。判斷式現在多包了一層子查詢
+    (`SELECT TOP 1 * FROM (<check_sql>) AS q(v)`),帶 ORDER BY 或回多欄的判斷式會從
+    「能算」變成「算不出來」,那種退化不該默默發生。
     """
     out = {}
     for c in conds:
         q = c.get("check_sql")
         if not q:
-            return None
+            return None, f"條件 {c.get('id')} 沒有判斷式(check_sql)"
         try:
             cursor.execute(_wrap_check_sql(q))
             row = cursor.fetchone()
-        except Exception:
-            return None
+        except Exception as e:
+            return None, f"條件 {c.get('id')} 的判斷式執行失敗:{str(e)[:120]}"
         if not row:
-            return None
+            return None, f"條件 {c.get('id')} 的判斷式沒有回傳值"
         out[c["id"]] = bool(row[0])
-    return out
+    return out, ""
 
 
 def execute_cases(sql: str, plan: dict) -> dict:
@@ -1261,8 +1266,10 @@ def execute_cases(sql: str, plan: dict) -> dict:
                 # 沒有條件可比時一律不下標籤結論(傳 None):空的 conds 會讓
                 # _eval_conditions 回 {},那樣 label_ok 會變成 True——一個
                 # 「標籤驗過了」的假訊號,比沒有這一欄更糟。
+                # 沒有條件可比時不下任何標籤結論——那道守衛在 _apply_label_checks
+                # 裡(一處就好);這裡只管算,算不出來的原因往下傳
                 conds = plan.get("conditions") or []
-                actual_conds = _eval_conditions(c, conds) if conds else None
+                actual_conds, label_skip = _eval_conditions(c, conds)
             finally:
                 try:
                     con.rollback()
@@ -1278,6 +1285,10 @@ def execute_cases(sql: str, plan: dict) -> dict:
                 # 結論留到全部跑完再下:變體要跟它那一支的基準比,而基準不一定
                 # 排在變體前面(見 _apply_label_checks)。
                 truth[case["case_id"]] = actual_conds
+            else:
+                # 標籤沒驗到要留下痕跡:少了這一欄,「沒驗」跟「驗過沒問題」在
+                # 報告上長得一樣
+                r["label_unverified"] = label_skip
             results.append(r)
             if not r["ok"]:
                 mismatches.append({**r, "rows": case["rows"]})
@@ -1576,6 +1587,27 @@ def _apply_label_checks(plan: dict, results: list[dict], truth: dict) -> None:
             r["label_cofail"] = cofail
 
 
+def _unverified(case_results: list[dict]) -> list[dict]:
+    """標籤完全沒驗到的案例(判斷式缺漏或算不出來)。"""
+    return [{"case_id": r.get("case_id"), "reason": r["label_unverified"]}
+            for r in case_results if r.get("label_unverified")]
+
+
+def _unverified_note(case_results: list[dict]) -> str:
+    """寫進「執行驗證通過」那條 finding 的一句話:標籤有沒有真的驗到。
+
+    刻意**不**列入覆蓋缺口:舊格式的凍結測資根本沒有 check_sql,列入的話它們會
+    全部變成「不通過」——那是另一回事,不是這次驗證的品質問題。但也不能不講:
+    「案例皆符合預期」在標籤完全沒驗到的時候,證明力比看起來小得多。
+    """
+    bad = _unverified(case_results)
+    if not bad:
+        return ""
+    return (f"另外有 {len(bad)}/{len(case_results)} 個案例的標籤未經驗證"
+            f"(無法確認資料真的測到它宣稱的那一條):{bad[0]['reason']}"
+            + ("等" if len(bad) > 1 else "") + "。")
+
+
 def _label_gaps(case_results: list[dict]) -> list[str]:
     """標籤與資料對不上的案例 = 該條件該向**沒有真的被驗到**(#23 第 3 點)。
 
@@ -1765,10 +1797,12 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                                  f"執行驗證:{len(effective)} 個生成測試案例皆符合預期",
                                  f"測資由模型依規格 {spec_code} 產生,涵蓋每個條件成立與不成立"
                                  f"兩種情況,以及門檻邊界值;再於沙盒實際編譯執行。"
-                                 f"執行本身是確定性的,但測資與驗證出自模型,AI 可能有幻覺。"))
+                                 f"執行本身是確定性的,但測資與驗證出自模型,AI 可能有幻覺。"
+                                 + _unverified_note(ex["case_results"])))
     return {"passed": passed, "spec_code": spec_code, "engine": ex["engine"],
             "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
             "case_results": ex["case_results"], "dropped_cases": dropped_cases,
+            "label_unverified": _unverified(ex["case_results"]),
             "findings": findings}
 
 

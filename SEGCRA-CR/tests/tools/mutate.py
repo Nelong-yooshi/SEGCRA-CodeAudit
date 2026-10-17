@@ -1750,8 +1750,8 @@ MUTANTS.update({
         "        if cofail:" + NL + "            r[\"label_cofail\"] = cofail",
         "        if False:" + NL + "            r[\"label_cofail\"] = cofail"),
     "測資:判斷式算不出來時回部分結果": (S,
-        "        except Exception:\n            return None\n        if not row:\n            return None",
-        "        except Exception:\n            continue\n        if not row:\n            continue"),
+        "        except Exception as e:\n            return None, f\"條件 {c.get('id')} 的判斷式執行失敗:{str(e)[:120]}\"",
+        "        except Exception:\n            continue"),
     # 基準＋變體(測資正確率的修法)。預期值由構造決定,不由模型判斷——實測
     # 模型在 46 個案例裡填錯 12 個,其中 10 個是「只滿足一條卻說該命中」。
     "測資:基準/變體的預期值照抄模型給的": (S,
@@ -1810,8 +1810,24 @@ MUTANTS.update({
         "    if meta is not None:" + NL + "        meta[\"exhausted\"] = True",
         "    if meta is not None:" + NL + "        meta[\"exhausted\"] = False"),
     "執行:沒有條件可比也下標籤結論": (S,
-        "                actual_conds = _eval_conditions(c, conds) if conds else None",
-        "                actual_conds = _eval_conditions(c, conds)"),
+        "    conds = plan.get(\"conditions\") or []" + NL
+        + "    if not conds:" + NL
+        + "        return",
+        "    conds = plan.get(\"conditions\") or []" + NL
+        + "    if False:" + NL
+        + "        return"),
+    # 標籤檢查沒跑成時,整個案例的標籤就靜靜地沒被驗,報告上跟「驗過沒問題」一樣
+    # (#47 review 的建議)。判斷式多包一層子查詢之後,帶 ORDER BY 或回多欄的會從
+    # 「能算」變成「算不出來」,那種退化不該默默發生。
+    "執行:標籤沒驗到不留痕跡": (S,
+        '                r["label_unverified"] = label_skip',
+        "                pass"),
+    "執行:放棄的原因不帶出來": (S,
+        '            return None, f"條件 {c.get(\'id\')} 沒有判斷式(check_sql)"',
+        '            return None, ""'),
+    "執行:通過的 finding 不提標籤沒驗到": (S,
+        '                                 + _unverified_note(ex["case_results"])))',
+        "                                 ))"),
     "測資:標籤不符不列入覆蓋缺口": (S,
         "        if r.get(\"label_ok\") is not False:" + NL + "            continue",
         "        if True:" + NL + "            continue"),

@@ -760,12 +760,16 @@ def test_判斷式算不出來時整個放棄而不是部分回報():
     那正是這道檢查要抓的東西,半套的結果比沒有更危險。"""
     conds = [{"id": "C1", "desc": "x", "check_sql": "SELECT 1"},
              {"id": "C2", "desc": "y", "check_sql": "SELECT 1"}]
-    assert spec_exec._eval_conditions(_Cur([(1,), RuntimeError("boom")]), conds) is None
-    assert spec_exec._eval_conditions(_Cur([(1,), None]), conds) is None, "沒有列也要放棄"
+    vec, why = spec_exec._eval_conditions(_Cur([(1,), RuntimeError("boom")]), conds)
+    assert vec is None and "C2" in why and "執行失敗" in why, why
+    vec, why = spec_exec._eval_conditions(_Cur([(1,), None]), conds)
+    assert vec is None and "沒有回傳值" in why, "沒有列也要放棄,而且要說是為什麼"
     # 有條件沒附判斷式 → 整個放棄(不能只驗一半的條件)
-    assert spec_exec._eval_conditions(_Cur([(1,)]),
-                                      [conds[0], {"id": "C2", "desc": "y"}]) is None
-    assert spec_exec._eval_conditions(_Cur([(1,), (0,)]), conds) == {"C1": True, "C2": False}
+    vec, why = spec_exec._eval_conditions(_Cur([(1,)]),
+                                          [conds[0], {"id": "C2", "desc": "y"}])
+    assert vec is None and "沒有判斷式" in why, why
+    vec, why = spec_exec._eval_conditions(_Cur([(1,), (0,)]), conds)
+    assert (vec, why) == ({"C1": True, "C2": False}, "")
 
 
 # ── 不符要列入覆蓋缺口 ──
@@ -1825,3 +1829,75 @@ def test_execute_cases_的變體判定走完整路徑(monkeypatch):
     var = next(r for r in out["case_results"] if r["case_id"] == "C1-1-v")
     assert var["label_ok"] is True, var.get("label_mismatch")
     assert spec_exec._label_gaps(out["case_results"]) == []
+
+
+# ─────────── 標籤完全沒驗到的案例要留下痕跡(#47 review 的建議) ───────────
+
+def test_標籤沒驗到要留下痕跡(monkeypatch):
+    """`_eval_conditions` 整個放棄時,原本什麼都不留 —— 報告上「案例皆符合預期」
+    跟「標籤完全沒驗到」長得一模一樣。判斷式現在多包了一層子查詢,帶 ORDER BY 或
+    回多欄的會從「能算」變成「算不出來」,那種退化不該默默發生。"""
+    _fake_sandbox(monkeypatch)
+
+    class _BoomCursor(_FakeCursor):
+        def execute(self, sql, params=None):
+            super().execute(sql, params)
+            if "AS q(v)" in sql:          # 判斷式被包成子查詢之後的樣子
+                raise RuntimeError("Incorrect syntax near 'ORDER'")
+
+    monkeypatch.setattr(_FakeCon, "cursor", lambda self: _BoomCursor())
+    plan = {"schema_ddl": ["CREATE TABLE t (id INT)"],
+            "conditions": [{"id": "C1", "desc": "x", "check_sql": "SELECT 1 ORDER BY 1"}],
+            "cases": [{"case_id": "C1-T", "condition_id": "C1", "direction": "true",
+                       "expect_flagged": True, "note": "", "rows": [["t", 1]]}]}
+    out = spec_exec.execute_cases("SELECT id FROM t", plan)
+    r = out["case_results"][0]
+    assert "label_ok" not in r, "算不出來就不該下標籤結論"
+    assert "ORDER" in r["label_unverified"], r.get("label_unverified")
+    assert spec_exec._unverified(out["case_results"]) == [
+        {"case_id": "C1-T", "reason": r["label_unverified"]}]
+
+
+def test_標籤沒驗到不列入覆蓋缺口():
+    """舊格式的凍結測資根本沒有 check_sql,列入覆蓋缺口的話它們會全部變成
+    「不通過」—— 那是另一回事,不是這次驗證的品質問題。"""
+    results = [{"case_id": "A", "condition_id": "C1", "direction": "true",
+                "label_unverified": "條件 C1 沒有判斷式(check_sql)"}]
+    assert spec_exec._label_gaps(results) == []
+
+
+def test_通過的_finding_要說標籤有幾個沒驗到():
+    """「案例皆符合預期」在標籤完全沒驗到的時候,證明力比看起來小得多,
+    所以要寫在同一條 finding 裡,不是只留在稽核欄位。"""
+    results = [{"case_id": "A", "label_unverified": "條件 C1 沒有判斷式(check_sql)"},
+               {"case_id": "B", "label_ok": True}]
+    note = spec_exec._unverified_note(results)
+    assert "1/2" in note and "沒有判斷式" in note, note
+    assert spec_exec._unverified_note([{"case_id": "B", "label_ok": True}]) == ""
+
+
+def test_run_spec_exec_把標籤沒驗到寫進通過的_finding(monkeypatch):
+    """走 run_spec_exec 的完整路徑:上面那條只測 _unverified_note 自己,
+    所以把 finding 裡那段接起來的程式拿掉也不會紅。"""
+    plan = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)])
+
+    async def fake_generate(cfg, code, text, profile_name=None):
+        return plan, [], []
+
+    def fake_execute(sql, plan_):
+        return {"engine": "stub", "sandbox_error": None, "testdata_error": None,
+                "sql_error": None, "mismatches": [],
+                "case_results": [
+                    {"case_id": "C1-T", "label_unverified": "條件 C1 沒有判斷式(check_sql)"},
+                    {"case_id": "C1-F", "label_ok": True}]}
+
+    monkeypatch.setattr(spec_exec, "generate_cases", fake_generate)
+    monkeypatch.setattr(spec_exec, "execute_cases", fake_execute)
+    mr = {"files": [{"path": "sql/rules/r201.sql", "full_content": "SELECT 1",
+                     "diff": "@@ -1 +1 @@\n+SELECT 1"}]}
+    r = asyncio.run(run_spec_exec(None, None, mr, "R-201", "規格內容"))
+    assert r["passed"] is True, r["coverage_gaps"]
+    assert r["label_unverified"] == [{"case_id": "C1-T",
+                                      "reason": "條件 C1 沒有判斷式(check_sql)"}]
+    passed_finding = next(f for f in r["findings"] if "皆符合預期" in f["title"])
+    assert "1/2 個案例的標籤未經驗證" in passed_finding["detail"], passed_finding["detail"]
