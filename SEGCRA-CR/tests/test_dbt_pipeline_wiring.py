@@ -545,7 +545,9 @@ def test_notice_added_even_when_model_said_nothing():
     [f] = _notice_findings(report)
     assert f == {"file": "models/mrt_x.sql", "line": 0, "severity": "info",
                  "title": _DBT_NOTICE_TITLE, "detail": _RELATION_NOTICE,
-                 "suggestion": f["suggestion"], "citations": []}
+                 "suggestion": f["suggestion"], "citations": [],
+                 # 程式補的 finding 都標 _source:判斷「這條是誰寫的」不靠標題
+                 "_source": "program"}
     assert f["suggestion"]
 
 

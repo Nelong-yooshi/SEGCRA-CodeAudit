@@ -1,33 +1,34 @@
 """判斷校準的確定性測試 — 不呼叫 LLM、不連資料庫。
 
-為什麼值得單獨測:這三道後處理做的是**把模型的指控往下壓**(降級、壓到 minor、
-甚至移除),壓錯的代價是真缺陷從報告上消失。所以每一條都要證明兩件事:
-該壓的壓得到,**不該壓的不會被壓到**。
+**方向(#39 review 定的)**:模型照實報,後處理只能依「執行出來的證據」調整。
+Code review 是上正式環境前最後一道,漏抓的代價(帶著問題進正式環境、要到稽核才發現)
+比誤報(有人花幾分鐘確認)高得多。所以這三道後處理:
 
-驗的東西:
-  1. 執行驗證對照「實作與規格不符」:兩向都驗過且符合預期才降成 info;有覆蓋缺口、
-     對不上條件、案例被剔除、結果不符 → 一律維持原判(只加註)。
-  2. 兩種測資格式都吃得下:舊格式(每條件 true/false 兩向)與新格式(基準案例 +
-     單一條件變體)。
-  3. 執行驗證沒跑成(無規格 / 沒有案例結果)→ 整步跳過;無規格另外記「要人看」。
-  4. 程式自己補的執行驗證 finding 不被自己降級(它是證據,不是指控)。
-  5. 規格「待補 / 未載明」段落:規格不符類指控改成 info 提問 + 要人看;沒對應到的
-     finding 不受影響。
-  6. 斷言要有依據:自述等價 → 最多 minor;語法斷言解析得過 → 移除、解析不過 → 最多
-     minor;fan-out 要指名 JOIN 鍵並說明會進到輸出,否則最多 minor。
-  7. 驗收情境:三種等價重構(反連接改寫、過濾移進條件聚合、CTE 別名在外層 WHERE)
-     跑完一輪後沒有 major、決策不是 blocked。
+  * **不刪 finding、不降嚴重度**,除非有執行出來的證據推翻它;
+  * 對不上證據的**加註並交人工**(`_needs_human`);
+  * **只碰模型寫的指控**(程式補的那些本身就是證據)。
+
+上一版用「用字」判斷指控有沒有依據,重放 441 份真實報告時三個樣式全部誤中
+(通過數 371 → 108、少抓 292 個植入缺陷,乾淨報告一份也沒變乾淨)。所以這個檔案裡
+**有一半的測試是在證明「不該動的沒有被動」** —— 那些例子直接取自那次重放。
 """
+import asyncio
+import pathlib
+import sys
+
 import pytest
 
-from orchestrator.pipeline import (_DBT_NOTICE_TITLE, _FORMAT_TITLE, _PARSE_FAIL_TITLE,
-                                   _RENDER_FAIL_TITLE, _TOOL_REFUSAL_TITLE,
-                                   _UNREVIEWABLE_TITLE, apply_policy, apply_rubric,
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+
+from orchestrator import pipeline
+from orchestrator.pipeline import (apply_policy, apply_rubric,
                                    calibrate_with_execution, enforce_claim_evidence,
                                    enforce_spec_pending)
 
+SPEC_DIR = pathlib.Path(__file__).resolve().parents[1] / "specs"
 CONDS = [{"id": "C1", "desc": "交易類型為 WITHDRAW"},
          {"id": "C2", "desc": "七日內累計金額達 500000 以上"}]
+EXECUTED = "sql/rules/r201.sql"
 
 
 def _case(cid, expect, ok=True, **over):
@@ -38,18 +39,19 @@ def _case(cid, expect, ok=True, **over):
 
 
 def _spec_exec(**over):
-    """C1、C2 都兩向驗過且全部符合預期(舊格式)。"""
+    """C1、C2 都兩向驗過且全部符合預期,執行的是 EXECUTED 那個檔。"""
     base = {"passed": True, "spec_code": "R-201", "conditions": CONDS,
-            "coverage_gaps": [], "dropped_cases": [],
+            "executed_file": EXECUTED, "coverage_gaps": [], "dropped_cases": [],
             "case_results": [_case("C1", True), _case("C1", False),
                              _case("C2", True), _case("C2", False)]}
     base.update(over)
     return base
 
 
-def _mismatch(detail="缺少 WITHDRAW 的過濾", severity="major", **over):
-    f = {"file": "sql/rules/r201.sql", "line": 10, "severity": severity,
-         "title": "實作與核定規格不符", "detail": detail, "suggestion": "", "citations": []}
+def _claim(detail="缺少 WITHDRAW 的過濾", severity="major", title="實作與核定規格不符",
+           file=EXECUTED, **over):
+    f = {"file": file, "line": 10, "severity": severity, "title": title,
+         "detail": detail, "suggestion": "", "citations": []}
     f.update(over)
     return f
 
@@ -61,356 +63,414 @@ def _report(findings, spec_exec=None):
     return r
 
 
-# ---- 1. 執行驗證對照模型的「規格不符」指控 ----
+# ─────────── 1. 執行驗證對照模型的指控:加註 + 交人工,不降級 ───────────
 
-def test_條件兩向都驗過且符合預期_指控降成_info():
-    """同一份報告並列「案例皆符合預期」與「實作與規格不符 major」是實測看到的矛盾。
-    執行驗證已經對這個條件跑過成立/不成立兩向,指控沒被重現 → 降成 info。"""
-    r = calibrate_with_execution(_report([_mismatch()], _spec_exec()))
+def test_兩向都通過時加註並交人工_但不降級():
+    """「兩向案例都通過」證明的是「生成的那幾筆資料上沒有差異」,不是「模型講的情境
+    沒問題」。重放實測:降級讓 8 份報告從 needs_human 變成 auto_approved,其中 5 份是
+    真的有錯(指控對,但生成的案例沒落在被改動的邊界上)。"""
+    r = calibrate_with_execution(_report([_claim()], _spec_exec()))
     f = r["findings"][0]
-    assert f["severity"] == "info"
-    assert "執行驗證未重現" in f["detail"]
-    assert "C1" in f["detail"]
-    assert r["_calibration"]["downgraded"][0]["conditions"] == "C1"
+    assert f["severity"] == "major", "不得降級"
+    assert "執行驗證未重現" in f["detail"] and "C1" in f["detail"]
+    assert any("未重現" in x for x in r["_needs_human"])
+    assert r["_calibration"]["annotated"]
 
 
-def test_新格式的基準案例加變體也算驗過():
-    """新格式把「整支條件都成立」拆成基準案例(掛在 __base__<分支>),條件自己只留
-    把單一條件弄假的變體。兩種格式都要吃得下,否則測資格式一改,這一步就靜默失效。"""
-    conds = [{"id": "C1", "desc": "交易類型為 WITHDRAW", "branch": "B1"}]
-    se = _spec_exec(conditions=conds,
-                    case_results=[_case("__base__B1", True), _case("C1", False)])
-    r = calibrate_with_execution(_report([_mismatch()], se))
-    assert r["findings"][0]["severity"] == "info"
+def test_對不上條件時註明未覆蓋並交人工():
+    f = _claim(detail="報表的欄位順序與規格附錄不同")
+    r = calibrate_with_execution(_report([f], _spec_exec()))
+    assert r["findings"][0]["severity"] == "major"
+    assert "執行驗證未覆蓋" in r["findings"][0]["detail"]
+    assert r["_needs_human"]
 
 
-def test_只驗了一向不算驗過():
-    """只跑「成立」那向,證明不了「不成立時不會誤報」→ 不得據以降級。"""
-    se = _spec_exec(case_results=[_case("C1", True)])
-    r = calibrate_with_execution(_report([_mismatch()], se))
+def test_有覆蓋缺口時註明未覆蓋():
+    se = _spec_exec(coverage_gaps=["條件 C1 缺 false 向案例"])
+    r = calibrate_with_execution(_report([_claim()], se))
     assert r["findings"][0]["severity"] == "major"
     assert "執行驗證未覆蓋" in r["findings"][0]["detail"]
 
 
-def test_條件有覆蓋缺口_維持原判並註明():
-    se = _spec_exec(coverage_gaps=["條件 C1 缺 false 向案例"])
-    r = calibrate_with_execution(_report([_mismatch()], se))
-    f = r["findings"][0]
-    assert f["severity"] == "major"
-    assert "執行驗證未覆蓋" in f["detail"] and "C1" in f["detail"]
-    assert r["_calibration"]["uncovered"]
+def test_只對實際執行的那個檔案加註():
+    """`run_spec_exec` 只跑 MR 裡最後一個有內容的 SQL 檔。別的檔案根本沒被執行,
+    拿這份結果說它「未重現」是錯的(#39 review 第 2 點)。"""
+    other = _claim(file="sql/rules/r999.sql")
+    r = calibrate_with_execution(_report([other], _spec_exec()))
+    assert r["findings"][0]["detail"] == "缺少 WITHDRAW 的過濾", "沒執行的檔不得加註"
+    assert "_needs_human" not in r
 
 
-def test_覆蓋缺口的條件編號逐字比對_C10_不算_C1():
-    """C1 和 C10 共用前綴。拿子字串比對會讓 C10 的缺口把 C1 一起當成沒驗到,
-    結果是「有驗過的指控照樣維持 major」——方向保守,但判斷是錯的。"""
-    se = _spec_exec(coverage_gaps=["條件 C10 缺 true 向案例"])
-    r = calibrate_with_execution(_report([_mismatch()], se))
-    assert r["findings"][0]["severity"] == "info"
+def test_沒記執行檔案時對所有檔都加註():
+    """舊的結果(或測試用的替身)沒有 executed_file → 退回原本的行為,不要整步失效。"""
+    se = _spec_exec()
+    del se["executed_file"]
+    r = calibrate_with_execution(_report([_claim(file="sql/rules/r999.sql")], se))
+    assert "執行驗證" in r["findings"][0]["detail"]
 
 
-def test_案例被仲裁剔除_不算驗過():
-    se = _spec_exec(case_results=[_case("C1", True, dropped=True), _case("C1", False)])
-    r = calibrate_with_execution(_report([_mismatch()], se))
-    assert r["findings"][0]["severity"] == "major"
+def test_程式補的finding不碰():
+    """判斷靠 `_source` 欄位,不是標題:注入掃描那條沒有固定前綴,而模型寫成
+    「[R-140] 實作與核定規格不符」反而會被誤認成程式補的(#39 review 第 4 點)。"""
+    program = _claim(title="執行驗證失敗:實作與規格行為不符",
+                     detail="規則 R-201 在依規格生成的測資上行為不符",
+                     _source=pipeline.PROGRAM_SOURCE)
+    model_with_bracket = _claim(title="[R-140] 實作與核定規格不符")
+    r = calibrate_with_execution(_report([program, model_with_bracket], _spec_exec()))
+    assert "執行驗證未重現" not in r["findings"][0]["detail"], "程式補的是證據,不是指控"
+    assert "執行驗證未重現" in r["findings"][1]["detail"], "模型寫的要對照,不管標題長怎樣"
 
 
-def test_案例結果不符預期_不算驗過():
-    se = _spec_exec(case_results=[_case("C1", True, ok=False), _case("C1", False)])
-    r = calibrate_with_execution(_report([_mismatch()], se))
-    assert r["findings"][0]["severity"] == "major"
-
-
-def test_對不上任何條件_維持原判並註明():
-    f = _mismatch(title="實作與核定規格不符", detail="報表的欄位順序與規格附錄不同")
-    r = calibrate_with_execution(_report([f], _spec_exec()))
-    assert r["findings"][0]["severity"] == "major"
-    assert "無法對應到執行驗證的任何條件" in r["findings"][0]["detail"]
-
-
-def test_只命中一個泛用字眼不算對上():
-    """條件描述有兩個以上有辨識度的字串時,要求至少命中兩個。只憑一個(例如同時
-    出現在好幾條條件裡的字眼)就認定對上,會把不相干的指控降級。"""
-    conds = [{"id": "C1", "desc": "七日內累計金額達 500000 以上"}]
-    se = _spec_exec(conditions=conds,
-                    case_results=[_case("C1", True), _case("C1", False)])
-    r = calibrate_with_execution(_report([_mismatch(detail="累計區間的起算日沒有說明")], se))
-    assert r["findings"][0]["severity"] == "major"
-
-
-def test_非規格不符類的_finding_不碰():
-    f = {"file": "a.sql", "line": 1, "severity": "major", "title": "[R001] DELETE 沒有 WHERE",
-         "detail": "全表刪除", "suggestion": "", "citations": []}
-    r = calibrate_with_execution(_report([f], _spec_exec()))
-    assert r["findings"][0] == f
-
-
-def test_程式補的執行驗證_finding_不被自己降級():
-    """沙盒跑出來的「行為不符」是證據,不是待對照的指控。拿證據去對照證據,會讓
-    唯一真的跑過的那條 finding 被自己的案例結果降成 info。"""
-    f = {"file": "a.sql", "line": 0, "severity": "major",
-         "title": "執行驗證失敗:實作與規格行為不符",
-         "detail": "規則 R-201 在依規格生成的測資上行為不符:交易類型為 WITHDRAW 的案例",
-         "suggestion": "", "citations": []}
-    r = calibrate_with_execution(_report([f], _spec_exec()))
-    assert r["findings"][0]["severity"] == "major"
-    assert "執行驗證未重現" not in r["findings"][0]["detail"]
-
-
-def test_無規格時不降級_而是記下要人看():
-    """「沒找到規格」的意思是無法確認意圖,不是問題變小。"""
-    r = calibrate_with_execution(_report([_mismatch()], {"passed": False, "no_spec": True,
-                                                         "conditions": [], "case_results": []}))
+def test_無規格時記一筆要人看():
+    r = calibrate_with_execution(_report([_claim()], {"passed": False, "no_spec": True,
+                                                      "conditions": [], "case_results": []}))
     assert r["findings"][0]["severity"] == "major"
     assert any("無規格可對照" in x for x in r["_needs_human"])
 
 
 @pytest.mark.parametrize("se", [
-    None,                                              # 執行驗證整段沒跑(逾時/例外)
+    None,
     {"passed": False, "conditions": [], "case_results": []},
-    {"passed": False, "conditions": CONDS, "case_results": []},   # 測資建不起來
+    {"passed": False, "conditions": CONDS, "case_results": []},
 ])
 def test_執行驗證沒跑成就整步跳過(se):
-    r = calibrate_with_execution(_report([_mismatch()], se))
-    assert r["findings"][0]["severity"] == "major"
-    assert "執行驗證" not in r["findings"][0]["detail"]
+    r = calibrate_with_execution(_report([_claim()], se))
+    assert r["findings"][0]["detail"] == "缺少 WITHDRAW 的過濾"
     assert "_calibration" not in r
 
 
-# ---- 2. 規格「待補 / 未載明」 ----
+# ─────────── 2. 規格「待補 / 未載明」:加註 + 交人工,不降級 ───────────
 
-SPEC_PENDING = """# R-201 大額提款通報
-
-## 判定條件
-- 交易類型為 WITHDRAW
-- 七日內累計金額達 500000 以上
-
-## 幣別處理(待補)
-- 外幣交易的折算基準由業務單位另行提供。
-"""
+R140 = (SPEC_DIR / "R-140.md").read_text(encoding="utf-8")
 
 
-def test_待補段落的指控改成提問並要人看():
-    f = _mismatch(title="實作與核定規格不符:幣別未折算",
-                  detail="程式直接把外幣金額與門檻相比,未依幣別折算")
-    r = enforce_spec_pending(_report([f]), SPEC_PENDING)
-    out = r["findings"][0]
-    assert out["severity"] == "info"
-    assert out["title"] == "規格未載明,請業務單位確認"
-    assert "不符" not in out["title"]
-    assert any("規格未載明" in x for x in r["_needs_human"])
-
-
-def test_待補的標題底下的細項也算同一件事():
-    """「## 幣別處理(待補)」的標記在標題上,細項寫在底下。只看標記那一行會漏掉
-    細項講的「折算基準」,那正是指控會用的字眼。"""
-    f = _mismatch(title="實作與核定規格不符", detail="折算基準與規格不一致")
-    r = enforce_spec_pending(_report([f]), SPEC_PENDING)
-    assert r["findings"][0]["severity"] == "info"
-
-
-def test_規格沒有待補段落就不動():
-    spec = "# R-201\n## 判定條件\n- 交易類型為 WITHDRAW\n"
-    f = _mismatch()
-    r = enforce_spec_pending(_report([f]), spec)
-    assert r["findings"][0] == f
+def test_真規格加真門檻錯誤_維持major不加註():
+    """#39 review 的重現案例。團隊的規格範本每份都有「## 待補(核定規格未載明,
+    不從程式碼腦補)」這個標題,而 system prompt 規定不符的標題要寫「實作與核定規格
+    不符」—— 上一版把標題那一行也當成待補內容,切出的「核定」「定規」兩邊重疊就過了
+    門檻,於是幾乎每條規格不符都被改成 info(重放:336 條 major、37 條 blocker)。"""
+    f = _claim(detail="規格寫達 50 萬(含),實作用 >,剛好 50 萬的交易會漏報")
+    r = enforce_spec_pending(_report([f]), R140)
+    assert r["findings"][0]["severity"] == "major"
+    assert "待補" not in r["findings"][0]["detail"]
     assert "_needs_human" not in r
 
 
-def test_待補段落沒對應到的指控不受影響():
-    f = _mismatch(detail="缺少 WITHDRAW 的過濾條件")
-    r = enforce_spec_pending(_report([f]), SPEC_PENDING)
-    assert r["findings"][0]["severity"] == "major"
+def test_真的命中待補項目_加註並交人工():
+    """R-140 的待補段列的是「幣別」「cash_flag 的來源」「同一帳戶跨分行」三項。"""
+    f = _claim(title="實作與核定規格不符:幣別未折算",
+               detail="外幣交易直接把金額與門檻相比,未依幣別折算")
+    r = enforce_spec_pending(_report([f]), R140)
+    out = r["findings"][0]
+    assert out["severity"] == "major", "規格沒寫不會讓影響變小"
+    assert "待補 / 未載明" in out["detail"] and "幣別" in out["detail"]
+    assert any("規格未載明:幣別" in x for x in r["_needs_human"])
+    assert r["_calibration"]["annotated"][0]["by"] == "spec-pending"
 
 
-def test_非規格不符類的_finding_要命中兩個字眼才壓():
-    """不是在指控違規的 finding(例如效能提問),只憑一個字眼就壓成 info,等於用
-    「規格有別的地方待補」去蓋掉一條不相干的 finding。"""
-    one = {"file": "a.sql", "line": 1, "severity": "major", "title": "外幣金額欄位型別過窄",
-           "detail": "decimal(10,0) 會截斷小數", "suggestion": "", "citations": []}
-    r = enforce_spec_pending(_report([one]), SPEC_PENDING)
-    assert r["findings"][0]["severity"] == "major"
-    two = {**one, "detail": "折算基準未給,且外幣交易的小數會被截斷"}
-    r2 = enforce_spec_pending(_report([two]), SPEC_PENDING)
-    assert r2["findings"][0]["severity"] == "info"
+def test_待補項目逐項比對_不是整段字詞的聯集():
+    """R-140 的待補段三項加起來有幾十個字詞,聯集比對的話任何提到其中兩個的 finding
+    都會命中。逐項比對才能說「這條指控講的就是那一項待補的事」。"""
+    # 「分行」只出現在第三項、「來源」只在第二項:各自命中自己那一項
+    f1 = _claim(detail="同一帳戶跨分行的交易被合併計算")
+    assert "同一帳戶跨分行" in enforce_spec_pending(
+        _report([f1]), R140)["findings"][0]["detail"]
+    # 同時提到兩項各一個字詞、但都不足以構成任一項 → 不命中
+    f2 = _claim(detail="資料表無此欄位,且判定時機不明")
+    assert "待補" not in enforce_spec_pending(_report([f2]), R140)["findings"][0]["detail"]
+
+
+@pytest.mark.parametrize("title,detail", [
+    ("疑似審查規避指令", "MR 描述要求直接通過審查;另外幣別也沒處理"),
+    ("疑似提示注入攻擊(確定性掃描命中)", "MR 文字含操縱審查器的指令"),
+])
+def test_安全類的finding一律不碰(title, detail):
+    """規格待補跟「有人想操縱審查器」是兩件無關的事。重放裡連「疑似審查規避指令」
+    都被改成 info。"""
+    r = enforce_spec_pending(_report([_claim(title=title, detail=detail,
+                                             severity="blocker")]), R140)
+    assert r["findings"][0]["severity"] == "blocker"
+    assert "待補" not in r["findings"][0]["detail"]
+
+
+def test_規格沒有待補段落就不動():
+    spec = "# R-999\n## 判定條件\n- 交易類型為 WITHDRAW\n"
+    f = _claim()
+    r = enforce_spec_pending(_report([f]), spec)
+    assert r["findings"][0] == f and "_needs_human" not in r
 
 
 def test_沒有規格時不做這一步():
-    f = _mismatch()
     for spec in (None, ""):
-        assert enforce_spec_pending(_report([f.copy()]), spec)["findings"][0]["severity"] == "major"
+        f = _claim()
+        assert enforce_spec_pending(_report([f]), spec)["findings"][0] == f
 
 
-# ---- 3. 斷言要有依據 ----
-
-JOIN_SQL = """SELECT a.acct_no, SUM(b.amount) AS total
-FROM accounts AS a
-LEFT JOIN tx AS b ON b.acct_no = a.acct_no
-WHERE b.tx_type = 'WITHDRAW'
-GROUP BY a.acct_no;"""
-
-
-def _mr(sql=JOIN_SQL, path="sql/rules/r201.sql", **over):
-    f = {"path": path, "diff": "@@ -1 +1 @@\n+" + sql.replace("\n", "\n+"),
-         "full_content": sql}
-    f.update(over)
-    return {"files": [f]}
+def test_repo_裡每份有待補段的規格都抽得出項目():
+    """團隊範本的待補段標題固定是「## 待補(核定規格未載明,不從程式碼腦補)」,
+    抽不出項目的話這一道等於沒作用,而且不會有任何徵兆。"""
+    found = {}
+    for path in sorted(SPEC_DIR.glob("*.md")):
+        text = path.read_text(encoding="utf-8")
+        if "待補" in text:
+            found[path.name] = pipeline._pending_items(text)
+    assert found, "repo 裡應該有帶待補段的規格"
+    for name, items in found.items():
+        assert items, f"{name} 有待補段卻抽不出任何項目"
 
 
-def _finding(title, detail, severity="major", file="sql/rules/r201.sql"):
-    return {"file": file, "line": 1, "severity": severity, "title": title,
-            "detail": detail, "suggestion": "", "citations": []}
+# ─────────── 3. 只有沙盒實際執行成功才動嚴重度 ───────────
+
+def _ran_ok(**over):
+    base = {"executed_file": EXECUTED, "sql_error": None,
+            "case_results": [_case("C1", True)]}
+    base.update(over)
+    return base
 
 
-def test_自述等價的_finding_最多_minor():
-    f = _finding("過濾條件移進條件聚合", "改寫後最終結果相同,但可讀性下降")
-    r = enforce_claim_evidence(_report([f]), _mr())
-    assert r["findings"][0]["severity"] == "minor"
-    assert r["_calibration"]["capped"][0]["by"] == "self-equivalent"
+def test_沙盒跑成功_無法執行的blocker降到major():
+    f = _claim(title="語法錯誤:別名不可在 WHERE 使用",
+               detail="doubled 是 CTE 的別名,這段 SQL 無法執行", severity="blocker")
+    r = enforce_claim_evidence(_report([f], _ran_ok()), {})
+    out = r["findings"][0]
+    assert out["severity"] == "major", "降一級,不是移除"
+    assert "沙盒已實際執行成功" in out["detail"]
+    assert r["_calibration"]["downgraded"][0]["by"] == "sandbox-ran-ok"
+    assert r["_needs_human"], "跑得動不等於算得對,仍要交人工"
 
 
-def test_語法斷言_解析得過就不能報():
-    """「CTE 裡定義的欄位不可在外層 WHERE 使用」在 T-SQL 是可以的。解析得過代表
-    這個斷言被確定性否證 → 移除,並留在 _calibration 可追。"""
-    sql = ("WITH t AS (SELECT acct_no, amount * 2 AS doubled FROM tx)\n"
-           "SELECT acct_no FROM t WHERE doubled > 100;")
-    f = _finding("別名不可在 WHERE 使用", "doubled 是 CTE 的別名,無法執行", severity="blocker")
-    r = enforce_claim_evidence(_report([f]), _mr(sql))
-    assert r["findings"] == []
-    assert r["_calibration"]["dropped"][0]["by"] == "syntax-claim-verified-ok"
+def test_沙盒跑成功但指控不是無法執行_不動():
+    f = _claim(title="門檻寫錯", detail="規格寫 >=,實作寫 >", severity="blocker")
+    r = enforce_claim_evidence(_report([f], _ran_ok()), {})
+    assert r["findings"][0]["severity"] == "blocker"
 
 
-def test_語法斷言_驗不了的壓到_minor():
-    """解析不過代表「我們驗不了這個斷言」。真的語法錯誤由預掃的 enforce_parse 與
-    沙盒的執行驗證確定性補報,不靠模型這條撐著。"""
-    f = _finding("語法錯誤", "這段 SQL 無法執行")
-    r = enforce_claim_evidence(_report([f]), _mr("SELEKT ( FROM WHERE"))
-    assert r["findings"][0]["severity"] == "minor"
-    assert r["_calibration"]["capped"][0]["by"] == "syntax-claim-unverified"
+def test_沒跑成功就不動():
+    """沙盒不可用、SQL 真的跑不起來、或根本沒執行 → 沒有證據,不得調整。"""
+    f = _claim(title="語法錯誤", detail="無法執行", severity="blocker")
+    for se in (None, {}, _ran_ok(sql_error="Incorrect syntax near 'FORM'"),
+               _ran_ok(case_results=[]), _ran_ok(executed_file="")):
+        r = enforce_claim_evidence(_report([dict(f)], se), {})
+        assert r["findings"][0]["severity"] == "blocker", se
 
 
-def test_fanout_指名_JOIN_鍵並說明會進輸出_維持原判():
-    f = _finding("LEFT JOIN 造成列數膨脹",
-                 "tx 的 acct_no 不唯一,多出來的列會進到輸出的 total")
-    r = enforce_claim_evidence(_report([f]), _mr())
+def test_不是執行的那個檔不動():
+    f = _claim(title="語法錯誤", detail="無法執行", severity="blocker",
+               file="sql/rules/r999.sql")
+    r = enforce_claim_evidence(_report([f], _ran_ok()), {})
+    assert r["findings"][0]["severity"] == "blocker"
+
+
+def test_major以下的無法執行指控不動():
+    """只處理 blocker:它會直接擋下 MR,所以「被執行否證」要反映在決策上。
+    major 本來就是交人工,沒有調整的必要。"""
+    f = _claim(title="語法錯誤", detail="無法執行", severity="major")
+    r = enforce_claim_evidence(_report([f], _ran_ok()), {})
     assert r["findings"][0]["severity"] == "major"
+    assert "沙盒已實際執行成功" not in r["findings"][0]["detail"]
 
 
-def test_fanout_沒指名_JOIN_鍵_壓到_minor():
-    f = _finding("LEFT JOIN 造成列數膨脹", "join 可能讓列數變多,建議改寫")
-    r = enforce_claim_evidence(_report([f]), _mr())
-    assert r["findings"][0]["severity"] == "minor"
-    assert r["_calibration"]["capped"][0]["by"] == "fanout-unsubstantiated"
+# ── 以下是上一版用「用字」判斷時會誤中的例子,全部取自 441 份報告的重放 ──
 
-
-def test_fanout_指名了鍵但沒說會進輸出_壓到_minor():
-    """反連接改寫的誤報就長這樣:鍵講對了,但被排除的列根本不會進輸出。"""
-    f = _finding("LEFT JOIN 造成列數膨脹", "acct_no 在 tx 不唯一")
-    r = enforce_claim_evidence(_report([f]), _mr())
-    assert r["findings"][0]["severity"] == "minor"
-
-
-def test_fanout_而_SQL_根本沒有_JOIN_壓到_minor():
-    f = _finding("列數膨脹", "acct_no 不唯一會讓輸出的列數增加")
-    r = enforce_claim_evidence(_report([f]), _mr("SELECT acct_no FROM tx;"))
-    assert r["findings"][0]["severity"] == "minor"
-
-
-def test_沒有_full_content_時從_diff_還原_SQL():
-    """真實 GitLab 模式沒有 full_content。還原不到 SQL 就驗不了語法斷言,
-    結果會變成「驗證得過」或「沒有 JOIN 鍵」,兩邊都判錯。"""
-    sql = ("WITH t AS (SELECT acct_no, amount * 2 AS doubled FROM tx)\n"
-           "SELECT acct_no FROM t WHERE doubled > 100;")
-    mr = {"files": [{"path": "sql/rules/r201.sql",
-                     "diff": "@@ -0,0 +1,2 @@\n" + "\n".join("+" + ln for ln in sql.splitlines()),
-                     "full_content": None}]}
-    f = _finding("別名不可在 WHERE 使用", "doubled 無法執行", severity="blocker")
-    r = enforce_claim_evidence(_report([f]), mr)
-    assert r["findings"] == []
-
-
-def test_程式補的執行驗證_finding_不被壓():
-    f = _finding("執行驗證失敗:實作與規格行為不符",
-                 "SQL 無法在測資上執行:語法錯誤 near 'FORM'")
-    r = enforce_claim_evidence(_report([f]), _mr())
+@pytest.mark.parametrize("detail", [
+    "改寫後與原本不等價:NULL 時結果不同",
+    "看似等價,但金額為 NULL 時會漏報",
+    "新舊結果不完全相同,邊界 300 會漏報",
+    "DISTINCT 只能去除完全相同的重複行,無法修正膨脹",
+    "MR 描述宣稱「等價重構」,但 NULL 時結果不同",
+])
+def test_自述等價的樣式不再被壓(detail):
+    """否定、讓步、引述都會中到「等價」這個樣式。最後一句尤其糟:只要 MR 作者在描述
+    寫「等價重構」,模型引述它就能把自己的反駁壓掉。被壓的 10 條有 8 條在有缺陷的
+    題目上。"""
+    f = _claim(title="改寫改變了行為", detail=detail)
+    r = enforce_claim_evidence(_report([f], _ran_ok()), {})
     assert r["findings"][0]["severity"] == "major"
+    assert r["findings"][0]["detail"] == detail, "不得加註也不得改寫"
 
 
-def test_一般的正確性_finding_不受影響():
-    """三道都不該碰的對照組:沒有自述等價、沒有語法斷言、沒有 fan-out。"""
-    f = _finding("比較運算子與規格不一致", "規格寫「達」應為 >=,實作寫 >")
-    r = enforce_claim_evidence(_report([f]), _mr())
-    assert r["findings"][0] == f
+@pytest.mark.parametrize("sql", [
+    "SELECT amount * 2 AS amt2 FROM txn WHERE amt2 > 100",
+    "SELECT acct FROM txn WHERE SUM(amount) > 100 GROUP BY acct",
+    "SELECT no_such_col FROM txn",
+])
+def test_解析得過不代表跑得動(sql):
+    """這三段 sqlglot 都解析得過,但 SQL Server 跑不動。上一版「解析得過就整條刪掉」
+    會把真的語法問題刪掉——而現在的判準是「沙盒有沒有真的跑完」,所以這三段只要沒進
+    沙盒就不會被動到。"""
+    f = _claim(title="語法錯誤", detail=f"這段無法執行:{sql}", severity="blocker")
+    r = enforce_claim_evidence(_report([f], None), {"files": [{"path": EXECUTED,
+                                                              "full_content": sql}]})
+    assert r["findings"][0]["severity"] == "blocker"
 
 
-# ---- 4. 驗收情境:三種等價重構跑完一輪後不得有 major、決策不是 blocked ----
+def test_規範類的不得在某處使用不再被刪():
+    """「不得在…使用」這個樣式會中到規範類的 finding。"""
+    f = _claim(title="不得在正式報表使用 SELECT *",
+               detail="欄位變動時報表會跟著變,團隊慣例禁止", severity="major")
+    r = enforce_claim_evidence(_report([f], _ran_ok()), {})
+    assert r["findings"][0]["severity"] == "major"
+    assert "沙盒" not in r["findings"][0]["detail"]
+
+
+def test_fanout指控沒指名鍵也不再被壓():
+    """被壓的 14 條有 9 條在有缺陷的題目上,只是模型沒照樣式寫出鍵名。"""
+    f = _claim(title="LEFT JOIN 造成列數膨脹", detail="join 可能讓列數變多")
+    r = enforce_claim_evidence(_report([f], _ran_ok()), {})
+    assert r["findings"][0]["severity"] == "major"
+    assert r["findings"][0]["detail"] == "join 可能讓列數變多"
+
+
+def test_dbt樣板解析不過也不再被壓():
+    """dbt 檔的原始 Jinja 本來就解析不過。那種報告裡已經有程式補的展開失敗 finding
+    在講這件事了,不需要再壓模型那條。"""
+    f = _claim(title="語法錯誤", detail="{{ ref('x') }} 無法執行", severity="blocker")
+    r = enforce_claim_evidence(_report([f], None), {})
+    assert r["findings"][0]["severity"] == "blocker"
+
+
+# ─────────── 4. #39 的完成條件(照 review 調整後) ───────────
 
 POLICY = {"auto_approve": {"max_diff_lines": 30, "min_score": 95,
                            "allowed_severities": ["info"], "forbid_pending_hints": True},
           "block": {"min_blockers": 1}}
+MR = {"files": [{"path": EXECUTED, "diff": "@@ -1 +1 @@\n+SELECT 1;",
+                 "full_content": "SELECT 1;"}]}
 
 
-def test_三種等價重構_不出現_major_決策不是_blocked():
-    cte = ("WITH t AS (SELECT acct_no, amount * 2 AS doubled FROM tx)\n"
-           "SELECT acct_no FROM t WHERE doubled > 100;")
+def test_完成條件_三種等價重構的決策不是blocked():
+    """review 把這條從「沒有 major」改成「決策不是 blocked」:多報一條 major 只是
+    多一個人看,而擋下才是真的擾民。唯一降級的那條靠沙盒跑成功的證據。"""
     findings = [
-        _finding("LEFT JOIN 造成列數膨脹", "join 讓列數變多"),
-        _finding("過濾條件移進條件聚合", "最終結果相同,但不易讀"),
-        _finding("別名不可在 WHERE 使用", "doubled 無法執行", severity="blocker"),
+        _claim(title="LEFT JOIN 造成列數膨脹", detail="join 讓列數變多"),
+        _claim(title="過濾條件移進條件聚合", detail="最終結果相同,但不易讀"),
+        _claim(title="別名不可在 WHERE 使用", detail="doubled 無法執行",
+               severity="blocker"),
     ]
-    mr = {"files": [{"path": "sql/rules/r201.sql", "diff": "@@ -1 +1 @@\n+SELECT 1;",
-                     "full_content": cte}]}
-    r = apply_policy(apply_rubric(enforce_claim_evidence(_report(findings), mr)), mr, POLICY)
-    assert not [f for f in r["findings"] if f["severity"] in ("major", "blocker")]
-    assert r["decision"] != "blocked"
+    r = enforce_claim_evidence(_report(findings, _ran_ok()), MR)
+    r = apply_policy(apply_rubric(r), MR, POLICY)
+    assert not [f for f in r["findings"] if f["severity"] == "blocker"]
+    assert r["decision"] == "needs_human"
 
 
-def test_條件沒標分支時_所有基準案例都要通過():
-    """新格式的基準案例掛在 `__base__<分支>` 下。條件沒標分支(或標成全域 `*`)時要把
-    所有基準案例都算進來:只認同名分支的話,沒標分支的條件永遠對不到任何基準案例,
-    變成「只看變體案例就算驗過」——那是放寬,方向錯了。"""
-    for branch in (None, "*"):
-        conds = [{"id": "C1", "desc": "交易類型為 WITHDRAW", "branch": branch}]
-        se = _spec_exec(conditions=conds,
-                        case_results=[_case("__base__B1", True, ok=False),
-                                      _case("C1", False)])
-        r = calibrate_with_execution(_report([_mismatch()], se))
-        assert r["findings"][0]["severity"] == "major", branch
-
-    # 自己兩向都過了,但分支的基準案例沒過 → 這個條件在「整支成立」的情境下沒驗過,
-    # 一樣不算驗過。只認同名分支的話,沒標分支的條件會漏掉這一半。
-    for branch in (None, "*"):
-        conds = [{"id": "C1", "desc": "交易類型為 WITHDRAW", "branch": branch}]
-        se = _spec_exec(conditions=conds,
-                        case_results=[_case("C1", True), _case("C1", False),
-                                      _case("__base__B1", True, ok=False)])
-        r = calibrate_with_execution(_report([_mismatch()], se))
-        assert r["findings"][0]["severity"] == "major", branch
+def test_完成條件_加註不會讓任何東西自動放行():
+    """三道加起來也不能放行:加註的同時一定記 _needs_human。"""
+    r = _report([_claim()], _spec_exec())
+    r = calibrate_with_execution(r)
+    r = enforce_spec_pending(r, R140)
+    r = enforce_claim_evidence(r, MR)
+    r = apply_policy(apply_rubric(r), MR, POLICY)
+    assert r["decision"] == "needs_human"
+    assert r["_policy_signals"]["needs_human"]
 
 
-# ---- 5. 程式自己補的 finding 是證據,三道都不得碰它 ----
+# ─────────── 加註的用字要分得出「驗過但沒重現」與「根本沒驗到」 ───────────
+#
+# 兩者的意思完全不同:前者是「跑過了,那幾筆資料上沒差異」(矛盾,交人工判斷),
+# 後者是「這條指控沒有經過執行驗證」(沒有任何證據)。看報告的人要分得出來。
 
-PROGRAM_FINDINGS = [
-    # 預掃解析失敗:內文本來就寫「無法解析」,正好命中語法斷言的樣式
-    _finding(_PARSE_FAIL_TITLE, "sqlglot 無法解析此檔,rule-base 規則未執行"),
-    _finding(_RENDER_FAIL_TITLE, "樣板展開失敗,規則掃的是未展開的原文"),
-    _finding(_DBT_NOTICE_TITLE, "展開後的表名未驗證"),
-    _finding(_FORMAT_TITLE, "模型輸出的 finding 不是物件"),
-    _finding(_TOOL_REFUSAL_TITLE, "模型要求呼叫未開放的寫入工具"),
-    _finding(_UNREVIEWABLE_TITLE, "diff 過大,內容無法取得,未經審查"),
-    _finding("[R001] DELETE 沒有 WHERE", "全表刪除;這段 SQL 無法執行會造成列數膨脹"),
-    _finding("執行驗證失敗:實作與規格行為不符",
-             "外幣交易的折算基準與核定規格不符:門檻不一致,但結果相同"),
-]
+def test_只驗了一向算沒驗到():
+    """只跑「成立」那向,證明不了「不成立時不會誤報」。"""
+    se = _spec_exec(case_results=[_case("C1", True)])
+    f = calibrate_with_execution(_report([_claim()], se))["findings"][0]
+    assert "執行驗證未覆蓋" in f["detail"] and "未重現" not in f["detail"]
 
 
-@pytest.mark.parametrize("f", PROGRAM_FINDINGS, ids=lambda f: f["title"][:18])
-def test_程式補的_finding_三道都不碰(f):
-    """程式補的 finding 是確定性證據,不是待對照的指控。這些內文刻意寫得會命中
-    三道的樣式(「無法解析」「無法執行」「結果相同」「與核定規格不符」):壓到它們
-    等於把唯一真的驗過的那條結論弄掉。"""
-    before = dict(f)
-    r = _report([f], _spec_exec())
-    r = enforce_claim_evidence(enforce_spec_pending(
-        calibrate_with_execution(r), SPEC_PENDING), _mr())
-    assert r["findings"] == [before]
+def test_案例被仲裁剔除算沒驗到():
+    se = _spec_exec(case_results=[_case("C1", True, dropped=True), _case("C1", False)])
+    f = calibrate_with_execution(_report([_claim()], se))["findings"][0]
+    assert "執行驗證未覆蓋" in f["detail"]
+
+
+def test_案例結果不符預期算沒驗到():
+    se = _spec_exec(case_results=[_case("C1", True, ok=False), _case("C1", False)])
+    f = calibrate_with_execution(_report([_claim()], se))["findings"][0]
+    assert "執行驗證未覆蓋" in f["detail"]
+
+
+def test_覆蓋缺口的條件編號逐字比對_C10_不算_C1():
+    """C1 和 C10 共用前綴。拿子字串比對會讓 C10 的缺口把 C1 一起當成沒驗到,
+    於是註解寫成「未覆蓋」——方向保守,但講的事情是錯的。"""
+    se = _spec_exec(coverage_gaps=["條件 C10 缺 true 向案例"])
+    f = calibrate_with_execution(_report([_claim()], se))["findings"][0]
+    assert "執行驗證未重現" in f["detail"], f["detail"]
+
+
+def test_新格式的基準案例加變體也算驗過():
+    """新格式把「整支條件都成立」拆成基準案例(掛在 __base__<分支>),條件自己只留
+    把單一條件弄假的變體。兩種格式都要吃得下,否則測資格式一改這一步就靜默失效。"""
+    conds = [{"id": "C1", "desc": "交易類型為 WITHDRAW", "branch": "B1"}]
+    se = _spec_exec(conditions=conds,
+                    case_results=[_case("__base__B1", True), _case("C1", False)])
+    f = calibrate_with_execution(_report([_claim()], se))["findings"][0]
+    assert "執行驗證未重現" in f["detail"]
+
+
+def test_沒標分支的條件_所有基準案例都要通過():
+    """條件沒標分支(或標成全域 `*`)時取所有基準案例:取多了只會要求更多案例通過,
+    不會放寬。"""
+    conds = [{"id": "C1", "desc": "交易類型為 WITHDRAW"}]
+    # 刻意讓條件自己的兩向都通過、只有基準沒通過:**不取基準的話會看成「驗過了」**
+    se = _spec_exec(conditions=conds,
+                    case_results=[_case("C1", True), _case("C1", False),
+                                  _case("__base__B1", True, ok=False)])
+    f = calibrate_with_execution(_report([_claim()], se))["findings"][0]
+    assert "執行驗證未覆蓋" in f["detail"], "基準沒通過就不能說「驗過了」"
+
+
+def test_只命中一個泛用字眼不算對上():
+    """條件描述有兩個以上有辨識度的字串時,要求至少命中兩個;只憑一個(例如同時出現
+    在好幾條條件裡的字眼)就認定對上,註解會指到錯的條件。"""
+    conds = [{"id": "C1", "desc": "七日內累計金額達 500000 以上"}]
+    se = _spec_exec(conditions=conds,
+                    case_results=[_case("C1", True), _case("C1", False)])
+    f = calibrate_with_execution(
+        _report([_claim(detail="累計區間的起算日沒有說明")], se))["findings"][0]
+    assert "無法對應到執行驗證的任何條件" in f["detail"]
+
+
+# ─────────── 程式補的 finding 一定要標 _source ───────────
+
+def test_程式補的finding都標了來源():
+    """判斷「這條是誰寫的」靠這個欄位。少標一個地方,那條就會被當成模型的指控拿去
+    對照——而它其實是確定性證據。"""
+    from orchestrator import spec_exec
+    # spec_exec 不能 import pipeline(pipeline 匯入它,反向會循環),所以那邊的字串
+    # 是寫死的 —— 兩邊要一致
+    assert spec_exec._finding("a.sql", "major", "t", "d")["_source"] == "program"
+    assert pipeline.PROGRAM_SOURCE == "program"
+    inj = pipeline.enforce_injection({"findings": []},
+                                     [{"category": "prompt_leak"}])["findings"][0]
+    assert inj["_source"] == pipeline.PROGRAM_SOURCE
+    pre = [{"path": "a.sql", "rules": [{"rule": "R001", "message": "DELETE 沒有 WHERE",
+                                        "severity": "major"}]}]
+    assert pipeline.enforce_rules({"findings": []}, pre)["findings"][0]["_source"] \
+        == pipeline.PROGRAM_SOURCE
+
+
+def test_程式補的規格不符類finding不被拿去對照():
+    """實際會踩到的例子:檢核點補報的內文含「與核定規格不符」,正好命中指控的樣式。
+    拿執行結果去對照它,等於拿證據去對照證據。"""
+    program = _claim(title="[H003] 檢核點待人工確認(模型未回應)",
+                     detail="與核定規格不符的部分模型沒有回應",
+                     _source=pipeline.PROGRAM_SOURCE)
+    r = calibrate_with_execution(_report([program], _spec_exec()))
+    assert "執行驗證" not in r["findings"][0]["detail"]
+    assert "_needs_human" not in r
+
+
+def test_項目名含泛用字眼時不靠那些字眼命中():
+    """待補項目的名稱剛好含「規格」「條件」這類到處都有的字眼時,不可以只靠它們命中
+    ——那會讓任何一條規格不符的指控都對上這一項。"""
+    # 用只在 _PENDING_SKIP 裡的字眼(核定、定規):_distinct_tokens 自己已經濾掉
+    # 「規格」「條件」,所以那兩個測不到這一道。
+    # 這正是 review 找到的誤判:system prompt 規定不符的標題要寫「實作與核定規格不符」,
+    # 切出來的「核定」「定規」跟規格文件的用語重疊,於是幾乎每條指控都會對上。
+    spec = ("# R-999\n\n## 待補(核定規格未載明,不從程式碼腦補)\n\n"
+            "- **核定規格的版本**:尚未確認用哪一版。\n")
+    f = _claim(detail="門檻寫錯:規格寫 >=,實作寫 >,剛好等於門檻的會漏報")
+    r = enforce_spec_pending(_report([f]), spec)
+    assert "待補" not in r["findings"][0]["detail"], r["findings"][0]["detail"]
+    # 對照:真的在講那一項(用它特有的字眼)就要命中
+    f2 = _claim(detail="實作讀的是舊的核定規格的版本,與現行版本對不上")
+    assert "待補" in enforce_spec_pending(_report([f2]), spec)["findings"][0]["detail"]

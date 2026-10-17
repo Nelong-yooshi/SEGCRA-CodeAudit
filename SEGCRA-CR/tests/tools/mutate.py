@@ -1765,67 +1765,75 @@ MUTANTS.update({
  "校準:沒有規格時不記要人看": ("pipeline.py",
      '    if se.get("no_spec"):\n        _mark_needs_human(report, "無規格可對照,無法確認實作意圖")',
      '    if se.get("no_spec"):\n        pass'),
+ # 判斷「這條是誰寫的」改用 _source 欄位(#39 review 第 4 點):靠標題兩個方向都會錯
+ "來源:程式補的 finding 不標 _source": ("pipeline.py",
+     '    return f.get("_source") == PROGRAM_SOURCE',
+     "    return False"),
+ "來源:改回用標題開頭判斷": ("pipeline.py",
+     '    return f.get("_source") == PROGRAM_SOURCE',
+     '    return str(f.get("title") or "").startswith("[")'),
  "校準:程式補的 finding 也拿去對照": ("pipeline.py",
-     "        if _is_program_finding(f):\n"
+     "        if not isinstance(f, dict) or _is_program_finding(f):\n"
      "            continue\n"
-     "        text = _finding_text(f)\n"
-     "        if not _MISMATCH_CLAIM.search(text):",
-     "        if False:\n"
+     "        if executed and str(f.get(\"file\") or \"\") != executed:",
+     "        if not isinstance(f, dict):\n"
      "            continue\n"
-     "        text = _finding_text(f)\n"
-     "        if not _MISMATCH_CLAIM.search(text):"),
- "待補:程式補的 finding 也拿去壓": ("pipeline.py",
-     "        if _is_program_finding(f):\n"
-     "            continue\n"
-     "        text = _finding_text(f)\n"
-     "        low = text.lower()",
-     "        if False:\n"
-     "            continue\n"
-     "        text = _finding_text(f)\n"
-     "        low = text.lower()"),
- "斷言:程式補的 finding 也拿去壓": ("pipeline.py",
-     "        if _is_program_finding(f):\n"
-     "            kept.append(f)\n"
-     "            continue",
-     "        if False:\n"
-     "            kept.append(f)\n"
-     "            continue"),
- "斷言:只認執行驗證那幾條是程式補的(規則補報與預掃失敗會被壓)": ("pipeline.py",
-     '    return (title.startswith("[") or title in fixed\n'
-     '            or "執行驗證" in title or title.startswith("無規格可驗"))',
-     '    return "執行驗證" in title'),
- "待補:只看標記那一行(標題底下的細項漏掉)": ("pipeline.py",
-     '            if lines[i].lstrip().startswith("#"):',
-     "            if False:"),
- "待補:不是指控類也只要一個字眼就壓": ("pipeline.py",
-     "        elif len(hits) < 2:\n            continue",
-     "        elif False:\n            continue"),
- "待補:壓了嚴重度但不改標題(報告上仍是指控)": ("pipeline.py",
-     '        if _MISMATCH_CLAIM.search(str(f.get("title") or "")):\n'
-     '            f["title"] = _PENDING_TITLE',
-     '        if False:\n'
-     '            f["title"] = _PENDING_TITLE'),
- "待補:不記要人看(info 可被自動放行)": ("pipeline.py",
-     '        _mark_needs_human(report, f"規格未載明:{topic}")',
+     "        if executed and str(f.get(\"file\") or \"\") != executed:"),
+ # 校準只對「實際被執行的那個檔案」加註:別的檔沒被跑過,這份結果對它沒有證據力
+ "校準:對沒被執行的檔案也加註": ("pipeline.py",
+     '        if executed and str(f.get("file") or "") != executed:\n            continue',
+     "        if False:\n            continue"),
+ # 加註不得改嚴重度(#39 review:降級讓 8 份真缺陷自動放行,其中 5 份是真的有錯)
+ "校準:加註時順手降成 info": ("pipeline.py",
+     '            why = f"執行驗證未重現(條件 {ids}),但指控仍在"',
+     '            f["severity"] = "info"\n'
+     '            why = f"執行驗證未重現(條件 {ids}),但指控仍在"'),
+ "校準:加註但不記要人看": ("pipeline.py",
+     "        _mark_needs_human(report, why)",
      "        pass"),
- "斷言:自述等價的不壓": ("pipeline.py",
-     "        if _EQUIVALENT_CLAIM.search(text):",
-     "        if False:"),
- "斷言:語法斷言驗得過照樣報": ("pipeline.py",
-     "            if sql and _sql_parses(sql):",
-     "            if False:"),
- "斷言:語法斷言驗不了也不壓": ("pipeline.py",
-     '            if _cap_severity(f, "minor", "(無法確定性驗證此寫法真的不能執行"',
-     '            if False and _cap_severity(f, "minor", "(無法確定性驗證此寫法真的不能執行"'),
- "斷言:fan-out 不必指名 JOIN 鍵": ("pipeline.py",
-     "            named = any(k in low for k in _join_key_names(sql))",
-     "            named = True"),
- "斷言:fan-out 不必說明會進到輸出": ("pipeline.py",
-     "            if not (named and _REACHES_OUTPUT.search(text)):",
-     "            if not named:"),
- "斷言:沒有 full_content 時不從 diff 還原 SQL": ("pipeline.py",
-     '        sql = f.get("full_content") or _sql_from_diff(f.get("diff", ""))\n        if sql:',
-     '        sql = f.get("full_content")\n        if sql:'),
+ # 待補:只看標題底下的條列項目、逐項比對、安全類不碰、不動嚴重度
+ # 項目名剛好含泛用字眼時(例如「**規格與條件**」),略過清單讓它不會只靠那些字眼命中
+ "待補:泛用字眼不排除": ("pipeline.py",
+     "    toks = _distinct_tokens(name) - _PENDING_SKIP",
+     "    toks = _distinct_tokens(name)"),
+ "待補:比對用整行而不是項目名": ("pipeline.py",
+     "    toks = _distinct_tokens(name) - _PENDING_SKIP",
+     "    toks = _distinct_tokens(item) - _PENDING_SKIP"),
+ "待補:逐項比對改成整段聯集": ("pipeline.py",
+     "        hit = next((name for name, toks in items if _is_match(toks, low)), None)",
+     "        _all = set().union(*[t for _, t in items])\n"
+     "        hit = items[0][0] if _is_match(_all, low) else None"),
+ "待補:安全類的 finding 也碰": ("pipeline.py",
+     "        if _SECURITY_CLAIM.search(text):\n            continue",
+     "        if False:\n            continue"),
+ "待補:加註時順手降成 info": ("pipeline.py",
+     '        note = (f"(規格把「{hit}」列在「待補 / 未載明」:這件事沒有可對照的核定要求,"',
+     '        f["severity"] = "info"\n'
+     '        note = (f"(規格把「{hit}」列在「待補 / 未載明」:這件事沒有可對照的核定要求,"'),
+ "待補:不記要人看": ("pipeline.py",
+     '        _mark_needs_human(report, f"規格未載明:{hit}")',
+     "        pass"),
+ # 嚴重度只能被「執行出來的證據」調整:沙盒真的跑完、而且沒有 SQL 錯誤
+ "證據:沒跑成功也照樣降級": ("pipeline.py",
+     '    ran_ok = bool(se.get("case_results")) and not se.get("sql_error")',
+     "    ran_ok = True"),
+ "證據:SQL 錯誤也算跑成功": ("pipeline.py",
+     '    ran_ok = bool(se.get("case_results")) and not se.get("sql_error")',
+     '    ran_ok = bool(se.get("case_results"))'),
+ "證據:不是執行的那個檔也降級": ("pipeline.py",
+     '        if str(f.get("file") or "") != executed:\n            continue',
+     "        if False:\n            continue"),
+ "證據:不限「無法執行」類的指控": ("pipeline.py",
+     '        if f.get("severity") != "blocker" or not _UNRUNNABLE_CLAIM.search(_finding_text(f)):',
+     '        if f.get("severity") != "blocker":'),
+ "證據:降級時把 finding 整條移除": ("pipeline.py",
+     '        f["severity"] = "major"\n'
+     '        note = (f"(沙盒已實際執行成功:{executed} 在依規格生成的測資上編譯並執行完成,"',
+     '        f["severity"] = "info"\n'
+     '        note = (f"(沙盒已實際執行成功:{executed} 在依規格生成的測資上編譯並執行完成,"'),
+ "證據:降級後不交人工": ("pipeline.py",
+     '        _mark_needs_human(report, "指控的「無法執行」已被沙盒否證,其餘內容待確認")',
+     "        pass"),
  # ---- 接線:三道都在執行驗證之後、rubric 與決策之前
  "校準:整步沒接進管線": ("pipeline.py",
      "        report = calibrate_with_execution(report)",
@@ -1836,12 +1844,16 @@ MUTANTS.update({
  "斷言:整步沒接進管線": ("pipeline.py",
      "        report = enforce_claim_evidence(report, mr)",
      "        pass"),
- "校準:接在 rubric 之後(分數與決策看不到降級)": ("pipeline.py",
+ # 三道現在不動嚴重度,所以跟 rubric 的前後沒有差別;**要求是排在 apply_policy 之前**
+ # ——它們記的 _needs_human 是決策的硬條件,排在決策之後就等於沒記。
+ "校準:接在決策之後(needs_human 來不及被看到)": ("pipeline.py",
      "        report = calibrate_with_execution(report)\n"
      "        report = enforce_spec_pending(report, spec_text)\n"
      "        report = enforce_claim_evidence(report, mr)\n\n"
-     "        report = apply_rubric(report)",
      "        report = apply_rubric(report)\n"
+     "        report = apply_policy(report, mr, cfg.policy)",
+     "        report = apply_rubric(report)\n"
+     "        report = apply_policy(report, mr, cfg.policy)\n"
      "        report = calibrate_with_execution(report)\n"
      "        report = enforce_spec_pending(report, spec_text)\n"
      "        report = enforce_claim_evidence(report, mr)"),
