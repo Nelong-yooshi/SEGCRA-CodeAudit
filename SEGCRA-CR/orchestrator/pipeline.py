@@ -12,6 +12,8 @@ from pathlib import Path
 
 from .agent import extract_json, run_agent
 from .config import DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, estimate_tokens
+from .dbt_affected import AffectedCheck, check_affected_models, impact_finding
+from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_render import is_dbt_template, render_model_isolated
 from .security import scan_mr
 from .skills_loader import always_skills, load_skills, skills_index
@@ -300,7 +302,8 @@ _DBT_DATABASE_MISMATCH = (
     "不展開此檔(請檢查環境變數 SEGCRA_DBT_DATABASE)")
 
 
-def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, str | None, str | None]:
+def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict,
+                            dbt_ctx: DbtContext | None = None) -> tuple[str, str | None, str | None]:
     """dbt 樣板先展開成純 SQL 再交給規則層(#7)。
     回傳 (交給規則層的 sql, 展開失敗原因或 None, ref()/source() 精確度提醒或 None)。
 
@@ -310,9 +313,12 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, st
     macro 呼叫時,原文解析得過、0 條規則命中(#16 review)。待審內容一律走
     render_model_isolated()(子行程隔離 + 逾時 + Linux 上限記憶體)。
 
-    尚無列 GitLab 目錄的工具,所以這裡沒有 macro 目錄可餵(code_root 不給、只給
-    source);呼叫到專案自訂 macro 的 model 會如預期展開失敗,原因見
-    config/models.yaml 的 dbt 區塊註解。
+    dbt_ctx 給定(檔案在取回的 dbt 專案裡,見 dbt_context)時,用專案的 macro 展開,並依
+    專案資訊驗證 ref() / source();沒給(專案外的檔案、mock 模式)時沒有 macro 可用,
+    呼叫到專案自訂 macro 的 model 會如預期展開失敗。
+
+    專案裡有同名的 macro 時算展開失敗:dbt 會直接編譯失敗,而我們只有單一命名空間、
+    擇一展開的結果不一定是 dbt 會用的那個,不能當成正確的 SQL 交給規則層。
 
     用到 ref()/source() 時,展開出的表名有已知的精確度落差(不驗證 model 是否
     存在、不讀 sources.yml、不套用 alias——見 dbt_render 模組文件),不影響
@@ -322,38 +328,150 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict) -> tuple[str, st
         # 設定載入時已擋過,這裡再擋一次:dbt_cfg 也可能不經 load_config() 直接傳入。
         # 不符就不展開(fail closed),由 enforce_dbt_render_failure 補 major 交人工。
         return sql, _DBT_DATABASE_MISMATCH, None
+    project = {}
+    if dbt_ctx is not None and dbt_ctx.project is not None:
+        project = {"macro_files": dbt_ctx.macro_files, "macro_dirs": dbt_ctx.project.macro_paths,
+                   "project": dbt_ctx.info}
     rendered = render_model_isolated(path or "model.sql", source=sql,
-                                     database=dbt_cfg["database"])
+                                     database=dbt_cfg["database"], **project)
+    if rendered.ok and rendered.macro_conflicts:
+        return sql, (f"dbt 專案裡有 {len(rendered.macro_conflicts)} 組同名的 macro"
+                     "(dbt 會編譯失敗),無法確定展開結果"), None
     if rendered.ok:
         return rendered.sql, None, rendered.relation_notice
     return sql, rendered.error, None
 
 
-async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None) -> list[dict]:
+_DBT_FETCH_FAILED = "無法取回 dbt 專案:"
+
+
+def _dbt_head_source(f: dict, sql: str, dbt_ctx: DbtContext | None) -> tuple[str, str | None, bool]:
+    """dbt 專案裡的 .sql:改用 head commit 的完整內容。
+    回傳 (要檢查的內容, 取回失敗的原因或 None, 檔案是否在 dbt 專案裡)。
+
+    真實 GitLab 模式的 diff 只有新增的行;只改了幾行的 model,拿片段去展開沒有意義,
+    改到的那幾行沒有樣板標記也不代表整個檔案沒有。所以只要 head 的完整內容是 dbt 樣板,
+    就用完整內容。不是樣板的檔案(例如已編譯的純 SQL)維持原本的來源。
+
+    專案取不回來時,專案裡的 .sql(以及其他確定是樣板的檔案)一律回報失敗:不知道它是不是
+    樣板、或沒有 macro 可用,都不可以當成沒事。"""
+    rel = dbt_ctx.relative(f.get("path")) if dbt_ctx is not None else None
+    if rel is None:
+        return sql, None, False
+    if dbt_ctx.error is not None:
+        # .sql 不論內容都算(片段看不出是不是樣板);其他檔案只有確定是樣板的才算——
+        # 沒有專案就沒有 macro,拿去展開等於退回「沒有 macro」
+        if rel.endswith(".sql") or is_dbt_template(sql):
+            return sql, _DBT_FETCH_FAILED + dbt_ctx.error, True
+        return sql, None, True
+    if not rel.endswith(".sql"):
+        return sql, None, True
+    head = dbt_ctx.project.files.get(rel)
+    if head is not None and is_dbt_template(head):
+        return head, None, True
+    return sql, None, True
+
+
+def _mr_for_spec_exec(mr: dict, dbt_ctx: DbtContext | None) -> dict:
+    """執行驗證用:dbt 專案裡的樣板檔(含 macro 檔)帶上 head commit 的完整內容。
+
+    run_spec_exec 以「檔案內容有沒有樣板標記」決定要不要送沙盒。真實 GitLab 模式拿到的只有
+    diff 新增的行:只改了 macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL
+    拿去生測資、執行——執行的是不完整的片段,結果沒有意義,萬一通過還會被當成驗證過。
+    帶上完整內容後,既有的判斷就會如實回報「dbt 樣板尚未支援執行驗證」。原本的 MR 不動。"""
+    if dbt_ctx is None or dbt_ctx.project is None:
+        return mr
+    files = []
+    for f in mr.get("files", []):
+        head = dbt_ctx.head_text(f.get("path")) if isinstance(f, dict) else None
+        files.append({**f, "full_content": head} if head is not None and is_dbt_template(head) else f)
+    return {**mr, "files": files}
+
+
+# 注入掃描額外加進去的內容(取回的完整內容、展開後的 SQL)合計最多幾個字元。展開可以把很短的
+# 樣板放大成幾百萬字元,掃描器對特製的內容(大量沒有結尾的 /*)是平方時間;超過的不掃,
+# 補 major 交人工(enforce_scan_skipped)。真實的 model 展開後遠小於此
+MAX_EXTRA_SCAN_CHARS = 200_000
+
+
+def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None, rendered=()) -> dict:
+    """注入掃描用:把取回的完整內容與展開後的 SQL 也列進去掃。
+
+    預掃改用 head 的完整內容後,規則命中帶的 SQL 片段可能來自 diff 以外的行;那些行
+    以前不會進到審查流程,也就沒被掃過。展開還會把沒改到的 macro 與這次傳的參數組合在一起,
+    組出來的文字在 MR 與 macro 檔裡各自都沒有;展開後的語句(規則命中)與解析錯誤的片段會
+    進 prompt。已合併的 macro 也不能假設掃過(掃描器與規則會更新)。所以實際會送進模型的
+    內容一律再掃一次。rendered 是預掃收集的 [{path, full_content}]。原本的 diff 照舊保留。
+
+    加進去的內容合計超過 MAX_EXTRA_SCAN_CHARS 時,放不下的那幾份不掃,份數記在回傳值的
+    `_scan_skipped`(由 enforce_scan_skipped 補 major)。"""
+    extra = list(rendered)
+    if dbt_ctx is not None and dbt_ctx.project is not None:
+        extra += [{"path": f.get("path"), "full_content": text} for f in mr.get("files", [])
+                  if isinstance(f, dict) and (text := dbt_ctx.head_text(f.get("path"))) is not None]
+    kept, skipped, used = [], 0, 0
+    for item in extra:
+        size = len(item.get("full_content") or "")
+        if used + size > MAX_EXTRA_SCAN_CHARS:
+            skipped += 1
+            continue
+        used += size
+        kept.append(item)
+    if not (kept or skipped):
+        return mr
+    out = {**mr, "files": [*mr["files"], *kept]}
+    if skipped:
+        out["_scan_skipped"] = skipped
+    return out
+
+
+async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
+                  dbt_ctx: DbtContext | None = None, rendered: list | None = None) -> list[dict]:
     """對每個變更檔跑 rule-base + lint(不經 LLM)。
 
     dbt_cfg 給定且 enabled 時,含 dbt 樣板標記的檔案先展開成純 SQL 再交給規則層
     (見 _dbt_expand_for_prescan)。**預設關閉**:dbt_cfg 為 None、空字典、或
     enabled 不是 True,行為與展開器上線前完全相同——不會因為呼叫端忘記傳
     dbt_cfg 而默默改變審查結果。
+
+    dbt_ctx(prepare_dbt_context 的結果)給定時,dbt 專案裡的 .sql 改用 head commit 的完整
+    內容與專案的 macro 展開;取回失敗則記成展開失敗交人工。沒開 dbt 時不看 dbt_ctx。
+
+    rendered 給定時,展開成功的檔案以 {path, full_content: 展開後的 SQL} 加進去,給注入掃描用
+    (見 _mr_with_head_text)。
     """
     dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True
     results = []
     for f in files:
         sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or f.get("diff", "")
         entry = {"path": f["path"]}
+        dbt_error, in_project = None, False
+        # 專案的 macro 檔不是 model:拿去當 model 展開只會得到幾乎空白的結果、規則 0 命中,
+        # 看起來沒問題。它對 model 的影響由 macro 反查負責(enforce_dbt_impact);這裡仍對
+        # 改到的內容跑規則,保住不需要語法樹的規則(例如寫死的憑證)。
+        is_macro = dbt_enabled and dbt_ctx is not None and dbt_ctx.is_macro(f.get("path"))
+        if dbt_enabled and not is_macro:
+            sql, dbt_error, in_project = _dbt_head_source(f, sql, dbt_ctx)
         rule_sql = sql
-        if dbt_enabled and sql and is_dbt_template(sql):
-            rule_sql, dbt_error, dbt_notice = _dbt_expand_for_prescan(f.get("path", ""), sql, dbt_cfg)
+        if is_macro:
+            entry["dbt_macro"] = True
+        elif dbt_error is not None:
+            entry["dbt_render_error"] = dbt_error
+        elif dbt_enabled and sql and is_dbt_template(sql):
+            rule_sql, dbt_error, dbt_notice = _dbt_expand_for_prescan(
+                f.get("path", ""), sql, dbt_cfg, dbt_ctx if in_project else None)
             if dbt_error is not None:
                 entry["dbt_render_error"] = dbt_error
+            elif rendered is not None:
+                rendered.append({"path": f.get("path"), "full_content": rule_sql})
             if dbt_notice is not None:
                 entry["dbt_render_notice"] = dbt_notice
         rules = await hub.call_json("sqltools__run_rules", {"sql": rule_sql})
         if isinstance(rules, dict):
             hits = rules.get("hits")
             entry["rules"] = hits if isinstance(hits, list) else []
-            if rules.get("error"):
+            # macro 定義本來就不是完整的 SQL,解析不了是預期中的事,不另外報「無法解析」
+            if rules.get("error") and not is_macro:
                 entry["parse_error"] = rules["error"]
         else:
             entry["rules"] = rules if isinstance(rules, list) else []
@@ -438,15 +556,24 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             report["_mode"] = "baseline"
             return report
 
-        pre = await prescan(hub, mr["files"], cfg.dbt)
+        dbt_ctx = prepare_dbt_context(mr, cfg.dbt)   # 需要時取回 MR 那個 commit 的 dbt 專案
+        rendered: list[dict] = []          # 展開後的 SQL,給注入掃描用
+        pre = await prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered)
         if capture is not None:
             capture["mr"] = mr
             capture["prescan_raw"] = copy.deepcopy(pre)
-        injection_hits = scan_mr(mr)   # 確定性注入掃描(不經 LLM)
+        # 確定性注入掃描(不經 LLM):MR、取回的完整內容、展開後的 SQL
+        scan_target = _mr_with_head_text(mr, dbt_ctx, rendered)
+        injection_hits = scan_mr(scan_target)
 
         # 找 spec(確定性;執行驗證與 prompt 的規格段共用)。依檔名對應與展開器
         # 同一個開關:關閉時行為與接線前完全相同。
         spec_code, spec_text = await find_spec(hub, mr, by_path=cfg.dbt.get("enabled") is True)
+        # MR 改到 macro 等:檢查不在變更清單裡、但受影響的 model(沒有反查結果時是 None)
+        affected = await check_affected_models(hub, mr, cfg.dbt, dbt_ctx, find_spec=find_spec)
+        if spec_code is None and spec_text is None and affected is not None and affected.spec:
+            # MR 本身對不到規格(只改了 macro),而受影響的 model 都對到同一份:用它來審
+            spec_code, spec_text = affected.spec
 
         # 分層知識檢索:依變更內容的 scope + query,
         # 只注入 binding 恆常規範(scope 內全數)+ 相關 guideline top_k。
@@ -482,7 +609,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                             "prescan_final": copy.deepcopy(pre)})
 
         if dry_run:
-            return await _dry_run_report(hub, mr_id, mr, pre, spec_code, spec_text)
+            return await _dry_run_report(hub, mr_id, mr, pre, spec_code, spec_text,
+                                         affected, dbt_ctx)
 
         # 路徑觸發的 skill 自動注入:異常交易規則檔一律載入領域知識,不賭模型主動載
         always_block = always_skills(skills)
@@ -540,6 +668,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 放在 enforce_hints / enforce_style 之後:它們以關鍵詞判斷模型是否已回應,
         # 程式補的文字若先進報告,可能被誤當成模型的回應而吞掉檢核點
         report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述
+        report = enforce_scan_skipped(report, scan_target.get("_scan_skipped", 0))  # 內容太多沒掃完
+        report = enforce_dbt_impact(report, affected, dbt_ctx)  # macro 等變更影響的其他 model
         report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
         report = enforce_format(report)        # 模型輸出有格式錯誤 → major;須在 sanitize 之後
         report = enforce_injection(report, injection_hits)  # 確定性 blocker,不論模型是否被攻陷
@@ -547,9 +677,11 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_tool_refusals(report, hub.refused_calls)  # 模型要求了寫入工具
 
         # 執行驗證(必跑;測資生成 → 沙盒執行 → 仲裁)——在 rubric 之前
-        spec_result = await run_spec_exec(cfg, hub, mr, spec_code, spec_text)
+        spec_result = await run_spec_exec(cfg, hub, _mr_for_spec_exec(mr, dbt_ctx),
+                                          spec_code, spec_text)
         report.setdefault("findings", []).extend(spec_result["findings"])
         report["_spec_exec"] = {k: v for k, v in spec_result.items() if k != "findings"}
+        report = enforce_dbt_unexecuted(report, mr, dbt_ctx, cfg.dbt)  # dbt 的變更沒被執行驗證到
 
         report = apply_rubric(report)
         report = apply_policy(report, mr, cfg.policy)
@@ -761,6 +893,60 @@ def enforce_dbt_render_failure(report: dict, pre: list[dict]) -> dict:
     for entry in pre:
         if entry.get("dbt_render_error"):
             _put_program_finding(report, _render_fail_finding(entry))
+    return report
+
+
+def enforce_dbt_impact(report: dict, affected: AffectedCheck | None,
+                       dbt_ctx: DbtContext | None = None) -> dict:
+    """MR 改到 macro、屬性檔或專案設定檔時,把「影響到哪些 model、檢查出什麼」補成一條 finding
+    (內容與嚴重度見 dbt_affected.impact_finding)。
+
+    確定性補報,不看模型有沒有自己提到:只改 macro 的 MR,diff 裡看不到任何一個受影響的
+    model。標題只能由程式產生(_put_program_finding)。排在 enforce_hints / enforce_style
+    之後,理由同 enforce_dbt_notice。"""
+    impact = impact_finding(affected, dbt_ctx.prefix if dbt_ctx is not None else "")
+    if impact is not None:
+        _put_program_finding(report, impact)
+    return report
+
+
+_DBT_UNEXECUTED_TITLE = "dbt 的變更沒有經過執行驗證"
+
+
+def _mr_touches_dbt(mr: dict, dbt_ctx: DbtContext | None, dbt_cfg: dict | None) -> bool:
+    """這個 MR 有沒有改到 dbt 的東西。有取回專案時由 dbt_context 判斷(知道哪些是 macro、
+    屬性檔,也看得到完整內容);沒有時(mock 模式、專案外的檔案)只能看手上的內容有沒有樣板標記。
+    沒開 dbt 一律不算:那時樣板檔會解析失敗,本來就有別的 major。"""
+    if not dbt_cfg or dbt_cfg.get("enabled") is not True:
+        return False
+    files = mr.get("files", [])
+    if dbt_ctx is not None and dbt_ctx.touches_dbt(files):
+        return True
+    return any(is_dbt_template(f.get("full_content") or f.get("diff") or "")
+               for f in files if isinstance(f, dict))
+
+
+def enforce_dbt_unexecuted(report: dict, mr: dict, dbt_ctx: DbtContext | None,
+                           dbt_cfg: dict | None = None) -> dict:
+    """MR 改到 dbt 的東西(樣板、macro、屬性檔、專案設定檔),而執行驗證卻「通過」時,補一條 major。
+
+    dbt 樣板目前不送沙盒(展開後的表名對不到沙盒的測資表),所以這種 MR 的執行驗證結果
+    應該是「尚未支援、未執行」。結果是通過,代表被執行的是 MR 裡**別的內容**(同一個 MR 的
+    純 SQL 檔,或沒有樣板標記的片段),dbt 的變更本身沒有被驗證到——自動放行的硬條件
+    「執行驗證通過」在這裡不成立。確定性補報,標題只能由程式產生。
+
+    要排在執行驗證之後(看的是它的結果)。沒開 dbt 不受影響。mock 模式沒有取回專案,
+    一樣適用:樣板檔與純 SQL 檔混在同一個 MR 時,通過的是純 SQL 檔。"""
+    if not _mr_touches_dbt(mr, dbt_ctx, dbt_cfg):
+        return report
+    if (report.get("_spec_exec") or {}).get("passed") is not True:
+        return report            # 執行驗證自己已經說了沒通過 / 沒執行,不重複
+    _put_program_finding(report, {
+        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _DBT_UNEXECUTED_TITLE,
+        "detail": "這個 MR 改到 dbt 的樣板、macro 或設定,但執行驗證通過的是 MR 裡的其他內容;"
+                  "dbt 樣板目前不會送進沙盒執行,這些變更沒有經過執行驗證,不得自動放行。",
+        "suggestion": "以 dbt compile 取得展開後的 SQL,人工依核定規格核對。",
+        "citations": []})
     return report
 
 
@@ -1051,6 +1237,25 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     return report
 
 
+_SCAN_SKIPPED_TITLE = "部分內容超過注入掃描的上限,沒有掃描"
+
+
+def enforce_scan_skipped(report: dict, skipped: int) -> dict:
+    """取回的完整內容與展開後的 SQL 合計超過注入掃描的上限(MAX_EXTRA_SCAN_CHARS),有幾份沒有掃:
+    補一條 major,不得自動放行。沒掃的內容仍可能進到審查模型(規則命中的語句、解析錯誤的片段)。
+    標題只能由程式產生(見 _put_program_finding)。"""
+    if not skipped:
+        return report
+    _put_program_finding(report, {
+        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _SCAN_SKIPPED_TITLE,
+        "detail": (f"取回的完整內容與展開後的 SQL 合計超過 {MAX_EXTRA_SCAN_CHARS} 字元,其中 {skipped} 份"
+                   "沒有做注入掃描(避免掃描被特製的大量內容拖住)。這些內容可能進到審查模型,"
+                   "不得自動放行。"),
+        "suggestion": "人工確認展開後的內容;若 MR 確實需要這麼大的檔案,請拆小。",
+        "citations": []})
+    return report
+
+
 def enforce_injection(report: dict, hits: list[dict]) -> dict:
     """確定性注入防線:掃描器命中 → 一律加 blocker,不參考模型輸出。
 
@@ -1185,7 +1390,8 @@ def _format_comment(fd: dict) -> str:
 
 
 async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
-                          spec_code, spec_text) -> dict:
+                          spec_code, spec_text, affected: AffectedCheck | None = None,
+                          dbt_ctx: DbtContext | None = None) -> dict:
     """不經 LLM 的管線煙霧測試:預掃結果直接轉 findings,並驗證 memory/spec 可用。
     (執行驗證需要 LLM 生成測資,dry-run 不跑;只回報 spec 是否找得到。)"""
     mem_sample = await hub.call_json("memory__lookup_similar_reviews",
@@ -1211,6 +1417,7 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                             "spec_found": bool(spec_text), "spec_code": spec_code,
                             "files_scanned": len(pre)}}
     report = enforce_dbt_notice(report, pre)   # 與正式路徑一致:表名未驗證的提醒不可少
+    report = enforce_dbt_impact(report, affected, dbt_ctx)
     for fd in report["findings"]:
         await hub.call("gitlab__post_inline_comment",
                        {"mr_id": mr_id, "file": fd["file"], "line": 0,
