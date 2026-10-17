@@ -193,7 +193,7 @@ def _file_change(f: dict, head_text, relative) -> ConfigChange | None:
         sides = _snippets(hunks)
     if is_sql:
         return _sql_change(path, sides, full)
-    return _yaml_change(path, sides, full, rel == "dbt_project.yml")
+    return _yaml_change(path, sides, full, "unknown" if rel == "dbt_project.yml" else "other")
 
 
 # ─────────────────── diff ───────────────────
@@ -516,16 +516,24 @@ def _inert(chain, full) -> bool:
     return any(k in _NOT_CONFIG or k in inert for k in chain)
 
 
-def _yaml_line(chain, line: str, full, project_file: bool = False) -> str | None:
+def _yaml_line(chain, line: str, full, outside: str | None = None) -> str | None:
     """一行改動算什麼:受關注設定的名稱、"other"(其他設定)、"unknown"(看不出改了什麼),
-    或 None(不算:空行、註解、屬性檔的 models / snapshots / seeds 以外、欄位、測試、說明)。
+    或 None(不算:空行、註解、欄位、測試、說明)。
 
-    dbt_project.yml 的其他區段一律算「看不出改了什麼」:on-run-start / on-run-end 是會執行的
-    SQL,vars 會改變 model 裡 var() 的值,profile、目錄設定、dispatch 會改變整個專案的行為。"""
+    outside:models / snapshots / seeds 以外的區段怎麼算(只在看得到完整內容時分得出來)。
+      * "unknown":dbt_project.yml。on-run-start / on-run-end 是會執行的 SQL,vars 會改變 model 裡
+        var() 的值,profile、目錄設定、dispatch 會改變整個專案的行為
+      * "other":屬性檔。sources 的 identifier 改了,用到它的 model 就讀別的表;受關注的設定
+        (例如 sources 的 schema、database)照樣算受關注的設定
+      * None:不算(新增的檔案只列它在 models 等底下設定了什麼)"""
     if not chain:
         return None
     if full and chain[0] not in _CONFIG_ROOTS:
-        return "unknown" if project_file else None
+        if outside is None or _inert(chain, full):
+            return None
+        if outside == "unknown":
+            return "unknown"
+        return next((k for k in reversed(chain) if k in WATCHED), "other")
     if _inert(chain, full):
         return None
     # 最靠近這一行的受關注鍵(hook 底下的清單、跨行的字串都算那個 hook)
@@ -541,7 +549,7 @@ def _tab_indented(lines) -> bool:
     return any("\t" in ln[:len(ln) - len(ln.lstrip())] for ln in lines)
 
 
-def _yaml_change(path, sides: _Sides, full, project_file: bool = False) -> ConfigChange | None:
+def _yaml_change(path, sides: _Sides, full, outside: str | None = None) -> ConfigChange | None:
     keys, other, unknown = set(), False, False
     counted = ([], [])                       # 算進去的改動:(變更前的行, 變更後的行)
     aliases = bool(_YAML_ALIAS.search("\n".join(sides.old))
@@ -556,11 +564,12 @@ def _yaml_change(path, sides: _Sides, full, project_file: bool = False) -> Confi
         chains = _yaml_chains(lines)
         for idx in sorted(changed):
             chain = chains[idx]
-            kind = _yaml_line(chain, lines[idx], full, project_file)
+            kind = _yaml_line(chain, lines[idx], full, outside)
+            if aliases and chain and not _inert(chain, full):
+                # 檔案裡有別名 / merge key:改到的值可能被引用到 models 底下,不管這一行本身算什麼
+                unknown = True
+                counted[side].append(idx)
             if kind is None:
-                if aliases and chain and not _inert(chain, full):
-                    unknown = True           # 改到的值可能被別名引用到 models 底下
-                    counted[side].append(idx)
                 continue
             counted[side].append(idx)
             # 同一行用 { } 寫了好幾個設定時,前後逐項比較(見下方)

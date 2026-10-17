@@ -367,10 +367,28 @@ def test_dbt_project_yml_models以外的區段_算看不出改了什麼(old, new
     assert _keys("dbt_project.yml", old, new) == [((), False, True)]
 
 
-def test_屬性檔_models以外的區段_不算():
-    """屬性檔裡 sources 這類區段不影響 model 的物化與排程(dbt_project.yml 不一樣,見上一個測試)。"""
-    old = PROPERTIES + "sources:\n  - name: raw\n    loader: a\n"
-    assert _changes("models/schema.yml", old, old.replace("loader: a", "loader: b")) == []
+@pytest.mark.parametrize("old, new, expect", [
+    # identifier 改了,用到這個 source 的 model 就讀別的表:列為其他設定(info)
+    ("sources:\n  - name: raw\n    tables:\n      - name: t\n        identifier: a\n",
+     "sources:\n  - name: raw\n    tables:\n      - name: t\n        identifier: b\n", ((), True, False)),
+    # sources 的 schema 是受關注的設定(讀的表換到別的位置)
+    ("sources:\n  - name: raw\n    schema: a\n", "sources:\n  - name: raw\n    schema: b\n",
+     (("schema",), False, False)),
+], ids=["identifier", "schema"])
+def test_屬性檔_models以外的區段_照樣列出(old, new, expect):
+    """dbt 沒開時沒有反查,這類變更以前完全沒有提醒。"""
+    assert _keys("models/schema.yml", PROPERTIES + old, PROPERTIES + new) == [expect]
+
+
+def test_屬性檔_models以外的說明_不算():
+    old = PROPERTIES + "sources:\n  - name: raw\n    description: a\n"
+    assert _changes("models/schema.yml", old, old.replace("description: a", "description: b")) == []
+
+
+def test_新增的屬性檔_models以外的區段不列():
+    """新增的檔案只列它在 models 等底下設定了什麼;version: 2、sources 這類區段每個檔案都有,列出來只是雜訊。"""
+    new = "version: 2\nsources:\n  - name: raw\n    loader: a\n"
+    assert _changes("models/schema.yml", "", new) == []
 
 
 def test_dbt_project_yml_跨行的清單():
@@ -760,3 +778,13 @@ def test_刪掉的SQL註解行_在diff裡以三個減號開頭_照樣比對():
     assert "\n--- 舊的寫法\n" in "\n" + diff
     assert _keys("models/mrt_sample.sql", old, new) == [(("materialized",), False, False)]
     assert _keys("models/mrt_sample.sql", old, new, full=False) == [(("materialized",), False, False)]
+
+
+def test_屬性檔_最上層的錨點被改_merge_key引用到models底下_算看不出():
+    """屬性檔 models 以外的區段會列成其他設定;但改到的值可能經由 merge key 引用到 models 底下。"""
+    old = ("defaults: &d\n  materialized: view\n"
+           "models:\n  - name: m\n    config:\n      <<: *d\n")
+    new = old.replace("materialized: view", "materialized: table")
+    [(keys, other, unknown)] = _keys("models/schema.yml", old, new)
+    assert unknown
+
