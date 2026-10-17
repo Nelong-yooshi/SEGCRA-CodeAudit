@@ -486,6 +486,26 @@ MUTANTS.update({
      + "                timeout=SPEC_EXEC_TIMEOUT_SECONDS)",
      "            spec_result = await run_spec_exec(cfg, hub, mr, spec_code, spec_text)"),
 })
+# ---- 取回整份新檔的四道防線:唯讀 token、單檔上限、不退回舊版、取不到要交人工
+MUTANTS.update({
+ "完整檔:讀程式碼用有寫入權的 token": ("../toolbox/gitlab.py",
+     "    if not GITLAB_READ_TOKEN or GITLAB_READ_TOKEN == GITLAB_TOKEN:" + NL
+     + "        return None",
+     "    if False:" + NL
+     + "        return None"),
+ "完整檔:單檔沒有大小上限": ("../toolbox/gitlab.py",
+     "    if len(r.content) > MAX_FILE_BYTES:" + NL + "        return None",
+     "    if False:" + NL + "        return None"),
+ "完整檔:沒釘住版本時退回目標分支(= #22 的原始 bug)": ("../toolbox/gitlab.py",
+     '        ref = ref or review_ref() or ""',
+     '        ref = ref or review_ref() or "main"'),
+ "完整檔:取不到完整內容不交人工": ("pipeline.py",
+     '    no_full = [f["path"] for f in mr.get("files", [])' + NL
+     + '               if f.get("full_content_unavailable") and not f.get("unreviewable")]',
+     '    no_full = []'),
+})
+
+
 
 def copy_project(src: pathlib.Path, dst: pathlib.Path) -> None:
     """複製整個專案(除了下面明列的建置產物/快取/憑證),不是手動列出「測試會用到
@@ -1336,8 +1356,10 @@ MUTANTS.update({
 
 # ---- get_mr_diff 帶出 diff_refs 的三個 sha(#15 接線與 #22 共用)
 MUTANTS.update({
+ # #22 把 real 模式的 _diff_refs(mr) 先存成 refs(補 full_content 時要用 head_sha),
+ # 所以字面從 **_diff_refs(mr) 變成 **refs;突變本身不變,仍是「不帶出三個 sha」。
  "diff_refs:real 模式不帶出": ("../toolbox/gitlab.py",
-     '"sha": mr.get("sha", ""), **_diff_refs(mr), "files": files,',
+     '"sha": mr.get("sha", ""), **refs, "files": files,',
      '"sha": mr.get("sha", ""), "files": files,'),
  "diff_refs:mock 模式不帶出": ("../toolbox/gitlab.py",
      '"sha": mr.get("sha", f"mock-{mr_id}"), **_diff_refs(mr),',
