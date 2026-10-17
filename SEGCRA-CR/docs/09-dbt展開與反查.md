@@ -476,13 +476,27 @@ model)與確定性補報。讀 MR 與打包下載各用一把 project access tok
 | 沒有設定 `GITLAB_READ_TOKEN` | 取回失敗;被改到的 macro 檔記成展開失敗;反查當成全部 model 可能受影響;兩條 major |
 | `GITLAB_READ_TOKEN` 與 `GITLAB_TOKEN` 是同一把 | 拒絕下載(不退回用另一把);三個 MR 都交人工 |
 
-以上是依 review 修正**之前**的版本(2026-10-12);修正之後改 macro 那一列不會再因為專案有 snapshot 就標
-不確定(snapshot 改由反查判斷有沒有呼叫到被改的 macro),其餘行為不變,尚未用修正後的版本重跑。
+以上是依 review 修正**之前**的版本(2026-10-12)。
+
+**修正後重跑**(2026-10-17,同一個測試專案,另加兩個 MR;同樣只讀取)。每次都先讀 head 的
+`dbt_project.yml` 一次,再決定要不要下載。
+
+| 情況 | 讀設定檔 / 下載 | 結果 |
+|---|---|---|
+| MR 改 model | 1 / 1(head) | 與修正前相同:展開後的整句 SQL 送去跑規則,沒有補報 |
+| MR 改 macro | 1 / 2(head、base) | 多出 `R003 major`,補報寫出「展開後第 1 句」;**不再**因為專案有 snapshot 就標不確定 |
+| MR 改 `dbt_project.yml` | 1 / 2 | 與修正前相同:全部 model 可能受影響,補 major |
+| MR 只改 `README.md` | 1 / 0 | 不下載、不算改到 dbt;沒有 dbt 相關的補報 |
+| dbt 專案在子目錄(`dbt.project_dir: dbt_sub`),MR 改其中的 model | 1(`dbt_sub/dbt_project.yml`)/ 1(只下載 `dbt_sub`) | 取回成功,展開後的 SQL 送去跑規則 |
+| `GITLAB_READ_TOKEN` 與 `GITLAB_TOKEN` 是同一把 | 1 / 1(拒絕) | 取回失敗,兩條 major;變更檔也不取回完整內容 |
+| 沒有設定 `GITLAB_READ_TOKEN` | 1 / 1(拒絕) | 同上 |
+
+只改 `README.md`、只改 `dbt_project.yml` 時,這個分支的預掃會把它當成 SQL 解析失敗而補一條 major;
+非 SQL 檔的處理在另一個 PR。
 
 另外確認:三個 MR 的 `base_sha` 都是目標分支的最新 commit;seed、snapshot、Python model 都列在
 `ref()` 找得到的名稱裡,並標成表名無法確定;專案資訊在子行程裡整理,正常完成;錯誤訊息不含 token
-或網址。實測沒有涵蓋:呼叫模型之後的步驟(模型審查、執行驗證、寫回 GitLab)、dbt 專案在子目錄
-(`dbt.project_dir`;打包下載與取回專案在子目錄的情況已於上一節實測)、超過上限的大量受影響 model。
+或網址。實測沒有涵蓋:呼叫模型之後的步驟(模型審查、執行驗證、寫回 GitLab)、超過上限的大量受影響 model。
 
 **已知限制**
 
