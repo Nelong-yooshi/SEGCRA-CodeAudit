@@ -473,3 +473,18 @@ def test_項目名含泛用字眼時不靠那些字眼命中():
     # 對照:真的在講那一項(用它特有的字眼)就要命中
     f2 = _claim(detail="實作讀的是舊的核定規格的版本,與現行版本對不上")
     assert "待補" in enforce_spec_pending(_report([f2]), spec)["findings"][0]["detail"]
+
+
+def test_經過_put_program_finding_的一律標上來源():
+    """程式專用標題的 finding 都走這個函式(`enforce_parse`、`enforce_format`、
+    `enforce_dbt_notice`…,同事在 #33/#44 加的 `enforce_dbt_unexecuted`、
+    `enforce_spec_change` 也是)。在這裡標 `_source`,新增的 enforce_* 就不必各自記得
+    —— 漏標的後果是那條程式補的 finding 會被校準當成模型的指控去對照。"""
+    report = {"findings": []}
+    pipeline._put_program_finding(
+        report, {"file": "a.sql", "line": 0, "severity": "major", "title": "程式專用標題",
+                 "detail": "與核定規格不符", "suggestion": "", "citations": []})
+    assert report["findings"][0]["_source"] == pipeline.PROGRAM_SOURCE
+    # 而且校準不會碰它
+    r = calibrate_with_execution({**report, "_spec_exec": _spec_exec()})
+    assert "執行驗證" not in r["findings"][0]["detail"]

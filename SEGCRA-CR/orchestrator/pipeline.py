@@ -632,6 +632,11 @@ def _put_program_finding(report: dict, finding: dict) -> None:
 
     被移除的那條若比程式的嚴重,採較嚴重的等級:後處理只能讓決策更保守,不能更寬鬆。
     只動同一個檔案的:其他檔案上的同標題 finding 沒有程式的版本可以取代,移掉只會更寬鬆。
+
+    **這裡會自動補上 `_source`**:判斷校準那三道只碰模型寫的指控,靠的就是這個欄位
+    (標題認不出來——注入掃描那條沒有固定前綴,而模型寫成「[R-140] …」反而會被誤認)。
+    經過這個函式的 finding 一律是程式產生的,所以在這裡標,新增的 enforce_* 就不必
+    各自記得。
     """
     key = (finding["file"], finding["title"])
     kept, worst = [], finding["severity"]
@@ -640,7 +645,7 @@ def _put_program_finding(report: dict, finding: dict) -> None:
             kept.append(f)
         elif _SEVERITY_RANK.get(f.get("severity"), -1) > _SEVERITY_RANK[worst]:
             worst = f["severity"]
-    kept.append({**finding, "severity": worst})
+    kept.append({**finding, "severity": worst, "_source": PROGRAM_SOURCE})
     report["findings"] = kept
 
 
