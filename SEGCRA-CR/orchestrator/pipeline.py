@@ -10,7 +10,7 @@ from collections import Counter
 
 from pathlib import Path
 
-from .agent import extract_json, run_agent
+from .agent import extract_json, output_truncated, run_agent
 from .config import DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, estimate_tokens
 from .dbt_affected import AffectedCheck, check_affected_models, impact_finding
 from .dbt_context import DbtContext, prepare_dbt_context
@@ -1563,66 +1563,40 @@ _TRUNCATED_TITLE = "審查模型的輸出被截斷,審查結果可能不完整"
 _TRUNCATED_SUMMARY = "審查模型的輸出被截斷、無法解析;以下只有程式確定性檢查的結果。"
 
 
-def _output_truncated(meta: dict, max_output_tokens) -> bool:
-    """主審查的最後一次回應是不是被輸出長度上限切斷(#26 第 1 點)。
-
-    `meta` 由 run_agent 回填(#18)。兩個條件任一成立就算:
-    - 端點回報 `finish_reason == "length"`
-    - 回報的 `completion_tokens` 已達該 profile 的 `max_output_tokens`——不是每個端點都照規格
-      回 `length`,用量達到上限本身就代表輸出是被切斷的
-
-    端點什麼都沒回報時判成沒有截斷(與測資生成的做法一致):沒有依據就報,會讓每一個 MR
-    都轉人工。
-    """
-    if meta.get("finish_reason") == "length":
-        return True
-    used = meta.get("completion_tokens")
-    return (_is_count(used) and _is_count(max_output_tokens)
-            and 0 < max_output_tokens <= used)
+# 稽核紀錄裡結束原因的長度上限(端點回的字串原樣記,只截長度)
+_FINISH_REASON_MAX = 64
 
 
-def _is_count(value) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-# 端點回報的 finish_reason 只認這幾個值;其餘一律記成 "other",不把端點給的任意字串寫進報告
-_KNOWN_FINISH = ("stop", "length", "tool_calls", "content_filter", "function_call")
-
-
-def _output_meta_record(meta: dict, max_output_tokens) -> dict:
+def _output_meta_record(meta: dict, max_output_tokens: int) -> dict:
     """寫進報告 `_output_meta` 的稽核紀錄:主審查最後一次回應的結束原因與用量。
 
     評測存下來的報告靠它統計截斷發生的次數(run_eval 不傳 capture,只有報告會留下來)。
     """
     reason = meta.get("finish_reason")
-    used = meta.get("completion_tokens")
     return {
-        "finish_reason": (None if reason is None
-                          else reason if isinstance(reason, str) and reason in _KNOWN_FINISH
-                          else "other"),
-        "completion_tokens": used if _is_count(used) else None,
-        "max_output_tokens": max_output_tokens if _is_count(max_output_tokens) else None,
-        "truncated": _output_truncated(meta, max_output_tokens),
+        "finish_reason": None if reason is None else str(reason)[:_FINISH_REASON_MAX],
+        "completion_tokens": meta.get("completion_tokens"),
+        "max_output_tokens": max_output_tokens,
+        "truncated": output_truncated(meta, max_output_tokens),
     }
 
 
-def _parse_model_output(raw: str, meta: dict, max_output_tokens) -> dict | None:
+def _parse_model_output(raw: str, meta: dict, max_output_tokens: int) -> dict | None:
     """解析主審查模型的輸出。被截斷又解析不出來時回一份空報告,讓審查繼續走完。
 
-    截斷的位置若在第一個 `}` 之前,extract_json 連修補都沒有東西可以修,回 None;原本會丟
-    例外讓整次審查中斷、MR 收不到任何結果。但程式的確定性檢查(規則命中、注入掃描、
-    預掃無法解析…)與模型無關,不該跟著消失——用空報告走完後處理,截斷本身由
-    enforce_truncation 補一條 major。
+    截斷的位置在第一個 `}` 之前時,extract_json 沒有東西可以修補,回 None。程式的確定性檢查
+    (規則命中、注入掃描、預掃無法解析…)與模型無關,不跟著消失:用空報告走完後處理,
+    截斷本身由 enforce_truncation 補一條 major。
 
-    沒有截斷卻解析不出來的,維持原本的行為(回 None,由呼叫端丟例外)。
+    沒有截斷卻解析不出來時回 None,由呼叫端丟例外。
     """
     report = extract_json(raw)
-    if not report and _output_truncated(meta, max_output_tokens):
+    if not report and output_truncated(meta, max_output_tokens):
         return {"summary": _TRUNCATED_SUMMARY, "findings": []}
     return report
 
 
-def enforce_truncation(report: dict, meta: dict, max_output_tokens) -> dict:
+def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict:
     """主審查的輸出被截斷 → 補一條 major(確定性,不得自動放行)。
 
     extract_json 的修補退路會把被切斷的 JSON 補成合法物件:後半的 finding 不見了,報告
@@ -1637,13 +1611,13 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens) -> dict:
     同名欄位會被蓋掉)。
     """
     report["_output_meta"] = _output_meta_record(meta, max_output_tokens)
-    if not _output_truncated(meta, max_output_tokens):
+    if not output_truncated(meta, max_output_tokens):
         return report
-    limit = f"({max_output_tokens} tokens)" if _is_count(max_output_tokens) else ""
     _put_program_finding(report, {
         "file": "(MR 內容)", "line": 0, "severity": "major", "title": _TRUNCATED_TITLE,
-        "detail": f"審查模型的輸出達到長度上限{limit}而被切斷,切斷之後的內容沒有產出。"
-                  "已解析出來的 finding 予以保留,但可能有缺漏,這次的審查結果需人工確認。",
+        "detail": f"審查模型的輸出達到長度上限({max_output_tokens} tokens)而被切斷,"
+                  "切斷之後的內容沒有產出。已解析出來的 finding 予以保留,但可能有缺漏,"
+                  "這次的審查結果需人工確認。",
         "suggestion": "重新觸發審查;若持續發生,請拆分 MR,或調高審查模型的輸出上限。",
         "citations": []})
     return report

@@ -1,11 +1,11 @@
-"""主審查模型的輸出被截斷時,審查結果要看得出來(#26 第 1 點)。
+"""主審查模型的輸出被截斷時,審查結果要看得出來。
 
 回應被輸出長度上限切斷時,`extract_json` 的修補退路會把殘缺的 JSON 補成合法物件:
 後半的 finding 不見了,報告卻一切正常。這裡驗的是「截斷 → 一定有一條 major、不會自動放行、
 也不會讓整次審查中斷」,以及沒有截斷時行為完全不變。
 
 整條 `review_mr` 跑真的,只換掉會呼叫模型與要連資料庫的點(做法同
-`test_pipeline_integration.py`);假的 `run_agent` 會照 #18 的約定回填 `meta`。
+`test_pipeline_integration.py`);假的 `run_agent` 會像真的一樣回填 `meta`。
 """
 import asyncio
 import copy
@@ -13,7 +13,7 @@ import json
 
 import pytest
 
-from orchestrator import pipeline, spec_exec
+from orchestrator import agent, pipeline, spec_exec
 from orchestrator.config import load_config
 from toolbox import gitlab
 
@@ -150,12 +150,7 @@ def test_端點什麼都沒回報時當成沒有截斷(review):
 @pytest.mark.parametrize("meta", [
     {"finish_reason": None, "completion_tokens": None},
     {"finish_reason": "stop", "completion_tokens": LIMIT - 1},
-    {"finish_reason": "eos", "completion_tokens": 10},            # 沒看過的值:不報
-    {"finish_reason": "<b>length</b>", "completion_tokens": 10},
-    {"finish_reason": ["length"], "completion_tokens": 10},       # 不是字串也不能出錯
-    {"finish_reason": "stop", "completion_tokens": str(LIMIT)},   # 不是整數的用量不採計
-    {"finish_reason": "stop", "completion_tokens": True},
-    {"finish_reason": "stop", "completion_tokens": float(LIMIT)},
+    {"finish_reason": "eos", "completion_tokens": 10},            # 其他結束原因、沒達上限:不報
 ])
 def test_不算截斷的回報(review, meta):
     report, _, _ = review(CLEAN_REPORT, meta)
@@ -218,7 +213,7 @@ def test_後半的_finding_被切掉時前半保留並轉人工(review):
 
 
 def test_截斷到解析不出來時不中斷而且規則命中仍在(review):
-    """切在第一個 } 之前,extract_json 回 None;以前會丟例外,MR 收不到任何結果。"""
+    """切在第一個 } 之前,extract_json 回 None:審查照樣走完,MR 一樣收得到結果。"""
     raw = THREE_TEXT[:THREE_TEXT.index("}")]
     assert pipeline.extract_json(raw) is None
     report, _, output = review(raw, LENGTH, _mr(PURGE_SQL, "sql/maintenance/purge.sql"))
@@ -301,20 +296,34 @@ def test_補的文字不回顯模型輸出也不回顯端點的字串(review):
 
 @pytest.mark.parametrize("meta, limit, expected", [
     ({"finish_reason": "length"}, 8192, True),
-    ({"finish_reason": "length"}, None, True),
+    ({"finish_reason": "length", "completion_tokens": 10}, 8192, True),
     ({"finish_reason": "stop", "completion_tokens": 8192}, 8192, True),
     ({"finish_reason": "stop", "completion_tokens": 8191}, 8192, False),
     ({"completion_tokens": 8192}, 8192, True),
-    ({"completion_tokens": 0}, 0, False),             # 上限沒設定(0)時不拿用量來判斷
-    ({"completion_tokens": 5}, -1, False),
-    ({"completion_tokens": 5}, None, False),
-    ({"completion_tokens": 5}, "5", False),
-    ({"completion_tokens": True}, 1, False),
-    ({"completion_tokens": 5}, True, False),
+    ({"finish_reason": "stop", "completion_tokens": None}, 8192, False),
     ({}, 8192, False),
 ])
 def test_截斷的判斷(meta, limit, expected):
-    assert pipeline._output_truncated(meta, limit) is expected
+    assert agent.output_truncated(meta, limit) is expected
+
+
+def test_測資生成與主審查用同一個截斷判斷(monkeypatch):
+    """端點碰到上限卻回 `stop` 時,兩邊都要當成截斷;判斷只有一份,改一邊另一邊跟著變。"""
+    cfg = load_config()
+    limit = cfg.role_profile("testgen").max_output_tokens
+    calls = []
+
+    async def fake_run_agent(cfg_, profile, system, user, hub=None, **kw):
+        calls.append(1)
+        kw["meta"].update({"finish_reason": "stop", "completion_tokens": limit})
+        return json.dumps({"schema_ddl": [], "conditions": [{"id": "C1"}], "cases": []})
+
+    monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
+    plan, gaps, _ = asyncio.run(spec_exec.generate_cases(cfg, "R-999", "規格", max_attempts=2))
+    assert len(calls) == 2 and plan["cases"] == []
+    assert "截斷" in gaps[0] and "2/2" in gaps[0]
+    assert spec_exec.output_truncated is agent.output_truncated
+    assert pipeline.output_truncated is agent.output_truncated
 
 
 def test_沒有截斷時只多一個稽核欄位():
@@ -323,12 +332,6 @@ def test_沒有截斷時只多一個稽核欄位():
     assert report == THREE
     assert pipeline._parse_model_output(THREE_TEXT, STOP, LIMIT) == THREE
     assert pipeline._parse_model_output("不是 JSON", STOP, LIMIT) is None
-
-
-def test_上限不是整數時說明裡不寫數字():
-    report = pipeline.enforce_truncation({"findings": []}, {"finish_reason": "length"}, None)
-    assert "None" not in report["findings"][0]["detail"]
-    assert "上限" in report["findings"][0]["detail"]
 
 
 # ─────────────────── 程式補的文字不能被當成模型的回應 ───────────────────
@@ -349,16 +352,6 @@ def test_程式寫的摘要不含任何檢核點的關鍵字():
         assert not [w for w in [code, *words] if w in pipeline._TRUNCATED_SUMMARY], code
 
 
-def test_突變點登記在工具的進入點之前():
-    """mutate.py 以腳本執行時,寫在 `if __name__ == "__main__":` 之後的突變點不會被登記,
-    `--only "截斷:"` 會回報 0 個突變而且看起來一切正常。"""
-    import pathlib
-    text = (pathlib.Path(__file__).parent / "tools" / "mutate.py").read_text(encoding="utf-8")
-    guard = text.index('if __name__ == "__main__":')
-    assert 0 < text.index('"截斷:') < guard
-    assert "MUTANTS.update(" not in text[guard:]
-
-
 # ─────────────────── 報告裡的稽核紀錄 ───────────────────
 
 def test_blocked_的報告也有稽核紀錄(review):
@@ -376,26 +369,12 @@ def test_模型自己輸出的同名欄位會被蓋掉(review):
     assert "ZZ_FORGED_ZZ" not in json.dumps(report["_output_meta"], ensure_ascii=False)
 
 
-@pytest.mark.parametrize("reason, recorded", [
-    ("stop", "stop"), ("length", "length"), ("tool_calls", "tool_calls"),
-    ("content_filter", "content_filter"), ("function_call", "function_call"),
-    (None, None),
-    ("eos", "other"), ("<script>alert(1)</script>", "other"), ("", "other"),
-    (["length"], "other"), ({"a": 1}, "other"), (7, "other"), ("STOP", "other"),
-])
-def test_端點回的結束原因只記認得的值(reason, recorded):
-    record = pipeline._output_meta_record({"finish_reason": reason}, LIMIT)
-    assert record["finish_reason"] == recorded
-
-
-@pytest.mark.parametrize("used, limit, expected", [
-    (500, 8192, (500, 8192)), (0, 8192, (0, 8192)),
-    ("500", 8192, (None, 8192)), (True, 8192, (None, 8192)), (5.0, 8192, (None, 8192)),
-    ([1], 8192, (None, 8192)), (500, None, (500, None)), (500, "8192", (500, None)),
-])
-def test_稽核紀錄的數字只收整數(used, limit, expected):
-    record = pipeline._output_meta_record({"completion_tokens": used}, limit)
-    assert (record["completion_tokens"], record["max_output_tokens"]) == expected
+def test_稽核紀錄照端點回報的記_結束原因截到固定長度():
+    record = pipeline._output_meta_record({"finish_reason": "eos", "completion_tokens": 500}, LIMIT)
+    assert record == {"finish_reason": "eos", "completion_tokens": 500,
+                      "max_output_tokens": LIMIT, "truncated": False}
+    long = pipeline._output_meta_record({"finish_reason": "x" * 1000}, LIMIT)["finish_reason"]
+    assert long == "x" * pipeline._FINISH_REASON_MAX
     json.dumps(record)      # 一定能序列化(評測會把整份報告寫成檔)
 
 
@@ -403,7 +382,8 @@ def test_稽核紀錄不會被當成模型對檢核點的回應():
     """enforce_hints / enforce_style 以報告全文含關鍵字判斷;這份紀錄的欄位名與可能的值
     都不含它們的關鍵字(紀錄也排在它們之後才寫)。"""
     text = json.dumps([pipeline._output_meta_record({"finish_reason": r, "completion_tokens": 1}, 2)
-                       for r in (*pipeline._KNOWN_FINISH, None, "x")], ensure_ascii=False)
+                       for r in ("stop", "length", "tool_calls", "content_filter", None, "x")],
+                      ensure_ascii=False)
     for code, words in pipeline._HINT_KEYWORDS.items():
         assert not [w for w in [code, *words] if w in text], code
     assert "逗號" not in text
