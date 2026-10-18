@@ -29,6 +29,8 @@
     * 被 `dbt_project.yml` 的 hook 參照:影響全部 model
     * 檔案解析失敗、路徑不合法、超過資源上限
     * 未提供變更前的內容(被刪除或改名的 macro 會找不到)
+  哪些 macro 被改,以 macro 為單位判斷:同一個檔案裡,內容(語法樹)前後相同的 macro 不算
+  被改,只有內容不同、新增、刪除的才算。看不準時以整個檔案判斷(見 _changed_in_file)。
     * 改到 dbt 設定類檔案(yml、seeds、snapshots…)——本模組不分析其影響
   與 macro 反查無關的不確定因素(例如 MR 只改 model 時,某個未變更的 macro 檔無法解析)
   不會觸發上述判定。
@@ -52,11 +54,11 @@
     內省(例如把 macro 當參數傳給另一個 macro,再在裡面以執行期組出的名稱取屬性)
     隱藏呼叫,靜態分析無法完全判定。已擋下常見與低成本的手法(見上方不確定情況與測試);
     真正的防線是執行沙盒與資安審查
-  * 以檔案為單位判定變更:macro 檔有變更時,檔內所有 macro 都視為已變更
   * 不讀取 `dbt_project.yml` 的 model-paths / macro-paths 設定,目錄由呼叫端指定
   * 不分析第三方套件(packages)內的 macro
   * 規格對應的檔名慣例(預設只去除 `mrt_` 前綴)待確認
 """
+import hashlib
 from dataclasses import dataclass, field
 
 import jinja2
@@ -190,6 +192,12 @@ def _is_ident(text) -> bool:
     return (isinstance(text, str) and bool(text) and text.isascii()
             and (text[0].isalpha() or text[0] == "_")
             and all(ch.isalnum() or ch == "_" for ch in text))
+
+
+def display_name(name) -> str:
+    """寫進說明文字的 macro 名稱。名稱來自 MR,Jinja 也接受非 ASCII 的識別字(例如一整句中文),
+    不合白名單的不照抄,改寫成固定文字:說明文字會貼回 MR 留言。"""
+    return name if _is_ident(name) else "(名稱含非 ASCII 字元的 macro)"
 
 
 def _is_file_name(text: str) -> bool:
@@ -650,6 +658,74 @@ class _Scanner:
             return None
 
 
+# ------------------------------------------------------------------ macro 的內容指紋
+def _node_tokens(root, budget: list):
+    """依序產出語法樹的內容(節點型別、欄位名稱與值),不含行號。以明確的堆疊走訪,不用遞迴。
+
+    root 底下的 macro 定義只產出名稱、不往下走(它們各自比較);root 本身是 macro 時照常展開。
+    budget[0] 是還能走訪的節點數,用完丟 _LimitExceeded。"""
+    stack = [root]
+    while stack:
+        item = stack.pop()
+        if not isinstance(item, nodes.Node):
+            yield item
+            continue
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise _LimitExceeded(f"語法樹節點數超過 {MAX_AST_NODES}")
+        if isinstance(item, nodes.Macro) and item is not root:
+            yield f"macro:{item.name}"
+            continue
+        yield f"node:{type(item).__name__}"
+        children = []
+        for name, value in item.iter_fields():
+            children.append(f"field:{name}")
+            if isinstance(value, (list, tuple)):
+                children.append(f"list:{len(value)}")
+                children.extend(v if isinstance(v, nodes.Node) else f"value:{v!r}" for v in value)
+            elif isinstance(value, nodes.Node):
+                children.append(value)
+            else:
+                children.append(f"value:{value!r}")
+        stack.extend(reversed(children))
+
+
+def _fingerprint(root, budget: list) -> str:
+    digest = hashlib.sha256()
+    for token in _node_tokens(root, budget):
+        digest.update(token.encode("utf-8", "surrogatepass"))
+        digest.update(b"\x00")
+    return digest.hexdigest()
+
+
+def _is_blank_output(node) -> bool:
+    """macro 檔頂層的純文字(多半是 macro 之間的空行):dbt 只取出 macro 區塊,其餘不執行。"""
+    return isinstance(node, nodes.Output) and all(
+        isinstance(part, nodes.TemplateData) for part in node.nodes)
+
+
+def _macro_fingerprints(env, text: str, budget: list) -> tuple[str, dict] | None:
+    """(頂層的指紋, {macro 名稱: 內容指紋})。同一個檔案裡有同名的 macro 時回 None(看不準)。
+
+    頂層只算 macro 定義以外、不是純文字的部分;macro 的位置與順序不算。"""
+    tree = env.parse(text)
+    macros: dict[str, str] = {}
+    stack = [tree]
+    while stack:                        # 找出所有 macro 定義(含巢狀的),不用遞迴
+        node = stack.pop()
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise _LimitExceeded(f"語法樹節點數超過 {MAX_AST_NODES}")
+        if isinstance(node, nodes.Macro):
+            if node.name in macros:
+                return None
+            macros[node.name] = _fingerprint(node, budget)
+        stack.extend(node.iter_child_nodes())
+    top = nodes.Template([n for n in tree.body
+                          if not isinstance(n, nodes.Macro) and not _is_blank_output(n)])
+    return _fingerprint(top, budget), macros
+
+
 # ------------------------------------------------------------------ 二、macro 反查
 def _kind(path: str, model_dirs, macro_dirs, resource_dirs=None) -> str:
     """resource_dirs:專案設定的 seed / snapshot / analysis / test 目錄;None = 不知道,
@@ -713,7 +789,7 @@ def _walk(callers_of: dict, start, label, snapshot_hits=None):
             if kind == "macro":
                 if who not in seen:
                     seen.add(who)
-                    queue.append((who, chain + (who,)))
+                    queue.append((who, chain + (display_name(who),)))
             elif kind == "model":
                 model_hits.append((who, chain + (who,)))
             elif kind == "snapshot":
@@ -825,7 +901,8 @@ class _Analysis:
                 self.all_reasons.append(f"macro 檔 {path} 無法解析,無法確認其中的呼叫關係")
             for name, paths in sorted(self.macro_files.items()):
                 if len(paths) > 1:
-                    self.uncertain.append(f"macro {name} 在多個檔案中重複定義({', '.join(sorted(paths))})")
+                    self.uncertain.append(
+                        f"macro {display_name(name)} 在多個檔案中重複定義({', '.join(sorted(paths))})")
 
         unreferenced: list[str] = []
         if changed_macros:
@@ -973,6 +1050,7 @@ class _Analysis:
                 problems.append(
                     f"macro 檔 {path} 沒有變更前內容,也未被宣告為新增檔"
                     f"(added_paths),無法確認是否有 macro 被刪除或改名")
+            names = {}
             for label, text in (("變更後", new_text), ("變更前", old_text)):
                 if text is None:
                     continue
@@ -980,8 +1058,38 @@ class _Analysis:
                 if result is None:
                     problems.append(f"macro 檔 {path}({label})無法解析,無法得知變更了哪些 macro")
                     continue
-                changed |= set(result.macros)
+                names[label] = set(result.macros)
+            if len(names) == 2:
+                changed |= self._changed_in_file(new_text, old_text, names)
+            else:
+                for found in names.values():
+                    changed |= found
         return changed, problems
+
+    def _changed_in_file(self, new_text: str, old_text: str, names: dict) -> set:
+        """同一個 macro 檔變更前後都解析得了時,哪些 macro 被改:內容不同、新增或刪除的。
+
+        看不準時整個檔案的 macro 都算被改(跟以前的做法相同,只會多報):
+          * 前後內容完全相同:變更清單說改了卻看不到差異,可能是取回的版本不對
+          * 同一個檔案裡有同名的 macro
+          * macro 以外的頂層內容有變(dbt 不執行,但不確定時不猜)
+          * 語法樹太深或太大(節點數另有一份上限,用完時退回整個檔案,不讓整個反查失敗)"""
+        whole_file = names["變更後"] | names["變更前"]
+        if new_text == old_text:
+            return whole_file
+        budget = [MAX_AST_NODES]
+        try:
+            new = _macro_fingerprints(self.scanner.env, new_text, budget)
+            old = _macro_fingerprints(self.scanner.env, old_text, budget)
+        except (TemplateSyntaxError, RecursionError, _LimitExceeded):
+            return whole_file
+        if new is None or old is None or new[0] != old[0]:
+            return whole_file
+        new_macros, old_macros = new[1], old[1]
+        if set(new_macros) != names["變更後"] or set(old_macros) != names["變更前"]:
+            return whole_file           # 跟掃描器認到的 macro 不一致:不猜
+        return {name for name in new_macros.keys() | old_macros.keys()
+                if new_macros.get(name) != old_macros.get(name)}
 
     # ---------------------------------------------------------------- 反查
     def _add_model(self, path: str, chain, certain: bool) -> None:
@@ -1074,7 +1182,7 @@ class _Analysis:
 
         def label(name: str) -> str:
             where = ", ".join(sorted(self.macro_files.get(name, set()))) or "已刪除"
-            return f"{name}({where})"
+            return f"{display_name(name)}({where})"
 
         snapshot_hits: list = []
         model_hits, yml_hits, referenced = _walk(callers_of, changed_macros, label, snapshot_hits)
@@ -1090,7 +1198,7 @@ class _Analysis:
         for name in sorted(changed_macros):
             if _is_builtin_override(name):
                 self.all_reasons.append(
-                    f"變更的 macro {name} 覆寫了 dbt 內建行為,dbt 執行任何 model 時都可能呼叫")
+                    f"變更的 macro {display_name(name)} 覆寫了 dbt 內建行為,dbt 執行任何 model 時都可能呼叫")
             elif name not in referenced:
                 unreferenced.append(name)
 
@@ -1113,7 +1221,7 @@ class _Analysis:
             dynamic_snapshot_hits: list = []
             model_hits, yml_hits, _ = _walk(
                 callers_of, dynamic_macros,
-                lambda n: f"{n} 內有動態呼叫或無法解析的樣板字串,可能呼叫到變更的 macro",
+                lambda n: f"{display_name(n)} 內有動態呼叫或無法解析的樣板字串,可能呼叫到變更的 macro",
                 dynamic_snapshot_hits)
             self._apply_hits(model_hits, yml_hits, certain=False)
             for path, chain in dynamic_snapshot_hits:

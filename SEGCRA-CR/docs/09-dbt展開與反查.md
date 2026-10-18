@@ -523,7 +523,7 @@ major。加上非 SQL 檔的處理之後,改由非 SQL 檔的分類與設定比�
   再展開一次
 - 真實 GitLab 模式下,dbt 專案以外的 SQL 檔(與專案裡不是樣板的 SQL 檔)仍只有 diff 新增的行,
   完整內容由 #22 以 Files API 依 head sha 取得
-- 反查以檔案為單位;不分析第三方套件內的 macro;目錄由呼叫端指定
+- 不分析第三方套件內的 macro;目錄由呼叫端指定
 - `invocation_id` 為固定值,樣板若輸出它,結果會與 dbt compile 不同
 - 待確認:規格檔名慣例(目前只去除 `mrt_` 前綴);earlyjob model 應歸屬主規則的規格,
   確認前會交人工
