@@ -525,7 +525,7 @@ def _diff_text(mr: dict) -> str:
 
 
 _AFFECTED_SPECS_HEADER = """這個 MR 沒有對到自己的規格:它改的是共用的 macro / 設定,影響下列 model。\
-以下是這些 model 各自的核定規格(檔名後面寫的是對到它的 model)。
+以下是這些 model 各自的規格(檔名後面寫的是對到它的 model)。
 - 請逐一核對:這次的變更讓哪個 model 的行為與**它自己的**規格不符(例如門檻、代碼清單、方向條件)。
 - 引用規格時寫出是哪一份(specs/<代號>.md);不要拿 A model 的規格去要求 B model。
 - 下面列為沒有附上規格的 model,不要自行推測它的規格。"""
