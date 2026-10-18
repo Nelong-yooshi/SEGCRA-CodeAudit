@@ -431,6 +431,8 @@ def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None, rendered=()) -> dic
 # dbt 專案裡的屬性檔與 dbt_project.yml、其他檔案(設定檔、程式碼、副檔名不認得的)分開處理,
 # 見 enforce_non_sql。
 _DOC_SUFFIXES = (".md", ".markdown", ".rst")
+# 只留文字層規則命中的非 SQL 檔:說明文件與 YAML(見 _non_sql_entry)
+_TEXT_ONLY_SUFFIXES = _DOC_SUFFIXES + (".yml", ".yaml")
 
 
 def _project_prefix(dbt_cfg) -> str:
@@ -469,24 +471,26 @@ def _non_sql_kind(path, dbt_rel: str | None = None) -> str | None:
 _NON_SQL_HIT_MESSAGE = "規則 {rule} 在這個非 SQL 檔有命中;命中的原文不顯示(可能含憑證),請到檔案裡確認"
 
 
-async def _non_sql_entry(hub: ToolHub, text: str, kind: str) -> dict:
+async def _non_sql_entry(hub: ToolHub, text: str, kind: str, path: str) -> dict:
     """非 SQL 檔的預掃結果:不跑 lint,規則層只留嚴重命中,而且**只留規則代號、嚴重度與固定文字**。
 
     內容照樣送進規則層(sqltools__run_rules 會試著當成 SQL 解析,解析錯誤丟掉不用):寫死的憑證
     不需要語法樹,而設定檔正是它最常出現的地方。只留 major 以上的命中;檢核點與 minor 不留
-    (說明文件提到規則編號,不代表要核對規格)。說明文件只留不需要語法樹的命中:文件裡的 SQL
-    範例(例如一句 DELETE)不會被執行。其他檔案語法樹規則有命中也留:副檔名不是 .sql 的檔案
-    仍可能是會被執行的 SQL。
+    (說明文件提到規則編號,不代表要核對規格)。說明文件與 YAML 只留不需要語法樹的命中:文件裡的
+    SQL 範例(例如一句 DELETE)不會被執行;YAML 整份當成 SQL 解析得過只會是巧合,命中說不出
+    所以然,看報告的人分不出真假(YAML 裡會執行的 SQL,例如 hook,由設定比對處理)。其他檔案
+    語法樹規則有命中也留:副檔名不是 .sql 的檔案仍可能是會被執行的 SQL。
 
     命中的訊息與語句不留:R004 的訊息含比對到的原文(例如整段密碼),會進到 prompt 的預掃結果、
     報告,並被貼回 MR 留言(留言會寄通知,事後改掉 commit 也刪不到)。"""
     rules = await hub.call_json("sqltools__run_rules", {"sql": text})
     hits = rules.get("hits") if isinstance(rules, dict) else rules
+    text_only = str(path or "").lower().endswith(_TEXT_ONLY_SUFFIXES)
     kept = []
     for h in hits if isinstance(hits, list) else []:
         if not (isinstance(h, dict) and isinstance(h.get("rule"), str)
                 and _SEVERITY_RANK.get(h.get("severity"), -1) >= _SEVERITY_RANK["major"]
-                and (kind != "doc" or not h.get("statement"))):
+                and not (text_only and h.get("statement"))):
             continue
         rule = h["rule"] if re.fullmatch(r"[A-Z]{1,3}-?\d{1,4}", h["rule"]) else "(未知規則)"
         item = {"rule": rule, "severity": h["severity"],
@@ -519,7 +523,7 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
         entry = {"path": f["path"]}
         kind = _non_sql_kind(f.get("path"), _dbt_relative(f.get("path"), dbt_ctx, dbt_cfg))
         if kind is not None:
-            entry.update(await _non_sql_entry(hub, sql, kind))
+            entry.update(await _non_sql_entry(hub, sql, kind, f.get("path")))
             results.append(entry)
             continue
         dbt_error, in_project = None, False

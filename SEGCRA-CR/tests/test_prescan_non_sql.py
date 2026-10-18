@@ -109,6 +109,17 @@ def test_寫死的憑證_非SQL檔照樣抓到(path):
     assert [(h["rule"], h["severity"]) for h in pre[0]["rules"]] == [("R004", "blocker")]
 
 
+@pytest.mark.parametrize("path", ["models/schema.yml", ".gitlab-ci.yaml", "conf/Profiles.YML"])
+def test_YAML只留文字層的命中(path):
+    """YAML 整份當成 SQL 解析得過只會是巧合,語法樹規則的命中說不出所以然,不留;文字層照留。"""
+    text = "DELETE FROM transactions;\n"
+    assert [h["rule"] for h in json.loads(run_rules(text))] == ["R001"]
+    pre, _ = _prescan([_file(path, text)])
+    assert pre[0]["rules"] == []
+    pre, _ = _prescan([_file(path, 'password: "Abc12345"\n')])
+    assert [(h["rule"], h["severity"]) for h in pre[0]["rules"]] == [("R004", "blocker")]
+
+
 def test_其他檔案是會執行的SQL時_語法樹規則的命中照樣留():
     """副檔名不是 .sql 的檔案仍可能是會被執行的 SQL(例如 .prc)。"""
     pre, _ = _prescan([_file("proc/purge.prc", "DELETE FROM transactions;")])
