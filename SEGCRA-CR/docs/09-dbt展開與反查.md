@@ -381,6 +381,7 @@ review_mr
  ├─ check_affected_models  受影響、但不在變更清單裡的 model:變更前後各展開一次,比較規則命中
  ├─ …模型審查…
  ├─ enforce_dbt_impact     影響範圍與檢查結果 → 一條 finding
+ ├─ enforce_dbt_config_change 只改設定(config()、dbt_project.yml、屬性檔)→ 每個檔案一條(見 04 篇)
  ├─ run_spec_exec          樣板檔帶上完整內容再交給它(如實回報「尚未支援」)
  └─ enforce_dbt_unexecuted 改到 dbt 而執行驗證卻通過 → major
 ```
@@ -490,8 +491,8 @@ model)與確定性補報。讀 MR 與打包下載各用一把 project access tok
 | `GITLAB_READ_TOKEN` 與 `GITLAB_TOKEN` 是同一把 | 1 / 1(拒絕) | 取回失敗,兩條 major;變更檔也不取回完整內容 |
 | 沒有設定 `GITLAB_READ_TOKEN` | 1 / 1(拒絕) | 同上 |
 
-只改 `README.md`、只改 `dbt_project.yml` 時,這個分支的預掃會把它當成 SQL 解析失敗而補一條 major;
-非 SQL 檔的處理在另一個 PR。
+重跑用的是接線那一版:只改 `README.md`、只改 `dbt_project.yml` 時,預掃把它當成 SQL 解析失敗而補一條
+major。加上非 SQL 檔的處理之後,改由非 SQL 檔的分類與設定比對處理,不再補解析失敗的 major。
 
 另外確認:三個 MR 的 `base_sha` 都是目標分支的最新 commit;seed、snapshot、Python model 都列在
 `ref()` 找得到的名稱裡,並標成表名無法確定;專案資訊在子行程裡整理,正常完成;錯誤訊息不含 token
