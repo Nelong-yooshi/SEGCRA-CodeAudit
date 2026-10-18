@@ -171,7 +171,16 @@ def _load_dbt_section(raw: dict) -> dict:
         raise ValueError(
             f"dbt.enabled 開啟時,環境變數 SEGCRA_DBT_DATABASE 必須設為約定的假名 "
             f"{DBT_DATABASE_PLACEHOLDER}(見 docs/09-dbt展開與反查.md);目前未設定或不符。")
-    return {"enabled": enabled, "database": database}
+    # dbt 專案在 repo 裡的目錄(dbt_project.yml 所在;空字串 = repo 根目錄)。會被接進
+    # GitLab 打包下載的路徑,載入時就檢查,不等到審查時每個檔案各自失敗
+    from .dbt_project import DbtProjectError, check_project_dir
+    try:
+        project_dir = check_project_dir(section.get("project_dir", ""))
+    except DbtProjectError as e:
+        raise ValueError(f"{e};只接受 repo 內的相對目錄(英數與 _ . -,以 / 分段)") from None
+    # 只有設了才帶這個鍵(讀的一方用 .get("project_dir", "")):沒設時回傳的內容與接線前相同
+    return {"enabled": enabled, "database": database,
+            **({"project_dir": project_dir} if project_dir else {})}
 
 
 def load_config(path: Path | None = None) -> Config:

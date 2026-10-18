@@ -1,0 +1,17 @@
+{
+  "title": "調整 mrt_sample 的篩選條件",
+  "description": "多排除 id 為 0 的資料。(合成資料,僅供示範 dbt 接線)",
+  "sha": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+  "diff_refs": {
+    "base_sha": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0",
+    "head_sha": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+    "start_sha": "a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0"
+  },
+  "files": [
+    {
+      "path": "models/mrt_sample.sql",
+      "old_path": "models/mrt_sample.sql",
+      "diff": "@@ -1,3 +1,4 @@\n select id, amount\n from {{ ref('txn_log') }}\n where {{ is_large('amount') }}\n+  and id > 0\n"
+    }
+  ]
+}

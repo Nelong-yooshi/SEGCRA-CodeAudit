@@ -121,8 +121,9 @@ def test_deleted_macro_is_traced_end_to_end():
 
 
 def test_project_in_subdirectory_paths_are_relative_to_it():
-    _, load, analyze = _run(_diff("dbt/macros/fmt.sql", "app/main.py", "dbt_other/x.sql"),
-                            project_dir="dbt/")
+    # dbt_macros/x.sql:前綴少比對一個斜線的話會被切成 macros/x.sql,剛好落在 dbt 的目錄裡
+    _, load, analyze = _run(_diff("dbt/macros/fmt.sql", "app/main.py", "dbt_other/x.sql",
+                                  "dbt_macros/x.sql"), project_dir="dbt/")
     assert load.calls == [(HEAD, "dbt/"), (BASE, "dbt/")]
     assert analyze.calls[0]["changed"] == ["macros/fmt.sql"]
 
@@ -300,28 +301,50 @@ def test_hook_in_dbt_project_yml_calling_changed_macro_affects_every_model():
     assert report.all_models_possibly_affected and report.needs_human
 
 
-def test_snapshot_and_seed_contents_are_not_given_to_the_analysis():
-    """反查只追 model:snapshot / seed 目錄的內容不交給它(否則會被當成目錄外的 .sql)。"""
+def test_seed_contents_are_not_given_to_the_analysis_but_snapshots_are():
+    """seed 目錄的內容不交給反查(會被當成目錄外的檔案);snapshot 也是 .sql 樣板、也會呼叫
+    macro,交給反查追。"""
     files = BASE_FILES | {"snapshots/s.sql": SNAPSHOT, "seeds/props.yml": "version: 2\n"}
     _, _, analyze = _run(_diff("models/b.sql"), head=_project(files), base=_project(files))
-    assert set(analyze.calls[0]["files"]) == set(BASE_FILES) | {"dbt_project.yml"}
+    assert set(analyze.calls[0]["files"]) == set(BASE_FILES) | {"dbt_project.yml", "snapshots/s.sql"}
+    assert analyze.calls[0]["snapshot_dirs"] == ("snapshots",)
 
 
-@pytest.mark.parametrize("names, change, uncertain", [
-    (("snapshots/s.sql",), "macros/fmt.sql", True),    # 有 snapshot、改 macro → 交人工
-    (("snapshots/s.sql",), "models/b.sql", False),     # 只改 model → 不受影響
-    ((), "macros/fmt.sql", False),                     # 沒有 snapshot → 照常
-], ids=["snapshot-macro", "snapshot-model-only", "no-snapshot"])
-def test_snapshot_impact_is_not_reported_as_none(names, change, uncertain):
-    """#20:反查不追 snapshot。有 macro 變更、而專案有 snapshot 時,不能說「沒有影響」。
-    但不標「全部 model 可能受影響」:受影響的可能是 snapshot,不是 model。"""
-    head_files = BASE_FILES | {"macros/fmt.sql": MACRO_V2, "models/b.sql": "select 2"}
+HELPER = "{% macro wrap(x) %}{{ fmt(x) }}{% endmacro %}"
+
+
+@pytest.mark.parametrize("snapshot, change, uncertain", [
+    (SNAPSHOT, "macros/fmt.sql", True),                                   # 直接呼叫被改的 macro
+    ("{% snapshot snap_txn %}select {{ wrap('c') }} from t{% endsnapshot %}",
+     "macros/fmt.sql", True),                                             # 經由另一個 macro 呼叫
+    ("{% snapshot snap_txn %}select c from t{% endsnapshot %}", "macros/fmt.sql", False),
+    (SNAPSHOT, "models/b.sql", False),                                    # 只改 model
+    ("{% snapshot snap_txn %}select {{ fmt( from t{% endsnapshot %}", "macros/fmt.sql", True),
+], ids=["calls-changed-macro", "calls-through-helper", "does-not-call", "model-only", "unparsable"])
+def test_snapshot_is_uncertain_only_when_it_calls_the_changed_macro(snapshot, change, uncertain):
+    """以前專案裡只要有 snapshot,所有改到 macro 的 MR 都標不確定(major):乾淨的 macro 重構
+    與真的有問題的修改拿到一樣的結果。現在 snapshot 也交給反查:呼叫到(直接或間接)被改的
+    macro、或看不懂時才標不確定。不標「全部 model 可能受影響」:受影響的是 snapshot。"""
+    head_files = BASE_FILES | {"macros/fmt.sql": MACRO_V2, "macros/wrap.sql": HELPER,
+                               "models/b.sql": "select 2", "snapshots/s.sql": snapshot}
+    base_files = BASE_FILES | {"macros/wrap.sql": HELPER, "snapshots/s.sql": snapshot}
+    names = ("snapshots/s.sql",)
     report, _, _ = _run(_diff(change), head=_project(head_files, names=names),
-                        base=_project(BASE_FILES, names=names), analyze=analyze_macro_impact)
+                        base=_project(base_files, names=names), analyze=analyze_macro_impact)
     snapshot_reason = any("snapshot" in r for r in report.uncertain)
-    assert snapshot_reason is uncertain
-    if uncertain:
-        assert report.needs_human and not report.all_models_possibly_affected
+    assert snapshot_reason is uncertain, report.uncertain
+    assert not report.all_models_possibly_affected
+
+
+def test_snapshot_in_custom_directory_is_not_reported_as_stray_sql():
+    files = BASE_FILES | {"macros/fmt.sql": MACRO_V2, "snaps/s.sql": "{% snapshot s %}select 1{% endsnapshot %}"}
+    head = DbtProject(ok=True, files=files, model_paths=("models",), macro_paths=("macros",),
+                      root_files=dict(ROOT), snapshot_paths=("snaps",), names=("snaps/s.sql",))
+    base = DbtProject(ok=True, files={**files, "macros/fmt.sql": MACRO_V1}, model_paths=("models",),
+                      macro_paths=("macros",), root_files=dict(ROOT), snapshot_paths=("snaps",),
+                      names=("snaps/s.sql",))
+    report, _, _ = _run(_diff("macros/fmt.sql"), head=head, base=base, analyze=analyze_macro_impact)
+    assert report.uncertain == ()
 
 
 # ------------------------------------------------------------------ 模組能力
@@ -343,3 +366,36 @@ def test_module_never_reads_files_or_renders():
     assert not names & {"open", "eval", "exec", "compile", "__import__"}
     assert not attrs & {"read_text", "write_text", "open", "system", "popen", "render",
                         "from_string", "get_template"}
+
+
+def test_snapshot的屬性檔呼叫被改的macro_也標不確定():
+    """snapshot 的 post_hook 可以寫在 snapshot 目錄的屬性檔裡,效果跟寫在 .sql 裡一樣。"""
+    props = "version: 2\nsnapshots:\n  - name: snap_txn\n    config:\n      post_hook: \"{{ fmt('x') }}\"\n"
+    head_files = BASE_FILES | {"macros/fmt.sql": MACRO_V2, "snapshots/props.yml": props,
+                               "snapshots/s.sql": "{% snapshot snap_txn %}select 1{% endsnapshot %}"}
+    base_files = BASE_FILES | {"snapshots/props.yml": props,
+                               "snapshots/s.sql": "{% snapshot snap_txn %}select 1{% endsnapshot %}"}
+    report, _, _ = _run(_diff("macros/fmt.sql"), head=_project(head_files), base=_project(base_files),
+                        analyze=analyze_macro_impact)
+    assert any("snapshots/props.yml" in r for r in report.uncertain), report.uncertain
+    assert not report.all_models_possibly_affected
+
+
+def test_自訂的seed目錄_改到資料檔也標不確定():
+    """seed 目錄改名(seed-paths)時,反查照專案的設定判斷:改到資料檔跟預設的 seeds/ 一樣交人工,
+    不會因為目錄名稱不是 seeds 就當成跟 dbt 無關。"""
+    def project(names):
+        return DbtProject(ok=True, files=dict(BASE_FILES), model_paths=("models",),
+                          macro_paths=("macros",), root_files=dict(ROOT), seed_paths=("data",),
+                          snapshot_paths=("snapshots",), names=names)
+    report, _, _ = _run(_diff("data/codes.csv"), head=project(("data/codes.csv",)),
+                        base=project(("data/codes.csv",)), analyze=analyze_macro_impact)
+    assert report.needs_human and any("data/codes.csv" in r for r in report.uncertain), report.uncertain
+
+
+def test_反查拿到專案的資源目錄設定():
+    head = DbtProject(ok=True, files=dict(BASE_FILES), model_paths=("models",), macro_paths=("macros",),
+                      root_files=dict(ROOT), seed_paths=("data",), snapshot_paths=("snaps",),
+                      analysis_paths=("an",), test_paths=("checks",))
+    _, _, analyze = _run(_diff("macros/fmt.sql"), head=head, base=head)
+    assert analyze.calls[0]["resource_dirs"] == ("data", "snaps", "an", "checks")

@@ -212,6 +212,48 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
 
    endpoint 在別處時:`export OLLAMA_URL=http://<host>:11434/v1`。
 
+### 開啟 dbt 接線(選用;預設關閉)
+
+規則程式是 dbt model 時,審查要先把樣板展開成 SQL 才檢查得了。這個功能**預設關閉**;關閉時含樣板的檔案一律
+「無法解析、交人工」。機制與限制見 `docs/09-dbt展開與反查.md`。
+
+**開啟要設三樣:**
+
+| 設定 | 值 | 說明 |
+|---|---|---|
+| `config/models.yaml` 的 `dbt.enabled` | `true` | 只接受布林值 |
+| 環境變數 `SEGCRA_DBT_DATABASE` | `DBT_PLACEHOLDER` | 固定的假名,只用來把 `ref()` / `source()` 展開成完整表名,不會連線。不符就在載入設定時報錯 |
+| 環境變數 `GITLAB_READ_TOKEN` | 唯讀的 project access token | 見上方第 2 點;用來依 MR 的 commit 取回 dbt 專案(macro 與專案資訊)。不可與 `GITLAB_TOKEN` 相同 |
+
+dbt 專案不在 repo 根目錄時,另外在 `models.yaml` 的 `dbt` 底下設 `project_dir`(`dbt_project.yml` 所在的目錄)。
+
+**開啟後的行為:**
+
+- 哪些檔案算 dbt 的:`dbt_project.yml` 設定的 model / macro / analysis / test / seed / snapshot 目錄,與根目錄的設定檔。先讀 MR 那個 commit 的 `dbt_project.yml` 判斷;只改到其他檔案(CI 設定、一般的 SQL)時不取回專案
+- MR 改到 dbt 專案裡的 model:用該 commit 的完整檔案與專案的 macro 展開,再跑規則
+- MR 改到 macro、屬性檔(yml)或 `dbt_project.yml`:反查受影響的 model,比較變更前後的規則命中,補一條
+  「dbt 變更對其他 model 的影響」
+- 專案取不回來(token 沒設、權限不足、GitLab 連不上、設定看不懂):被改到的檔案記成展開失敗,**交人工**
+- dbt 樣板目前不做執行驗證,所以**改到 dbt 的 MR 一律不會自動放行**
+
+**先用內附的範例確認(不用 GitLab、不呼叫模型):**
+
+`examples/dbt_wiring/fixtures/` 有一個合成的小專案與兩個 MR:`mr_801.json` 只改 model、`mr_802.json`
+只改 macro(`--mr` 後面接的就是這個編號)。把 `models.yaml` 的 `dbt.enabled` 暫時改成 `true`
+(只在本機改,不要提交),然後:
+
+```bash
+export SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER FIXTURES_DIR=examples/dbt_wiring/fixtures
+.venv/bin/python demo.py --mr 801 --dry-run    # 只改 model:findings 是空的(展開成功、規則沒有命中)
+.venv/bin/python demo.py --mr 802 --dry-run    # 只改 macro:多一條 major「dbt 變更對其他 model 的影響」
+```
+
+只改 macro 的那個 MR 會多一條 major,列出受影響的 `models/mrt_sample.sql`:macro 的變更讓它展開後的
+第 1 句多出 `NOT IN` 子查詢(R003)。把 `dbt.enabled` 改回 `false` 再跑,兩個 MR 都會變成「預掃無法解析」。
+
+**關閉:**把 `dbt.enabled` 改回 `false` 即可,行為與沒有這個功能時相同(有測試鎖住)。`GITLAB_READ_TOKEN`
+不用時到 GitLab 撤銷。
+
 ## 6. Webhook 自動觸發
 
 webhook server 建議跑在**與 GitLab 同一台主機**(放在哪個目錄都可以):
