@@ -11,16 +11,10 @@
 連**鍵名**都不原樣回顯:大小寫與 `api-key`/`api_key` 這些寫法也是作者的文字,而我們自己的
 分類標籤(「API 金鑰類的鍵指定了字串常值」)資訊量一樣夠。
 """
-import sys
-from pathlib import Path
-
 import pytest
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-
-from orchestrator.pipeline import enforce_rules          # noqa: E402
-from toolbox.sqltools import _text_rules, run_rules      # noqa: E402
+from orchestrator.pipeline import enforce_parse, enforce_rules
+from toolbox.sqltools import _text_rules, mask_secrets, run_rules
 
 # 假的值:每一個都夠特殊,出現在訊息裡一定抓得到
 CASES = [
@@ -63,9 +57,9 @@ def test_補出來的finding不含憑證原文(sql, secret, _kind):
 
 
 @pytest.mark.parametrize("sql,secret,_kind", CASES)
-def test_整個預掃結果不含憑證原文以外的回顯(sql, secret, _kind):
+def test_R004_的訊息欄位不含憑證原文(sql, secret, _kind):
     """預掃結果本身會整包放進 prompt,但那沒問題——SQL 原文本來就在 prompt 裡。
-    這條確認的是**訊息欄位**乾淨:它是唯一會被複製進 finding 與 MR 留言的部分。"""
+    這條只驗 R004 的**訊息欄位**:它是會被複製進 finding 與 MR 留言的那一部分。"""
     import json
     for h in json.loads(run_rules(sql)):
         if h["rule"] == "R004":
@@ -85,3 +79,70 @@ def test_沒命中就不報():
     assert _r004("SELECT account_id FROM txn WHERE amount > 1000") == []
     # 鍵名像憑證但值不是字串常值(例如對欄位比較)→ 不是硬編碼
     assert _r004("SELECT 1 FROM users WHERE password = other_column") == []
+
+
+# ───────── 同一份報告的其他 finding 也不能把憑證帶出去(#42 review) ─────────
+#
+# R004 的訊息乾淨了,但檔案解析不過時,「預掃無法解析此檔的 SQL」那條 finding 的內文
+# 就是解析錯誤訊息 —— 而 sqlglot 的訊息帶著出錯位置附近的原文。那條一樣會貼回 MR 留言、
+# 寫進 review_output/,所以同一個問題還在。
+
+SECRET = "S3cr3t-P@ss"
+LEAKY = [
+    # 少打一個字 → 解析失敗,錯誤訊息帶著那一行
+    f"SELEC * FROM t WHERE pwd = '{SECRET}'",
+    # 沒展開的 dbt 樣板:pre_hook 裡有連線憑證
+    "{{ config(pre_hook=\"EXEC sp_addlinkedsrvlogin @rmtsrvname='R', "
+    f"@rmtpassword='{SECRET}'\") }}}}",
+]
+
+
+@pytest.mark.parametrize("sql", LEAKY)
+def test_整份報告都不含憑證原文(sql):
+    """走預掃 → enforce_rules + enforce_parse,斷言**整份報告**(含解析失敗那條)
+    都不含那串密碼。"""
+    import json
+
+    raw = json.loads(run_rules(sql))
+    entry = {"path": "a.sql", "rules": raw["hits"] if isinstance(raw, dict) else raw}
+    if isinstance(raw, dict) and raw.get("error"):
+        entry["parse_error"] = raw["error"]
+    report = enforce_parse(enforce_rules({"findings": []}, [entry]), [entry])
+    blob = json.dumps(report, ensure_ascii=False)
+    assert SECRET not in blob, blob[:400]
+
+
+@pytest.mark.parametrize("sql", LEAKY)
+def test_解析錯誤訊息本身遮掉憑證(sql):
+    """遮的是值,位置與錯誤類型要留著 —— 不然看報告的人不知道哪裡壞了。"""
+    import json
+    raw = json.loads(run_rules(sql))
+    err = raw.get("error", "") if isinstance(raw, dict) else ""
+    if err:                      # 第二個例子 sqlglot 解析得過,沒有錯誤訊息
+        assert SECRET not in err
+        assert "●●●" in err, err
+        assert "parse failed" in err
+
+
+def test_遮罩保留位置與錯誤類型():
+    masked = mask_secrets("parse failed: Invalid expression. Line 1, Col: 12. "
+                          f"SELEC * FROM t WHERE pwd = '{SECRET}'")
+    assert SECRET not in masked
+    assert "Line 1, Col: 12" in masked and "Invalid expression" in masked
+
+
+def test_沒有憑證的錯誤訊息原樣保留():
+    msg = "parse failed: Invalid expression. Line 3, Col: 7. SELEC * FROM t"
+    assert mask_secrets(msg) == msg
+
+
+def test_模型工具的解析錯誤也遮掉憑證():
+    """`sqltools__parse_ast` 是模型拿得到的工具。它的錯誤訊息不會變成 finding,
+    所以不會貼回 MR —— 但遮掉的成本是零,而工具回傳值會進模型的 context、也可能被
+    寫進 agent 的對話存檔,沒有理由讓它留著明碼。"""
+    import json
+
+    from toolbox.sqltools import parse_ast
+    out = json.loads(parse_ast(f"SELEC * FROM t WHERE pwd = '{SECRET}'"))
+    assert SECRET not in json.dumps(out, ensure_ascii=False)
+    assert "●●●" in out["error"]

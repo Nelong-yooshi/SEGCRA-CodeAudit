@@ -1363,6 +1363,20 @@ MUTANTS.update({
 # ---- R004 的訊息不得回顯比對到的憑證原文(#42)。憑證本來就在 diff 裡,但訊息會被
 # 複製進 finding、貼回 MR 留言、寫進 review_output/ —— 作者改掉那一行之後,留言裡還留著。
 MUTANTS.update({
+ # 解析錯誤訊息帶著出錯位置附近的原文,而「預掃無法解析此檔的 SQL」那條 finding 的
+ # 內文就是它 —— 一樣會貼回 MR 留言、寫進 review_output/(#42 review)
+ "R004:解析錯誤訊息不遮憑證": ("../toolbox/sqltools.py",
+     "        statements, parse_error = [], mask_secrets(" + NL
+     + "            f\"parse failed: {' '.join(msg.split())[:200]}\")",
+     "        statements, parse_error = [], (" + NL
+     + "            f\"parse failed: {' '.join(msg.split())[:200]}\")"),
+ "R004:遮罩把整段訊息都換掉(位置與錯誤類型不見)": ("../toolbox/sqltools.py",
+     "    return _SECRET_RE.sub(_MASK, text or \"\")",
+     "    return _MASK if _SECRET_RE.search(text or \"\") else (text or \"\")"),
+ "R004:parse_ast 的錯誤訊息不遮": ("../toolbox/sqltools.py",
+     '        return json.dumps({"error": mask_secrets(f"parse failed: {e}")},' + NL
+     + "                          ensure_ascii=False)",
+     '        return json.dumps({"error": f"parse failed: {e}"}, ensure_ascii=False)'),
  "R004:訊息回顯比對到的原文": ("../toolbox/sqltools.py",
      'f"疑似硬編碼憑證/密碼/金鑰於 SQL:{_secret_kind(m)}——"',
      'f"疑似硬編碼憑證/密碼/金鑰於 SQL:「{m.group(0)[:40]}」——"'),

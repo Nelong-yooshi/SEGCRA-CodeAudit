@@ -28,7 +28,8 @@ def parse_ast(sql: str) -> str:
     try:
         statements = _parse(sql)
     except Exception as e:
-        return json.dumps({"error": f"parse failed: {e}"}, ensure_ascii=False)
+        return json.dumps({"error": mask_secrets(f"parse failed: {e}")},
+                          ensure_ascii=False)
     for st in statements:
         if st is None:
             continue
@@ -156,6 +157,24 @@ _SECRET_KINDS = {
 }
 
 
+_MASK = "●●●"
+
+
+def mask_secrets(text: str) -> str:
+    """把文字裡疑似憑證的片段換成 ●●●。
+
+    用在**解析錯誤訊息**上:sqlglot 的訊息帶著出錯位置附近的原文,而解析失敗那條
+    finding 的內文就是它 —— 會貼回 MR 留言、寫進 review_output/。R004 的訊息已經
+    不回顯了,但同一份報告的另一條照樣會把密碼帶出去(#42 review 實測:
+    `SELEC * FROM t WHERE pwd = 'S3cr3t-P@ss'` 少打一個字,錯誤訊息就含那串密碼;
+    沒展開的 dbt 樣板 `pre_hook="… @rmtpassword='…'"` 也一樣)。
+
+    用跟 R004 同一個樣式:它認得的寫法就是我們會判成憑證的寫法,兩邊一致。
+    整段一起換掉(含鍵名),遮得比較徹底,而位置與錯誤類型都還在。
+    """
+    return _SECRET_RE.sub(_MASK, text or "")
+
+
 def _secret_kind(m: "re.Match") -> str:
     """命中的是哪一類憑證(固定字串,不含任何比對到的原文)。"""
     if m.group("url"):
@@ -256,7 +275,9 @@ def run_rules(sql: str) -> str:
         # 解析失敗時 AST 規則無法執行,但文字層規則(R004 明碼憑證等)不需要 AST,
         # 照樣要跑 —— 否則一段解析不了的 SQL 會連明碼密碼都一起放過。
         msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e))      # 去掉 sqlglot 錯誤訊息裡的終端機色碼
-        statements, parse_error = [], f"parse failed: {' '.join(msg.split())[:200]}"
+        # 錯誤訊息帶著出錯位置附近的原文 → 疑似憑證的片段先遮掉(見 mask_secrets)
+        statements, parse_error = [], mask_secrets(
+            f"parse failed: {' '.join(msg.split())[:200]}")
     for st in statements:
         if st is None:
             continue
