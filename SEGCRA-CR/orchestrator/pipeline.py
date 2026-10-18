@@ -406,13 +406,20 @@ def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None, rendered=()) -> dic
     內容一律再掃一次。rendered 是預掃收集的 [{path, full_content}]。原本的 diff 照舊保留。
 
     加進去的內容合計超過 MAX_EXTRA_SCAN_CHARS 時,放不下的那幾份不掃,份數記在回傳值的
-    `_scan_skipped`(由 enforce_scan_skipped 補 major)。"""
+    `_scan_skipped`(由 enforce_scan_skipped 補 major)。
+
+    跟 MR 檔案本身的完整內容逐字相同的(同一個路徑)不再加:MR 檔案本來就會整份掃到,重複加
+    只會佔掉上限,讓沒有必要的檔案被記成「沒有掃」。"""
     extra = list(rendered)
     if dbt_ctx is not None and dbt_ctx.project is not None:
         extra += [{"path": f.get("path"), "full_content": text} for f in mr.get("files", [])
                   if isinstance(f, dict) and (text := dbt_ctx.head_text(f.get("path"))) is not None]
+    scanned = {(f.get("path"), f["full_content"]) for f in mr.get("files", [])
+               if isinstance(f, dict) and isinstance(f.get("full_content"), str) and f["full_content"]}
     kept, skipped, used = [], 0, 0
     for item in extra:
+        if (item.get("path"), item.get("full_content")) in scanned:
+            continue
         size = len(item.get("full_content") or "")
         if used + size > MAX_EXTRA_SCAN_CHARS:
             skipped += 1

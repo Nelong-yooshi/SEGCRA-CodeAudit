@@ -864,6 +864,30 @@ def test_展開後的內容超過掃描上限_放不下的不掃_其餘照掃(mo
     assert "_scan_skipped" not in pipeline._mr_with_head_text(mr, None, rendered[:1])
 
 
+def test_跟MR檔案本身逐字相同的內容不重複加_不佔掃描上限(monkeypatch):
+    """MR 檔案的完整內容本來就會整份掃到;取回的同一份內容再加一次只會佔掉上限。"""
+    monkeypatch.setattr(pipeline, "MAX_EXTRA_SCAN_CHARS", len(MODEL) + 10)
+    mr = _mr([_f("models/mrt_big.sql", full_content=MODEL)])
+    ctx = _ctx(mr=mr)
+    rendered = [{"path": "models/mrt_big.sql", "full_content": "SELECT 1 -- 展開後"}]
+    out = _mr_with_head_text(mr, ctx, rendered)
+    assert out["files"][1:] == rendered and "_scan_skipped" not in out
+
+
+@pytest.mark.parametrize("own", [None, "", MODEL + " ", 5])
+def test_MR檔案沒有同一份完整內容時_取回的照樣加(own):
+    """內容不同(多一個空白也算)、沒有完整內容、不是字串:MR 那邊沒掃到這份,照樣加。"""
+    f = {**_f("models/mrt_big.sql"), "full_content": own}
+    out = _mr_with_head_text(_mr([f]), _ctx(mr=_mr([f])))
+    assert [x["full_content"] for x in out["files"][1:]] == [MODEL]
+
+
+def test_同一份內容在別的路徑_照樣加():
+    mr = _mr([_f("models/other.sql", full_content=MODEL), _f("models/mrt_big.sql")])
+    out = _mr_with_head_text(mr, _ctx(mr=mr))
+    assert [x["path"] for x in out["files"][2:]] == ["models/mrt_big.sql"]
+
+
 def test_沒有掃完時補major():
     report = pipeline.enforce_scan_skipped({"findings": []}, 2)
     [fd] = report["findings"]
