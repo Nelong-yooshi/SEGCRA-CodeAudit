@@ -3,14 +3,14 @@
 > 格式依 `examples/sample/RETAIL_M1_spec.md` 的骨架整理,並補上執行驗證所需的
 > **資料表定義**段。
 >
-> ⚠️ 合成資料:表名、欄位、代碼、金額門檻皆為虛構,僅供評測使用(golden case `mr_802`)。
+> ⚠️ 合成資料:表名、欄位、代碼、金額門檻皆為虛構,僅供評測使用(golden case `mr_862`)。
 > 與另一份評測規格共用同一張門檻表(`macros/alert_threshold.sql`),兩份的門檻不同。
 
 ## 基本資料
 
 | 欄位 | 值 |
 |---|---|
-| 序號 / 程式名稱 | EVAL802 / SHARED_B_EVAL |
+| 序號 / 程式名稱 | EVAL862 / SHARED_B_EVAL |
 | 資料取用 | txn_log |
 | 程式負責人 | 資料工程團隊 |
 

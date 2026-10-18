@@ -131,7 +131,7 @@ def test_預設的fixtures沒有dbt專案_既有的MR都不取回():
 
 
 # golden set 裡放了 dbt 專案(eval/golden/dbt_archives/<commit>/)的 case
-GOLDEN_WITH_DBT_PROJECT = ["mr_802"]
+GOLDEN_WITH_DBT_PROJECT = ["mr_862"]
 
 
 def test_golden_set只有放了專案的case會取回(monkeypatch):
@@ -301,7 +301,7 @@ def test_base的專案不在fixture裡_反查保守處理(example):
     assert ctx.error is None and ctx.impact.all_models_possibly_affected and ctx.base_project is None
 
 
-def test_golden_mr_802的標準答案_不會被程式補的finding命中():
+def test_golden_mr_862的標準答案_不會被程式補的finding命中():
     """執行驗證遇到 dbt 樣板時,會在被改的 macro 檔上補一條 major(行號 0)。標準答案若不限行號,
     模型沒抓到缺陷 recall 也會算命中。"""
     import sys
@@ -309,7 +309,7 @@ def test_golden_mr_802的標準答案_不會被程式補的finding命中():
     sys.path.insert(0, str(PKG_ROOT / "eval"))      # 與 tests/test_eval_scoring.py 相同的載入方式
     from run_eval import match_expected
 
-    case = json.loads((PKG_ROOT / "eval" / "golden" / "mr_802.json").read_text(encoding="utf-8"))
+    case = json.loads((PKG_ROOT / "eval" / "golden" / "mr_862.json").read_text(encoding="utf-8"))
     [expected] = case["expected"]
     program = {"file": "macros/alert_threshold.sql", "line": 0, "severity": "major",
                "title": "執行驗證無法進行:dbt 樣板尚未支援執行驗證"}
