@@ -132,13 +132,36 @@ RULES = [
 
 # --- 文字層資安規則(regex on 原始 SQL,比 AST 更能抓 hardcode 字串) ---
 # R004:hardcode 憑證/密碼/金鑰(資安紅線,一律 blocker)
+#
+# 命中的那段文字**不可以進訊息**。訊息會走到三個地方:送進模型的預掃結果、
+# enforce_rules 補的 finding(標題取訊息前 60 字)、以及貼回 MR 的行內留言與
+# review_output/ 的結果檔。憑證本來就在 diff 裡,所以不是新的外洩;問題是作者把那一行
+# 改掉之後,**留言與結果檔裡還留著一份**,而留言不會跟著 diff 消失。
+# 其他程式補報的 finding 一律不回顯作者寫的文字(注入掃描、寫入工具、截斷、同檔多處),
+# 這裡要一致。
 _SECRET_RE = re.compile(
     r"""(?ix)
-    (password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token
+    (?P<key>password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token
        |token|credential|conn(ection)?[_-]?string)
     \s*[:=]\s*['"][^'"]{3,}['"]
-    | ://[^:/\s'"]+:[^@/\s'"]+@          # user:pass@host 連線字串
+    | (?P<url>://[^:/\s'"]+:[^@/\s'"]+@)          # user:pass@host 連線字串
     """)
+# 命中的鍵名 → **我們自己的**分類標籤。連鍵名都不原樣回顯:大小寫與 `api-key`/`api_key`
+# 這些寫法也是作者的文字,而分類標籤是固定字串,說明的資訊量一樣夠。
+_SECRET_KINDS = {
+    "password": "密碼", "passwd": "密碼", "pwd": "密碼",
+    "secret": "密鑰", "apikey": "API 金鑰", "accesskey": "存取金鑰",
+    "authtoken": "存取權杖", "token": "權杖", "credential": "憑證",
+    "connectionstring": "連線字串", "connstring": "連線字串",
+}
+
+
+def _secret_kind(m: "re.Match") -> str:
+    """命中的是哪一類憑證(固定字串,不含任何比對到的原文)。"""
+    if m.group("url"):
+        return "連線字串含帳號與密碼"
+    key = re.sub(r"[_-]", "", m.group("key") or "").lower()
+    return f"{_SECRET_KINDS.get(key, '憑證')}類的鍵指定了字串常值"
 # H004:看起來異常的查詢(撈憑證欄位、明碼比對密碼)——交 LLM 判斷是否正當
 _CRED_COL_RE = re.compile(r"(?i)\bSELECT\b[^;]*\b(password|passwd|pwd|secret|"
                           r"api[_-]?key|token|private[_-]?key|cvv|card[_-]?no)\b")
@@ -202,7 +225,7 @@ def _text_rules(sql: str):
     m = _SECRET_RE.search(sql)
     if m:
         hits.append(("R004", "blocker",
-                     f"疑似硬編碼憑證/密碼/金鑰於 SQL:「{m.group(0)[:40]}」——"
+                     f"疑似硬編碼憑證/密碼/金鑰於 SQL:{_secret_kind(m)}——"
                      f"一律禁止,應改用參數/密鑰管理服務"))
     if _PW_COMPARE_RE.search(sql):
         hits.append(("H004", "hint",
