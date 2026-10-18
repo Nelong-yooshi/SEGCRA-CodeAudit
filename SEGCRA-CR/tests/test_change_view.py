@@ -76,6 +76,97 @@ def test_行尾空白不影響對應():
     assert changed_lines("@@ -1 +1 @@\n+select 1;   ", "select 1;") == {1}
 
 
+# ─────────────────── 刪掉的行 ───────────────────
+
+# 從 SQL 拿掉「AND t.channel = 'ATM'」這個條件:只刪不增,完整內容裡看不到任何 `>`
+SQL_NO_CHANNEL = SQL.replace("  AND t.channel = 'ATM'\n", "")
+DIFF_NO_CHANNEL = ("@@ -5,4 +5,3 @@\n"
+                   " FROM transactions t\n"
+                   " WHERE t.tx_type = 'WITHDRAW'\n"
+                   "-  AND t.channel = 'ATM'\n"
+                   "   AND t.tx_time >= @start_date")
+
+
+def _body(block):
+    return block.splitlines()[2:-1]
+
+
+def test_只刪不增_在刪除的位置寫明刪了幾行():
+    assert change_view.changes(DIFF_NO_CHANNEL, SQL_NO_CHANNEL) == (set(), {7: "這裡刪掉了 1 行"})
+    block, _ = file_view(PATH, SQL_NO_CHANNEL, DIFF_NO_CHANNEL, 10_000)
+    body = _body(block)
+    i = body.index("-    | (這裡刪掉了 1 行,原本的內容見上面的 diff)")
+    assert body[i - 1] == "   6 | WHERE t.tx_type = 'WITHDRAW'"
+    assert body[i + 1] == "   7 |   AND t.tx_time >= @start_date"
+    assert "channel" not in block                         # 不放被刪的內容(那在 diff 裡)
+    assert len(body) == len(SQL_NO_CHANNEL.splitlines()) + 1
+
+
+def test_刪在檔頭與檔尾():
+    text = "b\nc"
+    assert change_view.changes("@@ -1,2 +1 @@\n-a\n b", text) == (set(), {1: "這裡刪掉了 1 行"})
+    found = change_view.changes("@@ -2,3 +2 @@\n c\n-d\n-e", "b\nc")
+    assert found == (set(), {3: "這裡刪掉了 2 行"})
+    body = _body(file_view(PATH, text, "@@ -2,3 +2 @@\n c\n-d\n-e", 10_000)[0])
+    assert body[-2:] == ["  2 | c", "-   | (這裡刪掉了 2 行,原本的內容見上面的 diff)"]
+
+
+def test_沒有上下文的刪除段落_位置由新檔的行號算():
+    """`+N,0`:這一段在新檔沒有任何行,N 是刪除處的前一行。"""
+    text = "a\nb\nd"
+    assert change_view.changes("@@ -3 +2,0 @@\n-c", text) == (set(), {3: "這裡刪掉了 1 行"})
+
+
+def test_改寫時刪掉的比新增的多_寫明取代了幾行():
+    text = "select 1\nwhere a = 1\n"
+    diff = "@@ -1,4 +1,2 @@\n select 1\n-where a = 1\n-  and b = 2\n-  and c = 3\n+where a = 1"
+    assert change_view.changes(diff, text) == ({2}, {2: "下面 1 行取代了原本的 3 行"})
+
+
+def test_改寫時刪掉的不比新增的多_不另外寫():
+    assert change_view.changes("@@ -1 +1 @@\n-old\n+select 1;", "select 1;") == ({1}, {})
+    diff = "@@ -1 +1,2 @@\n-old\n+select 1;\n+select 2;"
+    assert change_view.changes(diff, "select 1;\nselect 2;") == ({1, 2}, {})
+
+
+def test_整個檔改寫但刪掉的比較多_照樣放():
+    """每一行都是新增的,但原本更長:只放 diff 會看不出少了什麼,不能當成新檔略過。"""
+    block, _ = file_view(PATH, "a", "@@ -1,3 +1 @@\n-x\n-y\n-z\n+a", 10_000)
+    assert _body(block) == ["-   | (下面 1 行取代了原本的 3 行,原本的內容見上面的 diff)", "> 1 | a"]
+
+
+@pytest.mark.parametrize("diff", [
+    "@@ -5,4 +5,3 @@\n FROM 對不上\n WHERE t.tx_type = 'WITHDRAW'\n-  AND t.channel = 'ATM'",
+    "@@ -1,3 +1,3 @@\n x\n-y\n z",                       # 上下文對不上:說不準刪在哪裡
+    "@@ -99 +99,0 @@\n-x",                                 # 刪除的位置超出檔案
+])
+def test_上下文對不上或位置超出檔案時不標記(diff):
+    assert change_view.changes(diff, SQL_NO_CHANNEL) is None
+    block, _ = file_view(PATH, SQL_NO_CHANNEL, diff, 10_000)
+    assert "未標記改動的行" in block.splitlines()[0] and "刪掉了" not in block
+
+
+def test_超過預算時刪除的位置也算改動所在():
+    lines = [f"-- line {i}" for i in range(1, 401)]
+    lines[199] = "select 200;"
+    text = "\n".join(lines)
+    diff = "@@ -199,3 +199,2 @@\n -- line 199\n-gone;\n select 200;"
+    block, used = file_view(PATH, text, diff, 300)
+    assert "內容超出預算,只放改動所在的語句" in block.splitlines()[0] and used <= 300
+    body = _body(block)
+    i = body.index("-     | (這裡刪掉了 1 行,原本的內容見上面的 diff)")
+    assert body[i - 1] == "  199 | -- line 199" and body[i + 1] == "  200 | select 200;"
+
+
+def test_超過預算時刪在檔尾():
+    text = "\n".join(f"-- line {i}" for i in range(1, 401))
+    diff = "@@ -400,2 +400 @@\n -- line 400\n-gone;"
+    block, _ = file_view(PATH, text, diff, 300)
+    assert "只放改動所在的語句" in block.splitlines()[0]
+    assert _body(block)[-2:] == ["  400 | -- line 400",
+                                 "-     | (這裡刪掉了 1 行,原本的內容見上面的 diff)"]
+
+
 # ─────────────────── 單一檔案的排版 ───────────────────
 
 def test_完整內容帶行號並標出改動的行():
@@ -309,9 +400,9 @@ def test_內容明顯超過預算時不先排整份(monkeypatch):
     calls = []
     real = change_view._numbered
 
-    def spy(lines, keep, marked):
+    def spy(lines, keep, marked, notes=None):
         calls.append(keep)
-        return real(lines, keep, marked)
+        return real(lines, keep, marked, notes)
 
     monkeypatch.setattr(change_view, "_numbered", spy)
     text = _lines(20_000, changed={10_000})
