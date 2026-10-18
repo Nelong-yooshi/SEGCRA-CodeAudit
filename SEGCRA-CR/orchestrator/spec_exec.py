@@ -319,6 +319,34 @@ def _ddl_columns(ddl: list[str]) -> dict[str, list[dict]]:
     return out
 
 
+# SQL Server 收得下、而第一版擋掉的三種寫法(#47 review):yyyymmdd 不分語系都認得、
+# 加上時間也認得、DATETIME2 的小數**預設就是 7 位**(strptime 的 %f 只吃到 6 位,所以
+# 小數要自己檢查)。擋掉這些會把合法的測資判成形狀不合法,變成假的覆蓋缺口。
+_TIME_ONLY = re.compile(r"\d{1,2}:\d{2}(:\d{2})?(\.\d{1,7})?$")
+_DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+                 "%Y%m%d %H:%M:%S", "%Y%m%d %H:%M", "%Y%m%d")
+
+
+def _datetime_ok(v: str) -> tuple[bool, str]:
+    """SQL Server 收不收這個日期時間字串。回傳 (收不收, 不收的原因)。"""
+    text = v.strip().replace("T", " ")
+    if _TIME_ONLY.match(text):
+        # SQL Server 其實收得下,但日期會變成 1900-01-01 —— 那不會是誰的本意,
+        # 而且測資的時間窗一定對不上。擋下來,並把原因講清楚讓重試時改得到。
+        return False, (f"值只給了時間、沒有日期({v[:30]})——SQL Server 會把日期當成 "
+                       f"1900-01-01,時間窗一定對不上")
+    head, _, frac = text.partition(".")
+    if frac and not re.fullmatch(r"\d{1,7}", frac):
+        return False, f"值的小數秒不合法({v[:30]})——DATETIME2 最多 7 位數字"
+    for fmt in _DATE_FORMATS:
+        try:
+            datetime.strptime(head, fmt)
+            return True, ""
+        except ValueError:
+            continue
+    return False, f"值不是可辨識的日期時間({v[:30]})"
+
+
 def _as_number(v):
     """值轉成數字(字串形式的數字也算)。轉不出來回 None。"""
     if isinstance(v, bool):
@@ -349,15 +377,8 @@ def _value_fits(col: dict, v) -> str:
     if type_name in _DATE_TYPES:
         if not isinstance(v, str):
             return ""
-        text = v.strip().replace("T", " ")
-        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
-                    "%Y-%m-%d %H:%M", "%Y-%m-%d"):
-            try:
-                datetime.strptime(text, fmt)
-                return ""
-            except ValueError:
-                continue
-        return f"{name} 是 {type_name},但值不是可辨識的日期時間({v[:30]})"
+        ok, why = _datetime_ok(v)
+        return "" if ok else f"{name} 是 {type_name},{why}"
     if type_name in _INT_LIMITS:
         num = _as_number(v)
         if num is None:
@@ -1531,9 +1552,18 @@ def _variant_label_check(conds: list[dict], cols_by_table: dict,
     if changed is not None and tcond is not None and tcond.get("check_sql"):
         if not changed:
             why.append("變體的資料與基準完全相同,沒有改動任何東西")
-        elif not any(col in _norm_sql(tcond["check_sql"]) for col in changed):
-            why.append(f"變體改的欄位({'、'.join(sorted(changed))})沒有出現在 "
-                       f"{target} 的判斷式裡,改的不是這個條件")
+        else:
+            # **每一欄**都要出現在目標的判斷式裡,不是「有一欄算一欄」。混著改的變體
+            # 才抓得到:C1-1 是「代碼 IN (OP01, OP02)」、C1-6 是「SUM(符合代碼的金額)
+            # >= 500,000」,基準是 OP01 十萬 + OP02 六十萬。只改代碼(OP01→OP99)總額
+            # 還有六十萬、規則照樣命中 → 正確地算缺口;只改金額 → 也算缺口。但兩個
+            # 一起改,用 any 就會判成「驗到了 C1-1」—— 而真正讓規則不命中的是金額,
+            # 代碼那一改本身沒有作用。那正是 #23 第 3 點要防的情況。
+            stray_cols = sorted(c for c in changed
+                                if c not in _norm_sql(tcond["check_sql"]))
+            if stray_cols:
+                why.append(f"變體改的欄位 {'、'.join(stray_cols)} 沒有出現在 "
+                           f"{target} 的判斷式裡,那幾處的改動歸因不到這個條件")
     return why
 
 

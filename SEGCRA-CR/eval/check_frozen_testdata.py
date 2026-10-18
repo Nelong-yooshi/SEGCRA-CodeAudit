@@ -23,7 +23,8 @@ from pathlib import Path
 PKG_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PKG_ROOT))
 
-from orchestrator.spec_exec import _shape_check, execute_cases  # noqa: E402
+from orchestrator.spec_exec import (_label_gaps, _shape_check,  # noqa: E402
+                                     _unverified, execute_cases)
 
 import testdata_cache  # noqa: E402 - 與本檔同目錄(eval/),執行時已在 sys.path[0]
 
@@ -202,8 +203,25 @@ def main() -> int:
         for m in ok["mismatches"]:
             print(f"  - {m.get('case_id')}:預期 {m.get('expect_flagged')},實際 {m.get('actual_flagged')}")
         return 1
-    print(f"正確的 SQL:{len(ok['case_results'])} 個案例全部符合預期\n")
+    # 預期值符不符只是一半。標籤檢查(每個案例的資料有沒有真的測到它宣稱的那一條)
+    # 與最後的 passed 也要印:上一輪 10/10 與 5 個標籤缺口是**同一次執行**的結果,
+    # 而只印預期值就把那 5 個藏起來了 —— 凍結檔「能不能用」看不出來(#47 review)。
+    label_gaps = _label_gaps(ok["case_results"])
+    unverified = _unverified(ok["case_results"])
+    effective = [r for r in ok["case_results"] if not r.get("dropped")]
+    passed = bool(effective) and not ok["mismatches"] and not gaps and not label_gaps
+    print(f"正確的 SQL:{len(ok['case_results'])} 個案例全部符合預期")
+    print(f"標籤檢查:{len(label_gaps)} 個案例的資料與標籤不符、"
+          f"{len(unverified)} 個案例的標籤未經驗證")
+    for g in label_gaps:
+        print(f"  - {g}")
+    for u in unverified:
+        print(f"  - {u['case_id']}:{u['reason']}")
+    print(f"執行驗證的結論:passed={passed}"
+          f"{'' if passed else '(有缺口 → 不得自動放行,凍結檔還不能用)'}\n")
 
+    if not passed:
+        print("‼ 凍結檔本身還不能用:上面的缺口要先處理(抓不抓得到寫錯的版本另外看)\n")
     survived = []
     print("| SQL 寫錯成 | 凍結檔抓得到嗎 | 抓到的案例 |")
     print("|---|---|---|")

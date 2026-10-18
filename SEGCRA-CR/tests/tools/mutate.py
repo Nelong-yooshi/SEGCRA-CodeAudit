@@ -1728,7 +1728,7 @@ MUTANTS.update({
         '        return "" if col["nullable"] else f"{name} 宣告 NOT NULL,卻給了 NULL"',
         '        return ""'),
     "測資:日期格式不檢查": (S,
-        '        return f"{name} 是 {type_name},但值不是可辨識的日期時間({v[:30]})"',
+        '        return "" if ok else f"{name} 是 {type_name},{why}"',
         '        return ""'),
     "測資:整數欄位給小數也放行": (S,
         '            return f"{name} 是整數欄位,但值有小數({v})"',
@@ -1883,8 +1883,9 @@ MUTANTS.update({
         "    if len(pred) < 8:",
         "    if False:"),
     "測資:不檢查改的欄位跟目標條件有不有關": (S,
-        '        elif not any(col in _norm_sql(tcond["check_sql"]) for col in changed):',
-        "        elif False:"),
+        "            stray_cols = sorted(c for c in changed" + NL
+        + '                                if c not in _norm_sql(tcond["check_sql"]))',
+        "            stray_cols = []"),
     "測資:資料與基準完全相同也算驗過": (S,
         "        if not changed:" + NL
         + '            why.append("變體的資料與基準完全相同,沒有改動任何東西")',
@@ -1897,7 +1898,24 @@ MUTANTS.update({
         '        return [] if actual.get(target) is False else [' + NL
         + '            f"沒有分支 {b_id} 的基準可以比對,而 {target} 仍然成立"]',
         "        return []"),
-    "測資:其他分支整個成立時不算有效驗證": (S,
+    # #47 review 第二輪:每一欄都要在目標的判斷式裡(any 會放過混著改的變體)、
+ # SQL Server 收得下的日期寫法不可以擋掉(擋了就是假的覆蓋缺口)
+ "測資:改的欄位有一個對上就算驗到(混著改的變體會漏過)": (S,
+     "            stray_cols = sorted(c for c in changed" + NL
+     + '                                if c not in _norm_sql(tcond["check_sql"]))',
+     "            stray_cols = ([] if any(c in _norm_sql(tcond[\"check_sql\"])" + NL
+     + "                                   for c in changed) else sorted(changed))"),
+ "測資:yyyymmdd 的日期當成不合法": (S,
+     '_DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",' + NL
+     + '                 "%Y%m%d %H:%M:%S", "%Y%m%d %H:%M", "%Y%m%d")',
+     '_DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d")'),
+ "測資:小數秒只認 6 位(DATETIME2 預設是 7 位)": (S,
+     '    if frac and not re.fullmatch(r"\\d{1,7}", frac):',
+     '    if frac and not re.fullmatch(r"\\d{1,6}", frac):'),
+ "測資:只給時間也放行(日期會變成 1900-01-01)": (S,
+     "    if _TIME_ONLY.match(text):",
+     "    if False:"),
+ "測資:其他分支整個成立時不算有效驗證": (S,
         "                r[\"label_ok\"] = False" + NL
         + "                r.setdefault(\"label_mismatch\", []).extend(",
         "                r[\"label_ok\"] = True" + NL

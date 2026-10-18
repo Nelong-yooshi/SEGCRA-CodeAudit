@@ -1901,3 +1901,96 @@ def test_run_spec_exec_把標籤沒驗到寫進通過的_finding(monkeypatch):
                                       "reason": "條件 C1 沒有判斷式(check_sql)"}]
     passed_finding = next(f for f in r["findings"] if "皆符合預期" in f["title"])
     assert "1/2 個案例的標籤未經驗證" in passed_finding["detail"], passed_finding["detail"]
+
+
+# ───────── #47 review 第二輪:混著改的變體、SQL Server 收得下的日期寫法 ─────────
+
+def test_混著改的變體不算驗到目標條件():
+    """**每一欄**都要出現在目標的判斷式裡,不是「有一欄算一欄」。
+
+    老闆的重現:C1-1 是「代碼 IN (OP01, OP02)」、C1-6 是「SUM(符合代碼的金額) >=
+    500,000」,基準是 OP01 十萬 + OP02 六十萬。
+      * 只改代碼(OP01→OP99):總額還有六十萬、規則照樣命中 → 正確地算缺口;
+      * 只改金額(60 萬→30 萬):改的不是 C1-1 → 也算缺口;
+      * **兩個一起改**:用 any 會判成「驗到了 C1-1」,但真正讓規則不命中的是金額,
+        代碼那一改本身沒有作用 —— 那正是 #23 第 3 點要防的情況。
+    """
+    conds = [
+        {"id": "C1-1", "desc": "代碼屬於清單", "branch": "C1",
+         "check_sql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log "
+                      "WHERE op_code IN ('OP01','OP02')) THEN 1 ELSE 0 END"},
+        {"id": "C1-6", "desc": "累計金額 >= 500000", "branch": "C1",
+         "check_sql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log GROUP BY account_id "
+                      "HAVING SUM(CASE WHEN op_code IN ('OP01','OP02') THEN amount ELSE 0 END) "
+                      ">= 500000) THEN 1 ELSE 0 END"},
+    ]
+    ddl = ["CREATE TABLE txn_log (account_id INT, op_code NVARCHAR(10), "
+           "amount DECIMAL(14,2));"]
+    cols = spec_exec._ddl_columns(ddl)
+    base_rows = [["txn_log", 101, "OP01", 100000.0], ["txn_log", 101, "OP02", 600000.0]]
+    base_vec = {"C1-1": True, "C1-6": True}
+    bases = {"C1": (base_vec, base_rows)}
+
+    def check(rows, actual):
+        case = {"case_id": "C1-1-v", "kind": "variant", "condition_id": "C1-1",
+                "direction": "false", "expect_flagged": False, "note": "", "rows": rows}
+        return spec_exec._variant_label_check(conds, cols, bases, case, actual)
+
+    # 只改代碼:總額還有六十萬 → C1-6 仍成立、規則照樣命中
+    only_code = [["txn_log", 101, "OP99", 100000.0], ["txn_log", 101, "OP02", 600000.0]]
+    assert check(only_code, {"C1-1": True, "C1-6": True}), "規則還會命中,不該算驗到"
+    # 只改金額:改的不是 C1-1
+    only_amt = [["txn_log", 101, "OP01", 100000.0], ["txn_log", 101, "OP02", 300000.0]]
+    why = check(only_amt, {"C1-1": True, "C1-6": False})
+    assert any("amount" in w for w in why), why
+    # 兩個一起改:any 會放過,all 才抓得到
+    both = [["txn_log", 101, "OP99", 100000.0], ["txn_log", 101, "OP02", 300000.0]]
+    why = check(both, {"C1-1": True, "C1-6": False})
+    assert any("amount" in w and "歸因不到" in w for w in why), why
+
+
+def test_只改目標判斷式裡的欄位照樣算驗到():
+    """改成 all 不可以把正常的變體一起擋掉。R-140 的凍結檔 6 個變體各自只改一欄、
+    而且都在目標的判斷式裡(老闆算過),所以這一條要維持通過。"""
+    conds = [{"id": "C1-1", "desc": "代碼屬於清單", "branch": "C1",
+              "check_sql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log "
+                           "WHERE op_code IN ('OP01','OP02')) THEN 1 ELSE 0 END"}]
+    ddl = ["CREATE TABLE txn_log (account_id INT, op_code NVARCHAR(10));"]
+    base_rows = [["txn_log", 101, "OP01"], ["txn_log", 101, "OP02"]]
+    case = {"case_id": "C1-1-v", "kind": "variant", "condition_id": "C1-1",
+            "direction": "false", "expect_flagged": False, "note": "",
+            "rows": [["txn_log", 101, "OP99"], ["txn_log", 101, "OP98"]]}
+    why = spec_exec._variant_label_check(
+        conds, spec_exec._ddl_columns(ddl), {"C1": ({"C1-1": True}, base_rows)},
+        case, {"C1-1": False})
+    assert why == [], why
+
+
+@pytest.mark.parametrize("value", [
+    "20260601",                      # yyyymmdd:SQL Server 不分語系都認得
+    "20260601 22:00:00",
+    "2026-06-01 22:00:00.1234567",   # DATETIME2 預設就是 7 位小數
+    "2026-06-01",
+    "2026-06-01 22:00",
+    "2026-06-01 22:00:00",
+    "2026-06-01T22:00:00",
+])
+def test_SQL_Server_收得下的日期寫法要放行(value):
+    """擋掉合法的寫法會把對的測資判成形狀不合法 → 變成假的覆蓋缺口 → 執行驗證永遠
+    通不過。strptime 的 %f 只吃到 6 位,所以 7 位小數要自己檢查。"""
+    ok, why = spec_exec._datetime_ok(value)
+    assert ok, why
+
+
+def test_只給時間要擋下來而且說明原因():
+    """SQL Server 其實收得下,但日期會變成 1900-01-01、時間窗一定對不上。
+    擋是對的,訊息要讓模型重試時知道要補日期。"""
+    ok, why = spec_exec._datetime_ok("22:00:00")
+    assert not ok
+    assert "1900-01-01" in why and "只給了時間" in why, why
+
+
+@pytest.mark.parametrize("value", ["2026-13-99", "abc", "2026-06-01 22:00:00.12345678",
+                                   "2026/06/01"])
+def test_真的不合法的日期照樣擋(value):
+    assert not spec_exec._datetime_ok(value)[0]
