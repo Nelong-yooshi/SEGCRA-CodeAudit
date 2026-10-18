@@ -2465,7 +2465,7 @@ MUTANTS.update({
     # 截斷偵測:被 max_tokens 硬切的 JSON 會被 json-repair 修補成合法物件,
     # 形狀檢查只看得到「案例比較少」。拿掉這一關,殘骸會被當成正常結果收下。
     "測資:不理會輸出被截斷(殘骸當結果收下)": (S,
-        '        if meta.get("finish_reason") == "length":',
+        '        if output_truncated(meta, profile.max_output_tokens):',
         "        if False:"),
     "執行中止:測資建不起來時沒跑到的案例不算缺口": (S,
         'f"{ex[\'testdata_error\']}。需人工執行驗證。"))' + NL
@@ -2476,6 +2476,65 @@ MUTANTS.update({
         + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
         + '                "conditions": plan["conditions"],' + NL
         + '                "coverage_gaps": coverage_gaps,'),
+})
+
+
+# ---- 主審查的輸出被截斷
+# 失效是靜默的:被切斷的 JSON 會被修補成合法物件,報告只是比較短。
+P = "pipeline.py"
+MUTANTS.update({
+    "截斷:主審查不把 meta 傳給 run_agent": (P,
+        "                              meta=output_meta)",
+        "                              )"),
+    "截斷:不理會 finish_reason": ("agent.py",
+        '    if meta.get("finish_reason") == "length":' + NL + "        return True" + NL
+        + '    used = meta.get("completion_tokens")',
+        '    used = meta.get("completion_tokens")'),
+    "截斷:不看用量是否達到上限": ("agent.py",
+        "    return used is not None and used >= max_output_tokens",
+        "    return False"),
+    "截斷:用量要超過上限才算(剛好等於不算)": ("agent.py",
+        "    return used is not None and used >= max_output_tokens",
+        "    return used is not None and used > max_output_tokens"),
+    "截斷:測資生成只看 finish_reason(兩邊判斷不一致)": ("spec_exec.py",
+        "        if output_truncated(meta, profile.max_output_tokens):" + NL + "            truncated += 1",
+        '        if meta.get("finish_reason") == "length":' + NL + "            truncated += 1"),
+    "截斷:解析不出來時照舊中斷審查": (P,
+        "    if not report and output_truncated(meta, max_output_tokens):",
+        "    if False:"),
+    "截斷:沒有截斷的解析失敗也用空報告帶過": (P,
+        "    if not report and output_truncated(meta, max_output_tokens):",
+        "    if not report:"),
+    "截斷:不補 major": (P,
+        "        report = enforce_truncation(report, output_meta, profile.max_output_tokens)  # 輸出被截斷" + NL,
+        ""),
+    "截斷:一律補 major(沒有截斷也補)": (P,
+        "    if not output_truncated(meta, max_output_tokens):" + NL + "        return report" + NL
+        + "    _put_program_finding(report, {",
+        "    _put_program_finding(report, {"),
+    "截斷:補成 minor(擋不住自動放行)": (P,
+        '"severity": "major", "title": _TRUNCATED_TITLE,',
+        '"severity": "minor", "title": _TRUNCATED_TITLE,'),
+    "截斷:同標題已存在就不補(模型可以關掉)": (P,
+        '    _put_program_finding(report, {' + NL
+        + '        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _TRUNCATED_TITLE,',
+        '    report.setdefault("findings", []).append({' + NL
+        + '        "file": "(MR 內容)", "line": 0, "severity": "info", "title": _TRUNCATED_TITLE,'),
+    "截斷:說明裡回顯端點回報的字串": (P,
+        'f"審查模型的輸出達到長度上限({max_output_tokens} tokens)而被切斷,',
+        'f"審查模型的輸出達到長度上限({max_output_tokens} tokens){meta.get(\'finish_reason\')}而被切斷,'),
+    "截斷:報告不記稽核紀錄": (P,
+        '    report["_output_meta"] = _output_meta_record(meta, max_output_tokens)' + NL,
+        ""),
+    "截斷:模型自己輸出的稽核紀錄不蓋掉": (P,
+        '    report["_output_meta"] = _output_meta_record(meta, max_output_tokens)',
+        '    report.setdefault("_output_meta", _output_meta_record(meta, max_output_tokens))'),
+    "截斷:稽核紀錄的結束原因不截長度": (P,
+        '"finish_reason": None if reason is None else str(reason)[:_FINISH_REASON_MAX],',
+        '"finish_reason": reason,'),
+    "截斷:capture 不記 finish_reason": (P,
+        '            capture["output_meta"] = dict(output_meta)' + NL,
+        ""),
 })
 
 
