@@ -10,6 +10,11 @@ schema 生成:從函式簽名 + docstring 自動產生——docstring 是給 LLM
 
 要把工具層重新包成 MCP server(掛進 VS Code Copilot / Claude Code 等 host)時,
 領域邏輯都在 toolbox/ 純模組,包一層薄轉接即可——見 README 附錄。
+
+**審查模型只拿得到唯讀工具**(#17,MODEL_TOOLS):MR 的標題、描述、SQL 註解都是作者寫的,
+可以夾帶給模型的指令。寫判例、學風格、開 MR、留言、設 label、設 commit status 只由管線
+自己用 call() 執行;模型那一端看到的工具清單(openai_tools)與執行入口
+(call_from_model)都只認白名單。
 """
 import inspect
 import json
@@ -27,6 +32,19 @@ TOOL_GROUPS = {
                memory.learn_style_from_examples, memory.lookup_similar_reviews,
                memory.record_feedback],
 }
+
+# 審查模型可以呼叫的工具(#17):全部唯讀。用名稱逐一列出,而不是「排除寫入類」——
+# 之後新增的工具預設**不**開放給模型,要開放必須在這裡明寫並確認它不會寫入。
+# 寫入類(post_inline_comment、post_summary、set_commit_status、create_rule_mr、set_label、
+# learn_style_from_examples、record_feedback)只由管線自己呼叫。
+MODEL_TOOLS = frozenset({
+    "gitlab__get_mr_diff", "gitlab__get_file",
+    "sqltools__parse_ast", "sqltools__lint", "sqltools__run_rules",
+    "memory__retrieve_knowledge", "memory__get_conventions", "memory__check_style",
+    "memory__lookup_similar_reviews",
+    "load_skill",
+})
+MODEL_REFUSAL = "(拒絕:此工具不開放給審查模型)"
 
 _TYPE_MAP = {str: "string", int: "integer", bool: "boolean", float: "number"}
 
@@ -67,6 +85,8 @@ class ToolHub:
         self.tools: dict[str, dict] = {}         # full_name -> openai schema
         self.local_tools: dict[str, tuple] = {}  # full_name -> (fn, schema)
         self._functions: dict[str, object] = {}  # full_name -> toolbox 函式
+        # 模型要求、但被拒絕的**已註冊**工具名稱(不記參數:參數可能是 MR 作者寫的文字)
+        self.refused_calls: list[str] = []
         for group in self.group_names:
             for fn in TOOL_GROUPS[group]:
                 full = f"{group}__{fn.__name__}"
@@ -90,7 +110,20 @@ class ToolHub:
 
     @property
     def openai_tools(self) -> list[dict]:
-        return list(self.tools.values())
+        """交給審查模型的工具清單:只含 MODEL_TOOLS(唯讀)。管線自己呼叫寫入類用 call()。"""
+        return [schema for name, schema in self.tools.items() if name in MODEL_TOOLS]
+
+    async def call_from_model(self, full_name: str, args: dict) -> str:
+        """模型要求的工具呼叫一律走這裡:不在 MODEL_TOOLS 就不執行。
+
+        openai_tools 已經不列寫入類工具,這是第二道:模型仍可能照 MR 內容的指示,
+        要求它看不到的工具。被拒絕的已註冊工具記進 refused_calls(管線據此補 finding);
+        不存在的名稱(模型自己編的)只回拒絕,不記錄。回給模型的是固定文字。"""
+        if full_name not in MODEL_TOOLS:
+            if full_name in self._functions or full_name in self.local_tools:
+                self.refused_calls.append(full_name)
+            return MODEL_REFUSAL
+        return await self.call(full_name, args)
 
     async def call(self, full_name: str, args: dict, truncate: bool = True) -> str:
         if full_name in self.local_tools:

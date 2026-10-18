@@ -8,6 +8,8 @@
 import importlib.util
 import pathlib
 
+import pytest
+
 _spec = importlib.util.spec_from_file_location(
     "mutate_tool", pathlib.Path(__file__).resolve().parent / "tools" / "mutate.py")
 mutate = importlib.util.module_from_spec(_spec)
@@ -57,13 +59,13 @@ def test_effective_timeout_never_shorter_than_three_baselines():
 def test_every_mutation_target_appears_exactly_once():
     """每個突變點在目標檔案裡必須剛好出現一次,否則改的根本不是想改的那行
     (工具執行時也會檢查,但那要跑很久才看得到;這裡秒級就擋下)。"""
-    root = pathlib.Path(__file__).resolve().parents[1] / "orchestrator"
+    proj = pathlib.Path(__file__).resolve().parents[1]
     bad = []
     entries = [(label, entry if len(entry) == 3 else ("dbt_render.py", *entry))
                for label, entry in mutate.MUTANTS.items()]
     entries.append(("金絲雀", mutate.CANARY))
     for label, (module, old, _new) in entries:
-        count = (root / module).read_text(encoding="utf-8").count(old)
+        count = (proj / "orchestrator" / module).read_text(encoding="utf-8").count(old)
         if count != 1:
             bad.append(f"{label}({module}:{count} 次)")
     assert bad == []
@@ -86,15 +88,41 @@ def test_every_mutant_produces_valid_python():
     """突變後若是語法錯誤,模組連匯入都失敗,任何測試都會紅——看起來「被抓到」,
     其實什麼行為都沒驗到(「隔離:啟動失敗不收斂」曾經就是這樣)。"""
     import ast
-    root = pathlib.Path(__file__).resolve().parents[1] / "orchestrator"
+    proj = pathlib.Path(__file__).resolve().parents[1]
     bad = []
     entries = [(label, entry if len(entry) == 3 else ("dbt_render.py", *entry))
                for label, entry in mutate.MUTANTS.items()]
     entries.append(("金絲雀", mutate.CANARY))
     for label, (module, old, new) in entries:
-        text = (root / module).read_text(encoding="utf-8")
+        text = (proj / "orchestrator" / module).read_text(encoding="utf-8")
         try:
             ast.parse(text.replace(old, new))
         except SyntaxError as e:
             bad.append(f"{label}(第 {e.lineno} 行)")
     assert bad == []
+
+
+@pytest.mark.parametrize("code, out, verdict", [
+    (0, "5 passed in 1s", "survived"),
+    (1, "FAILED tests/test_x.py::test_a - assert 1\n1 failed", "caught"),
+    (1, "ERROR tests/test_x.py::test_a - fixture\n1 error", "caught"),        # 測試本身出錯(突變造成)
+    (2, "ERROR collecting tests/test_x.py\nInterrupted: 1 error during collection", "error"),
+    (1, "ERROR collecting tests/test_x.py\n1 error", "error"),
+    (4, "ERROR: usage", "error"),
+    (5, "no tests ran", "error"),
+])
+def test_收集錯誤不算抓到(code, out, verdict):
+    assert mutate._verdict(code, out)[0] == verdict
+
+
+def test_逾時不算抓到(tmp_path, monkeypatch):
+    (tmp_path / "orchestrator").mkdir()
+    (tmp_path / "orchestrator" / "m.py").write_text("X = 1\n", encoding="utf-8")
+
+    def stuck(*a, **kw):
+        raise mutate.subprocess.TimeoutExpired("pytest", 1)
+
+    monkeypatch.setattr(mutate.subprocess, "run", stuck)
+    verdict, _ = mutate._run_mutant(tmp_path, ("m.py", "X = 1", "X = 2"), "python", 1, {})
+    assert verdict == "timeout"
+

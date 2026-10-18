@@ -81,13 +81,17 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
                    if use_tools and hub else {})
     # seed 沒設定(None)時不傳這個參數,讓模型維持原本的隨機性(能力報告用)
     seed_kwargs = {"seed": profile.seed} if profile.seed is not None else {}
+    # reasoning_effort 同理:沒設定就不送,用端點預設。送了不支援的參數可能讓整個
+    # 請求被退回,比多花一點 token 嚴重得多,所以預設不送而不是預設關閉思考。
+    effort_kwargs = ({"reasoning_effort": profile.reasoning_effort}
+                     if profile.reasoning_effort else {})
     for i in range(MAX_ITERATIONS):
         _dump(profile.model, messages, i)
         resp = await client.chat.completions.create(
             model=profile.model, messages=messages, **tool_kwargs,
             temperature=profile.temperature,
             max_tokens=profile.max_output_tokens,
-            **seed_kwargs,
+            **seed_kwargs, **effort_kwargs,
         )
         msg = resp.choices[0].message
         usage = getattr(resp, "usage", None)
@@ -124,7 +128,8 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
             if verbose:
                 print(f"[agent] tool #{i}: {tc.function.name}({str(args)[:120]})")
             try:
-                result = await hub.call(tc.function.name, args)
+                # 模型要求的只走白名單入口:寫入類工具不執行(#17,見 tool_hub.MODEL_TOOLS)
+                result = await hub.call_from_model(tc.function.name, args)
             except Exception as e:
                 result = f"(工具執行失敗:{e})"
             if trace is not None:

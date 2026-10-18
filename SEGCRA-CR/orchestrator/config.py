@@ -19,6 +19,14 @@ class ModelProfile:
     temperature: float
     max_output_tokens: int
     seed: int | None = None
+    # 思考的 token 也算在 max_output_tokens 裡,所以這個欄位實際上是在分配輸出預算:
+    # 實測 R-140 的測資生成,思考 5,054 字、JSON 本體 5,647 字——**將近一半的輸出
+    # 上限花在我們看不到也用不到的推理上**。None = 不送這個參數,用端點的預設值
+    # (會思考);設成 "none" 可以把整個上限讓給真正要的輸出。
+    #
+    # 不是所有端點都吃這個參數,所以預設不送:送了不支援的參數可能被整個請求退回,
+    # 那會比「多花一點 token」嚴重得多。
+    reasoning_effort: str | None = None
 
 
 def _env_float(name: str, lo: float, hi: float) -> float:
@@ -43,6 +51,30 @@ def _env_float(name: str, lo: float, hi: float) -> float:
             f"這種值端點可能自己夾住也可能照收,兩種都會讓這輪的數字量在"
             f"沒人知道的設定下,所以這裡直接擋下")
     return v
+
+
+# 端點接受的檔位。"none" 是「完全不要思考」,其餘是強度。
+# 空字串另外處理:代表「取消覆蓋,回到不送這個參數」,與「送 none」不同——
+# 前者用端點預設(會思考),後者明確要求不思考。
+_EFFORT_LEVELS = ("none", "minimal", "low", "medium", "high")
+
+
+def _env_effort(name: str) -> str | None:
+    """讀 reasoning_effort 的環境變數覆蓋。
+
+    壞值要當場擋下來,理由跟 _env_float 一樣:這個變數是手打在跑批指令前面的,
+    而打錯的後果很安靜——端點收到不認得的值可能整個請求退回(那還好,會看到錯誤),
+    也可能默默忽略,於是你以為關掉了思考、實際上沒有,整輪的比較就白做了。
+    """
+    raw = os.environ[name].strip().lower()
+    if not raw:
+        return None
+    if raw not in _EFFORT_LEVELS:
+        raise ValueError(
+            f"環境變數 {name} 的值不在可用檔位裡:{os.environ[name]!r}。"
+            f"可用:{'、'.join(_EFFORT_LEVELS)};"
+            f"或設成空字串代表不送這個參數(用端點預設)")
+    return raw
 
 
 def _env_seed(name: str) -> int | None:
@@ -89,6 +121,10 @@ class Config:
             prof.temperature = _env_float("LLM_TEMPERATURE", 0.0, 2.0)
         if "LLM_SEED" in os.environ:
             prof.seed = _env_seed("LLM_SEED")
+        # 量「關掉思考會不會讓覆蓋度變好」時,要用**同一份程式碼**跑開與關兩次,
+        # 所以得有環境變數可以覆蓋,不能只靠改 yaml(改了 yaml 兩次跑的就不是同一版)。
+        if "LLM_REASONING_EFFORT" in os.environ:
+            prof.reasoning_effort = _env_effort("LLM_REASONING_EFFORT")
         return prof
 
     def role_profile(self, role: str) -> ModelProfile:
@@ -135,7 +171,16 @@ def _load_dbt_section(raw: dict) -> dict:
         raise ValueError(
             f"dbt.enabled 開啟時,環境變數 SEGCRA_DBT_DATABASE 必須設為約定的假名 "
             f"{DBT_DATABASE_PLACEHOLDER}(見 docs/09-dbt展開與反查.md);目前未設定或不符。")
-    return {"enabled": enabled, "database": database}
+    # dbt 專案在 repo 裡的目錄(dbt_project.yml 所在;空字串 = repo 根目錄)。會被接進
+    # GitLab 打包下載的路徑,載入時就檢查,不等到審查時每個檔案各自失敗
+    from .dbt_project import DbtProjectError, check_project_dir
+    try:
+        project_dir = check_project_dir(section.get("project_dir", ""))
+    except DbtProjectError as e:
+        raise ValueError(f"{e};只接受 repo 內的相對目錄(英數與 _ . -,以 / 分段)") from None
+    # 只有設了才帶這個鍵(讀的一方用 .get("project_dir", "")):沒設時回傳的內容與接線前相同
+    return {"enabled": enabled, "database": database,
+            **({"project_dir": project_dir} if project_dir else {})}
 
 
 def load_config(path: Path | None = None) -> Config:
