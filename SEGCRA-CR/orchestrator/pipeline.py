@@ -573,7 +573,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # rubric 與決策之前(分數與三態都是從嚴重度算出來的)。
         report = calibrate_with_execution(report)
         report = enforce_spec_pending(report, spec_text)
-        report = enforce_claim_evidence(report, mr)
+        report = enforce_claim_evidence(report)
 
         report = apply_rubric(report)
         report = apply_policy(report, mr, cfg.policy)
@@ -1359,7 +1359,7 @@ _UNRUNNABLE_CLAIM = re.compile(r"語法錯誤|語法不合法|不合法的?語�
                                r"|跑不起來|無法編譯|編譯失敗|syntax error", re.I)
 
 
-def enforce_claim_evidence(report: dict, mr: dict) -> dict:
+def enforce_claim_evidence(report: dict) -> dict:
     """「這段 SQL 跑不起來」被沙盒實際執行推翻時,降一級並註明——其餘一概不動。
 
     **上一版做了太多事,而且做錯了方向**:它用「用字」判斷模型的指控有沒有依據

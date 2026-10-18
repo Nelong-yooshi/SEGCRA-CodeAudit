@@ -231,7 +231,7 @@ def _ran_ok(**over):
 def test_沙盒跑成功_無法執行的blocker降到major():
     f = _claim(title="語法錯誤:別名不可在 WHERE 使用",
                detail="doubled 是 CTE 的別名,這段 SQL 無法執行", severity="blocker")
-    r = enforce_claim_evidence(_report([f], _ran_ok()), {})
+    r = enforce_claim_evidence(_report([f], _ran_ok()))
     out = r["findings"][0]
     assert out["severity"] == "major", "降一級,不是移除"
     assert "沙盒已實際執行成功" in out["detail"]
@@ -241,7 +241,7 @@ def test_沙盒跑成功_無法執行的blocker降到major():
 
 def test_沙盒跑成功但指控不是無法執行_不動():
     f = _claim(title="門檻寫錯", detail="規格寫 >=,實作寫 >", severity="blocker")
-    r = enforce_claim_evidence(_report([f], _ran_ok()), {})
+    r = enforce_claim_evidence(_report([f], _ran_ok()))
     assert r["findings"][0]["severity"] == "blocker"
 
 
@@ -250,14 +250,14 @@ def test_沒跑成功就不動():
     f = _claim(title="語法錯誤", detail="無法執行", severity="blocker")
     for se in (None, {}, _ran_ok(sql_error="Incorrect syntax near 'FORM'"),
                _ran_ok(case_results=[]), _ran_ok(executed_file="")):
-        r = enforce_claim_evidence(_report([dict(f)], se), {})
+        r = enforce_claim_evidence(_report([dict(f)], se))
         assert r["findings"][0]["severity"] == "blocker", se
 
 
 def test_不是執行的那個檔不動():
     f = _claim(title="語法錯誤", detail="無法執行", severity="blocker",
                file="sql/rules/r999.sql")
-    r = enforce_claim_evidence(_report([f], _ran_ok()), {})
+    r = enforce_claim_evidence(_report([f], _ran_ok()))
     assert r["findings"][0]["severity"] == "blocker"
 
 
@@ -265,7 +265,7 @@ def test_major以下的無法執行指控不動():
     """只處理 blocker:它會直接擋下 MR,所以「被執行否證」要反映在決策上。
     major 本來就是交人工,沒有調整的必要。"""
     f = _claim(title="語法錯誤", detail="無法執行", severity="major")
-    r = enforce_claim_evidence(_report([f], _ran_ok()), {})
+    r = enforce_claim_evidence(_report([f], _ran_ok()))
     assert r["findings"][0]["severity"] == "major"
     assert "沙盒已實際執行成功" not in r["findings"][0]["detail"]
 
@@ -284,23 +284,22 @@ def test_自述等價的樣式不再被壓(detail):
     寫「等價重構」,模型引述它就能把自己的反駁壓掉。被壓的 10 條有 8 條在有缺陷的
     題目上。"""
     f = _claim(title="改寫改變了行為", detail=detail)
-    r = enforce_claim_evidence(_report([f], _ran_ok()), {})
+    r = enforce_claim_evidence(_report([f], _ran_ok()))
     assert r["findings"][0]["severity"] == "major"
     assert r["findings"][0]["detail"] == detail, "不得加註也不得改寫"
 
 
 @pytest.mark.parametrize("sql", [
-    "SELECT amount * 2 AS amt2 FROM txn WHERE amt2 > 100",
-    "SELECT acct FROM txn WHERE SUM(amount) > 100 GROUP BY acct",
-    "SELECT no_such_col FROM txn",
+    "SELECT amount * 2 AS amt2 FROM txn WHERE amt2 > 100",     # 同一層的別名用在 WHERE
+    "SELECT acct FROM txn WHERE SUM(amount) > 100 GROUP BY acct",   # WHERE 裡用聚合
+    "SELECT no_such_col FROM txn",                             # 欄位不存在
 ])
 def test_解析得過不代表跑得動(sql):
     """這三段 sqlglot 都解析得過,但 SQL Server 跑不動。上一版「解析得過就整條刪掉」
     會把真的語法問題刪掉——而現在的判準是「沙盒有沒有真的跑完」,所以這三段只要沒進
     沙盒就不會被動到。"""
     f = _claim(title="語法錯誤", detail=f"這段無法執行:{sql}", severity="blocker")
-    r = enforce_claim_evidence(_report([f], None), {"files": [{"path": EXECUTED,
-                                                              "full_content": sql}]})
+    r = enforce_claim_evidence(_report([f], None))
     assert r["findings"][0]["severity"] == "blocker"
 
 
@@ -308,7 +307,7 @@ def test_規範類的不得在某處使用不再被刪():
     """「不得在…使用」這個樣式會中到規範類的 finding。"""
     f = _claim(title="不得在正式報表使用 SELECT *",
                detail="欄位變動時報表會跟著變,團隊慣例禁止", severity="major")
-    r = enforce_claim_evidence(_report([f], _ran_ok()), {})
+    r = enforce_claim_evidence(_report([f], _ran_ok()))
     assert r["findings"][0]["severity"] == "major"
     assert "沙盒" not in r["findings"][0]["detail"]
 
@@ -316,7 +315,7 @@ def test_規範類的不得在某處使用不再被刪():
 def test_fanout指控沒指名鍵也不再被壓():
     """被壓的 14 條有 9 條在有缺陷的題目上,只是模型沒照樣式寫出鍵名。"""
     f = _claim(title="LEFT JOIN 造成列數膨脹", detail="join 可能讓列數變多")
-    r = enforce_claim_evidence(_report([f], _ran_ok()), {})
+    r = enforce_claim_evidence(_report([f], _ran_ok()))
     assert r["findings"][0]["severity"] == "major"
     assert r["findings"][0]["detail"] == "join 可能讓列數變多"
 
@@ -325,7 +324,7 @@ def test_dbt樣板解析不過也不再被壓():
     """dbt 檔的原始 Jinja 本來就解析不過。那種報告裡已經有程式補的展開失敗 finding
     在講這件事了,不需要再壓模型那條。"""
     f = _claim(title="語法錯誤", detail="{{ ref('x') }} 無法執行", severity="blocker")
-    r = enforce_claim_evidence(_report([f], None), {})
+    r = enforce_claim_evidence(_report([f], None))
     assert r["findings"][0]["severity"] == "blocker"
 
 
@@ -347,7 +346,7 @@ def test_完成條件_三種等價重構的決策不是blocked():
         _claim(title="別名不可在 WHERE 使用", detail="doubled 無法執行",
                severity="blocker"),
     ]
-    r = enforce_claim_evidence(_report(findings, _ran_ok()), MR)
+    r = enforce_claim_evidence(_report(findings, _ran_ok()))
     r = apply_policy(apply_rubric(r), MR, POLICY)
     assert not [f for f in r["findings"] if f["severity"] == "blocker"]
     assert r["decision"] == "needs_human"
@@ -358,7 +357,7 @@ def test_完成條件_加註不會讓任何東西自動放行():
     r = _report([_claim()], _spec_exec())
     r = calibrate_with_execution(r)
     r = enforce_spec_pending(r, R140)
-    r = enforce_claim_evidence(r, MR)
+    r = enforce_claim_evidence(r)
     r = apply_policy(apply_rubric(r), MR, POLICY)
     assert r["decision"] == "needs_human"
     assert r["_policy_signals"]["needs_human"]

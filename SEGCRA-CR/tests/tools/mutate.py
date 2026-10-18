@@ -1842,21 +1842,21 @@ MUTANTS.update({
      "        report = enforce_spec_pending(report, spec_text)",
      "        pass"),
  "斷言:整步沒接進管線": ("pipeline.py",
-     "        report = enforce_claim_evidence(report, mr)",
+     "        report = enforce_claim_evidence(report)",
      "        pass"),
  # 三道現在不動嚴重度,所以跟 rubric 的前後沒有差別;**要求是排在 apply_policy 之前**
  # ——它們記的 _needs_human 是決策的硬條件,排在決策之後就等於沒記。
  "校準:接在決策之後(needs_human 來不及被看到)": ("pipeline.py",
      "        report = calibrate_with_execution(report)\n"
      "        report = enforce_spec_pending(report, spec_text)\n"
-     "        report = enforce_claim_evidence(report, mr)\n\n"
+     "        report = enforce_claim_evidence(report)\n\n"
      "        report = apply_rubric(report)\n"
      "        report = apply_policy(report, mr, cfg.policy)",
      "        report = apply_rubric(report)\n"
      "        report = apply_policy(report, mr, cfg.policy)\n"
      "        report = calibrate_with_execution(report)\n"
      "        report = enforce_spec_pending(report, spec_text)\n"
-     "        report = enforce_claim_evidence(report, mr)"),
+     "        report = enforce_claim_evidence(report)"),
  "決策:不看「必須有人看」的理由": ("pipeline.py",
      "          and not needs_human",
      "          and True"),
