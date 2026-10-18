@@ -1001,3 +1001,27 @@ def test_random_project_matches_dbt(index, macro_file):
     else:
         assert not report.uncertain, f"產生器只用 dbt 解析得過的寫法,不該有不確定:{report.uncertain}"
         assert not report.all_models_possibly_affected
+
+
+# ------------------------------------------------------------------ 資源目錄依專案的設定
+def test_resource_dirs_follow_the_project_settings():
+    """seed / analysis / test 目錄由專案設定時,照設定判斷,不看 dbt 預設的目錄名稱。"""
+    files = {"models/a.sql": "select 1", "macros/m.sql": "{% macro m() %}1{% endmacro %}",
+             "an/x.sql": "select 2", "tests/y.sql": "select 3"}
+    custom = analyze_macro_impact(files, ["an/x.sql"], model_dirs=("",), resource_dirs=("an",))
+    assert any("an/x.sql" in r for r in custom.uncertain), custom.uncertain
+    assert not custom.affected_models
+    # 專案沒有把 tests 設成資源目錄(model 目錄是根目錄):tests/y.sql 就是 model
+    as_model = analyze_macro_impact(files, ["tests/y.sql"], model_dirs=("",), resource_dirs=("an",))
+    assert not as_model.uncertain
+    # 沒給目錄設定:退回 dbt 的預設名稱,跟以前一樣
+    default = analyze_macro_impact(files, ["tests/y.sql"], model_dirs=("",))
+    assert any("tests/y.sql" in r for r in default.uncertain), default.uncertain
+
+
+@pytest.mark.parametrize("resource_dirs", [("an", None), ("",), (".",)],
+                         ids=["none", "empty", "dot"])
+def test_invalid_resource_dirs_fail_closed(resource_dirs):
+    report = analyze_macro_impact({"models/a.sql": "select 1"}, ["models/a.sql"],
+                                  resource_dirs=resource_dirs)
+    assert report.all_models_possibly_affected and report.needs_human

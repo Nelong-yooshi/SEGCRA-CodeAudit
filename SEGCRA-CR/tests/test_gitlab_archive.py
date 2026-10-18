@@ -306,3 +306,70 @@ def test_error_during_streaming_does_not_leak(real_env, fake_http):
     with pytest.raises(gitlab.ArchiveDownloadError) as e:
         gitlab.download_archive(SHA, max_bytes=100)
     _err(e)
+
+
+# ------------------------------------------------------------------ 讀單一檔案(read_file_at)
+def test_read_file_uses_read_token_and_commit(real_env, fake_http):
+    rec = fake_http(response=_FakeResponse(chunks=["name: x\n".encode("utf-8")]))
+    assert gitlab.read_file_at(SHA, "dbt/dbt_project.yml", max_bytes=100) == "name: x\n"
+    [call] = rec.calls
+    assert call["url"] == ("https://gitlab.test/api/v4/projects/42/repository/files/"
+                           "dbt%2Fdbt_project.yml/raw")
+    assert call["params"] == {"ref": SHA}
+    assert call["headers"]["PRIVATE-TOKEN"] == READ_TOKEN and WRITE_TOKEN not in str(call)
+    assert call["follow_redirects"] is False and call["trust_env"] is False
+
+
+def test_read_file_missing_returns_none(real_env, fake_http):
+    fake_http(response=_FakeResponse(status=404))
+    assert gitlab.read_file_at(SHA, "dbt_project.yml", max_bytes=100) is None
+
+
+def test_archive_404_still_raises(real_env, fake_http):
+    fake_http(response=_FakeResponse(status=404))
+    with pytest.raises(gitlab.ArchiveDownloadError) as e:
+        gitlab.download_archive(SHA, max_bytes=100)
+    assert "404" in _err(e)
+
+
+@pytest.mark.parametrize("status", [401, 403, 500])
+def test_read_file_other_errors_raise(real_env, fake_http, status):
+    fake_http(response=_FakeResponse(status=status))
+    with pytest.raises(gitlab.ArchiveDownloadError) as e:
+        gitlab.read_file_at(SHA, "dbt_project.yml", max_bytes=100)
+    assert str(status) in _err(e)
+
+
+def test_read_file_size_limit_and_text_only(real_env, fake_http):
+    fake_http(response=_FakeResponse(chunks=[b"x" * 101]))
+    with pytest.raises(gitlab.ArchiveDownloadError):
+        gitlab.read_file_at(SHA, "dbt_project.yml", max_bytes=100)
+    fake_http(response=_FakeResponse(chunks=[b"\xff\xfe"]))
+    with pytest.raises(gitlab.ArchiveDownloadError):
+        gitlab.read_file_at(SHA, "dbt_project.yml", max_bytes=100)
+
+
+@pytest.mark.parametrize("sha, path", [("main", "dbt_project.yml"), (SHA, "../x.yml"),
+                                       (SHA, "a/../b"), (SHA, "/etc/passwd"), (SHA, ""),
+                                       (SHA, "a b.yml"), (SHA, None)])
+def test_read_file_bad_input_rejected_without_request(real_env, fake_http, sha, path):
+    rec = fake_http()
+    with pytest.raises(gitlab.ArchiveDownloadError):
+        gitlab.read_file_at(sha, path, max_bytes=100)
+    assert rec.calls == []
+
+
+def test_read_file_never_falls_back_to_write_token(real_env, fake_http, monkeypatch):
+    rec = fake_http()
+    monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", "")
+    with pytest.raises(gitlab.ArchiveDownloadError):
+        gitlab.read_file_at(SHA, "dbt_project.yml", max_bytes=100)
+    monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", WRITE_TOKEN)
+    with pytest.raises(gitlab.ArchiveDownloadError):
+        gitlab.read_file_at(SHA, "dbt_project.yml", max_bytes=100)
+    assert rec.calls == []
+
+
+def test_read_file_not_exposed_to_the_model():
+    from orchestrator.tool_hub import ToolHub
+    assert not any("read_file_at" in name for name in ToolHub().tools)

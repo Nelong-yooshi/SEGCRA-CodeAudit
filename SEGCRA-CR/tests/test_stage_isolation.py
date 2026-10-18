@@ -344,3 +344,33 @@ def test_逾時的finding要帶階段欄位與標題():
     assert f["title"].startswith("[執行驗證/測資生成]") and "逾時" in f["title"]
     assert f["severity"] == "major"
     assert "1200" in f["detail"]
+
+
+# ───────── dbt 專案的取回也要隔離(#53 review 指出的、測試掃不到的那一處) ─────────
+#
+# `prepare_dbt_context` 自己有 catch-all,但讀 `dbt_project.yml` 判斷專案佈局的那一步
+# (`_head_layout`)在那之外。而它不是 `report = X(report, ...)` 的形狀,所以
+# `test_每個後處理呼叫都有被包到` 掃原始碼看不到它 —— 只能明寫這兩條。
+
+def test_dbt_專案取回丟例外時不中斷審查(monkeypatch):
+    """出錯要當成「取回失敗」:後面的 enforce_dbt_unexecuted 會據此交人工,
+    而不是整份審查沒有輸出(#45 的原則)。"""
+    def boom(mr, dbt_cfg):
+        raise RuntimeError("讀 dbt_project.yml 爆掉:這段訊息不可以出現在報告裡")
+
+    monkeypatch.setattr(pipeline, "prepare_dbt_context", boom)
+    report = _report()
+    ctx = pipeline._dbt_context_or_none(report, {"files": []}, {"enabled": True})
+    assert ctx is not None, "不可以回 None —— 那代表「不適用」,會被當成沒有 dbt 要處理"
+    assert ctx.error, "要標成取回失敗"
+    inc = pipeline.review_incomplete(report)
+    assert len(inc) == 1 and "dbt 專案取回" in inc[0], inc
+    assert "爆掉" not in json.dumps(report, ensure_ascii=False), "不得回顯例外訊息"
+
+
+def test_dbt_專案取回正常時原樣回傳(monkeypatch):
+    sentinel = object()
+    monkeypatch.setattr(pipeline, "prepare_dbt_context", lambda mr, cfg: sentinel)
+    report = _report()
+    assert pipeline._dbt_context_or_none(report, {"files": []}, None) is sentinel
+    assert pipeline.review_incomplete(report) == []
