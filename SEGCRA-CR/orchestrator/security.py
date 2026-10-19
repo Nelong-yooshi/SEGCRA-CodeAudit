@@ -88,8 +88,43 @@ _TAG = re.compile("[\U000e0020-\U000e007e]")
 # (例:用西里爾字母冒充拉丁字母,肉眼難分辨,如 U+0456 冒充 i、U+043E 冒充 o)
 _MIXED_SCRIPT = re.compile(r"\b(?=\w*[A-Za-z])(?=\w*[\u0370-\u03ff\u0400-\u04ff])\w+\b")
 # SQL 註解(用來取出自然語言部分)
-_COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.S)
+# 註解的抽取不用正規式:`--[^\n]*|/\*.*?\*/` 的回溯讓它變成平方時間,而送進掃描的
+# 內容可以很大(取回的整份檔案、dbt 展開後的 SQL)。
+#
+# **不可以改成「先截到最後一個 `*/`」**:`--` 與 `/* */` 是一起比對的,截斷會把跨過
+# 最後一個 `*/` 的行註解砍掉,而註解內容會另外拆底線與駝峰再比對(`_split_words`),
+# 所以那段文字一旦被截掉就不只是少看註解、是少掉一整層比對。有測試釘住這個繞過。
 _COMMENT_MARK = re.compile(r"--|/\*|\*/")
+
+
+def _comments(code: str) -> list[str]:
+    """抽出所有註解(行註解到行尾、區塊註解到 `*/`),每個位置只看一次(線性時間)。
+
+    `/*` 找不到結尾時代表**之後都不會再有**區塊註解,所以把它關掉、只繼續找 `--`。
+    """
+    out: list[str] = []
+    i, n = 0, len(code)
+    next_line, next_block = code.find("--"), code.find("/*")
+    while i < n:
+        if next_line != -1 and next_line < i:
+            next_line = code.find("--", i)
+        if next_block != -1 and next_block < i:
+            next_block = code.find("/*", i)
+        if next_line == -1 and next_block == -1:
+            break
+        if next_block == -1 or (next_line != -1 and next_line < next_block):
+            end = code.find("\n", next_line)
+            end = n if end == -1 else end
+            out.append(code[next_line:end])
+            i = end
+            continue
+        close = code.find("*/", next_block + 2)
+        if close == -1:
+            next_block = -1
+            continue
+        out.append(code[next_block:close + 2])
+        i = close + 2
+    return out
 
 # base64(含 URL-safe)。邊界用「前後不是 base64 字元」判斷,不用 \b:
 # \b 在結尾的 "=" 補位後不成立(= 非單字字元),正規表示式會回溯、
@@ -198,12 +233,24 @@ def scan_injection(text: str, prose: str | None = None) -> list[dict]:
     return out
 
 
+def _text(value) -> str:
+    """只接受字串,其餘(None、數字、巢狀結構)當成沒有這個欄位。
+
+    這些欄位來自 GitLab API 或 fixture,型別不保證。不是字串時 `"\n".join(...)` 會丟
+    TypeError,而**那會讓整份審查沒有輸出** —— MR 沒擋、沒放、也沒人知道。掃描少看
+    一個壞欄位的代價小得多,而且那種欄位本來也沒有可掃的文字。"""
+    return value if isinstance(value, str) else ""
+
+
 def scan_mr(mr: dict) -> list[dict]:
     """掃描整個 MR:標題 + 描述 + **檔名**(PR #10 review 指出「檔名沒有
-    被掃描」)+ 每個檔案的 diff/內容(含程式註解)。"""
-    files = mr.get("files", [])
-    paths = [p for f in files for p in (f.get("path"), f.get("old_path")) if p]
-    code = "\n".join(f.get("full_content") or f.get("diff", "") for f in files)
-    comments = "\n".join(m.group(0) for m in _COMMENT.finditer(code))
-    head = [mr.get("title", ""), mr.get("description", ""), *paths]
+    被掃描」)+ 每個檔案的 diff/內容(含程式註解)。
+
+    變更清單裡不是物件的項目、以及欄位值不是字串的,一律略過(見 `_text`):
+    這一步丟例外會中斷整份審查,而旁邊的好項目照樣要掃到。"""
+    files = [f for f in (mr.get("files") or []) if isinstance(f, dict)]
+    paths = [p for f in files for p in (_text(f.get("path")), _text(f.get("old_path"))) if p]
+    code = "\n".join(_text(f.get("full_content")) or _text(f.get("diff")) for f in files)
+    comments = "\n".join(_comments(code))
+    head = [_text(mr.get("title")), _text(mr.get("description")), *paths]
     return scan_injection("\n".join(head + [code]), prose="\n".join(head + [comments]))
