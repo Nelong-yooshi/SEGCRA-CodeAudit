@@ -42,7 +42,9 @@ class _Msg:
 
 class _Choice:
     message = _Msg()
-    finish_reason = "tool_calls"
+    # **刻意是 "stop"**:實測端點在帶 tool_calls 的回應上也回 stop,所以呼叫端只看
+    # finish_reason 偵測不到「回合被用完」—— 這正是需要 exhausted 這個標記的原因。
+    finish_reason = "stop"
 
 
 class _Usage:
@@ -116,6 +118,8 @@ def test_用完回合要標記(rounds):
     meta: dict = {}
     _run(meta)
     assert meta["exhausted"] is True
+    assert meta["finish_reason"] == "stop", \
+        "端點回 stop,所以只靠 finish_reason 偵測不到 —— 標記才是唯一的訊號"
 
 
 def test_一開始就寫_False(monkeypatch):
