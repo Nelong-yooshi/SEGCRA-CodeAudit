@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 
 from .config import DBT_DATABASE_PLACEHOLDER
 from .dbt_context import DbtContext
-from .dbt_impact import ImpactReport, display_name
+from .dbt_impact import ImpactReport
 from .dbt_render import DEFAULT_ISOLATED_TIMEOUT_S, render_model_isolated
 
 MAX_CHECKED_MODELS = 50
@@ -322,6 +322,12 @@ def _hits_text(m: CheckedModel) -> str:
     return "、".join(out)
 
 
+def _code(name: str) -> str:
+    """macro 名稱以 code 格式寫出,標明它是被引用的識別字。名稱是 Jinja 的識別字,不含反引號。
+    名稱裡寫了指示性的文字時,由注入掃描判斷要不要擋。"""
+    return f"`{name}`"
+
+
 def _listed(items: list[str]) -> str:
     more = f" 等共 {len(items)} 個" if len(items) > _MAX_LISTED else ""
     return "、".join(items[:_MAX_LISTED]) + more
@@ -358,7 +364,7 @@ def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None
     if impact.changed_macro_files:
         parts.append(f"改到的 macro 檔:{_listed([full(p) for p in impact.changed_macro_files])}。")
         if impact.changed_macros:
-            parts.append(f"內容有變的 macro:{_listed([display_name(n) for n in impact.changed_macros])}。")
+            parts.append(f"內容有變的 macro:{_listed([_code(n) for n in impact.changed_macros])}。")
         elif not impact.all_models_possibly_affected:
             parts.append("這些檔案裡沒有任何 macro 被新增、刪除或改變內容(例如只改了註解或空行)。")
     if impact.all_models_possibly_affected:
@@ -419,7 +425,7 @@ def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None
         parts.append("沒有對應到規格:" + _listed(unmapped) + "。")
     if impact.unreferenced_macros:
         parts.append("沒有任何 model 呼叫的 macro:"
-                     f"{_listed([display_name(n) for n in impact.unreferenced_macros])}。")
+                     f"{_listed([_code(n) for n in impact.unreferenced_macros])}。")
     if severity == "info":
         parts.append("沒有檢查出問題;清單供人工確認影響範圍。")
     return {"file": "(MR 內容)", "line": 0, "severity": severity, "title": IMPACT_TITLE,

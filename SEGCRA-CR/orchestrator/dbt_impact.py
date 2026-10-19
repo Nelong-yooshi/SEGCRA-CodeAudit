@@ -46,7 +46,8 @@
     超過即判定為不確定並保守列出全部 model(fail closed)
   * 語法樹以明確的堆疊走訪、反查以索引佇列走訪,皆不用遞迴;名稱掃描為線性時間,
     不使用正規表達式
-  * 輸出的說明文字長度與數量有上限,且只含已過白名單的路徑與識別字
+  * 輸出的說明文字長度與數量有上限,只含已過白名單的路徑與 Jinja 識別字(macro 名稱照常寫出;
+    識別字可以是任何語言的文字,名稱裡寫了指示性的句子由注入掃描判斷)
   * 不可信內容請用 analyze_macro_impact_isolated()(子行程、逾時、記憶體上限)
 
 已知限制:
@@ -192,12 +193,6 @@ def _is_ident(text) -> bool:
     return (isinstance(text, str) and bool(text) and text.isascii()
             and (text[0].isalpha() or text[0] == "_")
             and all(ch.isalnum() or ch == "_" for ch in text))
-
-
-def display_name(name) -> str:
-    """寫進說明文字的 macro 名稱。名稱來自 MR,Jinja 也接受非 ASCII 的識別字(例如一整句中文),
-    不合白名單的不照抄,改寫成固定文字:說明文字會貼回 MR 留言。"""
-    return name if _is_ident(name) else "(名稱含非 ASCII 字元的 macro)"
 
 
 def _is_file_name(text: str) -> bool:
@@ -789,7 +784,7 @@ def _walk(callers_of: dict, start, label, snapshot_hits=None):
             if kind == "macro":
                 if who not in seen:
                     seen.add(who)
-                    queue.append((who, chain + (display_name(who),)))
+                    queue.append((who, chain + (who,)))
             elif kind == "model":
                 model_hits.append((who, chain + (who,)))
             elif kind == "snapshot":
@@ -901,8 +896,7 @@ class _Analysis:
                 self.all_reasons.append(f"macro 檔 {path} 無法解析,無法確認其中的呼叫關係")
             for name, paths in sorted(self.macro_files.items()):
                 if len(paths) > 1:
-                    self.uncertain.append(
-                        f"macro {display_name(name)} 在多個檔案中重複定義({', '.join(sorted(paths))})")
+                    self.uncertain.append(f"macro {name} 在多個檔案中重複定義({', '.join(sorted(paths))})")
 
         unreferenced: list[str] = []
         if changed_macros:
@@ -1069,7 +1063,7 @@ class _Analysis:
     def _changed_in_file(self, new_text: str, old_text: str, names: dict) -> set:
         """同一個 macro 檔變更前後都解析得了時,哪些 macro 被改:內容不同、新增或刪除的。
 
-        看不準時整個檔案的 macro 都算被改(跟以前的做法相同,只會多報):
+        看不準時整個檔案的 macro 都算被改(只會多報):
           * 前後內容完全相同:變更清單說改了卻看不到差異,可能是取回的版本不對
           * 同一個檔案裡有同名的 macro
           * macro 以外的頂層內容有變(dbt 不執行,但不確定時不猜)
@@ -1182,7 +1176,7 @@ class _Analysis:
 
         def label(name: str) -> str:
             where = ", ".join(sorted(self.macro_files.get(name, set()))) or "已刪除"
-            return f"{display_name(name)}({where})"
+            return f"{name}({where})"
 
         snapshot_hits: list = []
         model_hits, yml_hits, referenced = _walk(callers_of, changed_macros, label, snapshot_hits)
@@ -1198,7 +1192,7 @@ class _Analysis:
         for name in sorted(changed_macros):
             if _is_builtin_override(name):
                 self.all_reasons.append(
-                    f"變更的 macro {display_name(name)} 覆寫了 dbt 內建行為,dbt 執行任何 model 時都可能呼叫")
+                    f"變更的 macro {name} 覆寫了 dbt 內建行為,dbt 執行任何 model 時都可能呼叫")
             elif name not in referenced:
                 unreferenced.append(name)
 
@@ -1221,7 +1215,7 @@ class _Analysis:
             dynamic_snapshot_hits: list = []
             model_hits, yml_hits, _ = _walk(
                 callers_of, dynamic_macros,
-                lambda n: f"{display_name(n)} 內有動態呼叫或無法解析的樣板字串,可能呼叫到變更的 macro",
+                lambda n: f"{n} 內有動態呼叫或無法解析的樣板字串,可能呼叫到變更的 macro",
                 dynamic_snapshot_hits)
             self._apply_hits(model_hits, yml_hits, certain=False)
             for path, chain in dynamic_snapshot_hits:
