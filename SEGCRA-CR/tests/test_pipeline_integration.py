@@ -89,7 +89,7 @@ def run(monkeypatch, tmp_path):
     systems: list[str] = []    # 每次呼叫模型時送出的 system prompt(驗 skill 有沒有注入)
 
     def _run(mr: dict, model_report: dict | None = None, *,
-             spec_exec_kind: str = "pass", mr_id: str = "900"):
+             spec_exec_kind: str = "pass", mr_id: str = "900", dry_run: bool = False):
         (fixtures / f"mr_{mr_id}.json").write_text(
             json.dumps(mr, ensure_ascii=False), encoding="utf-8")
 
@@ -134,7 +134,7 @@ def run(monkeypatch, tmp_path):
         monkeypatch.setattr(spec_exec, "execute_cases", fake_execute)
         monkeypatch.setattr(spec_exec, "arbitrate", fake_arbitrate)
 
-        report = asyncio.run(pipeline.review_mr(load_config(), mr_id))
+        report = asyncio.run(pipeline.review_mr(load_config(), mr_id, dry_run=dry_run))
         return report, output, mr_id
 
     _run.systems = systems
@@ -512,3 +512,16 @@ def test_組合掃描範圍丟例外時退回只掃_MR_本身(run, monkeypatch):
     assert report["_injection_scan"], "退回之後,描述裡的注入照樣要掃到"
     assert report["decision"] == "blocked"
     assert any("組合掃描範圍" in t for t in pipeline.review_incomplete(report))
+
+
+def test_dry_run_也會把環節未完整帶進報告(run, monkeypatch):
+    """走完整的 `review_mr --dry-run`:環節失敗的記錄在 `report` 存在之前就產生了,
+    呼叫 `_dry_run_report` 時要帶過去 —— 不帶的話這條路看起來一切正常,而它正是用來
+    檢查「確定性那半有沒有跑成」的。"""
+    def boom(target):
+        raise RuntimeError("掃描器爆掉")
+
+    monkeypatch.setattr(pipeline, "scan_mr", boom)
+    report, _, _ = run(_mr(CLEAN_SQL), dry_run=True)
+    assert report["verdict"] == "dry_run", "確認走的是 dry-run 那條路"
+    assert any("注入掃描" in t for t in pipeline.review_incomplete(report)), report["findings"]

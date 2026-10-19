@@ -386,3 +386,39 @@ def test_dbt_專案取回失敗時當成取回失敗_不是不適用(monkeypatch
                          {"files": []}, {"enabled": True})
     assert ctx is not None and ctx.error
     assert pipeline.review_incomplete(report)
+
+
+def test_dry_run_也要看得到環節未完整(monkeypatch):
+    """`--dry-run` 這條路最常被用來檢查「確定性那半有沒有跑成」,所以**環節失敗一定要
+    看得到**。那幾條 finding(預掃、dbt 取回、注入掃描)在 report 存在之前就產生了,
+    原本只在正式路徑被併進報告,dry-run 直接 return 就把它們丟掉了 —— 看起來像一切正常。
+    """
+    class _Hub:
+        async def call_json(self, name, args):
+            return {}
+
+        async def call(self, name, args):
+            return ""
+
+    stub = [pipeline._incomplete_finding("注入掃描", RuntimeError("x")),
+            pipeline._incomplete_finding("dbt 專案取回", RuntimeError("y"))]
+    report = asyncio.run(pipeline._dry_run_report(
+        _Hub(), "900", {"files": []}, [], None, None, incomplete=stub))
+    inc = pipeline.review_incomplete(report)
+    assert len(inc) == 2, inc
+    assert any("注入掃描" in t for t in inc) and any("dbt 專案取回" in t for t in inc)
+    # 分數要反映那兩條 major,否則「看起來正常」只是換個地方發生
+    assert report["score"] < 100
+
+
+def test_dry_run_沒有未完整時行為不變(monkeypatch):
+    class _Hub:
+        async def call_json(self, name, args):
+            return {}
+
+        async def call(self, name, args):
+            return ""
+
+    report = asyncio.run(pipeline._dry_run_report(
+        _Hub(), "900", {"files": []}, [], None, None))
+    assert report["findings"] == [] and report["score"] == 100

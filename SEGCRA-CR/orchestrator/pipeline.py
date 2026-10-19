@@ -848,8 +848,12 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                             "prescan_final": copy.deepcopy(pre)})
 
         if dry_run:
+            # 未完整的環節(預掃、dbt 取回、注入掃描)也要帶進 dry-run 的報告:
+            # 它們在 report 存在之前就產生了,不帶過去的話 --dry-run 看不到
+            # 「有環節沒跑完」——而那正是這條路最常用來檢查的事。
             return await _dry_run_report(hub, mr_id, mr, pre, spec_code, spec_text,
-                                         affected, dbt_ctx, cfg.dbt)
+                                         affected, dbt_ctx, cfg.dbt,
+                                         incomplete=report_stub["findings"])
 
         # 路徑觸發的 skill 自動注入:異常交易規則檔一律載入領域知識,不賭模型主動載
         always_block = always_skills(skills)
@@ -1888,12 +1892,17 @@ def _format_comment(fd: dict) -> str:
 
 async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                           spec_code, spec_text, affected: AffectedCheck | None = None,
-                          dbt_ctx: DbtContext | None = None, dbt_cfg: dict | None = None) -> dict:
+                          dbt_ctx: DbtContext | None = None, dbt_cfg: dict | None = None,
+                          incomplete: list[dict] | None = None) -> dict:
     """不經 LLM 的管線煙霧測試:預掃結果直接轉 findings,並驗證 memory/spec 可用。
-    (執行驗證需要 LLM 生成測資,dry-run 不跑;只回報 spec 是否找得到。)"""
+    (執行驗證需要 LLM 生成測資,dry-run 不跑;只回報 spec 是否找得到。)
+
+    `incomplete` 是在 report 存在之前就產生的「環節未完整」finding(預掃、dbt 取回、
+    注入掃描),一律帶進報告:這條路最常被用來檢查「確定性那半有沒有跑成」,
+    看不到環節失敗就失去意義。"""
     mem_sample = await hub.call_json("memory__lookup_similar_reviews",
                                      {"text": "SELECT *"})
-    findings = []
+    findings = list(incomplete or [])
     for entry in pre:
         for hit in entry["rules"]:
             findings.append({"file": entry["path"], "line": 0,

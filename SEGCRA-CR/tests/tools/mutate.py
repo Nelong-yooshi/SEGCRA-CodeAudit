@@ -494,6 +494,15 @@ MUTANTS.update({
  "隔離:取回失敗不當成取回失敗(回 None = 不適用)": ("pipeline.py",
      '                        DbtContext(prefix="", error="取回 dbt 專案時發生非預期錯誤"),',
      "                        None,"),
+ # dry-run 也要看得到環節未完整:那幾條在 report 存在之前就產生了,不帶過去的話
+ # 這條路看起來一切正常 —— 而它正是用來檢查「確定性那半有沒有跑成」的
+ "隔離:dry-run 丟掉環節未完整的記錄": ("pipeline.py",
+     "    findings = list(incomplete or [])",
+     "    findings = []"),
+ "隔離:dry-run 不帶未完整過去": ("pipeline.py",
+     "                                         affected, dbt_ctx, cfg.dbt," + NL
+     + '                                         incomplete=report_stub["findings"])',
+     "                                         affected, dbt_ctx, cfg.dbt)"),
  "隔離:注入掃描失敗時當成沒有注入(不記未完整)": ("pipeline.py",
      '        injection_hits = _step(report_stub, "注入掃描", scan_mr, [], scan_target)',
      "        injection_hits = scan_mr(scan_target)"),
