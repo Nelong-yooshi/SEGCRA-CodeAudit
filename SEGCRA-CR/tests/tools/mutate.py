@@ -554,11 +554,43 @@ MUTANTS.update({
      "                        key=lambda item: item[0].split(\"/\"))",
      "                        key=lambda item: 0)"),
  "字典來源:render_model 沒把字典傳下去": (
-     "macro_dirs, adapter, project, macro_files)", "macro_dirs, adapter, project)"),
+     "macro_dirs, adapter, project, macro_files,", "macro_dirs, adapter, project, None,"),
  "字典來源:給了字典仍讀 model 旁邊的 macros": (
      "    elif source is None and macro_files is None:", "    elif source is None:"),
  "字典來源:目錄互相包含時同一個檔載入兩次(與自己同名)": (
      "    files = list(dict(files).items())\n", ""),
+})
+
+# ---- 以增量模式展開(is_incremental() 為 True、提供 this)
+MUTANTS.update({
+    "增量:is_incremental 一律回 False": ("dbt_render.py",
+        "        env.segcra_incremental[\"called\"] = True" + NL + "        return incremental",
+        "        env.segcra_incremental[\"called\"] = True" + NL + "        return False"),
+    "增量:不記有沒有呼叫 is_incremental": ("dbt_render.py",
+        "        env.segcra_incremental[\"called\"] = True" + NL + "        return incremental",
+        "        return incremental"),
+    "增量:macro 檔最外層呼叫的也算": ("dbt_render.py",
+        "    env.segcra_incremental[\"called\"] = False" + NL + "    env.segcra_macro_phase = False",
+        "    env.segcra_macro_phase = False"),
+    "增量:不提供 this": ("dbt_render.py",
+        "        env.globals[\"this\"] = this(model_name)",
+        "        pass"),
+    "增量:沒有 database 時 this 給空字串": ("dbt_render.py",
+        "            return StrictUndefined(hint=\"未設定 database,無法提供 {{ this }}\", name=\"this\")",
+        "            return \"\""),
+    "增量:this 的字串內容不是表名": ("dbt_render.py",
+        "        obj = super().__new__(cls, text)",
+        "        obj = super().__new__(cls, name)"),
+    "增量:不記用到表名": ("dbt_render.py",
+        "            _mark_this_used(env.segcra_relation_usage, project, model_path.stem)",
+        "            pass"),
+    "增量:表名會改變的設定不記無法確定": ("dbt_render.py",
+        "    if project is not None and (project.global_uncertain or name in project.uncertain_models):" + NL
+        + "        usage[\"uncertain\"] = True",
+        "    if False:" + NL + "        usage[\"uncertain\"] = True"),
+    "增量:結果不帶有沒有呼叫": ("dbt_render.py",
+        "        incremental_checked=incremental_checked,",
+        "        incremental_checked=False,"),
 })
 
 # ---- 取回 MR 那個 commit 的 dbt 專案並接進預掃(dbt_context)

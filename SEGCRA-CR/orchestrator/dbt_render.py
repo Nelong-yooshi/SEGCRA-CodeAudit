@@ -63,12 +63,14 @@
 
 設計底線:**寧可展開失敗,也不要產出看似成功、實則錯誤的 SQL**。
 所以未定義的 dbt 內建(StrictUndefined)、沒有預設值又沒被提供的 var、
-未設定 database 卻用到 ref/source、`{{ this }}`,一律是硬失敗;絕不猜值。
+未設定 database 卻用到 ref/source,一律是硬失敗;絕不猜值。`{{ this }}` 只在以增量模式
+展開時(incremental=True)提供,其餘時候未定義、硬失敗。
 
 已知限制:
-  * **incremental 分支不會被掃到**:`is_incremental()` 比照 compile 固定為 False,
-    `{% if is_incremental() %}` 裡的 SQL 不會出現在輸出中。要審查該分支需另外以
-    True 再展開一次(且需支援 `{{ this }}`)。
+  * `is_incremental()` 預設比照 compile 回 False,`{% if is_incremental() %}` 裡的 SQL 不在
+    輸出裡。呼叫端可以再以 incremental=True 展開一次取得增量分支;`RenderResult.incremental_checked`
+    說明樣板(含它呼叫的 macro)有沒有呼叫 `is_incremental()`,沒有就不必展開第二次。
+    增量模式的 `{{ this }}` 是這個 model 自己的表名,規則與 ref() 相同(見 _make_relations)。
   * 記憶體上限依賴作業系統(Linux 的 RLIMIT_AS);Windows 上只有逾時與上述上限。
   * `ref()` / `source()` 的精確度取決於呼叫端有沒有給 `project`(DbtProjectInfo,
     由 dbt_relations.project_info_from_files() 從專案檔案整理):
@@ -480,7 +482,37 @@ def _make_relations(database: str | None, schema: str, usage: dict,
         # dbt 的預設:schema = 來源名、表名 = table 名;宣告了才用宣告的
         return relation(identifier or table_name, declared_schema or source_name)
 
-    return ref, source
+    def this(name: str):
+        """增量模式的 {{ this }}:這個 model 自己的表,展開規則與 ref(自己) 相同。
+
+        沒有 database 時給未定義值,用到就大聲失敗(不猜值)。不在這裡記「用到 ref()」:
+        macro 載入完會把紀錄歸零,由 render_model 在環境建好之後記(見 _mark_this_used)。"""
+        _check_ident("表", name)
+        if database is None:
+            return StrictUndefined(hint="未設定 database,無法提供 {{ this }}", name="this")
+        text = f'"{database}"."{_check_ident("綱要", schema)}"."{name}"'
+        return _Relation(text, database, schema, name)
+
+    return ref, source, this
+
+
+def _mark_this_used(usage: dict, project: "DbtProjectInfo | None", name: str) -> None:
+    """增量模式一律當成用到這個 model 的表名(比照 ref(自己)):表名會改變的設定記 uncertain。
+    樣板沒有用到 {{ this }} 時,relation_notice 只會多帶一句提醒,不影響判斷。"""
+    usage["used"] = True
+    if project is not None and (project.global_uncertain or name in project.uncertain_models):
+        usage["uncertain"] = True
+
+
+class _Relation(str):
+    """{{ this }}:字串內容就是 "<database>"."<schema>"."<表>",任何字串操作的結果都是真的值;
+    另外提供 dbt Relation 常用的屬性。"""
+
+    def __new__(cls, text: str, database: str, schema: str, name: str):
+        obj = super().__new__(cls, text)
+        obj.database, obj.schema = database, schema
+        obj.identifier = obj.name = obj.table = name
+        return obj
 
 
 class _Adapter:
@@ -535,6 +567,8 @@ class RenderResult:
     # 展開出的表名不保證與 dbt 逐字相同——見下方三個已知限制;呼叫端應在報告中
     # 一併呈現,而不是讓審查者誤以為表名已經過完整驗證。
     relation_notice: str | None = None
+    # 樣板(含它呼叫的 macro)有沒有呼叫 is_incremental();沒有就不必以增量模式再展開一次
+    incremental_checked: bool = False
 
     def src_line(self, rendered_line: int) -> int:
         """渲染行(1-based)→ 原始行(1-based)。對應不到回 0 = 檔案層留言。"""
@@ -630,7 +664,8 @@ def _macro_files_from_dict(macro_files, dir_names: list[str]) -> list[tuple[str,
 def build_env(code_root=None, variables: dict | None = None,
               database: str | None = None, schema: str = DEFAULT_SCHEMA,
               macro_dirs=DEFAULT_MACRO_DIRS, adapter: str = DEFAULT_ADAPTER,
-              project: DbtProjectInfo | None = None, macro_files: dict | None = None):
+              project: DbtProjectInfo | None = None, macro_files: dict | None = None,
+              model_name: str | None = None, incremental: bool = False):
     """建好含 dbt 樁與 macro 的 Environment。code_root 與 macro_files 都沒給時不載入任何 macro。
 
     macro_files 專案的檔案 {相對專案根的路徑: 內容}(從 GitLab 取回、不在磁碟上的專案用)。
@@ -639,6 +674,8 @@ def build_env(code_root=None, variables: dict | None = None,
     macro_dirs  專案的 macro 目錄(dbt 的 macro-paths;預設 macros/)
     adapter     dbt 轉接器名稱,決定 adapter.dispatch 先找哪個前綴的實作
     project     專案層級資訊;給了才驗證 ref()/source() 的對象、套用 sources.yml
+    incremental `is_incremental()` 的回傳值;True 時另外提供 `{{ this }}`(需要 model_name)
+    model_name  這次展開的 model 名稱({{ this }} 的表名)
 
     回傳 (env, macro 名稱清單, 同名衝突清單)。
     """
@@ -664,14 +701,25 @@ def build_env(code_root=None, variables: dict | None = None,
     if project is not None and not isinstance(project, DbtProjectInfo):
         raise DbtRenderError("project 必須是 DbtProjectInfo")
     env.segcra_relation_usage = {"used": False, "uncertain": False}
-    ref, source = _make_relations(database, schema, env.segcra_relation_usage, project)
+    ref, source, this = _make_relations(database, schema, env.segcra_relation_usage, project)
     env.globals["ref"] = ref
     env.globals["source"] = source
+    if incremental:
+        if model_name is None:
+            raise DbtRenderError("以增量模式展開需要 model 名稱({{ this }} 的表名)")
+        env.globals["this"] = this(model_name)
     env.globals["config"] = _Config()
     env.globals["return"] = _return
     env.globals["var"] = _make_var(variables)
     env.globals["execute"] = True                   # compile 期為 True
-    env.globals["is_incremental"] = lambda: False   # compile 期一律視為全量
+    # 預設比照 compile 回 False;有沒有被呼叫記下來,呼叫端據此決定要不要以 True 再展開一次
+    env.segcra_incremental = {"called": False}
+
+    def is_incremental():
+        env.segcra_incremental["called"] = True
+        return incremental
+
+    env.globals["is_incremental"] = is_incremental
     # dbt 每次執行都會產生新的 invocation_id;這裡是固定值,樣板若真的輸出它,
     # 結果會與 dbt compile 不同(已知限制,見模組 docstring)。
     env.globals["invocation_id"] = "segcra00"
@@ -769,6 +817,7 @@ def build_env(code_root=None, variables: dict | None = None,
     env.segcra_relation_usage["used"] = False
     env.segcra_relation_usage["uncertain"] = False
     env.segcra_relation_usage["loading_macros"] = False
+    env.segcra_incremental["called"] = False
     env.segcra_macro_phase = False
     return env, sorted(macros), conflicts, problems
 
@@ -932,7 +981,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
                  schema: str = DEFAULT_SCHEMA, macro_dirs=DEFAULT_MACRO_DIRS,
                  adapter: str = DEFAULT_ADAPTER,
                  project: DbtProjectInfo | None = None,
-                 macro_files: dict | None = None) -> RenderResult:
+                 macro_files: dict | None = None, incremental: bool = False) -> RenderResult:
     """在同一行程內展開一份 dbt model。**待審的 MR 內容請改用 render_model_isolated()。**
 
     model_path  model 檔路徑(相對 code_root 或絕對路徑皆可)
@@ -948,6 +997,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
                 套用 sources.yml,且只在真的無法確定時才帶 relation_notice
     macro_files 專案的檔案 {相對路徑: 內容},macro 從這裡讀而不讀磁碟(見 build_env);
                 與 code_root 只能擇一
+    incremental 以 `is_incremental()` 為 True 展開(增量分支),並提供 `{{ this }}`(這個 model
+                自己的表名,檔名去掉副檔名)。預設 False,與 dbt compile 相同
 
     任何失敗都收斂成 ok=False 而不丟例外。
     """
@@ -965,10 +1016,16 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
         if len(source) > MAX_SOURCE_CHARS:
             raise DbtRenderError(f"原始碼超過 {MAX_SOURCE_CHARS} 字元上限")
         env, macros, conflicts, problems = build_env(root, variables, database, schema,
-                                                     macro_dirs, adapter, project, macro_files)
+                                                     macro_dirs, adapter, project, macro_files,
+                                                     model_path.stem, incremental)
+        if incremental and database is not None:
+            # 在 macro 載入、紀錄歸零之後才記(build_env 沒有 macro 時會提早回傳,所以不放在那裡)
+            _mark_this_used(env.segcra_relation_usage, project, model_path.stem)
         # dbt 讀檔時會去掉頭尾空白再渲染(開頭空行不會出現在編譯結果裡)
         body = source.strip()
         clean = _render_capped(env.from_string(body), MAX_OUTPUT_CHARS)
+        # 哨兵渲染會再呼叫一次;只算乾淨的那一次
+        incremental_checked = env.segcra_incremental["called"]
     except Exception as e:
         return RenderResult(ok=False, error=_safe_error(e))
 
@@ -1005,6 +1062,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
         source_lines=n_src,
         rendered_lines=n_out,
         relation_notice=_relation_notice(env.segcra_relation_usage, project),
+        incremental_checked=incremental_checked,
     )
 
 

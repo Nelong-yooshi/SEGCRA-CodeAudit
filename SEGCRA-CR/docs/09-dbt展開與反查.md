@@ -44,9 +44,11 @@
    - `ref()` / `source()` 展開成 `"<資料庫>"."<綱要>"."<表>"`(資料庫名由呼叫端傳入,不猜);
      沒有專案資訊時綱要固定為 `dbo`,有專案資訊時見下方「`ref()` / `source()` 的精確度」
    - `config()` 回傳空字串、`var()` 取呼叫端給的值、`execute` 為 True、
-     `is_incremental()` 為 False(比照 compile 期)
-   - `this`、`env_var` **刻意不定義**:給錯值會靜靜產出錯的 SQL,或把審查機的環境變數
-     寫進 SQL;未定義則由 `StrictUndefined` 大聲失敗。`target.database` 在未提供
+     `is_incremental()` 預設為 False(比照 compile 期)。以 `incremental=True` 展開時回 True,
+     並提供 `this`(這個 model 自己的表,規則與 `ref()` 相同、一律帶表名提醒);
+     `RenderResult.incremental_checked` 說明樣板(含它呼叫的 macro)有沒有呼叫 `is_incremental()`
+   - `env_var` **刻意不定義**,`this` 在非增量模式也不定義:給錯值會靜靜產出錯的 SQL,或把審查機
+     的環境變數寫進 SQL;未定義則由 `StrictUndefined` 大聲失敗。`target.database` 在未提供
      database 時同理
    - **所有 macro 檔共用同一個命名空間**:dbt 解析 macro 與檔案順序無關,逐檔各自展開
      會讓「呼叫排在後面檔案的 macro」找不到名稱(跨檔互相呼叫在真實專案很常見)
@@ -519,8 +521,8 @@ major。加上非 SQL 檔的處理之後,改由非 SQL 檔的分類與設定比�
 - **展開結果尚未在 MS SQL 沙盒實際執行過**(目前只驗證了展開字串與 `dbt compile`
   逐字一致)。要支援樣板的執行驗證,需把 `ref()`/`source()` 對應到沙盒每次建立的
   資料庫,且 model 引用的上游表與規格建立的測資表名稱不同,需要處理
-- `{% if is_incremental() %}` 內的 SQL 不會被掃到(比照 compile 固定為 False),需另以 True
-  再展開一次
+- `{% if is_incremental() %}` 內的 SQL 不會被掃到:展開器已能以增量模式展開(`incremental=True`),
+  但預掃與受影響 model 的前後比較還沒有用它
 - 真實 GitLab 模式下,dbt 專案以外的 SQL 檔(與專案裡不是樣板的 SQL 檔)仍只有 diff 新增的行,
   完整內容由 #22 以 Files API 依 head sha 取得
 - 反查以檔案為單位;不分析第三方套件內的 macro;目錄由呼叫端指定
