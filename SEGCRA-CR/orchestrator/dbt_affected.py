@@ -323,9 +323,10 @@ def _hits_text(m: CheckedModel) -> str:
 
 
 def _code(name: str) -> str:
-    """macro 名稱以 code 格式寫出,標明它是被引用的識別字。名稱是 Jinja 的識別字,不含反引號。
-    名稱裡寫了指示性的文字時,由注入掃描判斷要不要擋。"""
-    return f"`{name}`"
+    """macro 名稱以 code 格式寫出,標明它是被引用的識別字。名稱是 Jinja 的識別字,不含反引號;
+    長度由 MR 決定,跟其他說明一樣截長度(補報會貼回 MR 留言)。名稱裡寫了指示性的文字時,
+    由注入掃描判斷要不要擋。"""
+    return f"`{_clip(name)}`"
 
 
 def _listed(items: list[str]) -> str:

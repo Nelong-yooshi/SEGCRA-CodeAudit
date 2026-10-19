@@ -1728,8 +1728,11 @@ MUTANTS.update({
         "        elif not impact.all_models_possibly_affected:" + NL + "            parts.append(",
         "        elif False:" + NL + "            parts.append("),
     "macro 粒度:補報的名稱不用 code 格式": ("dbt_affected.py",
-        '    return f"`{name}`"',
-        "    return name"),
+        '    return f"`{_clip(name)}`"',
+        "    return _clip(name)"),
+    "macro 粒度:補報的名稱不截長度": ("dbt_affected.py",
+        '    return f"`{_clip(name)}`"',
+        '    return f"`{name}`"'),
 })
 
 # ---- get_mr_diff 帶出 diff_refs 的三個 sha(#15 接線與 #22 共用)

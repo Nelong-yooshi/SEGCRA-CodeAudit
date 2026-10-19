@@ -189,3 +189,12 @@ def test_指紋也看清單裡不是節點的值():
     three = one.replace("import a %}", "import c as a %}")
     fp = [dbt_impact._macro_fingerprints(env, t, [10_000])[1]["m"] for t in (one, two, three)]
     assert len(set(fp)) == 3
+
+
+def test_補報的macro名稱有長度上限():
+    """名稱的長度由 MR 決定(單檔上限內可以很長);補報會貼回 MR 留言,跟其他說明一樣截長度。"""
+    from orchestrator.dbt_affected import _MAX_REASON_CHARS
+    name = "m" + "x" * 10_000
+    report = _run(MACROS + "{% macro " + name + "() %}1{% endmacro %}\n")
+    detail = _finding(report)["detail"]
+    assert name not in detail and "`" + name[:_MAX_REASON_CHARS] + "`" in detail
