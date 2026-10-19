@@ -1,8 +1,7 @@
 """change_view — 把變更檔「變更後的完整內容」整理成 prompt 的一段。
 
 只給 diff 時,模型逐項核對規格對照的其實只有 diff 的那幾行:條件寫在離改動處超過幾行的
-地方,就會被報成「遺漏」。實測只改兩行註解的 MR 被報三條 major「缺少某某過濾」,而那三個
-條件就在同一個 WHERE 裡。
+地方,就會被報成「遺漏」。
 
 這裡只負責排版,不取檔、不連網:
   * 每一行前面加行號,這次新增或修改的行以 `>` 標記(由 diff 的 hunk 算出來)
@@ -12,7 +11,7 @@
   * 超過預算時只放改動所在的語句(往前後找到以分號結尾的行),略過的部分寫明行號範圍;
     刪除的位置也算改動所在。找不到分號時(dbt model 通常整個檔只有一句、不寫分號)改成
     前後各留 FALLBACK_CONTEXT 行,不一定是完整的語句或 CTE
-  * 沒有任何檔案有完整內容時回傳空字串:prompt 與之前逐字相同
+  * 沒有任何檔案有完整內容時回傳空字串:prompt 不多這一段
 
 內容來自待審的 MR,是不可信的文字。每一行都以行號開頭,所以內容裡的 ``` 不會出現在行首、
 關不掉外層的程式碼區塊。
@@ -101,12 +100,6 @@ def changes(diff, text: str) -> tuple[set[int], dict[int, str]] | None:
         current += 1                    # 上下文
     close()
     return (marked, notes) if current is not None else None
-
-
-def changed_lines(diff, text: str) -> set[int] | None:
-    """diff 新增的行在新檔裡的行號。看不懂、或對不上 text 的內容時回 None(不標記)。"""
-    found = changes(diff, text)
-    return None if found is None else found[0]
 
 
 def _numbered(lines: list[str], keep: list[tuple[int, int]], marked: set[int],

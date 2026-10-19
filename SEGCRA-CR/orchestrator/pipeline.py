@@ -771,7 +771,7 @@ def _split_spec_changes(files: list[dict], budget_tokens: int) -> tuple[list[dic
     規格的 diff 若跟程式的 diff 放在一起,模型會把它當成程式的一部分去審,或要求程式照著
     修改前的內容改。所以另外放一段,寫明上面附的規格已是修改後的版本。
 
-    MR 沒有改到規格檔時回傳 (原本的 files, ""):prompt 與之前逐字相同。
+    MR 沒有改到規格檔時回傳 (原本的 files, ""):prompt 不多這一段。
     """
     spec_files = [f for f in files if _is_spec_file(f)]
     if not spec_files:
@@ -791,8 +791,8 @@ _SPEC_TERMS = re.compile("不超過|不含|不足|以上|以下|以內|超過|�
 _CLAUSE_LABEL = re.compile(
     r"(?:條件|規則|項目)\s*[0-9一二三四五六七八九十]{1,3}"
     r"|第\s*[0-9一二三四五六七八九十]{1,3}\s*[條項款點]|§\s*\d{1,3}")
-# 路徑與規格代號只在全是英數與 _ . / - 時寫出來
-_SAFE_NAME = re.compile(r"[A-Za-z0-9_./-]{1,80}")
+# 路徑與規格代號照常寫出(code 格式),只截長度;路徑在注入掃描的範圍內
+MAX_PATH_CHARS = 200
 MAX_SPEC_NOTES = 15
 # 報告裡的數量上限:這些內容由 MR 決定,會貼回 MR 留言
 MAX_TOKEN_CHARS = 20            # 一個數字最多寫幾個字元
@@ -805,7 +805,7 @@ def _heading_text(line: str) -> str | None:
     """Markdown 標題(行首最多 3 個空白、1 到 6 個 #、接著空白)的文字;不是標題回 None。
 
     不用正規式:規格是 MR 的內容,「標題文字 + 結尾的空白與 #」用 `(.+?)\\s*#*\\s*$` 這類寫法
-    比對,特製的長行會讓回溯變成三次方時間(實測 2,000 字元約 8 秒)。"""
+    比對,特製的長行會讓回溯變成三次方時間。"""
     body = line.lstrip()
     if len(line) - len(body) > 3:
         return None
@@ -855,8 +855,17 @@ def _clause_label(text: str) -> str:
     return " ".join(m[0].split()) if m else ""
 
 
-def _safe_name(name) -> str:
-    return str(name) if _SAFE_NAME.fullmatch(str(name or "")) else ""
+def _code_span(text) -> str:
+    """以 Markdown 的 code 格式寫出 MR 裡的路徑或代號:不可列印的字元換成空白、截長度;
+    內容含反引號時用更長的反引號包住,不會提早結束、變成一般文字。"""
+    text = "".join(ch if ch.isprintable() else " " for ch in str(text))[:MAX_PATH_CHARS]
+    longest = run = 0
+    for ch in text:
+        run = run + 1 if ch == "`" else 0
+        longest = max(longest, run)
+    fence = "`" * (longest + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
 
 
 def _heading_labels(new_lines: list[str]) -> list[str]:
@@ -979,7 +988,7 @@ def enforce_spec_change(report: dict, mr: dict) -> dict:
     其他地方(確定性)。決策由 apply_policy 的 spec_changed 硬條件交人工,不靠這條的嚴重度。
 
     用 info:規格寫錯在同一個 MR 一起修正是正常流程,這是請人確認的事項,不是違規。內容只有
-    路徑(只在全是英數時)、行號、數字、固定清單裡的用語與編號型的條文名稱(見 _spec_change_notes),
+    路徑(code 格式)、行號、數字、固定清單裡的用語與編號型的條文名稱(見 _spec_change_notes),
     不回顯規格內容。標題只能由程式產生(見 _put_program_finding)。
     """
     spec_files = [f for f in mr.get("files", []) if _is_spec_file(f)]
@@ -987,12 +996,12 @@ def enforce_spec_change(report: dict, mr: dict) -> dict:
         return report
     versions, unavailable = _spec_versions_in_mr(mr)
     parts, shown = [], 0
-    for n, f in enumerate(spec_files[:MAX_SPEC_FILES_LISTED], 1):
+    for f in spec_files[:MAX_SPEC_FILES_LISTED]:
         notes, stale = _spec_change_notes(f)
         more = max(0, len(notes) - (MAX_SPEC_NOTES - shown))
         notes = notes[:MAX_SPEC_NOTES - shown]
         shown += len(notes)
-        name = _safe_name(f.get("path")) or f"第 {n} 個規格檔"
+        name = _code_span(f.get("path"))
         if notes:
             text = f"{name}:" + ";".join(notes) + (f";另有 {more} 處" if more else "")
         elif more:
@@ -1010,9 +1019,8 @@ def enforce_spec_change(report: dict, mr: dict) -> dict:
     detail = ("這個 MR 修改了規格" + (",同時也改了程式" if also_code else "") + "。"
               + "".join(parts))
     if unavailable:
-        names = sorted(filter(None, map(_safe_name, unavailable)))
-        detail += (f"有 {len(unavailable)} 個規格檔拿不到修改後的完整內容"
-                   + (f"({'、'.join(names)})" if names else "")
+        names = sorted(map(_code_span, unavailable))
+        detail += (f"有 {len(unavailable)} 個規格檔拿不到修改後的完整內容({'、'.join(names)})"
                    + ",無法確認審查讀到的是不是修改後的版本,也沒有檢查規格前後是否一致;")
     elif versions:
         detail += "審查與執行驗證以這個 MR 修改後的規格為準;"

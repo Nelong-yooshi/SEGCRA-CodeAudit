@@ -11,10 +11,18 @@ import pytest
 
 from orchestrator import change_view, pipeline, spec_exec
 from orchestrator.change_view import (
-    build_full_text_section, changed_lines, file_view,
+    build_full_text_section, changes, file_view,
 )
 from orchestrator.config import load_config
 from toolbox import gitlab
+
+
+
+def _added(diff, text):
+    """changes() 的第一個值(新增的行);看不懂時是 None。"""
+    found = changes(diff, text)
+    return None if found is None else found[0]
+
 
 HEADER = "## 變更後的完整內容"
 PATH = "sql/maintenance/x.sql"
@@ -48,13 +56,13 @@ def _lines(n, changed=()):
 # ─────────────────── 改動的行 ───────────────────
 
 def test_改動的行由_hunk_算出來():
-    assert changed_lines(DIFF, SQL) == {1, 2}
+    assert _added(DIFF, SQL) == {1, 2}
 
 
 def test_多個_hunk_與刪除的行():
     text = "a\nB\nc\nd\ne\nF\ng"
     diff = "@@ -1,4 +1,3 @@\n a\n-b\n-x\n+B\n c\n@@ -6,2 +5,3 @@\n e\n+F\n g"
-    assert changed_lines(diff, text) == {2, 6}
+    assert _added(diff, text) == {2, 6}
 
 
 @pytest.mark.parametrize("diff", [
@@ -65,15 +73,15 @@ def test_多個_hunk_與刪除的行():
     "@@ -1 +0,0 @@\n+行號是 0",
 ])
 def test_看不懂或對不上內容時不標記(diff):
-    assert changed_lines(diff, SQL) is None
+    assert _added(diff, SQL) is None
 
 
 def test_只有刪除時沒有要標的行():
-    assert changed_lines("@@ -1,2 +1 @@\n-x\n a", "a") == set()
+    assert _added("@@ -1,2 +1 @@\n-x\n a", "a") == set()
 
 
 def test_行尾空白不影響對應():
-    assert changed_lines("@@ -1 +1 @@\n+select 1;   ", "select 1;") == {1}
+    assert _added("@@ -1 +1 @@\n+select 1;   ", "select 1;") == {1}
 
 
 # ─────────────────── 刪掉的行 ───────────────────
@@ -428,9 +436,9 @@ def test_段落裡以三個加減號開頭的行_是內容不是檔頭():
     內容,跳過的話後面的行號全部錯開。"""
     text = "select 1\n++i\nfrom t\nwhere a = 1\n"
     diff = "@@ -1,4 +1,4 @@\n select 1\n--- 舊的說明\n+++i\n from t\n-where a = 2\n+where a = 1\n"
-    assert changed_lines(diff, text) == {2, 4}
+    assert _added(diff, text) == {2, 4}
     with_header = "--- a/x.sql\n+++ b/x.sql\n" + diff
-    assert changed_lines(with_header, text) == {2, 4}
+    assert _added(with_header, text) == {2, 4}
 
 
 def test_完整內容只放sql檔_其他檔案只有diff():
