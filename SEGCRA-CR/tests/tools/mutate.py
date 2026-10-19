@@ -2066,6 +2066,19 @@ MUTANTS.update({
      '"severity": "info", "title": _SCAN_SKIPPED_TITLE'),
 })
 
+# ---- 注入掃描:跟 MR 檔案本身相同的內容不重複加
+MUTANTS.update({
+    "掃描去重:相同內容照樣重複加(佔掉上限)": ("pipeline.py",
+        "        if _path_and_text(item) in scanned:" + NL + "            continue" + NL,
+        ""),
+    "掃描去重:只看內容不看路徑": ("pipeline.py",
+        "        if _path_and_text(item) in scanned:",
+        "        if item.get(\"full_content\") in {c for _, c in scanned}:"),
+    "掃描去重:形狀不對的項目也拿去當鍵": ("pipeline.py",
+        "    return (path, text) if isinstance(path, str) and isinstance(text, str) else None",
+        "    return (path, text)"),
+})
+
 
 # ---- 程式補的 finding 寫行號(#28 review 後續)
 MUTANTS.update({
