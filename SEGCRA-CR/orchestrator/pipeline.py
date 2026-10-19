@@ -396,6 +396,14 @@ def _mr_for_spec_exec(mr: dict, dbt_ctx: DbtContext | None) -> dict:
 MAX_EXTRA_SCAN_CHARS = 200_000
 
 
+def _path_and_text(item) -> tuple[str, str] | None:
+    """(路徑, 完整內容);不是物件、或兩者不是字串時回 None(變更清單的形狀不可信,不能拿去當集合的鍵)。"""
+    if not isinstance(item, dict):
+        return None
+    path, text = item.get("path"), item.get("full_content")
+    return (path, text) if isinstance(path, str) and isinstance(text, str) else None
+
+
 def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None, rendered=()) -> dict:
     """注入掃描用:把取回的完整內容與展開後的 SQL 也列進去掃。
 
@@ -414,11 +422,10 @@ def _mr_with_head_text(mr: dict, dbt_ctx: DbtContext | None, rendered=()) -> dic
     if dbt_ctx is not None and dbt_ctx.project is not None:
         extra += [{"path": f.get("path"), "full_content": text} for f in mr.get("files", [])
                   if isinstance(f, dict) and (text := dbt_ctx.head_text(f.get("path"))) is not None]
-    scanned = {(f.get("path"), f["full_content"]) for f in mr.get("files", [])
-               if isinstance(f, dict) and isinstance(f.get("full_content"), str) and f["full_content"]}
+    scanned = {key for f in mr.get("files", []) if (key := _path_and_text(f))}
     kept, skipped, used = [], 0, 0
     for item in extra:
-        if (item.get("path"), item.get("full_content")) in scanned:
+        if _path_and_text(item) in scanned:
             continue
         size = len(item.get("full_content") or "")
         if used + size > MAX_EXTRA_SCAN_CHARS:

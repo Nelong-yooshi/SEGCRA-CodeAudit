@@ -1991,14 +1991,14 @@ MUTANTS.update({
 # ---- 注入掃描:跟 MR 檔案本身相同的內容不重複加
 MUTANTS.update({
     "掃描去重:相同內容照樣重複加(佔掉上限)": ("pipeline.py",
-        "        if (item.get(\"path\"), item.get(\"full_content\")) in scanned:" + NL + "            continue" + NL,
+        "        if _path_and_text(item) in scanned:" + NL + "            continue" + NL,
         ""),
     "掃描去重:只看內容不看路徑": ("pipeline.py",
-        "        if (item.get(\"path\"), item.get(\"full_content\")) in scanned:",
+        "        if _path_and_text(item) in scanned:",
         "        if item.get(\"full_content\") in {c for _, c in scanned}:"),
-    "掃描去重:MR 檔案沒有完整內容也當成掃過": ("pipeline.py",
-        "               if isinstance(f, dict) and isinstance(f.get(\"full_content\"), str) and f[\"full_content\"]}",
-        "               if isinstance(f, dict)}"),
+    "掃描去重:形狀不對的項目也拿去當鍵": ("pipeline.py",
+        "    return (path, text) if isinstance(path, str) and isinstance(text, str) else None",
+        "    return (path, text)"),
 })
 
 
