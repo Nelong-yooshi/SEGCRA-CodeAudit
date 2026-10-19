@@ -2455,6 +2455,22 @@ MUTANTS.update({
 })
 
 
+# ---- 工具回合用完時不得把工具結果當成審查報告(#66)
+MUTANTS.update({
+ "回合用完:回傳最後一則工具結果": ("agent.py",
+     '    return "(達到工具呼叫上限,未產出最終結果)"',
+     '    return messages[-1].get("content") or "(達到工具呼叫上限,未產出最終結果)"'),
+ "回合用完:不標記": ("agent.py",
+     "    if meta is not None:" + NL + '        meta["exhausted"] = True',
+     "    if False:" + NL + '        meta["exhausted"] = True'),
+ "回合用完:一開始不寫 False(分不出舊版程式)": ("agent.py",
+     "        # 一開始就寫 False:呼叫端用 meta.get(\"exhausted\") 時,「沒有這個 key」" + NL
+     + "        # (舊版程式)與「跑完沒用光輪次」要分得出來。" + NL
+     + '        meta["exhausted"] = False',
+     "        pass"),
+})
+
+
 # ---- 測資生成的覆蓋度重試(spec_exec)
 # 這道防線的失效是**靜默**的:覆蓋不完整的測資照樣跑得完、報告看起來正常,
 # 只是執行驗證少驗了幾個條件。沒有突變點的話,測試是不是真的守著它無從得知。

@@ -100,6 +100,10 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
     # 請求被退回,比多花一點 token 嚴重得多,所以預設不送而不是預設關閉思考。
     effort_kwargs = ({"reasoning_effort": profile.reasoning_effort}
                      if profile.reasoning_effort else {})
+    if meta is not None:
+        # 一開始就寫 False:呼叫端用 meta.get("exhausted") 時,「沒有這個 key」
+        # (舊版程式)與「跑完沒用光輪次」要分得出來。
+        meta["exhausted"] = False
     for i in range(MAX_ITERATIONS):
         _dump(profile.model, messages, i)
         resp = await client.chat.completions.create(
@@ -152,7 +156,19 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
                               "result_preview": (result or "")[:400]})
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
-    return messages[-1].get("content") or "(達到工具呼叫上限,未產出最終結果)"
+    # 工具回合用完了,模型始終沒有產出最終回應。
+    #
+    # **不可以回傳最後一則工具結果**:那則內容是工具回來的、而工具看的是 MR,所以內容
+    # 由 MR 決定。它是 JSON 物件時 extract_json 會把它當成審查報告收下,而最後一次模型
+    # 呼叫的 finish_reason 是 "stop" —— 呼叫端從 meta 完全看不出發生了這件事,實測會
+    # 一路走到 auto_approved。
+    #
+    # 兩道一起上:回固定文字(就算呼叫端忘了看 meta,也拿不到工具結果),並標記
+    # exhausted(呼叫端據此比照截斷處理:不解析輸出、補一條 major、不得自動放行)。
+    # 只有 run_agent 知道迴圈是跑完還是被 return 出去的,所以標記只能在這裡做。
+    if meta is not None:
+        meta["exhausted"] = True
+    return "(達到工具呼叫上限,未產出最終結果)"
 
 
 def decode_byte_fallback(text: str) -> str:
