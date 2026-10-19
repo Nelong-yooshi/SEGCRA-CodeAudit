@@ -2525,6 +2525,39 @@ def _mutate_all(args, src: pathlib.Path) -> int:
     return 1 if survived or config_errors or timeouts or errors else 0
 
 
+# ---- 註解抽取改成線性時間,而且不能因此縮小掃描範圍(#33 review 第 3 點)
+MUTANTS.update({
+ "註解:改回平方時間的正規式": ("security.py",
+     "    out: list[str] = []" + NL + "    i, n = 0, len(code)",
+     "    import re" + NL
+     + "    return [m.group(0) for m in re.finditer(r\"--[^\\n]*|/\\*.*?\\*/\", code, re.S)]" + NL
+     + "    out: list[str] = []" + NL + "    i, n = 0, len(code)"),
+ "註解:沒有結尾的區塊註解不關掉(回到反覆回溯)": ("security.py",
+     "        if close == -1:" + NL + "            next_block = -1" + NL + "            continue",
+     "        if close == -1:" + NL + "            i = next_block + 2" + NL + "            continue"),
+ "註解:先截到最後一個結尾(會漏掉跨過它的行註解)": ("security.py",
+     "    i, n = 0, len(code)",
+     '    code = code[:code.rfind("*/") + 2] if "*/" in code else code' + NL
+     + "    i, n = 0, len(code)"),
+ "註解:行註解只到換行前一格": ("security.py",
+     '            end = code.find("\\n", next_line)',
+     '            end = code.find("\\n", next_line) - 1'),
+ "掃描:欄位的值型別不對也直接用(整份審查中斷)": ("security.py",
+     "    return value if isinstance(value, str) else \"\"",
+     "    return value"),
+ "掃描:full_content 型別不對時不退回 diff": ("security.py",
+     '    code = "\\n".join(_text(f.get("full_content")) or _text(f.get("diff")) for f in files)',
+     '    code = "\\n".join(_text(f.get("full_content") or f.get("diff")) for f in files)'),
+ "掃描:變更清單的壞項目不略過(整份審查中斷)": ("security.py",
+     '    files = [f for f in (mr.get("files") or []) if isinstance(f, dict)]',
+     '    files = mr.get("files") or []'),
+ "掃描:壞項目把整個清單丟掉": ("security.py",
+     '    files = [f for f in (mr.get("files") or []) if isinstance(f, dict)]',
+     '    files = [] if any(not isinstance(f, dict) for f in (mr.get("files") or [])) '
+     'else list(mr.get("files") or [])'),
+})
+
+
 # ---- 測資生成的覆蓋度重試(spec_exec)
 # 這道防線的失效是**靜默**的:覆蓋不完整的測資照樣跑得完、報告看起來正常,
 # 只是執行驗證少驗了幾個條件。沒有突變點的話,測試是不是真的守著它無從得知。
@@ -2568,7 +2601,7 @@ MUTANTS.update({
     # 截斷偵測:被 max_tokens 硬切的 JSON 會被 json-repair 修補成合法物件,
     # 形狀檢查只看得到「案例比較少」。拿掉這一關,殘骸會被當成正常結果收下。
     "測資:不理會輸出被截斷(殘骸當結果收下)": (S,
-        '        if meta.get("finish_reason") == "length":',
+        '        if output_truncated(meta, profile.max_output_tokens):',
         "        if False:"),
     "執行中止:測資建不起來時沒跑到的案例不算缺口": (S,
         'f"{ex[\'testdata_error\']}。需人工執行驗證。"))' + NL
@@ -2579,6 +2612,65 @@ MUTANTS.update({
         + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
         + '                "conditions": plan["conditions"],' + NL
         + '                "coverage_gaps": coverage_gaps,'),
+})
+
+
+# ---- 主審查的輸出被截斷
+# 失效是靜默的:被切斷的 JSON 會被修補成合法物件,報告只是比較短。
+P = "pipeline.py"
+MUTANTS.update({
+    "截斷:主審查不把 meta 傳給 run_agent": (P,
+        "                              meta=output_meta)",
+        "                              )"),
+    "截斷:不理會 finish_reason": ("agent.py",
+        '    if meta.get("finish_reason") == "length":' + NL + "        return True" + NL
+        + '    used = meta.get("completion_tokens")',
+        '    used = meta.get("completion_tokens")'),
+    "截斷:不看用量是否達到上限": ("agent.py",
+        "    return used is not None and used >= max_output_tokens",
+        "    return False"),
+    "截斷:用量要超過上限才算(剛好等於不算)": ("agent.py",
+        "    return used is not None and used >= max_output_tokens",
+        "    return used is not None and used > max_output_tokens"),
+    "截斷:測資生成只看 finish_reason(兩邊判斷不一致)": ("spec_exec.py",
+        "        if output_truncated(meta, profile.max_output_tokens):" + NL + "            truncated += 1",
+        '        if meta.get("finish_reason") == "length":' + NL + "            truncated += 1"),
+    "截斷:解析不出來時照舊中斷審查": (P,
+        "    if not report and output_truncated(meta, max_output_tokens):",
+        "    if False:"),
+    "截斷:沒有截斷的解析失敗也用空報告帶過": (P,
+        "    if not report and output_truncated(meta, max_output_tokens):",
+        "    if not report:"),
+    "截斷:不補 major": (P,
+        "        report = enforce_truncation(report, output_meta, profile.max_output_tokens)  # 輸出被截斷" + NL,
+        ""),
+    "截斷:一律補 major(沒有截斷也補)": (P,
+        "    if not output_truncated(meta, max_output_tokens):" + NL + "        return report" + NL
+        + "    _put_program_finding(report, {",
+        "    _put_program_finding(report, {"),
+    "截斷:補成 minor(擋不住自動放行)": (P,
+        '"severity": "major", "title": _TRUNCATED_TITLE,',
+        '"severity": "minor", "title": _TRUNCATED_TITLE,'),
+    "截斷:同標題已存在就不補(模型可以關掉)": (P,
+        '    _put_program_finding(report, {' + NL
+        + '        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _TRUNCATED_TITLE,',
+        '    report.setdefault("findings", []).append({' + NL
+        + '        "file": "(MR 內容)", "line": 0, "severity": "info", "title": _TRUNCATED_TITLE,'),
+    "截斷:說明裡回顯端點回報的字串": (P,
+        'f"審查模型的輸出達到長度上限({max_output_tokens} tokens)而被切斷,',
+        'f"審查模型的輸出達到長度上限({max_output_tokens} tokens){meta.get(\'finish_reason\')}而被切斷,'),
+    "截斷:報告不記稽核紀錄": (P,
+        '    report["_output_meta"] = _output_meta_record(meta, max_output_tokens)' + NL,
+        ""),
+    "截斷:模型自己輸出的稽核紀錄不蓋掉": (P,
+        '    report["_output_meta"] = _output_meta_record(meta, max_output_tokens)',
+        '    report.setdefault("_output_meta", _output_meta_record(meta, max_output_tokens))'),
+    "截斷:稽核紀錄的結束原因不截長度": (P,
+        '"finish_reason": None if reason is None else str(reason)[:_FINISH_REASON_MAX],',
+        '"finish_reason": reason,'),
+    "截斷:capture 不記 finish_reason": (P,
+        '            capture["output_meta"] = dict(output_meta)' + NL,
+        ""),
 })
 
 

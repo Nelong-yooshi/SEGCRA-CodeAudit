@@ -30,7 +30,7 @@ import re
 import time
 import uuid
 
-from .agent import extract_json, run_agent
+from .agent import extract_json, output_truncated, run_agent
 from .config import Config, PKG_ROOT
 
 SPECS_DIR = PKG_ROOT / "specs"
@@ -281,7 +281,7 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
         # 它其實是被硬切的殘骸。實測 RETAIL_M1:finish_reason=length、
         # completion_tokens 剛好 8192、輸出斷在一個數字中間,但照樣解析成功,
         # 案例從應有的 46 個掉到 9 個——而那 9 個會被當成正常結果收下。
-        if meta.get("finish_reason") == "length":
+        if output_truncated(meta, profile.max_output_tokens):
             truncated += 1
             user = (f"上一次的輸出超過長度上限被截斷了。請**大幅精簡**:"
                     f"`note` 一律留空字串,每個案例只放最少必要的資料列,"

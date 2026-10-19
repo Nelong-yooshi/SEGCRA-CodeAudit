@@ -441,7 +441,7 @@ def _truncating_agent(sequence):
         reason, raw = seq.pop(0)
         if meta is not None:
             meta["finish_reason"] = reason
-            meta["completion_tokens"] = 8192 if reason == "length" else 1234
+            meta["completion_tokens"] = 256 if reason == "length" else 123
         return raw
     return fake, seq
 
