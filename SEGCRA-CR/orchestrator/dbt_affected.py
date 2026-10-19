@@ -201,8 +201,8 @@ async def _compare(hub, rel: str, dbt_cfg: dict, ctx: DbtContext, render, deadli
     (macro 讓語句多了或少了一句、切不出語句)退回比較整個 model 同一條規則的命中數。兩種都只有
     「變多」才算新增。文字層的規則與對不到語句的命中沒有位置,只比個數。
 
-    變更前或變更後的樣板有呼叫 `is_incremental()` 時,兩邊再以增量模式各展開一次、照同樣的方式
-    比較。增量那次的 SQL 本來就包含非增量的部分,所以只補「增量那次多出來的」命中,以規則為
+    變更後的樣板有呼叫 `is_incremental()` 時,兩邊再以增量模式各展開一次、照同樣的方式比較
+    (變更後沒有呼叫的話,增量模式的結果跟一般模式相同,不會多出命中)。增量那次的 SQL 本來就包含非增量的部分,所以只補「增量那次多出來的」命中,以規則為
     單位、不寫第幾句(那是另一份展開結果的句序)。變更後的增量展開失敗算這個 model 的錯誤;
     變更前的失敗則跟沒有變更前的版本一樣,無法比較。"""
     head_text = ctx.project.files.get(rel)
@@ -231,7 +231,7 @@ async def _compare(hub, rel: str, dbt_cfg: dict, ctx: DbtContext, render, deadli
         return (), False, head_error
     new = _new_hits(head, base, base_error)
     blind = base_error is not None
-    if head.incremental_checked or (base is not None and base.incremental_checked):
+    if head.incremental_checked:
         head_inc, base_inc, inc_error, inc_base_error = await both(True)
         if inc_error is not None:
             return (), False, f"增量分支(is_incremental() 為 True):{inc_error}"
