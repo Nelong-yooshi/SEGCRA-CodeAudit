@@ -2422,6 +2422,39 @@ def _mutate_all(args, src: pathlib.Path) -> int:
     return 1 if survived or config_errors or timeouts or errors else 0
 
 
+# ---- 註解抽取改成線性時間,而且不能因此縮小掃描範圍(#33 review 第 3 點)
+MUTANTS.update({
+ "註解:改回平方時間的正規式": ("security.py",
+     "    out: list[str] = []" + NL + "    i, n = 0, len(code)",
+     "    import re" + NL
+     + "    return [m.group(0) for m in re.finditer(r\"--[^\\n]*|/\\*.*?\\*/\", code, re.S)]" + NL
+     + "    out: list[str] = []" + NL + "    i, n = 0, len(code)"),
+ "註解:沒有結尾的區塊註解不關掉(回到反覆回溯)": ("security.py",
+     "        if close == -1:" + NL + "            next_block = -1" + NL + "            continue",
+     "        if close == -1:" + NL + "            i = next_block + 2" + NL + "            continue"),
+ "註解:先截到最後一個結尾(會漏掉跨過它的行註解)": ("security.py",
+     "    i, n = 0, len(code)",
+     '    code = code[:code.rfind("*/") + 2] if "*/" in code else code' + NL
+     + "    i, n = 0, len(code)"),
+ "註解:行註解只到換行前一格": ("security.py",
+     '            end = code.find("\\n", next_line)',
+     '            end = code.find("\\n", next_line) - 1'),
+ "掃描:欄位的值型別不對也直接用(整份審查中斷)": ("security.py",
+     "    return value if isinstance(value, str) else \"\"",
+     "    return value"),
+ "掃描:full_content 型別不對時不退回 diff": ("security.py",
+     '    code = "\\n".join(_text(f.get("full_content")) or _text(f.get("diff")) for f in files)',
+     '    code = "\\n".join(_text(f.get("full_content") or f.get("diff")) for f in files)'),
+ "掃描:變更清單的壞項目不略過(整份審查中斷)": ("security.py",
+     '    files = [f for f in (mr.get("files") or []) if isinstance(f, dict)]',
+     '    files = mr.get("files") or []'),
+ "掃描:壞項目把整個清單丟掉": ("security.py",
+     '    files = [f for f in (mr.get("files") or []) if isinstance(f, dict)]',
+     '    files = [] if any(not isinstance(f, dict) for f in (mr.get("files") or [])) '
+     'else list(mr.get("files") or [])'),
+})
+
+
 # ---- 測資生成的覆蓋度重試(spec_exec)
 # 這道防線的失效是**靜默**的:覆蓋不完整的測資照樣跑得完、報告看起來正常,
 # 只是執行驗證少驗了幾個條件。沒有突變點的話,測試是不是真的守著它無從得知。
