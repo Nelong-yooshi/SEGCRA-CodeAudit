@@ -434,7 +434,7 @@ def test_prescan_model_path_with_traversal_does_not_touch_filesystem():
     真實檔案(讀到的話結果會明顯不同,或直接失敗)。"""
     hub = _FakePrescanHub()
     src = "SELECT {{ 1 + 1 }} AS two"
-    entries = _run(prescan(hub, _files("../../../../etc/passwd", src),
+    entries = _run(prescan(hub, _files("../../../../etc/passwd.sql", src),
                            {"enabled": True, "database": "DBT_PLACEHOLDER"}))
     assert hub.rules_calls == ["SELECT 2 AS two"]
     assert "dbt_render_error" not in entries[0]
