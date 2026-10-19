@@ -14,7 +14,7 @@
 import pytest
 
 from orchestrator.pipeline import enforce_parse, enforce_rules
-from toolbox.sqltools import _text_rules, mask_secrets, run_rules
+from toolbox.sqltools import _text_rules, parse_error_text, run_rules
 
 # 假的值:每一個都夠特殊,出現在訊息裡一定抓得到
 CASES = [
@@ -86,14 +86,23 @@ def test_沒命中就不報():
 # R004 的訊息乾淨了,但檔案解析不過時,「預掃無法解析此檔的 SQL」那條 finding 的內文
 # 就是解析錯誤訊息 —— 而 sqlglot 的訊息帶著出錯位置附近的原文。那條一樣會貼回 MR 留言、
 # 寫進 review_output/,所以同一個問題還在。
+#
+# **要防的是「解析錯誤把原文帶出去」,跟那段原文像不像密碼無關。** 所以不是「把疑似
+# 憑證的部分遮掉」——用樣式遮只遮得到樣式認得的寫法,下面 LEAKY 的前兩個就是 R004
+# 漏抓、遮罩也會一起漏的例子(#42 review 第二輪)。改成只留位置。
 
 SECRET = "S3cr3t-P@ss"
 LEAKY = [
     # 少打一個字 → 解析失敗,錯誤訊息帶著那一行
     f"SELEC * FROM t WHERE pwd = '{SECRET}'",
-    # 沒展開的 dbt 樣板:pre_hook 裡有連線憑證
-    "{{ config(pre_hook=\"EXEC sp_addlinkedsrvlogin @rmtsrvname='R', "
-    f"@rmtpassword='{SECRET}'\") }}}}",
+    # T-SQL 的 Unicode 字串:R004 的樣式認不得 N'…',所以遮罩也會漏
+    f"SELEC * FROM t WHERE password = N'{SECRET}'",
+    # 位置參數:值沒有跟在鍵名後面,R004 一樣認不得
+    f"EXEC sp_addlogin 'app', '{SECRET}' SELEC 1",
+    # 沒加引號的值
+    f"SELEC * FROM t WHERE password = {SECRET}",
+    # 斷詞就失敗(引號沒收):走的是 ParseError 以外的例外
+    f"SELECT 1 WHERE x = '{SECRET}",
 ]
 
 
@@ -102,7 +111,6 @@ def test_整份報告都不含憑證原文(sql):
     """走預掃 → enforce_rules + enforce_parse,斷言**整份報告**(含解析失敗那條)
     都不含那串密碼。"""
     import json
-
     raw = json.loads(run_rules(sql))
     entry = {"path": "a.sql", "rules": raw["hits"] if isinstance(raw, dict) else raw}
     if isinstance(raw, dict) and raw.get("error"):
@@ -110,39 +118,51 @@ def test_整份報告都不含憑證原文(sql):
     report = enforce_parse(enforce_rules({"findings": []}, [entry]), [entry])
     blob = json.dumps(report, ensure_ascii=False)
     assert SECRET not in blob, blob[:400]
+    assert "parse_error" in entry, "這幾個例子都該解析失敗,否則這條什麼都沒驗"
 
 
 @pytest.mark.parametrize("sql", LEAKY)
-def test_解析錯誤訊息本身遮掉憑證(sql):
-    """遮的是值,位置與錯誤類型要留著 —— 不然看報告的人不知道哪裡壞了。"""
+def test_解析錯誤訊息只留位置(sql):
+    """位置要留著 —— 不然看報告的人不知道哪裡壞了;原文一概不留。"""
     import json
-    raw = json.loads(run_rules(sql))
-    err = raw.get("error", "") if isinstance(raw, dict) else ""
-    if err:                      # 第二個例子 sqlglot 解析得過,沒有錯誤訊息
-        assert SECRET not in err
-        assert "●●●" in err, err
-        assert "parse failed" in err
+    err = json.loads(run_rules(sql))["error"]
+    assert SECRET not in err and "SELEC" not in err, err
+    assert "語法無法解析" in err
+    assert ("行第" in err) or ("Error" in err), f"要嘛有位置、要嘛有例外類型:{err}"
 
 
-def test_遮罩保留位置與錯誤類型():
-    masked = mask_secrets("parse failed: Invalid expression. Line 1, Col: 12. "
-                          f"SELEC * FROM t WHERE pwd = '{SECRET}'")
-    assert SECRET not in masked
-    assert "Line 1, Col: 12" in masked and "Invalid expression" in masked
+def test_解析錯誤不帶_sqlglot_的描述與前後文():
+    """`ParseError.errors` 的 description / start_context / highlight / end_context
+    都夾著 token 的原文,一概不用。"""
+    import sqlglot
+    try:
+        sqlglot.parse(f"SELEC * FROM t WHERE pwd = '{SECRET}'", dialect="tsql")
+        raise AssertionError("這段應該解析失敗")
+    except Exception as e:
+        raw = getattr(e, "errors", [{}])[0]
+        text = parse_error_text(e)
+    assert str(raw.get("description", "")) not in text
+    for key in ("start_context", "highlight", "end_context"):
+        val = str(raw.get(key) or "")
+        if len(val) > 3:
+            assert val not in text, key
+    assert "第 1 行第 12 欄" in text
 
 
-def test_沒有憑證的錯誤訊息原樣保留():
-    msg = "parse failed: Invalid expression. Line 3, Col: 7. SELEC * FROM t"
-    assert mask_secrets(msg) == msg
+def test_不是_ParseError_時只留例外類型():
+    class Boom(Exception):
+        def __str__(self):
+            return f"tokenizer blew up near '{SECRET}'"
+
+    text = parse_error_text(Boom())
+    assert SECRET not in text and "Boom" in text
 
 
-def test_模型工具的解析錯誤也遮掉憑證():
-    """`sqltools__parse_ast` 是模型拿得到的工具。它的錯誤訊息不會變成 finding,
-    所以不會貼回 MR —— 但遮掉的成本是零,而工具回傳值會進模型的 context、也可能被
-    寫進 agent 的對話存檔,沒有理由讓它留著明碼。"""
+def test_模型工具的解析錯誤不必處理():
+    """`sqltools__parse_ast` 只回給模型,而模型本來就看得到整份 SQL —— 那條不會變成
+    finding、不會貼回 MR,所以不另外處理(#42 review 第二輪確認)。"""
     import json
 
     from toolbox.sqltools import parse_ast
     out = json.loads(parse_ast(f"SELEC * FROM t WHERE pwd = '{SECRET}'"))
-    assert SECRET not in json.dumps(out, ensure_ascii=False)
-    assert "●●●" in out["error"]
+    assert "error" in out

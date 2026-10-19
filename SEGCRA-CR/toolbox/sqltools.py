@@ -28,8 +28,8 @@ def parse_ast(sql: str) -> str:
     try:
         statements = _parse(sql)
     except Exception as e:
-        return json.dumps({"error": mask_secrets(f"parse failed: {e}")},
-                          ensure_ascii=False)
+        # 這條只回給模型,而模型本來就看得到整份 SQL,所以不必像預掃那樣只留位置
+        return json.dumps({"error": f"parse failed: {e}"}, ensure_ascii=False)
     for st in statements:
         if st is None:
             continue
@@ -157,22 +157,24 @@ _SECRET_KINDS = {
 }
 
 
-_MASK = "●●●"
+def parse_error_text(e: Exception) -> str:
+    """解析失敗的說明:**只留位置,不帶任何原文**。
 
+    為什麼不是「把疑似憑證的部分遮掉」:要防的是「解析錯誤把原文帶出去」,跟那段原文
+    像不像密碼無關。用樣式遮只遮得到樣式認得的寫法(`N'…'` 的 Unicode 字串、位置參數
+    `EXEC sp_addlogin 'app', '…'`、沒加引號的值都漏),而這條訊息會變成「預掃無法解析
+    此檔的 SQL」那條 finding 的內文,貼回 MR 留言、寫進 review_output/。
 
-def mask_secrets(text: str) -> str:
-    """把文字裡疑似憑證的片段換成 ●●●。
-
-    用在**解析錯誤訊息**上:sqlglot 的訊息帶著出錯位置附近的原文,而解析失敗那條
-    finding 的內文就是它 —— 會貼回 MR 留言、寫進 review_output/。R004 的訊息已經
-    不回顯了,但同一份報告的另一條照樣會把密碼帶出去(#42 review 實測:
-    `SELEC * FROM t WHERE pwd = 'S3cr3t-P@ss'` 少打一個字,錯誤訊息就含那串密碼;
-    沒展開的 dbt 樣板 `pre_hook="… @rmtpassword='…'"` 也一樣)。
-
-    用跟 R004 同一個樣式:它認得的寫法就是我們會判成憑證的寫法,兩邊一致。
-    整段一起換掉(含鍵名),遮得比較徹底,而位置與錯誤類型都還在。
+    `ParseError.errors` 的 `line` / `col` 可以直接用;`description`、`start_context`、
+    `highlight`、`end_context` 一概不用——它們夾著 token 的原文。其他例外(斷詞失敗等)
+    的訊息同樣帶原文,所以只留例外類型。
     """
-    return _SECRET_RE.sub(_MASK, text or "")
+    spots = []
+    for d in getattr(e, "errors", None) or []:
+        if isinstance(d, dict) and d.get("line") is not None:
+            spots.append(f"第 {d['line']} 行第 {d.get('col', '?')} 欄")
+    where = "、".join(dict.fromkeys(spots))[:120] if spots else type(e).__name__
+    return f"parse failed: 語法無法解析({where})"
 
 
 def _secret_kind(m: "re.Match") -> str:
@@ -274,10 +276,9 @@ def run_rules(sql: str) -> str:
     except Exception as e:
         # 解析失敗時 AST 規則無法執行,但文字層規則(R004 明碼憑證等)不需要 AST,
         # 照樣要跑 —— 否則一段解析不了的 SQL 會連明碼密碼都一起放過。
-        msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e))      # 去掉 sqlglot 錯誤訊息裡的終端機色碼
-        # 錯誤訊息帶著出錯位置附近的原文 → 疑似憑證的片段先遮掉(見 mask_secrets)
-        statements, parse_error = [], mask_secrets(
-            f"parse failed: {' '.join(msg.split())[:200]}")
+        # 這條訊息會變成 finding 的內文、貼回 MR 留言,所以**只留位置**
+        # (見 parse_error_text:sqlglot 的訊息夾著出錯位置附近的原文)
+        statements, parse_error = [], parse_error_text(e)
     for st in statements:
         if st is None:
             continue

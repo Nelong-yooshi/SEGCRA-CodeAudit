@@ -1364,19 +1364,20 @@ MUTANTS.update({
 # 複製進 finding、貼回 MR 留言、寫進 review_output/ —— 作者改掉那一行之後,留言裡還留著。
 MUTANTS.update({
  # 解析錯誤訊息帶著出錯位置附近的原文,而「預掃無法解析此檔的 SQL」那條 finding 的
- # 內文就是它 —— 一樣會貼回 MR 留言、寫進 review_output/(#42 review)
- "R004:解析錯誤訊息不遮憑證": ("../toolbox/sqltools.py",
-     "        statements, parse_error = [], mask_secrets(" + NL
-     + "            f\"parse failed: {' '.join(msg.split())[:200]}\")",
-     "        statements, parse_error = [], (" + NL
-     + "            f\"parse failed: {' '.join(msg.split())[:200]}\")"),
- "R004:遮罩把整段訊息都換掉(位置與錯誤類型不見)": ("../toolbox/sqltools.py",
-     "    return _SECRET_RE.sub(_MASK, text or \"\")",
-     "    return _MASK if _SECRET_RE.search(text or \"\") else (text or \"\")"),
- "R004:parse_ast 的錯誤訊息不遮": ("../toolbox/sqltools.py",
-     '        return json.dumps({"error": mask_secrets(f"parse failed: {e}")},' + NL
-     + "                          ensure_ascii=False)",
-     '        return json.dumps({"error": f"parse failed: {e}"}, ensure_ascii=False)'),
+ # 內文就是它 —— 一樣會貼回 MR 留言、寫進 review_output/。要防的是「帶出原文」,
+ # 跟那段原文像不像密碼無關,所以只留位置(用樣式遮只遮得到樣式認得的寫法)。
+ "解析失敗:錯誤訊息照用 sqlglot 的原文": ("../toolbox/sqltools.py",
+     "        statements, parse_error = [], parse_error_text(e)",
+     '        statements, parse_error = [], f"parse failed: {e}"'),
+ "解析失敗:連 sqlglot 的描述一起帶出來": ("../toolbox/sqltools.py",
+     '            spots.append(f"第 {d[\'line\']} 行第 {d.get(\'col\', \'?\')} 欄")',
+     '            spots.append(f"第 {d[\'line\']} 行 {d.get(\'description\', \'\')}")'),
+ "解析失敗:其他例外照用訊息(不只留類型)": ("../toolbox/sqltools.py",
+     '    where = "、".join(dict.fromkeys(spots))[:120] if spots else type(e).__name__',
+     '    where = "、".join(dict.fromkeys(spots))[:120] if spots else str(e)'),
+ "解析失敗:連位置都不留(看不出哪裡壞了)": ("../toolbox/sqltools.py",
+     '    for d in getattr(e, "errors", None) or []:',
+     "    for d in []:"),
  "R004:訊息回顯比對到的原文": ("../toolbox/sqltools.py",
      'f"疑似硬編碼憑證/密碼/金鑰於 SQL:{_secret_kind(m)}——"',
      'f"疑似硬編碼憑證/密碼/金鑰於 SQL:「{m.group(0)[:40]}」——"'),
