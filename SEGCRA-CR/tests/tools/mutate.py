@@ -484,13 +484,19 @@ MUTANTS.update({
  # (_head_layout)在那之外。照 #45 的原則包起來,出錯當成取回失敗、交人工,
  # 不要讓整份審查沒有輸出。這一步不是 report = X(report, ...) 的形狀,掃原始碼的測試
  # 看不到它(#53 review 指出的),所以要有自己的突變點。
- "隔離:dbt 專案取回的例外往外丟(會中斷整份審查)": ("pipeline.py",
-     "        report.setdefault(\"findings\", []).append(" + NL
-     + '            _incomplete_finding("dbt 專案取回", e))',
-     "        raise"),
+ # 同步環節的隔離(取回 dbt 專案、注入掃描):那種形狀不吃 report,@_isolated_stage
+ # 套不上、掃原始碼的測試也看不到,而它們丟例外一樣會讓整份審查沒有輸出
+ "隔離:同步環節的例外往外丟(會中斷整份審查)": ("pipeline.py",
+     "    except Exception as e:                  # noqa: BLE001 — 任何例外都不得往外丟" + NL
+     + '        report.setdefault("findings", []).append(_incomplete_finding(stage, e))' + NL
+     + "        return default",
+     "    except Exception:" + NL + "        raise"),
  "隔離:取回失敗不當成取回失敗(回 None = 不適用)": ("pipeline.py",
-     '        return DbtContext(prefix="", error=f"取回 dbt 專案時發生 {type(e).__name__}")',
-     "        return None"),
+     '                        DbtContext(prefix="", error="取回 dbt 專案時發生非預期錯誤"),',
+     "                        None,"),
+ "隔離:注入掃描失敗時當成沒有注入(不記未完整)": ("pipeline.py",
+     '        injection_hits = _step(report_stub, "注入掃描", scan_mr, [], scan_target)',
+     "        injection_hits = scan_mr(scan_target)"),
  "隔離:執行驗證不設時間上限": ("pipeline.py",
      "            spec_result = await asyncio.wait_for(" + NL
      + "                run_spec_exec(cfg, hub, _mr_for_spec_exec(mr, dbt_ctx)," + NL
@@ -725,14 +731,16 @@ MUTANTS.update({
      "        if dbt_enabled and not is_macro:",
      "        if not is_macro:"),
  "專案接線:review_mr 不取回專案": ("pipeline.py",
-     "        dbt_ctx = _dbt_context_or_none(report_stub, mr, cfg.dbt)",
+     "        dbt_ctx = _step(report_stub, \"dbt 專案取回\", prepare_dbt_context," + NL
+     + '                        DbtContext(prefix="", error="取回 dbt 專案時發生非預期錯誤"),' + NL
+     + "                        mr, cfg.dbt)",
      "        dbt_ctx = None"),
  '專案接線:review_mr 沒把專案交給預掃': ('pipeline.py',
      '                           prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered), [])',
      '                           prescan(hub, mr["files"], cfg.dbt, None, rendered), [])'),
  '專案接線:注入掃描不掃取回的完整內容': ('pipeline.py',
-     '        scan_target = _mr_with_head_text(mr, dbt_ctx, rendered)',
-     '        scan_target = _mr_with_head_text(mr, None, rendered)'),
+     '                            _mr_with_head_text, dict(mr), mr, dbt_ctx, rendered)',
+     '                            _mr_with_head_text, dict(mr), mr, None, rendered)'),
  '專案接線:注入掃描只掃完整內容、漏掉原本的 diff': ('pipeline.py',
      '    out = {**mr, "files": [*mr["files"], *kept]}',
      '    out = {**mr, "files": kept}'),
@@ -1988,8 +1996,8 @@ MUTANTS.update({
      'if isinstance(f, dict) and (text := dbt_ctx.head_text(f.get("path"))) is not None]',
      'if (text := dbt_ctx.head_text(f.get("path"))) is not None]'),
  '專案接線:注入掃描不掃展開後的 SQL': ('pipeline.py',
-     '        scan_target = _mr_with_head_text(mr, dbt_ctx, rendered)',
-     '        scan_target = _mr_with_head_text(mr, dbt_ctx)'),
+     '                            _mr_with_head_text, dict(mr), mr, dbt_ctx, rendered)',
+     '                            _mr_with_head_text, dict(mr), mr, dbt_ctx)'),
  '專案接線:預掃不收集展開後的 SQL': ('pipeline.py',
      '            elif rendered is not None:\n                rendered.append(',
      '            elif False:\n                rendered.append('),

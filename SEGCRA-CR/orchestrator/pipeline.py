@@ -239,26 +239,23 @@ def _isolated(stage: str, fn):
     return wrapped
 
 
-def _dbt_context_or_none(report: dict, mr: dict, dbt_cfg: dict | None):
-    """取回 dbt 專案,**不讓它的例外中斷整份審查**。
+def _step(report: dict, stage: str, fn, default, *args, **kwargs):
+    """跑一個同步環節。失敗就記一條並回傳 default,讓後面的環節照跑。
 
-    `prepare_dbt_context` 自己有 catch-all,但讀 `dbt_project.yml` 判斷專案佈局的那一步
-    (`_head_layout`)在那之外。照 #45 的原則:出錯就當成**取回失敗**,跟取不回專案是
-    同一種處理——`enforce_dbt_unexecuted` 會據此交人工,而不是整份審查沒有輸出。
-
-    這一步不是 `report = X(report, ...)` 的形狀,所以掃原始碼的那條測試看不到它
-    (#53 review 指出的),只能在這裡明寫。
+    `report = X(report, ...)` 那種形狀的環節由 `@_isolated_stage` 處理(掃原始碼的測試
+    看得到);**這個是給「不吃 report、回傳別的東西」的步驟用的** —— 取回 dbt 專案、
+    注入掃描都是,而它們丟例外一樣會讓整份審查沒有輸出。新增同步步驟時照這個寫,
+    不要每次各寫一個 try。
     """
     try:
-        return prepare_dbt_context(mr, dbt_cfg)
-    except Exception as e:                  # noqa: BLE001 — 一律收斂成取回失敗
-        report.setdefault("findings", []).append(
-            _incomplete_finding("dbt 專案取回", e))
-        return DbtContext(prefix="", error=f"取回 dbt 專案時發生 {type(e).__name__}")
+        return fn(*args, **kwargs)
+    except Exception as e:                  # noqa: BLE001 — 任何例外都不得往外丟
+        report.setdefault("findings", []).append(_incomplete_finding(stage, e))
+        return default
 
 
 async def _astep(report: dict, stage: str, coro, default):
-    """跑一個非同步環節。失敗就記一條並回傳 default,讓後面的環節照跑。"""
+    """`_step` 的非同步版。失敗就記一條並回傳 default,讓後面的環節照跑。"""
     try:
         return await coro
     except Exception as e:
@@ -783,11 +780,14 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             report["_mode"] = "baseline"
             return report
 
-        # dbt 專案的取回也要隔離:它自己有 catch-all,但讀 dbt_project.yml 的那一步
-        # (_head_layout)在那之外,丟例外會讓整份審查消失。出錯就當成「取回失敗」
-        # ——後面的 enforce_dbt_unexecuted 會據此交人工,跟取不到專案是同一種處理。
+        # dbt 專案的取回也要隔離:它自己有 catch-all,但讀 dbt_project.yml 判斷專案
+        # 佈局的那一步在那之外。出錯就當成「取回失敗」(標了 error 的 DbtContext)
+        # ——後面的 enforce_dbt_unexecuted 會據此交人工;回 None 會被當成「不適用」,
+        # 等於把失敗變成靜默放寬。
         report_stub: dict = {"findings": []}
-        dbt_ctx = _dbt_context_or_none(report_stub, mr, cfg.dbt)
+        dbt_ctx = _step(report_stub, "dbt 專案取回", prepare_dbt_context,
+                        DbtContext(prefix="", error="取回 dbt 專案時發生非預期錯誤"),
+                        mr, cfg.dbt)
         rendered: list[dict] = []          # 展開後的 SQL,給注入掃描用
         # 預掃失敗不該讓整份審查消失:規則層與 dbt 展開都在裡面,壞了就記一條、
         # 用空的預掃往下走(模型仍然看得到 diff 與規格)。
@@ -797,8 +797,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             capture["mr"] = mr
             capture["prescan_raw"] = copy.deepcopy(pre)
         # 確定性注入掃描(不經 LLM):MR、取回的完整內容、展開後的 SQL
-        scan_target = _mr_with_head_text(mr, dbt_ctx, rendered)
-        injection_hits = scan_mr(scan_target)
+        # 掃描的兩步也要隔離:它們不吃 report,所以掃原始碼的測試看不到,而這裡丟例外
+        # 就是整份審查沒有輸出。掃不到時**不可以當成「沒有注入」**——退回只掃 MR 的
+        # 標題/描述/diff(_mr_with_head_text 失敗時的預設),命中為空時另外記一條
+        # 未完整,讓決策交人工。
+        scan_target = _step(report_stub, "注入掃描(組合掃描範圍)",
+                            _mr_with_head_text, dict(mr), mr, dbt_ctx, rendered)
+        injection_hits = _step(report_stub, "注入掃描", scan_mr, [], scan_target)
 
         # 找 spec(確定性;執行驗證與 prompt 的規格段共用)。依檔名對應與展開器
         # 同一個開關:關閉時行為與接線前完全相同。
@@ -925,13 +930,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
         report = enforce_tool_refusals(report, hub.refused_calls)  # 模型要求了寫入工具
 
-        # 執行驗證(必跑;測資生成 → 沙盒執行 → 仲裁)——在 rubric 之前
-        # **整段有時間上限**:沙盒的單一查詢有 120 秒上限,但整段原本沒有,
-        # 而測資生成實測大規則要 54-151 分鐘(黑盒量到一題光在沙盒就 38 分鐘)。
+        # 執行驗證(必跑;測資生成 → 沙盒執行 → 仲裁)——在 rubric 之前。
+        # **整段有時間上限**:沙盒的單一查詢自己有上限,但整段沒有,而測資生成可以跑
+        # 到數十分鐘。
         #
-        # 失敗或逾時要看得出是哪一個階段:run_spec_exec 把現在在跑哪一段寫進
-        # progress,逾時是外層丟的、它看不到裡面,所以只能這樣問。沙盒階段另外收
-        # 一個截止時間——它是同步呼叫,wait_for 插不進去(見 spec_exec._in_thread)。
+        # 失敗或逾時要看得出是哪一個階段:run_spec_exec 把現在在跑哪一段寫進 progress,
+        # 逾時是外層丟的、它看不到裡面,所以只能這樣問。沙盒階段另外收一個截止時間——
+        # 它是同步呼叫,wait_for 插不進去(見 spec_exec._in_thread)。
         progress: dict = {}
         deadline = time.monotonic() + SPEC_EXEC_TIMEOUT_SECONDS
         try:
@@ -965,7 +970,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             report["decision"] = "needs_human"
             report.setdefault("decision_reason", "決策閘門未完成,一律交人工")
 
-        # 回寫之前先確認這次審查還是最新的那次(#53 review 第 3 點)。
+        # 回寫之前先確認這次審查還是最新的那次。
         #
         # 取消只會在下一個真正的等待點生效,而貼留言、加 label、設狀態都是同步的工具
         # 呼叫——所以舊的那次有機會一路走到這裡。它較晚結束時,MR 上的 label 與總結
@@ -1825,6 +1830,7 @@ def _parse_model_output(raw: str, meta: dict, max_output_tokens: int) -> dict | 
     return report
 
 
+@_isolated_stage("截斷揭露")
 def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict:
     """主審查的輸出被截斷 → 補一條 major(確定性,不得自動放行)。
 

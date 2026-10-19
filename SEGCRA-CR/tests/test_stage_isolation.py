@@ -352,25 +352,37 @@ def test_逾時的finding要帶階段欄位與標題():
 # (`_head_layout`)在那之外。而它不是 `report = X(report, ...)` 的形狀,所以
 # `test_每個後處理呼叫都有被包到` 掃原始碼看不到它 —— 只能明寫這兩條。
 
-def test_dbt_專案取回丟例外時不中斷審查(monkeypatch):
-    """出錯要當成「取回失敗」:後面的 enforce_dbt_unexecuted 會據此交人工,
-    而不是整份審查沒有輸出(#45 的原則)。"""
-    def boom(mr, dbt_cfg):
-        raise RuntimeError("讀 dbt_project.yml 爆掉:這段訊息不可以出現在報告裡")
+def test_同步環節丟例外時記一條並回預設值():
+    """`_step` 是給「不吃 report、回傳別的東西」的步驟用的(取回 dbt 專案、注入掃描):
+    那種形狀 `@_isolated_stage` 套不上、掃原始碼的測試也看不到,而它們丟例外一樣會讓
+    整份審查沒有輸出。"""
+    def boom(a, b):
+        raise RuntimeError("內部爆掉:這段訊息不可以出現在報告裡")
 
-    monkeypatch.setattr(pipeline, "prepare_dbt_context", boom)
     report = _report()
-    ctx = pipeline._dbt_context_or_none(report, {"files": []}, {"enabled": True})
-    assert ctx is not None, "不可以回 None —— 那代表「不適用」,會被當成沒有 dbt 要處理"
-    assert ctx.error, "要標成取回失敗"
+    sentinel = object()
+    assert pipeline._step(report, "某個同步環節", boom, sentinel, 1, 2) is sentinel
     inc = pipeline.review_incomplete(report)
-    assert len(inc) == 1 and "dbt 專案取回" in inc[0], inc
+    assert len(inc) == 1 and "某個同步環節" in inc[0], inc
     assert "爆掉" not in json.dumps(report, ensure_ascii=False), "不得回顯例外訊息"
 
 
-def test_dbt_專案取回正常時原樣回傳(monkeypatch):
-    sentinel = object()
-    monkeypatch.setattr(pipeline, "prepare_dbt_context", lambda mr, cfg: sentinel)
+def test_同步環節正常時原樣回傳():
     report = _report()
-    assert pipeline._dbt_context_or_none(report, {"files": []}, None) is sentinel
+    assert pipeline._step(report, "x", lambda a: a * 2, None, 21) == 42
     assert pipeline.review_incomplete(report) == []
+
+
+def test_dbt_專案取回失敗時當成取回失敗_不是不適用(monkeypatch):
+    """預設值刻意是**標了 error 的 DbtContext**,不是 None:None 代表「不適用」,
+    會被當成這個 MR 沒有 dbt 要處理,等於把失敗變成靜默放寬。"""
+    def boom(mr, dbt_cfg):
+        raise RuntimeError("讀 dbt_project.yml 爆掉")
+
+    monkeypatch.setattr(pipeline, "prepare_dbt_context", boom)
+    report = _report()
+    ctx = pipeline._step(report, "dbt 專案取回", pipeline.prepare_dbt_context,
+                         pipeline.DbtContext(prefix="", error="取回 dbt 專案時發生非預期錯誤"),
+                         {"files": []}, {"enabled": True})
+    assert ctx is not None and ctx.error
+    assert pipeline.review_incomplete(report)
