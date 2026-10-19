@@ -1688,6 +1688,53 @@ MUTANTS.update({
      "from .dbt_impact import analyze_macro_impact as analyze_macro_impact_isolated"),
 })
 
+# ---- macro 反查以 macro 為單位判斷哪些被改
+# 失效有兩個方向:判得太寬只是多報;判得太窄(把有改的當成沒改)會安靜地漏掉受影響的 model。
+MUTANTS.update({
+    "macro 粒度:一律整個檔案(退回舊做法)": ("dbt_impact.py",
+        "        return {name for name in new_macros.keys() | old_macros.keys()",
+        "        return whole_file or {name for name in new_macros.keys() | old_macros.keys()"),
+    "macro 粒度:內容完全相同時不退回整個檔案": ("dbt_impact.py",
+        "        if new_text == old_text:" + NL + "            return whole_file" + NL,
+        ""),
+    "macro 粒度:頂層內容有變也逐一比較": ("dbt_impact.py",
+        "        if new is None or old is None or new[0] != old[0]:",
+        "        if new is None or old is None:"),
+    "macro 粒度:同名的 macro 不退回整個檔案": ("dbt_impact.py",
+        "            if node.name in macros:" + NL + "                return None" + NL,
+        ""),
+    "macro 粒度:超過節點上限時整個反查失敗": ("dbt_impact.py",
+        "        except (TemplateSyntaxError, RecursionError, _LimitExceeded):" + NL + "            return whole_file",
+        "        except (TemplateSyntaxError, RecursionError):" + NL + "            return whole_file"),
+    "macro 粒度:找 macro 時不計節點數": ("dbt_impact.py",
+        "        node = stack.pop()" + NL + "        budget[0] -= 1",
+        "        node = stack.pop()" + NL + "        budget[0] -= 0"),
+    "macro 粒度:頂層的空行也算內容": ("dbt_impact.py",
+        "    return isinstance(node, nodes.Output) and all(",
+        "    return False and all("),
+    "macro 粒度:指紋不看欄位的值": ("dbt_impact.py",
+        '                children.append(f"value:{value!r}")',
+        '                children.append("value")'),
+    "macro 粒度:指紋不看清單裡的值": ("dbt_impact.py",
+        '                children.extend(v if isinstance(v, nodes.Node) else f"value:{v!r}" for v in value)',
+        '                children.extend(v for v in value if isinstance(v, nodes.Node))'),
+    "macro 粒度:巢狀的 macro 併進外層比較": ("dbt_impact.py",
+        "        if isinstance(item, nodes.Macro) and item is not root:",
+        "        if False:"),
+    "macro 粒度:補報不寫內容有變的 macro": ("dbt_affected.py",
+        "        if impact.changed_macros:" + NL + "            parts.append(",
+        "        if False:" + NL + "            parts.append("),
+    "macro 粒度:沒有 macro 被改時不寫明": ("dbt_affected.py",
+        "        elif not impact.all_models_possibly_affected:" + NL + "            parts.append(",
+        "        elif False:" + NL + "            parts.append("),
+    "macro 粒度:補報的名稱不用 code 格式": ("dbt_affected.py",
+        '    return f"`{_clip(name)}`"',
+        "    return _clip(name)"),
+    "macro 粒度:補報的名稱不截長度": ("dbt_affected.py",
+        '    return f"`{_clip(name)}`"',
+        '    return f"`{name}`"'),
+})
+
 # ---- get_mr_diff 帶出 diff_refs 的三個 sha(#15 接線與 #22 共用)
 MUTANTS.update({
  # #22 把 real 模式的 _diff_refs(mr) 先存成 refs(補 full_content 時要用 head_sha),
