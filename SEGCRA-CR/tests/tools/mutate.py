@@ -1712,6 +1712,37 @@ MUTANTS.update({
      '_DIFF_REF_KEYS = ("base_sha", "head_sha")'),
 })
 
+# ---- R004 的訊息不得回顯比對到的憑證原文(#42)。憑證本來就在 diff 裡,但訊息會被
+# 複製進 finding、貼回 MR 留言、寫進 review_output/ —— 作者改掉那一行之後,留言裡還留著。
+MUTANTS.update({
+ # 解析錯誤訊息帶著出錯位置附近的原文,而「預掃無法解析此檔的 SQL」那條 finding 的
+ # 內文就是它 —— 一樣會貼回 MR 留言、寫進 review_output/。要防的是「帶出原文」,
+ # 跟那段原文像不像密碼無關,所以只留位置(用樣式遮只遮得到樣式認得的寫法)。
+ "解析失敗:錯誤訊息照用 sqlglot 的原文": ("../toolbox/sqltools.py",
+     "        statements, parse_error = [], parse_error_text(e)",
+     '        statements, parse_error = [], f"parse failed: {e}"'),
+ "解析失敗:連 sqlglot 的描述一起帶出來": ("../toolbox/sqltools.py",
+     '            spots.append(f"第 {d[\'line\']} 行第 {d.get(\'col\', \'?\')} 欄")',
+     '            spots.append(f"第 {d[\'line\']} 行 {d.get(\'description\', \'\')}")'),
+ "解析失敗:其他例外照用訊息(不只留類型)": ("../toolbox/sqltools.py",
+     '    where = "、".join(dict.fromkeys(spots))[:120] if spots else type(e).__name__',
+     '    where = "、".join(dict.fromkeys(spots))[:120] if spots else str(e)'),
+ "解析失敗:連位置都不留(看不出哪裡壞了)": ("../toolbox/sqltools.py",
+     '    for d in getattr(e, "errors", None) or []:',
+     "    for d in []:"),
+ "R004:訊息回顯比對到的原文": ("../toolbox/sqltools.py",
+     'f"疑似硬編碼憑證/密碼/金鑰於 SQL:{_secret_kind(m)}——"',
+     'f"疑似硬編碼憑證/密碼/金鑰於 SQL:「{m.group(0)[:40]}」——"'),
+ "R004:回顯鍵名原文(大小寫與寫法是作者的文字)": ("../toolbox/sqltools.py",
+     '    key = re.sub(r"[_-]", "", m.group("key") or "").lower()' + NL
+     + "    return f\"{_SECRET_KINDS.get(key, '憑證')}類的鍵指定了字串常值\"",
+     '    key = m.group("key") or ""' + NL
+     + '    return f"{key} 指定了字串常值"'),
+ "R004:連線字串那一支也報成鍵": ("../toolbox/sqltools.py",
+     '    if m.group("url"):' + NL + '        return "連線字串含帳號與密碼"',
+     "    if False:" + NL + '        return "連線字串含帳號與密碼"'),
+})
+
 # ---- R005 讀取執行環境(#26 第 7 項):規則層命中後,模型一定看得到 secure-sql 的說明
 MUTANTS.update({
  "R005:命中時不強制載入 secure-sql": ("pipeline.py",
