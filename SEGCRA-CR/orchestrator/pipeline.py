@@ -391,9 +391,10 @@ def _mr_for_spec_exec(mr: dict, dbt_ctx: DbtContext | None) -> dict:
 
 
 # 注入掃描額外加進去的內容(取回的完整內容、展開後的 SQL)合計最多幾個字元。展開可以把很短的
-# 樣板放大成幾百萬字元,掃描器對特製的內容(大量沒有結尾的 /*)是平方時間;超過的不掃,
-# 補 major 交人工(enforce_scan_skipped)。真實的 model 展開後遠小於此
-MAX_EXTRA_SCAN_CHARS = 200_000
+# 樣板放大成幾百萬字元;掃描是線性時間(約每 100 萬字元 1 秒),這個上限讓掃描時間有界。
+# 至少要放得下一份展開結果的上限(dbt_render.MAX_OUTPUT_CHARS),否則最大的那份一定不掃。
+# 超過的不掃,補 major 交人工(enforce_scan_skipped)。
+MAX_EXTRA_SCAN_CHARS = 5_000_000
 
 
 def _path_and_text(item) -> tuple[str, str] | None:
