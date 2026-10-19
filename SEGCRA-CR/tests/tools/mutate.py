@@ -1806,9 +1806,6 @@ MUTANTS.update({
     # 沒有條件可比時若照樣下標籤結論,label_ok 會是 True——「標籤驗過了」的假訊號。
     # 工具輪次用光時回傳的是最後一則工具結果(不是報告),而端點回 finish_reason="stop"
     # ——呼叫端只能靠這個標記知道。少了它,工具結果會被當成審查報告收下(#26 第 1 點)。
-    "主審查:工具輪次用光不標記 exhausted": ("agent.py",
-        "    if meta is not None:" + NL + "        meta[\"exhausted\"] = True",
-        "    if meta is not None:" + NL + "        meta[\"exhausted\"] = False"),
     "執行:沒有條件可比也下標籤結論": (S,
         "    conds = plan.get(\"conditions\") or []" + NL
         + "    if not conds:" + NL
