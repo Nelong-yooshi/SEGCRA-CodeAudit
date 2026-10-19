@@ -126,3 +126,13 @@ def test_逾時不算抓到(tmp_path, monkeypatch):
     verdict, _ = mutate._run_mutant(tmp_path, ("m.py", "X = 1", "X = 2"), "python", 1, {})
     assert verdict == "timeout"
 
+
+def test_所有突變點都登記在進入點之前():
+    """mutate.py 以腳本執行時,寫在 `if __name__ == "__main__":` 之後的突變點不會被登記:
+    `--only` 會回報 0 個突變,看起來一切正常。"""
+    text = (pathlib.Path(__file__).resolve().parent / "tools" / "mutate.py").read_text(
+        encoding="utf-8")
+    guard = text.index('if __name__ == "__main__":')
+    assert "MUTANTS.update(" not in text[guard:]
+    assert "MUTANTS[" not in text[guard:]
+    assert text.count("MUTANTS.update(") > 0
