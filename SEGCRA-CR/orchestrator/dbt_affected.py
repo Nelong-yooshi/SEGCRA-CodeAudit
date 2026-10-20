@@ -12,8 +12,10 @@ macro 反查(dbt_context 準備好的 ImpactReport)只說「哪些 model 受影�
   * 變更後展開失敗、或展開後無法解析:macro 的變更可能把它弄壞了,要看得到
   * 對應到的規格(依檔名;只改 macro 的 MR,也要能對應到受影響的 model 與規格)
 
-這些 model 不放進預掃結果、也不放進模型的 prompt:它們不在 diff 裡,放進預掃會讓每個
-檢核點(H 系列)各補一條「模型未回應」,放進 prompt 會佔掉預算並多一個注入的入口。
+這些 model 的內容不放進預掃結果、也不放進模型的 prompt:它們不在 diff 裡,放進預掃會讓
+每個檢核點(H 系列)各補一條「模型未回應」,放進 prompt 會佔掉預算並多一個注入的入口。
+它們對到的**規格**會放進 prompt(specs_by_priority):規格是核定的內容,
+不是待審的程式。
 
 上限(都算「沒檢查完」,由後處理補 major,不可以當成沒有問題):
   * 每個 MR 最多檢查 MAX_CHECKED_MODELS 個受影響的 model(每個要開兩次子行程)
@@ -24,6 +26,7 @@ macro 反查(dbt_context 準備好的 ImpactReport)只說「哪些 model 受影�
 import asyncio
 import contextvars
 import dataclasses
+import re
 import threading
 import time
 from collections import Counter
@@ -67,6 +70,49 @@ class AffectedCheck:
     unchecked: tuple[str, ...] = ()        # 受影響但沒檢查到的 model(超過數量或時間上限)
     spec: tuple[str, str] | None = None    # 受影響的 model 全部對到同一份規格時:(代號, 內容)
     specs_found: dict = field(default_factory=dict)   # 代號 → 內容
+
+
+@dataclass(frozen=True)
+class SpecForModels:
+    """一份規格,以及對到它的受影響 model(專案內的相對路徑)。"""
+    code: str
+    text: str
+    models: tuple[str, ...]
+    mentioned: bool = False                # 代號或 model 名稱出現在這次的 diff 裡
+
+
+def specs_by_priority(check: AffectedCheck | None, diff_text: str) -> tuple[SpecForModels, ...]:
+    """受影響的 model 對到的規格,依「這次改到的值會影響到哪幾份」排序。
+
+    排序只決定預算不夠時先放哪幾份,不影響判斷:
+      1. 規格代號或 model 名稱出現在這次的 diff 裡(含上下文行)。共用的註冊表 macro 常以
+         規格代號當鍵(內附範例的 `'RETAIL_M1': {...}`),改到哪一段,diff 附近通常就有那個鍵
+      2. 直接呼叫被改 macro 的 model(呼叫鏈較短)排在間接呼叫的前面
+      3. 其餘照路徑
+    名稱比對要前後都不是英數字或底線,短名稱(例如 `a`)不會因為出現在別的字裡就算。
+    """
+    if check is None:
+        return ()
+    groups: dict[str, list[CheckedModel]] = {}
+    for m in check.models:
+        if m.spec and m.spec in check.specs_found:
+            groups.setdefault(m.spec, []).append(m)
+    lowered = (diff_text or "").lower()
+
+    def appears(word: str) -> bool:
+        return bool(word) and re.search(
+            rf"(?<![0-9a-z_]){re.escape(word.lower())}(?![0-9a-z_])", lowered) is not None
+
+    specs = []
+    for code, models in groups.items():
+        models = sorted(models, key=lambda m: m.path)
+        specs.append((
+            (not (appears(code) or any(appears(m.name) for m in models)),
+             min(len(m.chain) for m in models), models[0].path),
+            SpecForModels(code=code, text=check.specs_found[code],
+                          models=tuple(m.path for m in models),
+                          mentioned=appears(code) or any(appears(m.name) for m in models))))
+    return tuple(spec for _, spec in sorted(specs, key=lambda item: item[0]))
 
 
 async def check_affected_models(hub, mr: dict, dbt_cfg: dict, ctx: DbtContext | None, *,
@@ -199,32 +245,56 @@ async def _compare(hub, rel: str, dbt_cfg: dict, ctx: DbtContext, render, deadli
 
     比較的單位是「每一句的規則命中數」:兩邊切出來的語句數量相同時,依語句的順序逐句比;否則
     (macro 讓語句多了或少了一句、切不出語句)退回比較整個 model 同一條規則的命中數。兩種都只有
-    「變多」才算新增。文字層的規則與對不到語句的命中沒有位置,只比個數。"""
+    「變多」才算新增。文字層的規則與對不到語句的命中沒有位置,只比個數。
+
+    變更後的樣板有呼叫 `is_incremental()` 時,兩邊再以增量模式各展開一次、照同樣的方式比較
+    (變更後沒有呼叫的話,增量模式的結果跟一般模式相同,不會多出命中)。增量那次的 SQL 本來就包含非增量的部分,所以只補「增量那次多出來的」命中,以規則為
+    單位、不寫第幾句(那是另一份展開結果的句序)。變更後的增量展開失敗算這個 model 的錯誤;
+    變更前的失敗則跟沒有變更前的版本一樣,無法比較。"""
     head_text = ctx.project.files.get(rel)
     if head_text is None:
         return (), False, "變更後的專案裡找不到這個 model 的內容"
-    head, head_error = await _hits(hub, rel, head_text, dbt_cfg, ctx.macro_files,
-                                   ctx.project.macro_paths, ctx.info, render, deadline, clock)
+    base_text = None if ctx.base_project is None else ctx.base_project.files.get(rel)
+
+    async def both(incremental: bool):
+        head, head_error = await _hits(hub, rel, head_text, dbt_cfg, ctx.macro_files,
+                                       ctx.project.macro_paths, ctx.info, render, deadline, clock,
+                                       incremental)
+        if head_error is not None:
+            return None, None, head_error, None
+        base, base_error = None, "沒有變更前的專案"
+        if ctx.base_project is not None:
+            if base_text is None:
+                base_error = "變更前沒有這個 model"
+            else:
+                base, base_error = await _hits(hub, rel, base_text, dbt_cfg, ctx.base_macro_files,
+                                               ctx.base_project.macro_paths, ctx.base_info, render,
+                                               deadline, clock, incremental)
+        return head, base, None, base_error
+
+    head, base, head_error, base_error = await both(False)
     if head_error is not None:
         return (), False, head_error
-    base, base_error = None, "沒有變更前的專案"
-    if ctx.base_project is not None:
-        base_text = ctx.base_project.files.get(rel)
-        if base_text is None:
-            base_error = "變更前沒有這個 model"
-        else:
-            base, base_error = await _hits(hub, rel, base_text, dbt_cfg, ctx.base_macro_files,
-                                           ctx.base_project.macro_paths, ctx.base_info, render,
-                                           deadline, clock)
-    if base_error is not None:
-        new = head.counts
-    elif head.statements is not None and head.statements == base.statements:
-        new = head.counts - base.counts
-    else:
-        new = _by_rule(head.counts) - _by_rule(base.counts)
+    new = _new_hits(head, base, base_error)
+    blind = base_error is not None
+    if head.incremental_checked:
+        head_inc, base_inc, inc_error, inc_base_error = await both(True)
+        if inc_error is not None:
+            return (), False, f"增量分支(is_incremental() 為 True):{inc_error}"
+        new = new + (_by_rule(_new_hits(head_inc, base_inc, inc_base_error)) - _by_rule(new))
+        blind = blind or inc_base_error is not None
     found = sorted(new.elements(), key=lambda h: (h[0], h[1], -1 if h[2] is None else h[2]))
     return (tuple((rule, sev, None if pos is None else pos + 1) for rule, sev, pos in found),
-            base_error is not None, None)
+            blind, None)
+
+
+def _new_hits(head: "_Hits", base: "_Hits | None", base_error: str | None) -> Counter:
+    """變更後比變更前多出來的命中;沒有變更前的版本可以比時,是變更後的全部命中。"""
+    if base_error is not None:
+        return head.counts
+    if head.statements is not None and head.statements == base.statements:
+        return head.counts - base.counts
+    return _by_rule(head.counts) - _by_rule(base.counts)
 
 
 def _by_rule(counts: Counter) -> Counter:
@@ -239,10 +309,13 @@ def _by_rule(counts: Counter) -> Counter:
 class _Hits:
     counts: Counter                 # {(規則, 嚴重度, 第幾句(從 0 起算)或 None): 次數}
     statements: int | None          # 切出來幾句;切不出來時是 None(只能整個 model 合計比較)
+    incremental_checked: bool = False   # 樣板有沒有呼叫 is_incremental()
 
 
-async def _hits(hub, rel, text, dbt_cfg, macro_files, macro_dirs, info, render, deadline, clock):
-    """展開一個 model 並跑規則。回傳 (_Hits, None) 或 (None, 錯誤原因);時間用完丟 _OutOfTime。"""
+async def _hits(hub, rel, text, dbt_cfg, macro_files, macro_dirs, info, render, deadline, clock,
+                incremental: bool = False):
+    """展開一個 model 並跑規則。回傳 (_Hits, None) 或 (None, 錯誤原因);時間用完丟 _OutOfTime。
+    incremental 為 True 時以增量模式展開(is_incremental() 為 True)。"""
     if dbt_cfg.get("database") != DBT_DATABASE_PLACEHOLDER:
         return None, "dbt 的資料庫名稱設定不符,無法展開"
     seconds = deadline - clock()
@@ -250,7 +323,8 @@ async def _hits(hub, rel, text, dbt_cfg, macro_files, macro_dirs, info, render, 
         raise _OutOfTime
     rendered = render(rel, source=text, database=dbt_cfg["database"], macro_files=macro_files,
                       macro_dirs=macro_dirs, project=info,
-                      timeout_s=min(DEFAULT_ISOLATED_TIMEOUT_S, seconds))
+                      timeout_s=min(DEFAULT_ISOLATED_TIMEOUT_S, seconds),
+                      **({"incremental": True} if incremental else {}))
     if not rendered.ok:
         if clock() >= deadline:
             raise _OutOfTime                # 展開被剩下的時間截斷,不是 model 本身的問題
@@ -282,7 +356,8 @@ async def _hits(hub, rel, text, dbt_cfg, macro_files, macro_dirs, info, render, 
                 pos = where
                 taken.add((hit["rule"], where))
         counts[(hit["rule"], hit["severity"], where)] += 1
-    return _Hits(counts, None if keys is None else len(keys)), None
+    return _Hits(counts, None if keys is None else len(keys),
+                 bool(getattr(rendered, "incremental_checked", False))), None
 
 
 def _statement_keys(sql: str) -> list[str] | None:
@@ -322,6 +397,13 @@ def _hits_text(m: CheckedModel) -> str:
     return "、".join(out)
 
 
+def _code(name: str) -> str:
+    """macro 名稱以 code 格式寫出,標明它是被引用的識別字。名稱是 Jinja 的識別字,不含反引號;
+    長度由 MR 決定,跟其他說明一樣截長度(補報會貼回 MR 留言)。名稱裡寫了指示性的文字時,
+    由注入掃描判斷要不要擋。"""
+    return f"`{_clip(name)}`"
+
+
 def _listed(items: list[str]) -> str:
     more = f" 等共 {len(items)} 個" if len(items) > _MAX_LISTED else ""
     return "、".join(items[:_MAX_LISTED]) + more
@@ -357,6 +439,10 @@ def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None
     parts = []
     if impact.changed_macro_files:
         parts.append(f"改到的 macro 檔:{_listed([full(p) for p in impact.changed_macro_files])}。")
+        if impact.changed_macros:
+            parts.append(f"內容有變的 macro:{_listed([_code(n) for n in impact.changed_macros])}。")
+        elif not impact.all_models_possibly_affected:
+            parts.append("這些檔案裡沒有任何 macro 被新增、刪除或改變內容(例如只改了註解或空行)。")
     if impact.all_models_possibly_affected:
         raise_to("major")
         parts.append("影響範圍無法確定,**全部 model 都可能受影響**,沒有逐一檢查。")
@@ -414,7 +500,8 @@ def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None
     if unmapped:
         parts.append("沒有對應到規格:" + _listed(unmapped) + "。")
     if impact.unreferenced_macros:
-        parts.append(f"沒有任何 model 呼叫的 macro:{_listed(list(impact.unreferenced_macros))}。")
+        parts.append("沒有任何 model 呼叫的 macro:"
+                     f"{_listed([_code(n) for n in impact.unreferenced_macros])}。")
     if severity == "info":
         parts.append("沒有檢查出問題;清單供人工確認影響範圍。")
     return {"file": "(MR 內容)", "line": 0, "severity": severity, "title": IMPACT_TITLE,

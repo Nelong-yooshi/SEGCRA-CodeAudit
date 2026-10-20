@@ -6,7 +6,8 @@ mock 模式沒有 GitLab 可以打包下載。fixture 目錄若放了某個 comm
 
 兩件事要守住:
 1. 內附的範例真的跑得起來(不替換任何下載函式),README 寫的結果是真的
-2. **沒有放專案的地方行為不變**:預設的 fixtures/、golden set 都不會因此開始取回專案
+2. **沒有放專案的地方行為不變**:預設的 fixtures/ 不會因此開始取回專案;golden set 只有放了
+   專案的那幾個 case(eval/golden/dbt_archives/)會取回
 """
 import asyncio
 import gzip
@@ -129,14 +130,36 @@ def test_預設的fixtures沒有dbt專案_既有的MR都不取回():
         assert prepare_dbt_context(mr, CFG) is None, name
 
 
-def test_golden_set的MR都不取回():
+# golden set 裡放了 dbt 專案(eval/golden/dbt_archives/<commit>/)的 case
+GOLDEN_WITH_DBT_PROJECT = ["mr_862"]
+
+
+def test_golden_set只有放了專案的case會取回(monkeypatch):
+    """評測時 FIXTURES_DIR 指向 eval/golden(eval/run_eval.py)。那裡的 dbt_archives/ 只放了指定
+    case 用的專案;其餘 case 不可以因此開始取回專案(行為與接線前相同)。"""
     golden = PKG_ROOT / "eval" / "golden"
+    monkeypatch.setattr(gitlab, "FIXTURES_DIR", golden)
     cases = sorted(golden.glob("mr_*.json"))
     assert cases
+    fetched = []
     for case in cases:
-        mr = json.loads(case.read_text(encoding="utf-8"))
-        mr = mr.get("mr", mr)
-        assert prepare_dbt_context(mr, CFG) is None, case.name
+        mr = json.loads(gitlab.get_mr_diff(case.stem[3:]))
+        ctx = prepare_dbt_context(mr, CFG)
+        if ctx is not None:
+            assert ctx.error is None, (case.name, ctx.error)
+            fetched.append(case.stem)
+    assert fetched == GOLDEN_WITH_DBT_PROJECT
+
+
+def test_golden_set的dbt專案_每個commit目錄都有case用到():
+    """放進 dbt_archives/ 卻沒有 case 用到的目錄,只會讓指紋變動、不會被測到。"""
+    golden = PKG_ROOT / "eval" / "golden"
+    used = set()
+    for name in GOLDEN_WITH_DBT_PROJECT:
+        mr = json.loads((golden / f"{name}.json").read_text(encoding="utf-8"))
+        used |= {mr["sha"], *(mr.get("diff_refs") or {}).values()}
+    present = {p.name for p in (golden / "dbt_archives").iterdir() if p.is_dir()}
+    assert present and present <= used
 
 
 def test_預設的fixtures沒有多出MR檔():
@@ -276,3 +299,22 @@ def test_base的專案不在fixture裡_反查保守處理(example):
     mr["base_sha"] = "d3" * 20
     ctx = prepare_dbt_context(mr, CFG)
     assert ctx.error is None and ctx.impact.all_models_possibly_affected and ctx.base_project is None
+
+
+def test_golden_mr_862的標準答案_不會被程式補的finding命中():
+    """執行驗證遇到 dbt 樣板時,會在被改的 macro 檔上補一條 major(行號 0)。標準答案若不限行號,
+    模型沒抓到缺陷 recall 也會算命中。"""
+    import sys
+
+    sys.path.insert(0, str(PKG_ROOT / "eval"))      # 與 tests/test_eval_scoring.py 相同的載入方式
+    from run_eval import match_expected
+
+    case = json.loads((PKG_ROOT / "eval" / "golden" / "mr_862.json").read_text(encoding="utf-8"))
+    [expected] = case["expected"]
+    program = {"file": "macros/alert_threshold.sql", "line": 0, "severity": "major",
+               "title": "執行驗證無法進行:dbt 樣板尚未支援執行驗證"}
+    model = {"file": "macros/alert_threshold.sql", "line": 3, "severity": "major",
+             "title": "門檻 60000 與規格 SHARED_A_EVAL 的 50,000 不符"}
+    assert not match_expected(expected, [program])
+    assert match_expected(expected, [model])
+

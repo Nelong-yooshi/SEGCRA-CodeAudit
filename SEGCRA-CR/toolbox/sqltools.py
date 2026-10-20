@@ -11,6 +11,9 @@ import re
 import sqlglot
 from sqlglot import exp
 
+from orchestrator.config import env_seconds
+from orchestrator.isolation import run_isolated
+
 logging.disable(logging.INFO)  # sqlfluff 的 INFO 輸出會灌爆 stderr
 
 # 規則程式跑在 MS SQL 上。用別的方言解析,T-SQL 的方括號識別字、TOP、WITH (NOLOCK)
@@ -28,6 +31,7 @@ def parse_ast(sql: str) -> str:
     try:
         statements = _parse(sql)
     except Exception as e:
+        # 這條只回給模型,而模型本來就看得到整份 SQL,所以不必像預掃那樣只留位置
         return json.dumps({"error": f"parse failed: {e}"}, ensure_ascii=False)
     for st in statements:
         if st is None:
@@ -44,14 +48,42 @@ def parse_ast(sql: str) -> str:
     return json.dumps(out, ensure_ascii=False)
 
 
+# lint 的耗時隨內容超線性成長,特製的內容(例如反覆的 `/*,`)幾千字元就可能要數十秒。
+# 預掃與模型的工具呼叫都在審查的同一條執行緒上同步呼叫,卡住就是整份審查卡住,外層的
+# asyncio 時間上限也插不進來。所以放進子行程跑,超過時間強制終止(見 orchestrator.isolation)。
+# 超過字數上限的不跑:幾乎一定逾時,先擋下省掉等待。
+LINT_TIMEOUT_SECONDS = env_seconds("LINT_TIMEOUT_SECONDS", 60)
+LINT_MAX_CHARS = 100_000
+LINT_MAX_MEMORY_MB = 1024
+# 沒跑完時回傳的那一筆。不回空清單:空清單代表「檢查過、沒有違規」。
+LINT_INCOMPLETE_CODE = "LINT_INCOMPLETE"
+_LINT_INCOMPLETE = json.dumps(
+    [{"line": 0, "code": LINT_INCOMPLETE_CODE,
+      "description": "lint 沒有跑完(超過時間上限、內容過長或執行失敗),這份內容沒有 lint 結果"}],
+    ensure_ascii=False)
+
+
 def lint(sql: str) -> str:
-    """以 sqlfluff 檢查風格與已知反模式,回傳違規清單。"""
+    """以 sqlfluff 檢查風格與已知反模式,回傳違規清單。
+
+    在子行程執行,有時間上限;沒跑完(逾時、內容過長、子行程失敗、sqlfluff 丟例外)時
+    回傳只有一筆 LINT_INCOMPLETE_CODE 的清單。"""
+    if isinstance(sql, str) and len(sql) > LINT_MAX_CHARS:
+        return _LINT_INCOMPLETE
+    return run_isolated(_lint_in_child, (sql,), timeout_s=LINT_TIMEOUT_SECONDS,
+                        max_memory_mb=LINT_MAX_MEMORY_MB,
+                        on_failure=lambda _message: _LINT_INCOMPLETE)
+
+
+def _lint_in_child(sql: str) -> str:
     import sqlfluff
 
     try:
         results = sqlfluff.lint(sql, dialect=DIALECT)
-    except Exception as e:
-        return json.dumps({"error": f"lint failed: {e}"}, ensure_ascii=False)
+    except Exception:
+        # sqlfluff 對內容本身的問題會回報成違規、不丟例外;會丟的是執行環境(例如方言設錯)。
+        # 當成沒跑完:不然每個檔都靜靜地沒有 lint 結果。例外訊息可能帶原文,不回傳。
+        return _LINT_INCOMPLETE
     slim = [
         {"line": r.get("start_line_no") or r.get("line_no"),
          "code": r.get("code"),
@@ -132,13 +164,56 @@ RULES = [
 
 # --- 文字層資安規則(regex on 原始 SQL,比 AST 更能抓 hardcode 字串) ---
 # R004:hardcode 憑證/密碼/金鑰(資安紅線,一律 blocker)
+#
+# 命中的那段文字**不可以進訊息**。訊息會走到三個地方:送進模型的預掃結果、
+# enforce_rules 補的 finding(標題取訊息前 60 字)、以及貼回 MR 的行內留言與
+# review_output/ 的結果檔。憑證本來就在 diff 裡,所以不是新的外洩;問題是作者把那一行
+# 改掉之後,**留言與結果檔裡還留著一份**,而留言不會跟著 diff 消失。
+# 其他程式補報的 finding 一律不回顯作者寫的文字(注入掃描、寫入工具、截斷、同檔多處),
+# 這裡要一致。
 _SECRET_RE = re.compile(
     r"""(?ix)
-    (password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token
+    (?P<key>password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token
        |token|credential|conn(ection)?[_-]?string)
     \s*[:=]\s*['"][^'"]{3,}['"]
-    | ://[^:/\s'"]+:[^@/\s'"]+@          # user:pass@host 連線字串
+    | (?P<url>://[^:/\s'"]+:[^@/\s'"]+@)          # user:pass@host 連線字串
     """)
+# 命中的鍵名 → **我們自己的**分類標籤。連鍵名都不原樣回顯:大小寫與 `api-key`/`api_key`
+# 這些寫法也是作者的文字,而分類標籤是固定字串,說明的資訊量一樣夠。
+_SECRET_KINDS = {
+    "password": "密碼", "passwd": "密碼", "pwd": "密碼",
+    "secret": "密鑰", "apikey": "API 金鑰", "accesskey": "存取金鑰",
+    "authtoken": "存取權杖", "token": "權杖", "credential": "憑證",
+    "connectionstring": "連線字串", "connstring": "連線字串",
+}
+
+
+def parse_error_text(e: Exception) -> str:
+    """解析失敗的說明:**只留位置,不帶任何原文**。
+
+    為什麼不是「把疑似憑證的部分遮掉」:要防的是「解析錯誤把原文帶出去」,跟那段原文
+    像不像密碼無關。用樣式遮只遮得到樣式認得的寫法(`N'…'` 的 Unicode 字串、位置參數
+    `EXEC sp_addlogin 'app', '…'`、沒加引號的值都漏),而這條訊息會變成「預掃無法解析
+    此檔的 SQL」那條 finding 的內文,貼回 MR 留言、寫進 review_output/。
+
+    `ParseError.errors` 的 `line` / `col` 可以直接用;`description`、`start_context`、
+    `highlight`、`end_context` 一概不用——它們夾著 token 的原文。其他例外(斷詞失敗等)
+    的訊息同樣帶原文,所以只留例外類型。
+    """
+    spots = []
+    for d in getattr(e, "errors", None) or []:
+        if isinstance(d, dict) and d.get("line") is not None:
+            spots.append(f"第 {d['line']} 行第 {d.get('col', '?')} 欄")
+    where = "、".join(dict.fromkeys(spots))[:120] if spots else type(e).__name__
+    return f"parse failed: 語法無法解析({where})"
+
+
+def _secret_kind(m: "re.Match") -> str:
+    """命中的是哪一類憑證(固定字串,不含任何比對到的原文)。"""
+    if m.group("url"):
+        return "連線字串含帳號與密碼"
+    key = re.sub(r"[_-]", "", m.group("key") or "").lower()
+    return f"{_SECRET_KINDS.get(key, '憑證')}類的鍵指定了字串常值"
 # H004:看起來異常的查詢(撈憑證欄位、明碼比對密碼)——交 LLM 判斷是否正當
 _CRED_COL_RE = re.compile(r"(?i)\bSELECT\b[^;]*\b(password|passwd|pwd|secret|"
                           r"api[_-]?key|token|private[_-]?key|cvv|card[_-]?no)\b")
@@ -202,7 +277,7 @@ def _text_rules(sql: str):
     m = _SECRET_RE.search(sql)
     if m:
         hits.append(("R004", "blocker",
-                     f"疑似硬編碼憑證/密碼/金鑰於 SQL:「{m.group(0)[:40]}」——"
+                     f"疑似硬編碼憑證/密碼/金鑰於 SQL:{_secret_kind(m)}——"
                      f"一律禁止,應改用參數/密鑰管理服務"))
     if _PW_COMPARE_RE.search(sql):
         hits.append(("H004", "hint",
@@ -232,8 +307,9 @@ def run_rules(sql: str) -> str:
     except Exception as e:
         # 解析失敗時 AST 規則無法執行,但文字層規則(R004 明碼憑證等)不需要 AST,
         # 照樣要跑 —— 否則一段解析不了的 SQL 會連明碼密碼都一起放過。
-        msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e))      # 去掉 sqlglot 錯誤訊息裡的終端機色碼
-        statements, parse_error = [], f"parse failed: {' '.join(msg.split())[:200]}"
+        # 這條訊息會變成 finding 的內文、貼回 MR 留言,所以**只留位置**
+        # (見 parse_error_text:sqlglot 的訊息夾著出錯位置附近的原文)
+        statements, parse_error = [], parse_error_text(e)
     for st in statements:
         if st is None:
             continue

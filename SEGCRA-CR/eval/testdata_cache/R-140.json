@@ -1,427 +1,646 @@
 {
   "spec_code": "R-140",
   "spec_sha256": "af1bcc2871ac",
-  "prompt_sha256": "58e729c7b99f",
-  "generated_at": "2026-10-02T17:26:27+0800",
-  "profile": "review",
+  "prompt_sha256": "e68c6c1759d7",
+  "generated_at": "2026-10-15T20:15:07+0800",
+  "profile": "testgen",
   "model": "gemma4:31b",
   "coverage_gaps": [],
-  "case_count": 19,
+  "case_count": 8,
+  "row_count": 48,
+  "cost": {
+    "llm_calls": null,
+    "generation_seconds": 1560.0,
+    "sandbox_seconds": 0.5,
+    "resumed_from": false,
+    "note": "2026-10-15 手動跑,當時尚無自動記錄;生成耗時取 gpu 使用權的取得與交回時間(19:49→20:15),呼叫次數未知(未開落檔)"
+  },
   "plan": {
     "schema_ddl": [
       "CREATE TABLE txn_log(account_id INT, tx_time DATETIME2, op_code NVARCHAR(10), amount DECIMAL(14,2), cash_flag NVARCHAR(10), rev_flag NVARCHAR(10), channel_name NVARCHAR(50));"
     ],
     "conditions": [
       {
-        "id": "C1",
-        "desc": "op_code IN ('OP01','OP02','OP03')"
+        "id": "C*-1",
+        "branch": "*",
+        "data_level": true,
+        "desc": "交易日期在 2026-06-01 當天 (半開區間)",
+        "check_sql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log WHERE tx_time >= '2026-06-01' AND tx_time < '2026-06-02') THEN 1 ELSE 0 END"
       },
       {
-        "id": "C2",
-        "desc": "cash_flag = 'Y'"
+        "id": "C1-1",
+        "branch": "C1",
+        "data_level": true,
+        "desc": "op_code 屬於 ('OP01','OP02','OP03')",
+        "check_sql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log WHERE op_code IN ('OP01','OP02','OP03')) THEN 1 ELSE 0 END"
       },
       {
-        "id": "C3",
-        "desc": "COALESCE(rev_flag,'N') <> 'Y'"
+        "id": "C1-2",
+        "branch": "C1",
+        "data_level": true,
+        "desc": "cash_flag = 'Y'",
+        "check_sql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log WHERE cash_flag = 'Y') THEN 1 ELSE 0 END"
       },
       {
-        "id": "C4",
-        "desc": "amount > 1000"
+        "id": "C1-3",
+        "branch": "C1",
+        "data_level": true,
+        "desc": "排除沖銷: COALESCE(rev_flag,'N') <> 'Y'",
+        "check_sql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log WHERE COALESCE(rev_flag,'N') <> 'Y') THEN 1 ELSE 0 END"
       },
       {
-        "id": "C5",
-        "desc": "COALESCE(channel_name,'') <> 'PROMO'"
+        "id": "C1-4",
+        "branch": "C1",
+        "data_level": true,
+        "desc": "排除小額: amount > 1000",
+        "check_sql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log WHERE amount > 1000) THEN 1 ELSE 0 END"
       },
       {
-        "id": "C6",
-        "desc": "tx_time >= '2026-06-01' AND tx_time < '2026-06-02'"
+        "id": "C1-5",
+        "branch": "C1",
+        "data_level": true,
+        "desc": "排除行銷撥入: COALESCE(channel_name,'') <> 'PROMO'",
+        "check_sql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log WHERE COALESCE(channel_name,'') <> 'PROMO') THEN 1 ELSE 0 END"
       },
       {
-        "id": "C7",
-        "desc": "SUM(amount) >= 500000"
+        "id": "C1-6",
+        "branch": "C1",
+        "data_level": true,
+        "desc": "單日現金入帳累計金額 >= 500,000",
+        "check_sql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log GROUP BY account_id HAVING SUM(CASE WHEN op_code IN ('OP01','OP02','OP03') AND cash_flag = 'Y' AND COALESCE(rev_flag,'N') <> 'Y' AND amount > 1000 AND COALESCE(channel_name,'') <> 'PROMO' THEN amount ELSE 0 END) >= 500000) THEN 1 ELSE 0 END"
       }
     ],
     "cases": [
       {
-        "case_id": "C1-T",
-        "condition_id": "C1",
-        "direction": "true",
+        "case_id": "C1-base",
+        "kind": "base",
+        "branch": "C1",
         "rows": [
           [
             "txn_log",
-            1,
+            101,
             "2026-06-01 10:00:00",
             "OP01",
-            500000.0,
-            "Y",
-            "N",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": true,
-        "note": "入帳 op_code 應命中"
-      },
-      {
-        "case_id": "C1-F",
-        "condition_id": "C1",
-        "direction": "false",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP21",
-            500000.0,
-            "Y",
-            "N",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": false,
-        "note": "出帳 op_code 不應命中"
-      },
-      {
-        "case_id": "C2-T",
-        "condition_id": "C2",
-        "direction": "true",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP01",
-            500000.0,
-            "Y",
-            "N",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": true,
-        "note": "現金入帳應命中"
-      },
-      {
-        "case_id": "C2-F",
-        "condition_id": "C2",
-        "direction": "false",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP01",
-            500000.0,
-            "N",
-            "N",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": false,
-        "note": "非現金入帳不應命中"
-      },
-      {
-        "case_id": "C3-T",
-        "condition_id": "C3",
-        "direction": "true",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP01",
-            500000.0,
-            "Y",
-            "N",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": true,
-        "note": "非沖銷交易應命中"
-      },
-      {
-        "case_id": "C3-TN",
-        "condition_id": "C3",
-        "direction": "true",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP01",
-            500000.0,
+            200000.0,
             "Y",
             null,
-            "ATM"
-          ]
-        ],
-        "expect_flagged": true,
-        "note": "rev_flag 為 NULL 視為非沖銷應命中"
-      },
-      {
-        "case_id": "C3-F",
-        "condition_id": "C3",
-        "direction": "false",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP01",
-            500000.0,
-            "Y",
-            "Y",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": false,
-        "note": "沖銷交易應排除"
-      },
-      {
-        "case_id": "C4-T",
-        "condition_id": "C4",
-        "direction": "true",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP01",
-            500000.0,
-            "Y",
-            "N",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": true,
-        "note": "金額 > 1000 應列計"
-      },
-      {
-        "case_id": "C4-F",
-        "condition_id": "C4",
-        "direction": "false",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP01",
-            500000.0,
-            "Y",
-            "N",
-            "ATM"
-          ],
-          [
-            "txn_log",
-            1,
-            "2026-06-01 11:00:00",
-            "OP01",
-            1000.0,
-            "Y",
-            "N",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": true,
-        "note": "恰 1000 元不列計，總額仍為 500k"
-      },
-      {
-        "case_id": "C4-B",
-        "condition_id": "C4",
-        "direction": "false",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP01",
-            499500.0,
-            "Y",
-            "N",
-            "ATM"
-          ],
-          [
-            "txn_log",
-            1,
-            "2026-06-01 11:00:00",
-            "OP01",
-            1000.0,
-            "Y",
-            "N",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": false,
-        "note": "邊界測試：恰 1000 不列計，導致總額 499500 < 500k"
-      },
-      {
-        "case_id": "C5-T",
-        "condition_id": "C5",
-        "direction": "true",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP01",
-            500000.0,
-            "Y",
-            "N",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": true,
-        "note": "一般通路應命中"
-      },
-      {
-        "case_id": "C5-TN",
-        "condition_id": "C5",
-        "direction": "true",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP01",
-            500000.0,
-            "Y",
-            "N",
             null
-          ]
-        ],
-        "expect_flagged": true,
-        "note": "channel_name 為 NULL 視為非行銷撥入應命中"
-      },
-      {
-        "case_id": "C5-F",
-        "condition_id": "C5",
-        "direction": "false",
-        "rows": [
+          ],
           [
             "txn_log",
-            1,
-            "2026-06-01 10:00:00",
+            101,
+            "2026-06-01 11:00:00",
+            "OP02",
+            200000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 12:00:00",
+            "OP03",
+            100000.0,
+            "Y",
+            null,
+            null
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 13:00:00",
             "OP01",
-            500000.0,
+            1000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 14:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "Y",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 15:00:00",
+            "OP01",
+            50000.0,
             "Y",
             "N",
             "PROMO"
           ]
         ],
-        "expect_flagged": false,
-        "note": "行銷活動撥入應排除"
-      },
-      {
-        "case_id": "C6-T",
-        "condition_id": "C6",
-        "direction": "true",
-        "rows": [
-          [
-            "txn_log",
-            1,
-            "2026-06-01 12:00:00",
-            "OP01",
-            500000.0,
-            "Y",
-            "N",
-            "ATM"
-          ]
-        ],
+        "checks": {
+          "total_amount": "500000.00 (>= 500000)"
+        },
+        "note": "基準案例：包含所有入帳代碼且總額剛好達標，並放入三筆剛好被排除的雜訊資料(恰1000,沖銷Y,PROMO)",
         "expect_flagged": true,
-        "note": "交易日在窗內應命中"
+        "condition_id": "__base__C1",
+        "direction": "true"
       },
       {
-        "case_id": "C6-F1",
-        "condition_id": "C6",
-        "direction": "false",
+        "case_id": "C*-1-v",
+        "kind": "variant",
+        "condition_id": "C*-1",
         "rows": [
           [
             "txn_log",
-            1,
-            "2026-05-31 23:59:59",
-            "OP01",
-            500000.0,
-            "Y",
-            "N",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": false,
-        "note": "交易日在窗前不應命中"
-      },
-      {
-        "case_id": "C6-F2",
-        "condition_id": "C6",
-        "direction": "false",
-        "rows": [
-          [
-            "txn_log",
-            1,
+            101,
             "2026-06-02 00:00:00",
             "OP01",
-            500000.0,
+            200000.0,
+            "Y",
+            null,
+            null
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-02 00:00:00",
+            "OP02",
+            200000.0,
             "Y",
             "N",
             "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-02 00:00:00",
+            "OP03",
+            100000.0,
+            "Y",
+            null,
+            null
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-02 00:00:00",
+            "OP01",
+            1000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-02 00:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "Y",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-02 00:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "N",
+            "PROMO"
           ]
         ],
+        "broke": "所有交易日期由 2026-06-01 改為 2026-06-02 (落在半開區間外)",
+        "note": "只讓 C*-1 不成立",
         "expect_flagged": false,
-        "note": "交易日在窗後(半開區間)不應命中"
+        "direction": "false"
       },
       {
-        "case_id": "C7-T",
-        "condition_id": "C7",
-        "direction": "true",
+        "case_id": "C1-1-v",
+        "kind": "variant",
+        "condition_id": "C1-1",
         "rows": [
           [
             "txn_log",
-            1,
+            101,
             "2026-06-01 10:00:00",
-            "OP01",
-            500000.0,
+            "OP99",
+            200000.0,
             "Y",
-            "N",
-            "ATM"
-          ]
-        ],
-        "expect_flagged": true,
-        "note": "累計金額恰 500,000 應命中"
-      },
-      {
-        "case_id": "C7-F",
-        "condition_id": "C7",
-        "direction": "false",
-        "rows": [
+            null,
+            null
+          ],
           [
             "txn_log",
-            1,
-            "2026-06-01 10:00:00",
-            "OP01",
-            499999.99,
+            101,
+            "2026-06-01 11:00:00",
+            "OP02",
+            200000.0,
             "Y",
             "N",
             "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 12:00:00",
+            "OP03",
+            100000.0,
+            "Y",
+            null,
+            null
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 13:00:00",
+            "OP01",
+            1000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 14:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "Y",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 15:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "N",
+            "PROMO"
           ]
         ],
+        "broke": "第一列 op_code 由 OP01 改為 OP99",
+        "note": "該筆不被計入，總額降至 300,000 < 500,000",
         "expect_flagged": false,
-        "note": "累計金額小於 500,000 不應命中"
+        "direction": "false"
       },
       {
-        "case_id": "C7-T2",
-        "condition_id": "C7",
-        "direction": "true",
+        "case_id": "C1-2-v",
+        "kind": "variant",
+        "condition_id": "C1-2",
         "rows": [
           [
             "txn_log",
-            1,
+            101,
             "2026-06-01 10:00:00",
             "OP01",
-            500000.01,
+            200000.0,
+            "N",
+            null,
+            null
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 11:00:00",
+            "OP02",
+            200000.0,
             "Y",
             "N",
             "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 12:00:00",
+            "OP03",
+            100000.0,
+            "Y",
+            null,
+            null
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 13:00:00",
+            "OP01",
+            1000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 14:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "Y",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 15:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "N",
+            "PROMO"
           ]
         ],
-        "expect_flagged": true,
-        "note": "累計金額大於 500,000 應命中"
+        "broke": "第一列 cash_flag 由 Y 改為 N",
+        "note": "該筆不被計入，總額降至 300,000 < 500,000",
+        "expect_flagged": false,
+        "direction": "false"
+      },
+      {
+        "case_id": "C1-3-v",
+        "kind": "variant",
+        "condition_id": "C1-3",
+        "rows": [
+          [
+            "txn_log",
+            101,
+            "2026-06-01 10:00:00",
+            "OP01",
+            200000.0,
+            "Y",
+            "Y",
+            null
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 11:00:00",
+            "OP02",
+            200000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 12:00:00",
+            "OP03",
+            100000.0,
+            "Y",
+            null,
+            null
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 13:00:00",
+            "OP01",
+            1000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 14:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "Y",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 15:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "N",
+            "PROMO"
+          ]
+        ],
+        "broke": "第一列 rev_flag 由 null 改為 Y",
+        "note": "該筆被視為沖銷不計入，總額降至 300,000 < 500,000",
+        "expect_flagged": false,
+        "direction": "false"
+      },
+      {
+        "case_id": "C1-4-v",
+        "kind": "variant",
+        "condition_id": "C1-4",
+        "rows": [
+          [
+            "txn_log",
+            101,
+            "2026-06-01 10:00:00",
+            "OP01",
+            200000.0,
+            "Y",
+            null,
+            null
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 11:00:00",
+            "OP02",
+            200000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 12:00:00",
+            "OP03",
+            1000.0,
+            "Y",
+            null,
+            null
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 13:00:00",
+            "OP01",
+            1000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 14:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "Y",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 15:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "N",
+            "PROMO"
+          ]
+        ],
+        "broke": "第三列 amount 由 100,000 改為 1,000 (恰好在排除門檻上)",
+        "note": "該筆因 <= 1000 不被計入，總額降至 400,000 < 500,000",
+        "expect_flagged": false,
+        "direction": "false"
+      },
+      {
+        "case_id": "C1-5-v",
+        "kind": "variant",
+        "condition_id": "C1-5",
+        "rows": [
+          [
+            "txn_log",
+            101,
+            "2026-06-01 10:00:00",
+            "OP01",
+            200000.0,
+            "Y",
+            null,
+            "PROMO"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 11:00:00",
+            "OP02",
+            200000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 12:00:00",
+            "OP03",
+            100000.0,
+            "Y",
+            null,
+            null
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 13:00:00",
+            "OP01",
+            1000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 14:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "Y",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 15:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "N",
+            "PROMO"
+          ]
+        ],
+        "broke": "第一列 channel_name 由 null 改為 PROMO",
+        "note": "該筆被視為行銷撥入不計入，總額降至 300,000 < 500,000",
+        "expect_flagged": false,
+        "direction": "false"
+      },
+      {
+        "case_id": "C1-6-lo",
+        "kind": "variant",
+        "condition_id": "C1-6",
+        "rows": [
+          [
+            "txn_log",
+            101,
+            "2026-06-01 10:00:00",
+            "OP01",
+            200000.0,
+            "Y",
+            null,
+            null
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 11:00:00",
+            "OP02",
+            200000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 12:00:00",
+            "OP03",
+            99999.99,
+            "Y",
+            null,
+            null
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 13:00:00",
+            "OP01",
+            1000.0,
+            "Y",
+            "N",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 14:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "Y",
+            "ATM"
+          ],
+          [
+            "txn_log",
+            101,
+            "2026-06-01 15:00:00",
+            "OP01",
+            50000.0,
+            "Y",
+            "N",
+            "PROMO"
+          ]
+        ],
+        "broke": "第三列 amount 由 100,000 改為 99,999.99",
+        "note": "總額變為 499,999.99，剛好低於門檻 500,000 一格",
+        "expect_flagged": false,
+        "direction": "false"
       }
     ]
   }

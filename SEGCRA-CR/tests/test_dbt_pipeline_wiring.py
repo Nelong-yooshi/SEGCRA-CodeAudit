@@ -84,7 +84,7 @@ def test_pipeline_passes_dbt_flag_to_find_spec():
     import inspect
     import orchestrator.pipeline as pipeline_mod
     src = inspect.getsource(pipeline_mod.review_mr)
-    assert 'find_spec(hub, mr, by_path=cfg.dbt.get("enabled") is True)' in src
+    assert 'find_spec_mr(hub, mr, by_path=cfg.dbt.get("enabled") is True)' in src
 
 
 # --------------------------------------------------- 開啟後:先查本機 specs/

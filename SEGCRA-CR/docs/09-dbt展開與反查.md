@@ -44,10 +44,15 @@
    - `ref()` / `source()` 展開成 `"<資料庫>"."<綱要>"."<表>"`(資料庫名由呼叫端傳入,不猜);
      沒有專案資訊時綱要固定為 `dbo`,有專案資訊時見下方「`ref()` / `source()` 的精確度」
    - `config()` 回傳空字串、`var()` 取呼叫端給的值、`execute` 為 True、
-     `is_incremental()` 為 False(比照 compile 期)
-   - `this`、`env_var` **刻意不定義**:給錯值會靜靜產出錯的 SQL,或把審查機的環境變數
-     寫進 SQL;未定義則由 `StrictUndefined` 大聲失敗。`target.database` 在未提供
-     database 時同理
+     `is_incremental()` 預設為 False(比照 compile 期)。以 `incremental=True` 展開時回 True;
+     `RenderResult.incremental_checked` 說明樣板(含它呼叫的 macro)有沒有呼叫 `is_incremental()`
+   - `this`:跟 dbt 一樣兩種模式都提供(這個 model 自己的表,規則與 `ref()` 相同),所以
+     `{% if this is defined %}` 裡的 SQL 一般模式就展開得出來,非增量的 model 直接寫 `{{ this }}`
+     (例如自我 join)也不會展開失敗。沒有 database、或 model 名稱不能當表名(例如有連字號、點、數字開頭,dbt 都接受)時給不出值:仍然算有定義(`this is defined` 為 True,跟 dbt 一樣,否則寫在裡面的語句會被藏起來),但任何使用都失敗,錯誤訊息不帶檔名;沒用到的 model 照常展開。
+     用到時帶表名提醒:增量模式一律算;一般模式看 model 本身有沒有寫到 `this`(只看語法樹,寫在
+     沒進去的分支裡也算),或呼叫了定義裡寫到 `this` 的 macro(macro 檔最外層的程式碼不算)
+   - `env_var` **刻意不定義**:會把審查機的環境變數寫進 SQL;未定義則由 `StrictUndefined` 大聲失敗。
+     `target.database` 在未提供 database 時同理
    - **所有 macro 檔共用同一個命名空間**:dbt 解析 macro 與檔案順序無關,逐檔各自展開
      會讓「呼叫排在後面檔案的 macro」找不到名稱(跨檔互相呼叫在真實專案很常見)
    - **`adapter.dispatch('x')`**:比照 dbt,先找 `<轉接器>__x`,再退回 `default__x`;
@@ -377,7 +382,8 @@ review_mr
  ├─ prescan                專案裡的樣板:用 head 的完整內容 + 專案的 macro + 專案資訊展開
  │                         專案的 macro 檔:不當成 model 展開,規則跑在改到的內容上
  ├─ 注入掃描               另外掃取回的完整內容與展開後的 SQL
- ├─ find_spec              MR 自己對不到規格、而受影響的 model 都對到同一份 → 用那一份
+ ├─ find_spec              MR 自己對不到規格、而受影響的 model 都對到同一份 → 用那一份;
+ │                         對到多份或只有部分對到 → 找到的都附上、標明對應哪個 model
  ├─ check_affected_models  受影響、但不在變更清單裡的 model:變更前後各展開一次,比較規則命中
  ├─ …模型審查…
  ├─ enforce_dbt_impact     影響範圍與檢查結果 → 一條 finding
@@ -395,6 +401,11 @@ review_mr
 **取不回來就是取不回來。** token 未設、權限不足、GitLab 連不上、專案設定看不懂、屬性檔解析逾時:
 專案裡被改到的 `.sql`(與其他確定是樣板的檔案)一律記成展開失敗 → major;macro 反查當成
 「全部 model 可能受影響」→ major。不退回「沒有 macro」繼續展開。
+
+**增量 model**:樣板(含它呼叫的 macro)有呼叫 `is_incremental()` 時,預掃再以增量模式(`is_incremental()` 為 True)
+展開一次,兩次的規則命中合併:同一條規則在同一句只算一次,只在增量那次出現的命中標
+`branch: "incremental"`,補報的說明會寫明它在增量分支裡。增量那次展開失敗照展開失敗處理(major);解析不了記成
+「無法解析」(major)。兩份展開結果都進注入掃描。
 
 **展開用的內容。** 真實 GitLab 模式的 diff 只有新增的行。專案裡的檔案只要 head 的完整內容是樣板,
 就用完整內容展開(改到的那幾行沒有樣板標記,不代表整個檔案沒有)。不是樣板的 SQL 檔維持原本的
@@ -415,6 +426,9 @@ alias 寫在 seed 目錄的屬性檔裡,都沒有讀,所以一律標成無法確
   的命中不能因為文字變了就當成新的。兩邊切出來的語句數量不同時,退回比較整個 model 同一條規則的
   命中數;文字層的規則與對不到語句的命中只比個數。原本就有的命中不重報(否則每個改到 macro 的 MR 都會被既有的寫法擋下)。
   命中寫出在展開後的第幾句
+- **增量分支**:變更後的樣板有呼叫 `is_incremental()` 時,兩邊再以增量模式各展開一次、照同樣的
+  方式比較。增量那次的 SQL 本來就包含非增量的部分,只補「增量那次多出來的」命中(以規則為單位、不寫第幾句)。
+  變更後的增量展開失敗算這個 model 的錯誤(major);變更前的失敗算無法比較
 - 整理成一條 finding(`enforce_dbt_impact`),嚴重度:
 
   | 嚴重度 | 條件 |
@@ -433,6 +447,17 @@ alias 寫在 seed 目錄的屬性檔裡,都沒有讀,所以一律標成無法確
   MR 在忙碌時可能多出「沒有檢查」的項目;方向是保守的(major)
 - 規格:每個受影響的 model 依檔名對應規格並列在 finding 裡。MR 自己對不到規格(只改了 macro)、
   而受影響的 model **全部檢查過、全部對到同一份**時,用那一份給模型審查
+- 對到多份規格、或只有部分對到時(`dbt_affected.specs_by_priority`、
+  `pipeline._affected_spec_section`):找到的規格**都附上**,每份標明對應哪些 model,並寫明
+  「逐一核對變更讓哪個 model 與它自己的規格不符,不要拿 A 的規格要求 B」;沒對到、沒查、沒檢查到的
+  model 也列出來。共用的註冊表 macro 常被好幾個 model 用到,這是最常見的情況
+  - 預算(`budget.spec`)不夠時的順序:規格代號或 model 名稱出現在這次的 diff 裡(含上下文;註冊表
+    常以規格代號當鍵)→ 直接呼叫被改 macro 的 → 照路徑。放不下的不截斷,列為「超出預算、沒有附上」;
+    第一份就放不下時截斷著放,至少給一份。排序只決定先放哪份,不影響判斷
+  - 引用白名單(`validate_citations`)接受附上的每一個代號;指名了沒附上的代號照舊剔除
+  - 執行驗證:沒有一份能代表整個 MR。交給它的檔案**全部是 dbt 樣板**時傳第一優先的那份——樣板
+    不會被執行,它會照實回報「dbt 樣板尚未支援執行驗證」,而不是說成「無規格可驗」;其他情況照舊
+    不傳,避免拿某個 model 的規格去驗不相干的 SQL
 
 **dbt 的變更不會被當成「執行驗證通過」。** dbt 樣板不送沙盒,所以這種 MR 的執行驗證應該是
 「尚未支援」。但 `run_spec_exec` 是看檔案內容有沒有樣板標記來決定的,真實 GitLab 模式下只改了
@@ -454,7 +479,7 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 |---|---|
 | `relation_notice` 改成確定性揭露 | 完成(#14):`enforce_dbt_notice` |
 | macro 目錄的取檔方式決定並實作 | 完成:依 commit 打包下載(#20),接進管線(本節) |
-| 進入點有 `if __name__ == "__main__":` 保護 | `demo.py` 與 `scripts/webhook_server.py` 都有,由 `tests/test_entrypoint_guard.py` 鎖住。展開、macro 反查、專案資訊都開子行程(spawn);進入點少了保護時,子行程會把整支程式從頭重跑一次。實際踩到時的結果是專案資訊整理失敗 → 當成取不回專案 → 交人工 |
+| 進入點有 `if __name__ == "__main__":` 保護 | `demo.py`、`scripts/webhook_server.py`、`tools/prescan.py`、`eval/run_eval.py` 都有;`tests/test_entrypoint_guard.py` 另外自動找出 `scripts/`、`tools/`、`eval/` 底下用到管線的腳本,檢查最外層不直接執行。展開、macro 反查、專案資訊與 lint 都開子行程(spawn);進入點少了保護時,子行程會把整支程式從頭重跑一次。實際踩到時的結果是專案資訊整理失敗 → 當成取不回專案 → 交人工 |
 | 資料庫假名確定並寫進文件,設錯要擋下 | 完成(#16):固定為 `DBT_PLACEHOLDER`,載入設定與展開前各檢查一次 |
 
 開啟與回復的步驟、以及不接 GitLab 就能跑的範例,見 README「開啟 dbt 接線」與 `examples/dbt_wiring/`。
@@ -504,8 +529,9 @@ major。加上非 SQL 檔的處理之後,改由非 SQL 檔的分類與設定比�
   (接線前的行為)。要在 mock 模式看到接線的效果,得照 `examples/dbt_wiring/` 的方式放專案
 - 注入掃描涵蓋 MR、取回的完整內容與預掃展開後的 SQL(會以規則命中的語句、解析錯誤的片段進 prompt);
   受影響 model 的展開結果不進 prompt(只有路徑、規則代號、語句序號),不另外掃。取回的完整內容與展開後的
-  SQL 合計最多掃 20 萬字元(`MAX_EXTRA_SCAN_CHARS`):展開可以把短樣板放大成幾百萬字元,而掃描器對特製的
-  內容(大量沒有結尾的 `/*`)是平方時間。超過的部分不掃,補 major「部分內容超過注入掃描的上限,沒有掃描」交人工
+  SQL 合計最多掃 500 萬字元(`MAX_EXTRA_SCAN_CHARS`,放得下一份展開結果的上限):展開可以把短樣板放大成
+  幾百萬字元,掃描是線性時間,這個上限讓掃描時間有界。超過的部分不掃,補 major「部分內容超過注入掃描的上限,沒有掃描」交人工
+  跟 MR 檔案本身的完整內容逐字相同(同一個路徑)的不重複掃,也不算進這個上限
 - 審查途中 MR 被推了新 commit 偵測不到:取回的是 `sha` 那一版,審查結果也寫在那一版上;新的
   commit 沒有 commit status,要等它自己的審查
 - 被刪除的 model 檔沿用接線前的行為(拿到的是被刪掉的內容,展開失敗 → major)
@@ -519,11 +545,9 @@ major。加上非 SQL 檔的處理之後,改由非 SQL 檔的分類與設定比�
 - **展開結果尚未在 MS SQL 沙盒實際執行過**(目前只驗證了展開字串與 `dbt compile`
   逐字一致)。要支援樣板的執行驗證,需把 `ref()`/`source()` 對應到沙盒每次建立的
   資料庫,且 model 引用的上游表與規格建立的測資表名稱不同,需要處理
-- `{% if is_incremental() %}` 內的 SQL 不會被掃到(比照 compile 固定為 False),需另以 True
-  再展開一次
 - 真實 GitLab 模式下,dbt 專案以外的 SQL 檔(與專案裡不是樣板的 SQL 檔)仍只有 diff 新增的行,
   完整內容由 #22 以 Files API 依 head sha 取得
-- 反查以檔案為單位;不分析第三方套件內的 macro;目錄由呼叫端指定
+- 不分析第三方套件內的 macro;目錄由呼叫端指定
 - `invocation_id` 為固定值,樣板若輸出它,結果會與 dbt compile 不同
 - 待確認:規格檔名慣例(目前只去除 `mrt_` 前綴);earlyjob model 應歸屬主規則的規格,
   確認前會交人工

@@ -864,6 +864,48 @@ def test_展開後的內容超過掃描上限_放不下的不掃_其餘照掃(mo
     assert "_scan_skipped" not in pipeline._mr_with_head_text(mr, None, rendered[:1])
 
 
+def test_跟MR檔案本身逐字相同的內容不重複加_不佔掃描上限(monkeypatch):
+    """MR 檔案的完整內容本來就會整份掃到;取回的同一份內容再加一次只會佔掉上限。"""
+    monkeypatch.setattr(pipeline, "MAX_EXTRA_SCAN_CHARS", len(MODEL) + 10)
+    mr = _mr([_f("models/mrt_big.sql", full_content=MODEL)])
+    ctx = _ctx(mr=mr)
+    rendered = [{"path": "models/mrt_big.sql", "full_content": "SELECT 1 -- 展開後"}]
+    out = _mr_with_head_text(mr, ctx, rendered)
+    assert out["files"][1:] == rendered and "_scan_skipped" not in out
+
+
+@pytest.mark.parametrize("own", [None, "", MODEL + " "])
+def test_MR檔案沒有同一份完整內容時_取回的照樣加(own):
+    """內容不同(多一個空白也算)、沒有完整內容:MR 那邊沒掃到這份,照樣加。"""
+    f = {**_f("models/mrt_big.sql"), "full_content": own}
+    out = _mr_with_head_text(_mr([f]), _ctx(mr=_mr([f])))
+    assert [x["full_content"] for x in out["files"][1:]] == [MODEL]
+
+
+def test_變更清單的項目形狀不對_比對時不當掉():
+    """變更清單來自 GitLab 回應或 fixture,形狀不可信(接線的其他步驟也一樣);
+    路徑或內容不是字串時不能拿去當集合的鍵。"""
+    mr = _mr([{"path": ["models/a.sql"], "full_content": "x"},
+              {"path": "models/b.sql", "full_content": ["x"]}, _f("models/mrt_big.sql")])
+    out = _mr_with_head_text(mr, _ctx(mr=_mr([_f("models/mrt_big.sql")])))
+    assert out["files"][:3] == mr["files"]
+
+
+def test_同一份內容在別的路徑_照樣加():
+    mr = _mr([_f("models/other.sql", full_content=MODEL), _f("models/mrt_big.sql")])
+    out = _mr_with_head_text(mr, _ctx(mr=mr))
+    assert [x["path"] for x in out["files"][2:]] == ["models/mrt_big.sql"]
+
+
+def test_掃描上限放得下一份展開結果():
+    """展開結果的上限以內,單一 model 的展開一定掃得到;放不下就一定會多一條「沒有掃描」的 major。"""
+    from orchestrator.dbt_render import MAX_OUTPUT_CHARS
+    assert pipeline.MAX_EXTRA_SCAN_CHARS >= MAX_OUTPUT_CHARS
+    rendered = [{"path": "models/a.sql", "full_content": "x" * MAX_OUTPUT_CHARS}]
+    out = pipeline._mr_with_head_text(_mr([_f("models/a.sql")]), None, rendered)
+    assert out["files"][1:] == rendered and "_scan_skipped" not in out
+
+
 def test_沒有掃完時補major():
     report = pipeline.enforce_scan_skipped({"findings": []}, 2)
     [fd] = report["findings"]
