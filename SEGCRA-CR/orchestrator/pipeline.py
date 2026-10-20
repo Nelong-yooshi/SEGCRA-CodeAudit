@@ -13,7 +13,7 @@ from collections import Counter
 
 from pathlib import Path
 
-from .agent import extract_json, output_truncated, run_agent
+from .agent import MAX_ITERATIONS, extract_json, output_truncated, run_agent
 from .config import (DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, env_seconds,
                      estimate_tokens)
 from .dbt_affected import (
@@ -1390,7 +1390,6 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             capture["user_prompt"] = user
             capture["agent_trace"] = trace
             capture["raw"] = raw
-            capture["output_meta"] = dict(output_meta)
         # 存模型原始輸出(未經 pipeline 後處理),供原汁原味檢視
         import os as _os
         _raw_dir = Path(_os.environ.get("REVIEW_OUTPUT", PKG_ROOT / "review_output"))
@@ -2306,6 +2305,8 @@ def enforce_unreviewable(report: dict, mr: dict) -> dict:
 
 _TRUNCATED_TITLE = "審查模型的輸出被截斷,審查結果可能不完整"
 _TRUNCATED_SUMMARY = "審查模型的輸出被截斷、無法解析;以下只有程式確定性檢查的結果。"
+_EXHAUSTED_TITLE = "審查模型用完工具呼叫回合,沒有產出審查結果"
+_EXHAUSTED_SUMMARY = "審查模型用完工具呼叫回合、沒有產出審查結果;以下只有程式確定性檢查的結果。"
 
 
 # 稽核紀錄裡結束原因的長度上限(端點回的字串原樣記,只截長度)
@@ -2323,18 +2324,24 @@ def _output_meta_record(meta: dict, max_output_tokens: int) -> dict:
         "completion_tokens": meta.get("completion_tokens"),
         "max_output_tokens": max_output_tokens,
         "truncated": output_truncated(meta, max_output_tokens),
+        "exhausted": bool(meta.get("exhausted")),
     }
 
 
 def _parse_model_output(raw: str, meta: dict, max_output_tokens: int) -> dict | None:
-    """解析主審查模型的輸出。被截斷又解析不出來時回一份空報告,讓審查繼續走完。
+    """解析主審查模型的輸出。沒有產出完整的結果時回一份空報告,讓審查繼續走完。
 
-    截斷的位置在第一個 `}` 之前時,extract_json 沒有東西可以修補,回 None。程式的確定性檢查
-    (規則命中、注入掃描、預掃無法解析…)與模型無關,不跟著消失:用空報告走完後處理,
-    截斷本身由 enforce_truncation 補一條 major。
+    - 用完工具呼叫回合(`meta["exhausted"]`):raw 不是模型的報告,一律不解析。最後拿到的是工具
+      的回傳(例如 MR 裡的檔案原文,內容由 MR 決定),裡面的 JSON 不能當成審查結果。
+    - 被截斷又解析不出來:截斷的位置在第一個 `}` 之前時,extract_json 沒有東西可以修補。
+
+    程式的確定性檢查(規則命中、注入掃描、預掃無法解析…)與模型無關,不跟著消失:用空報告
+    走完後處理,原因由 enforce_truncation 補一條 major。
 
     沒有截斷卻解析不出來時回 None,由呼叫端丟例外。
     """
+    if meta.get("exhausted"):
+        return {"summary": _EXHAUSTED_SUMMARY, "findings": []}
     report = extract_json(raw)
     if not report and output_truncated(meta, max_output_tokens):
         return {"summary": _TRUNCATED_SUMMARY, "findings": []}
@@ -2343,7 +2350,8 @@ def _parse_model_output(raw: str, meta: dict, max_output_tokens: int) -> dict | 
 
 @_isolated_stage("截斷揭露")
 def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict:
-    """主審查的輸出被截斷 → 補一條 major(確定性,不得自動放行)。
+    """主審查沒有產出完整的結果 → 補 major(確定性,不得自動放行):輸出被截斷、或用完工具呼叫
+    回合(後者的輸出已由 _parse_model_output 換成空報告)。
 
     extract_json 的修補退路會把被切斷的 JSON 補成合法物件:後半的 finding 不見了,報告
     看起來卻一切正常,只是比較短;不見的可能正是該擋下 MR 的那一條。已解析出來的 finding
@@ -2357,6 +2365,15 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
     同名欄位會被蓋掉)。
     """
     report["_output_meta"] = _output_meta_record(meta, max_output_tokens)
+    if meta.get("exhausted"):
+        exhausted = {
+            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _EXHAUSTED_TITLE,
+            "detail": f"審查模型連續 {MAX_ITERATIONS} 輪都沒有產出審查結果(一直呼叫工具,或回應是空的),"
+                      "用完回合上限;最後拿到的不是審查報告,不採用。這次只有程式確定性檢查的結果,需人工確認。",
+            "suggestion": "重新觸發審查;若持續發生,確認 MR 的描述或內容是否引導模型一直讀檔,"
+                          "或模型的輸出上限是否被思考用完。",
+            "citations": []}
+        _put_program_finding(report, exhausted)
     if not output_truncated(meta, max_output_tokens):
         return report
     _put_program_finding(report, {
