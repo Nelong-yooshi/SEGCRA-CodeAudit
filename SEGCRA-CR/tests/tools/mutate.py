@@ -468,6 +468,123 @@ MUTANTS.update({
      "    report[\"findings\"].append(major)\n    return report\n\n\n# 引用來源裡指名的規則碼"),
 })
 
+# ---- 環節隔離(#45):內層出事,外層要照常產出審查結果
+MUTANTS.update({
+ "隔離:環節丟例外時不補「審查未完整」": ("pipeline.py",
+     '                report.setdefault("findings", []).append(_incomplete_finding(stage, e))' + NL
+     + '                return report',
+     '                return report'),
+ "隔離:環節失敗記成 info(不影響決策)": ("pipeline.py",
+     '    return {"file": "", "line": 0, "severity": "major", "title": title,',
+     '    return {"file": "", "line": 0, "severity": "info", "title": title,'),
+ "隔離:把例外訊息寫進報告(可能回顯 MR 內容)": ("pipeline.py",
+     '        detail = (f"{stage} 執行時發生 {type(exc).__name__},已跳過。"',
+     '        detail = (f"{stage} 執行時發生 {exc},已跳過。"'),
+ # dbt 專案的取回:prepare_dbt_context 自己有 catch-all,但讀 dbt_project.yml 的那一步
+ # (_head_layout)在那之外。照 #45 的原則包起來,出錯當成取回失敗、交人工,
+ # 不要讓整份審查沒有輸出。這一步不是 report = X(report, ...) 的形狀,掃原始碼的測試
+ # 看不到它(#53 review 指出的),所以要有自己的突變點。
+ # 同步環節的隔離(取回 dbt 專案、注入掃描):那種形狀不吃 report,@_isolated_stage
+ # 套不上、掃原始碼的測試也看不到,而它們丟例外一樣會讓整份審查沒有輸出
+ "隔離:同步環節的例外往外丟(會中斷整份審查)": ("pipeline.py",
+     "    except Exception as e:                  # noqa: BLE001 — 任何例外都不得往外丟" + NL
+     + '        report.setdefault("findings", []).append(_incomplete_finding(stage, e))' + NL
+     + "        return default",
+     "    except Exception:" + NL + "        raise"),
+ "隔離:取回失敗不當成取回失敗(回 None = 不適用)": ("pipeline.py",
+     '                        DbtContext(prefix="", error="取回 dbt 專案時發生非預期錯誤"),',
+     "                        None,"),
+ # dry-run 也要看得到環節未完整:那幾條在 report 存在之前就產生了,不帶過去的話
+ # 這條路看起來一切正常 —— 而它正是用來檢查「確定性那半有沒有跑成」的
+ "隔離:dry-run 丟掉環節未完整的記錄": ("pipeline.py",
+     "    findings = list(incomplete or [])",
+     "    findings = []"),
+ "隔離:dry-run 不帶未完整過去": ("pipeline.py",
+     "                                         affected, dbt_ctx, cfg.dbt," + NL
+     + '                                         incomplete=report_stub["findings"])',
+     "                                         affected, dbt_ctx, cfg.dbt)"),
+ "隔離:注入掃描失敗時當成沒有注入(不記未完整)": ("pipeline.py",
+     '        injection_hits = _step(report_stub, "注入掃描", scan_mr, [], scan_target)',
+     "        injection_hits = scan_mr(scan_target)"),
+ "隔離:執行驗證不設時間上限": ("pipeline.py",
+     "            spec_result = await asyncio.wait_for(" + NL
+     + "                run_spec_exec(cfg, hub, _mr_for_spec_exec(mr, dbt_ctx)," + NL
+     + "                              spec_code, spec_text," + NL
+     + "                              progress=progress, deadline=deadline)," + NL
+     + "                timeout=SPEC_EXEC_TIMEOUT_SECONDS)",
+     "            spec_result = await run_spec_exec(" + NL
+     + "                cfg, hub, _mr_for_spec_exec(mr, dbt_ctx), spec_code, spec_text)"),
+})
+
+# ---- #53 review:時間上限要擋得住同步卡住的沙盒、未完成是硬條件、階段要分得出來
+MUTANTS.update({
+ # 第 1 點:execute_cases 是同步的 pymssql 呼叫,事件迴圈被它卡住,wait_for 插不進去。
+ # 老闆實測:上限 1 秒、沙盒卡 6 秒 → 跑了 6 秒、沒有逾時、結果照常回傳。
+ "逾時:沙盒不丟背景執行緒(事件迴圈被卡住)": ("spec_exec.py",
+     "        ex = await _in_thread(_execute, sql, plan, deadline)",
+     "        ex = _execute(sql, plan, deadline)"),
+ "逾時:背景執行緒不是 daemon(結束時會被拖住)": ("spec_exec.py",
+     '    threading.Thread(target=runner, name="spec-exec-sandbox", daemon=True).start()',
+     '    threading.Thread(target=runner, name="spec-exec-sandbox").start()'),
+ "逾時:背景執行緒不帶 contextvars(釘住的版本讀不到)": ("spec_exec.py",
+     "            out = ctx.run(fn, *args)",
+     "            out = fn(*args)"),
+ "逾時:沙盒不看截止時間(照跑完所有案例)": ("spec_exec.py",
+     "            if deadline is not None and time.monotonic() >= deadline:",
+     "            if False:"),
+ "逾時:沙盒中止不說是逾時": ("spec_exec.py",
+     '    if ex.get("timed_out"):',
+     "    if False:"),
+ # 第 5 點:沒跑完就至少交人工要寫死,不能只靠設定檔的 allowed_severities
+ "決策:未完成不是硬條件(設定一放寬就放行)": ("pipeline.py",
+     "          and not incomplete",
+     "          and True"),
+ "決策:注入命中不先寫進報告(注入防線丟例外就只剩 major)": ("pipeline.py",
+     "        if injection_hits:" + NL
+     + '            report["_injection_scan"] = injection_hits',
+     "        if False:" + NL
+     + '            report["_injection_scan"] = injection_hits'),
+ # 第 6、8 點:隔離清單改成裝飾器自己登記,呼叫處有沒有漏靠測試掃原始碼
+ "隔離:裝飾器不登記(掃原始碼的測試就失效)": ("pipeline.py",
+     "        _ISOLATED_STAGES[fn.__name__] = stage",
+     "        pass"),
+ "隔離:enforce_format 沒包進隔離(原本漏掉的那個)": ("pipeline.py",
+     '@_isolated_stage("輸出格式檢查")' + NL + "def enforce_format(report: dict) -> dict:",
+     "def enforce_format(report: dict) -> dict:"),
+ # 第 7 點:未完成的 finding 要標出階段,而且判斷要看欄位不是標題
+ "隔離:未完成的 finding 不標階段": ("pipeline.py",
+     '            "detail": detail, "stage": stage,',
+     '            "detail": detail,'),
+ "隔離:未完成的判斷改回比對標題開頭": ("pipeline.py",
+     '            if isinstance(f, dict) and f.get("stage")]',
+     '            if str(f.get("title", "")).startswith(INCOMPLETE_TITLE_PREFIX)]'),
+ "隔離:執行驗證逾時不說是哪個階段": ("pipeline.py",
+     "    stage = progress.get(\"stage\")" + NL
+     + '    return f"執行驗證/{stage}" if stage else "執行驗證"',
+     "    stage = None" + NL
+     + '    return f"執行驗證/{stage}" if stage else "執行驗證"'),
+ "隔離:各階段秒數不記進結果": ("spec_exec.py",
+     '        stage_seconds[stage] = round(time.monotonic() - t0, 1)',
+     "        pass"),
+ # 第 3 點:舊審查不得把結論貼上去
+ "回寫:不確認是不是最新的那次審查": ("pipeline.py",
+     '        if await _superseded(hub, mr_id, mr.get("head_sha") or mr.get("sha")):',
+     "        if False:"),
+ "回寫:問不出目前的 sha 就不回寫(變成另一種無聲失敗)": ("pipeline.py",
+     "    except Exception:                        # noqa: BLE001 — 問不出來就當作沒被取代" + NL
+     + "        return False",
+     "    except Exception:" + NL
+     + "        return True"),
+ # 第 9 點:參數讀不懂要退回預設值,不可以讓 webhook 起不來
+ "設定:秒數讀不懂就讓程式起不來": ("config.py",
+     "        print(f\"[config] 警告:環境變數 {name} 的值不是正整數秒數({raw!r}),\"" + NL
+     + '              f"改用預設 {default} 秒", flush=True)' + NL
+     + "        return default",
+     "        raise"),
+ "設定:0 或負數的秒數也照收": ("config.py",
+     "        if v <= 0:" + NL + "            raise ValueError",
+     "        if False:" + NL + "            raise ValueError"),
+})
 # ---- 取回整份新檔的四道防線:唯讀 token、單檔上限、不退回舊版、取不到要交人工
 MUTANTS.update({
  "完整檔:讀程式碼用有寫入權的 token": ("../toolbox/gitlab.py",
@@ -623,13 +740,16 @@ MUTANTS.update({
      "        if dbt_enabled and not is_macro:",
      "        if not is_macro:"),
  "專案接線:review_mr 不取回專案": ("pipeline.py",
-     "        dbt_ctx = prepare_dbt_context(mr, cfg.dbt)", "        dbt_ctx = None"),
+     "        dbt_ctx = _step(report_stub, \"dbt 專案取回\", prepare_dbt_context," + NL
+     + '                        DbtContext(prefix="", error="取回 dbt 專案時發生非預期錯誤"),' + NL
+     + "                        mr, cfg.dbt)",
+     "        dbt_ctx = None"),
  '專案接線:review_mr 沒把專案交給預掃': ('pipeline.py',
-     '        pre = await prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered)',
-     '        pre = await prescan(hub, mr["files"], cfg.dbt, None, rendered)'),
+     '                           prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered), [])',
+     '                           prescan(hub, mr["files"], cfg.dbt, None, rendered), [])'),
  '專案接線:注入掃描不掃取回的完整內容': ('pipeline.py',
-     '        scan_target = _mr_with_head_text(mr, dbt_ctx, rendered)',
-     '        scan_target = _mr_with_head_text(mr, None, rendered)'),
+     '                            _mr_with_head_text, dict(mr), mr, dbt_ctx, rendered)',
+     '                            _mr_with_head_text, dict(mr), mr, None, rendered)'),
  '專案接線:注入掃描只掃完整內容、漏掉原本的 diff': ('pipeline.py',
      '    out = {**mr, "files": [*mr["files"], *kept]}',
      '    out = {**mr, "files": kept}'),
@@ -782,10 +902,10 @@ MUTANTS.update({
      "        is_macro = dbt_enabled and dbt_ctx is not None and dbt_ctx.is_macro(f.get(\"path\"))",
      "        is_macro = dbt_ctx is not None and dbt_ctx.is_macro(f.get(\"path\"))"),
  "未執行:執行驗證拿到的是只有片段的 MR": ("pipeline.py",
-     "        spec_result = await run_spec_exec(cfg, hub, _mr_for_spec_exec(mr, dbt_ctx),\n"
-     "                                          spec_code, spec_text)",
-     "        spec_result = await run_spec_exec(cfg, hub, mr,\n"
-     "                                          spec_code, spec_text)"),
+     "                run_spec_exec(cfg, hub, _mr_for_spec_exec(mr, dbt_ctx)," + NL
+     + "                              spec_code, spec_text,",
+     "                run_spec_exec(cfg, hub, mr," + NL
+     + "                              spec_code, spec_text,"),
  "未執行:不是樣板的檔也帶完整內容": ("pipeline.py",
      "if head is not None and is_dbt_template(head) else f)", "if head is not None else f)"),
  "未執行:review_mr 不補": ("pipeline.py",
@@ -1970,8 +2090,8 @@ MUTANTS.update({
      'if isinstance(f, dict) and (text := dbt_ctx.head_text(f.get("path"))) is not None]',
      'if (text := dbt_ctx.head_text(f.get("path"))) is not None]'),
  '專案接線:注入掃描不掃展開後的 SQL': ('pipeline.py',
-     '        scan_target = _mr_with_head_text(mr, dbt_ctx, rendered)',
-     '        scan_target = _mr_with_head_text(mr, dbt_ctx)'),
+     '                            _mr_with_head_text, dict(mr), mr, dbt_ctx, rendered)',
+     '                            _mr_with_head_text, dict(mr), mr, dbt_ctx)'),
  '專案接線:預掃不收集展開後的 SQL': ('pipeline.py',
      '            elif rendered is not None:\n                rendered.append(',
      '            elif False:\n                rendered.append('),

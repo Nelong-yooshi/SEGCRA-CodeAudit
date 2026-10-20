@@ -173,3 +173,32 @@ def test_角色_profile_也吃得到(monkeypatch):
                  budget={"diff": 8000}, policy={})
     monkeypatch.setenv("LLM_REASONING_EFFORT", "none")
     assert cfg.role_profile("testgen").reasoning_effort == "none"
+
+
+# ───────── 秒數型的上限:讀不懂要退回預設值,不可以讓程式起不來 ─────────
+#
+# 跟 temperature/seed 的取捨刻意不同(那兩個是直接擋下)。讀這兩個的是 **webhook
+# 伺服器在 import 的時候**:填錯一個字就 int() 丟例外 → 伺服器根本起不來 → 所有 MR
+# 都收不到審查。那比「用預設值跑」糟得多,而且錯誤只出現在啟動時的終端機上,沒人看。
+
+def test_沒設定時用預設值(monkeypatch):
+    from orchestrator.config import env_seconds
+    monkeypatch.delenv("SPEC_EXEC_TIMEOUT_SECONDS", raising=False)
+    assert env_seconds("SPEC_EXEC_TIMEOUT_SECONDS", 1200) == 1200
+
+
+def test_正常值會生效(monkeypatch):
+    from orchestrator.config import env_seconds
+    monkeypatch.setenv("SPEC_EXEC_TIMEOUT_SECONDS", "600")
+    assert env_seconds("SPEC_EXEC_TIMEOUT_SECONDS", 1200) == 600
+
+
+@pytest.mark.parametrize("bad", ["", "  ", "abc", "12O0", "20 分鐘", "1.5", "0", "-1"])
+def test_讀不懂或不合理的值退回預設並印警告(monkeypatch, capsys, bad):
+    """包含 0 與負數:上限設成 0 等於每次都立刻逾時,不會是誰的本意。"""
+    from orchestrator.config import env_seconds
+    monkeypatch.setenv("REVIEW_TIMEOUT_SECONDS", bad)
+    assert env_seconds("REVIEW_TIMEOUT_SECONDS", 2400) == 2400
+    out = capsys.readouterr().out
+    if bad.strip():            # 空字串視同沒設定,不用吵
+        assert "REVIEW_TIMEOUT_SECONDS" in out and "預設 2400" in out, out
