@@ -1458,11 +1458,11 @@ def test_execute_cases_會把別支整個成立的案例判為未驗證(monkeypa
     assert any("分支 C2 整個成立" in g for g in spec_exec._label_gaps([r]))
 
 
-# ─────────────────── 生成的資料要先對過資料表定義(#47 review 第 2 點) ───────────────────
+# ─────────────────── 生成的資料要先對過資料表定義 ───────────────────
 #
-# 老闆拿兩份黑盒規格跑生成,各花 50 分鐘和 14 分鐘,**兩份的每一列**都有欄位值超過
-# 宣告長度,結果在沙盒灌資料時失敗 → 補一條「需人工執行驗證」就結束,等於花了一小時
-# 什麼都沒驗到。schema_ddl 本來就在 prompt 裡,所以這件事不能靠模型遵守。
+# 欄位值超過宣告長度會在灌資料時失敗,而灌資料失敗會讓整輪執行驗證停下來、只補一條
+# 「需人工執行驗證」—— 生成花掉的時間全丟,一個條件都沒驗到。schema_ddl 本來就在
+# prompt 裡,所以這件事不能靠模型遵守,要在收下計畫之前自己算。
 
 _WIDE_DDL = ("CREATE TABLE tx (acct NVARCHAR(10) NOT NULL, code CHAR(2), "
              "amount DECIMAL(18,2), cnt INT, tx_date DATE, flag BIT);",)
@@ -1903,13 +1903,13 @@ def test_run_spec_exec_把標籤沒驗到寫進通過的_finding(monkeypatch):
     assert "1/2 個案例的標籤未經驗證" in passed_finding["detail"], passed_finding["detail"]
 
 
-# ───────── #47 review 第二輪:混著改的變體、SQL Server 收得下的日期寫法 ─────────
+# ───────── 混著改的變體、SQL Server 收得下的日期寫法 ─────────
 
 def test_混著改的變體不算驗到目標條件():
     """**每一欄**都要出現在目標的判斷式裡,不是「有一欄算一欄」。
 
-    老闆的重現:C1-1 是「代碼 IN (OP01, OP02)」、C1-6 是「SUM(符合代碼的金額) >=
-    500,000」,基準是 OP01 十萬 + OP02 六十萬。
+    形狀:C1-1 是「代碼 IN (OP01, OP02)」、C1-6 是「SUM(符合代碼的金額) >= 500,000」,
+    基準是 OP01 十萬 + OP02 六十萬。
       * 只改代碼(OP01→OP99):總額還有六十萬、規則照樣命中 → 正確地算缺口;
       * 只改金額(60 萬→30 萬):改的不是 C1-1 → 也算缺口;
       * **兩個一起改**:用 any 會判成「驗到了 C1-1」,但真正讓規則不命中的是金額,
@@ -1950,8 +1950,8 @@ def test_混著改的變體不算驗到目標條件():
 
 
 def test_只改目標判斷式裡的欄位照樣算驗到():
-    """改成 all 不可以把正常的變體一起擋掉。R-140 的凍結檔 6 個變體各自只改一欄、
-    而且都在目標的判斷式裡(老闆算過),所以這一條要維持通過。"""
+    """逐欄比對不可以把正常的變體一起擋掉:各自只改一欄、而且那一欄就在目標的
+    判斷式裡的變體,是最常見的形狀,要維持通過。"""
     conds = [{"id": "C1-1", "desc": "代碼屬於清單", "branch": "C1",
               "check_sql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log "
                            "WHERE op_code IN ('OP01','OP02')) THEN 1 ELSE 0 END"}]
@@ -2110,3 +2110,104 @@ def test_run_spec_exec_的沙盒同步卡住時外層逾時得了(monkeypatch):
     assert took < 2.5, f"沙盒同步卡住時外層沒有準時中止(等了 {took:.1f} 秒)"
     assert progress["stage"] == spec_exec.STAGE_SANDBOX, \
         f"逾時的時候要看得出卡在哪個階段:{progress}"
+
+@pytest.mark.parametrize("type_name,value,ok", [
+    ("DATETIME", "2026-06-01 22:00:00.123", True),
+    ("DATETIME", "2026-06-01 22:00:00.1234", False),
+    ("SMALLDATETIME", "2026-06-01 22:00:00.123", True),
+    ("SMALLDATETIME", "2026-06-01 22:00:00.1234567", False),
+    ("DATETIME2", "2026-06-01 22:00:00.1234567", True),
+    ("DATETIMEOFFSET", "2026-06-01 22:00:00.1234567", True),
+    ("DATE", "2026-06-01 22:00:00.1234567", True),
+])
+def test_小數秒的位數上限照欄位型別(type_name, value, ok):
+    """DATETIME 與 SMALLDATETIME 只收 3 位。放過去的話形狀檢查會通過、灌資料才失敗,
+    而灌資料失敗會停掉整輪執行驗證,不是只丟掉那一個案例。"""
+    assert spec_exec._datetime_ok(value, type_name)[0] is ok
+
+
+def test_小數秒超過型別上限的原因要寫出位數():
+    ok, why = spec_exec._datetime_ok("2026-06-01 22:00:00.1234", "DATETIME")
+    assert not ok
+    assert "DATETIME" in why and "3 位" in why, why
+
+
+def test_沒給型別時用最寬鬆的位數():
+    """只檢查格式的呼叫端(例如測試與工具)行為不變。"""
+    assert spec_exec._datetime_ok("2026-06-01 22:00:00.1234567")[0] is True
+
+
+def test_欄位型別會帶進日期檢查():
+    """`_value_fits` 不帶型別進去的話,上面那些就只是 `_datetime_ok` 自己的測試。"""
+    col = {"name": "tx_time", "type": "DATETIME", "limits": [], "nullable": True}
+    assert spec_exec._value_fits(col, "2026-06-01 22:00:00.123") == ""
+    why = spec_exec._value_fits(col, "2026-06-01 22:00:00.1234")
+    assert "tx_time" in why and "3 位" in why, why
+
+def test_欄位名要整個對上_不是子字串():
+    """`amount` 不該被當成出現在 `fee_amount` 裡 —— 那會讓「改的欄位歸因不到這個
+    條件」這道檢查自己判錯(判成「驗到了」,缺口就不會被列出來)。"""
+    q = ("SELECT 1 FROM t WHERE SUM(CASE WHEN op_code IN ('OP01') "
+         "THEN fee_amount END) >= 500000")
+    cols = spec_exec._sql_columns(q)
+    assert cols == {"op_code", "fee_amount"}
+    assert "amount" not in cols and "id" not in cols
+
+
+def test_帶表別名的欄位取得到欄位本身():
+    assert spec_exec._sql_columns("SELECT 1 FROM tx AS x WHERE x.account_id > 0") \
+        == {"account_id"}
+
+
+def test_解析不出來時退回以詞為界的比對():
+    """判斷式壞掉不該讓這道檢查整個失效,但也不能退回子字串比對。"""
+    cols = spec_exec._sql_columns(">>> fee_amount 不是 SQL <<<")
+    assert "fee_amount" in cols
+    assert "amount" not in cols
+
+def test_欄名比對走解析_子字串不算命中():
+    """釘住 `_variant_label_check` 真的用解析。
+
+    目標條件的判斷式裡只有 `fee_amount`,變體改的是 `amount`:子字串比對會因為
+    `amount` 出現在 `fee_amount` 裡而判成「驗到了」,缺口就不會被列出來。
+    """
+    conds = [
+        {"id": "C1-1", "desc": "手續費門檻", "branch": "C1",
+         "check_sql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log "
+                      "WHERE fee_amount >= 50) THEN 1 ELSE 0 END"},
+        {"id": "C1-2", "desc": "金額門檻", "branch": "C1",
+         "check_sql": "SELECT CASE WHEN EXISTS (SELECT 1 FROM txn_log "
+                      "WHERE amount >= 100) THEN 1 ELSE 0 END"},
+    ]
+    cols = spec_exec._ddl_columns(
+        ["CREATE TABLE txn_log (amount DECIMAL(14,2), fee_amount DECIMAL(14,2));"])
+    bases = {"C1": ({"C1-1": True, "C1-2": True}, [["txn_log", 500.0, 80.0]])}
+    case = {"case_id": "C1-1-v", "kind": "variant", "condition_id": "C1-1",
+            "direction": "false", "expect_flagged": False, "note": "",
+            "rows": [["txn_log", 10.0, 80.0]]}           # 只改了 amount
+    why = spec_exec._variant_label_check(conds, cols, bases, case,
+                                         {"C1-1": False, "C1-2": True})
+    assert any("amount" in w and "歸因不到" in w for w in why), \
+        "改的是 amount、目標的判斷式只有 fee_amount,這個變體歸因不到目標條件"
+
+
+def test_一個有效案例都沒有不算通過():
+    """全部案例都被仲裁剔除時,沒有缺口也不等於驗過 —— 根本沒有案例作數。"""
+    ex = {"case_results": [{"case_id": "A", "dropped": True}], "timed_out": False}
+    gaps, passed = spec_exec.gaps_and_passed({"cases": [{"case_id": "A"}]}, ex)
+    assert gaps == [] and passed is False
+
+
+def test_有有效案例又沒缺口才算通過():
+    ex = {"case_results": [{"case_id": "A"}], "timed_out": False}
+    _, passed = spec_exec.gaps_and_passed({"cases": [{"case_id": "A"}]}, ex)
+    assert passed is True
+
+
+def test_腳本不自己算一份缺口與passed():
+    """凍結檔檢查印出來的結論必須跟正式流程同一份算法 —— 各算一份的話,正式流程多
+    一種缺口時腳本不會跟著變,而「凍結檔能不能用」看的就是那個結論。"""
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / "eval" / "check_frozen_testdata.py").read_text(encoding="utf-8")
+    assert "gaps_and_passed(" in src
+    assert "passed = bool(" not in src, "腳本又自己算了一份 passed"

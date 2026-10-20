@@ -3238,8 +3238,7 @@ MUTANTS.update({
         "    if len(pred) < 8:",
         "    if False:"),
     "測資:不檢查改的欄位跟目標條件有不有關": (S,
-        "            stray_cols = sorted(c for c in changed" + NL
-        + '                                if c not in _norm_sql(tcond["check_sql"]))',
+        "            stray_cols = sorted(c for c in changed if c not in in_target)",
         "            stray_cols = []"),
     "測資:資料與基準完全相同也算驗過": (S,
         "        if not changed:" + NL
@@ -3256,17 +3255,44 @@ MUTANTS.update({
     # #47 review 第二輪:每一欄都要在目標的判斷式裡(any 會放過混著改的變體)、
  # SQL Server 收得下的日期寫法不可以擋掉(擋了就是假的覆蓋缺口)
  "測資:改的欄位有一個對上就算驗到(混著改的變體會漏過)": (S,
-     "            stray_cols = sorted(c for c in changed" + NL
-     + '                                if c not in _norm_sql(tcond["check_sql"]))',
-     "            stray_cols = ([] if any(c in _norm_sql(tcond[\"check_sql\"])" + NL
-     + "                                   for c in changed) else sorted(changed))"),
+     "            stray_cols = sorted(c for c in changed if c not in in_target)",
+     "            stray_cols = ([] if any(c in in_target for c in changed)" + NL
+     + "                          else sorted(changed))"),
+ # 欄名比對退回子字串:amount 會被當成出現在 fee_amount 裡,這一道自己就判錯了
+ "測資:欄名用子字串比對(amount 對上 fee_amount)": (S,
+     '            in_target = _sql_columns(tcond["check_sql"])',
+     '            in_target = _norm_sql(tcond["check_sql"])'),
  "測資:yyyymmdd 的日期當成不合法": (S,
      '_DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",' + NL
      + '                 "%Y%m%d %H:%M:%S", "%Y%m%d %H:%M", "%Y%m%d")',
      '_DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d")'),
+ # 缺口與 passed 只有一份:腳本自己再算一份的時候,正式流程多一種缺口,
+ # 腳本印出來的「執行驗證的結論」就會跟真的不一樣
+ "共用:算 passed 時不看缺口": (S,
+     "    return gaps, bool(effective) and not faults and not gaps",
+     "    return gaps, bool(effective) and not faults"),
+ "共用:一個有效案例都沒有也算通過": (S,
+     "    return gaps, bool(effective) and not faults and not gaps",
+     "    return gaps, not faults and not gaps"),
+ "共用:逾時不算缺口": (S,
+     '    if ex.get("timed_out"):' + NL
+     + "        # 沒跑到的案例本身也是缺口,但不說「逾時」的話,看報告的人會以為是測資或",
+     "    if False:" + NL
+     + "        # 沒跑到的案例本身也是缺口,但不說「逾時」的話,看報告的人會以為是測資或"),
+ "共用:標籤缺口不併進去": (S,
+     '    gaps = list(base_gaps) + _label_gaps(ex["case_results"])',
+     "    gaps = list(base_gaps)"),
  "測資:小數秒只認 6 位(DATETIME2 預設是 7 位)": (S,
-     '    if frac and not re.fullmatch(r"\\d{1,7}", frac):',
-     '    if frac and not re.fullmatch(r"\\d{1,6}", frac):'),
+     '    digits = _FRAC_DIGITS.get(type_name or "", _FRAC_DIGITS_DEFAULT)',
+     "    digits = 6"),
+ # DATETIME/SMALLDATETIME 只收 3 位:放過去的值會通過形狀檢查、灌資料才失敗,
+ # 而灌資料失敗會停掉整輪執行驗證,不是只丟掉那一個案例
+ "測資:小數秒的上限不看型別(一律放到 7 位)": (S,
+     '_FRAC_DIGITS = {"DATETIME": 3, "SMALLDATETIME": 3}',
+     "_FRAC_DIGITS = {}"),
+ "測資:日期檢查不帶欄位型別進去": (S,
+     "        ok, why = _datetime_ok(v, type_name)",
+     "        ok, why = _datetime_ok(v)"),
  "測資:只給時間也放行(日期會變成 1900-01-01)": (S,
      "    if _TIME_ONLY.match(text):",
      "    if False:"),

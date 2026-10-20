@@ -291,11 +291,10 @@ def _check_sql_ok(text) -> bool:
 
 # ---- 生成的資料要先對過資料表定義 ----
 #
-# 為什麼要做這一關(#47 review 第 2 點):兩份黑盒規格各花了 50 分鐘和 14 分鐘生成,
-# 兩份的**每一列**都有欄位值超過宣告長度(例如 NVARCHAR(2) 的欄位塞了更長的字串),
-# 結果在沙盒灌資料時失敗。正式流程遇到灌資料失敗會補一條「需人工執行驗證」就結束
-# ——花掉一小時,一個條件都沒驗到。schema_ddl 本來就在 prompt 裡,模型看得到卻照樣
-# 寫超長,所以這件事不能靠它遵守,要在收下計畫之前自己算。
+# 為什麼要做這一關:欄位值超過宣告長度(例如 NVARCHAR(2) 的欄位塞了更長的字串)
+# 會在沙盒灌資料時失敗,而灌資料失敗會讓整輪執行驗證停下來、補一條「需人工執行
+# 驗證」就結束 —— 生成花掉的時間全丟,一個條件都沒驗到。schema_ddl 本來就在 prompt
+# 裡,模型看得到卻照樣寫超長,所以這件事不能靠它遵守,要在收下計畫之前自己算。
 #
 # 判定只往「看得懂才管」的方向做:型別或限制認不出來就不檢查。誤判的代價是把好案例
 # 丟掉重生(一輪補缺的呼叫),漏判的代價是整輪生成作廢,但**反過來把好案例判成壞的
@@ -342,16 +341,26 @@ def _ddl_columns(ddl: list[str]) -> dict[str, list[dict]]:
     return out
 
 
-# SQL Server 收得下、而第一版擋掉的三種寫法(#47 review):yyyymmdd 不分語系都認得、
-# 加上時間也認得、DATETIME2 的小數**預設就是 7 位**(strptime 的 %f 只吃到 6 位,所以
-# 小數要自己檢查)。擋掉這些會把合法的測資判成形狀不合法,變成假的覆蓋缺口。
+# 這三種寫法 SQL Server 都收得下,所以不能擋:yyyymmdd 不分語系都認得、加上時間也
+# 認得、DATETIME2 的小數**預設就是 7 位**(strptime 的 %f 只吃到 6 位,所以小數要自己
+# 檢查)。擋掉合法的測資會變成假的覆蓋缺口。
 _TIME_ONLY = re.compile(r"\d{1,2}:\d{2}(:\d{2})?(\.\d{1,7})?$")
 _DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
                  "%Y%m%d %H:%M:%S", "%Y%m%d %H:%M", "%Y%m%d")
 
 
-def _datetime_ok(v: str) -> tuple[bool, str]:
-    """SQL Server 收不收這個日期時間字串。回傳 (收不收, 不收的原因)。"""
+# 小數秒的位數上限照型別:DATETIME 與 SMALLDATETIME 只收 3 位,其餘收到 7 位。
+# 超過的值會通過形狀檢查、到灌資料時才轉換失敗,而灌資料失敗會讓整輪執行驗證停下來
+# (後面的案例全部沒跑),不是只丟掉那一個案例 —— 所以要在生成時就攔下來重生。
+_FRAC_DIGITS = {"DATETIME": 3, "SMALLDATETIME": 3}
+_FRAC_DIGITS_DEFAULT = 7
+
+
+def _datetime_ok(v: str, type_name: str | None = None) -> tuple[bool, str]:
+    """SQL Server 收不收這個日期時間字串。回傳 (收不收, 不收的原因)。
+
+    `type_name` 是宣告的型別;沒給的話用最寬鬆的位數,只檢查格式。
+    """
     text = v.strip().replace("T", " ")
     if _TIME_ONLY.match(text):
         # SQL Server 其實收得下,但日期會變成 1900-01-01 —— 那不會是誰的本意,
@@ -359,8 +368,10 @@ def _datetime_ok(v: str) -> tuple[bool, str]:
         return False, (f"值只給了時間、沒有日期({v[:30]})——SQL Server 會把日期當成 "
                        f"1900-01-01,時間窗一定對不上")
     head, _, frac = text.partition(".")
-    if frac and not re.fullmatch(r"\d{1,7}", frac):
-        return False, f"值的小數秒不合法({v[:30]})——DATETIME2 最多 7 位數字"
+    digits = _FRAC_DIGITS.get(type_name or "", _FRAC_DIGITS_DEFAULT)
+    if frac and not re.fullmatch(r"\d{1,%d}" % digits, frac):
+        return False, (f"值的小數秒不合法({v[:30]})——"
+                       f"{type_name or 'DATETIME2'} 最多 {digits} 位數字")
     for fmt in _DATE_FORMATS:
         try:
             datetime.strptime(head, fmt)
@@ -400,7 +411,7 @@ def _value_fits(col: dict, v) -> str:
     if type_name in _DATE_TYPES:
         if not isinstance(v, str):
             return ""
-        ok, why = _datetime_ok(v)
+        ok, why = _datetime_ok(v, type_name)
         return "" if ok else f"{name} 是 {type_name},{why}"
     if type_name in _INT_LIMITS:
         num = _as_number(v)
@@ -1504,6 +1515,24 @@ def _norm_sql(s: str) -> str:
     return " ".join(str(s or "").split()).lower()
 
 
+def _sql_columns(sql: str) -> set[str]:
+    """判斷式裡出現的欄位名(小寫)。
+
+    用解析而不是比對字串:`amount` 不該被當成出現在 `fee_amount` 裡,`id` 也不該
+    被 `account_id` 吃掉 —— 那會讓「改的欄位歸因不到這個條件」這道檢查自己判錯。
+    解析不出來時退回以詞為界的比對,仍然不會把子字串算成命中。
+    """
+    text = str(sql or "")
+    try:
+        import sqlglot
+        from sqlglot import exp
+        from toolbox.sqltools import DIALECT
+        tree = sqlglot.parse_one(text, dialect=DIALECT)
+    except Exception:                        # noqa: BLE001 — 解析失敗就退回詞比對
+        return {w.lower() for w in re.findall(r"[A-Za-z_][A-Za-z_0-9]*", text)}
+    return {c.name.lower() for c in tree.find_all(exp.Column) if c.name}
+
+
 def _predicate_of(cond: dict) -> str:
     """條件判斷式裡的述詞(WHERE 之後那段)。拿來判斷「誰是誰的下游」。"""
     m = _PREDICATE.search(str(cond.get("check_sql") or ""))
@@ -1593,8 +1622,8 @@ def _variant_label_check(conds: list[dict], cols_by_table: dict,
             # 還有六十萬、規則照樣命中 → 正確地算缺口;只改金額 → 也算缺口。但兩個
             # 一起改,用 any 就會判成「驗到了 C1-1」—— 而真正讓規則不命中的是金額,
             # 代碼那一改本身沒有作用。那正是 #23 第 3 點要防的情況。
-            stray_cols = sorted(c for c in changed
-                                if c not in _norm_sql(tcond["check_sql"]))
+            in_target = _sql_columns(tcond["check_sql"])
+            stray_cols = sorted(c for c in changed if c not in in_target)
             if stray_cols:
                 why.append(f"變體改的欄位 {'、'.join(stray_cols)} 沒有出現在 "
                            f"{target} 的判斷式裡,那幾處的改動歸因不到這個條件")
@@ -1723,6 +1752,28 @@ def _unrun_gaps(plan: dict, case_results: list[dict]) -> list[str]:
     missing = [c for c in plan.get("cases", []) if c.get("case_id") not in ran]
     return [f"案例 {c.get('case_id')}(條件 {c.get('condition_id')} "
             f"{c.get('direction')} 向)因執行中止而未驗證" for c in missing]
+
+
+def gaps_and_passed(plan: dict, ex: dict, base_gaps=(),
+                    faults=()) -> tuple[list[str], bool]:
+    """由執行結果算出覆蓋缺口與 `passed`。
+
+    正式流程(`run_spec_exec`)與 eval 的凍結檔檢查共用這一份:兩邊各寫一份的時候,
+    正式流程多一種缺口,腳本印出來的「執行驗證的結論」就會跟真的不一樣 —— 而那個
+    結論正是用來判斷凍結檔能不能用的依據。
+
+    `base_gaps` 是前面已經累積的缺口(生成階段的覆蓋檢查、仲裁剔除的案例);
+    `faults` 是仲裁判成「SQL 錯」的案例(腳本那邊是 `mismatches`)。
+    """
+    gaps = list(base_gaps) + _label_gaps(ex["case_results"])
+    if ex.get("timed_out"):
+        # 沒跑到的案例本身也是缺口,但不說「逾時」的話,看報告的人會以為是測資或
+        # SQL 壞了 —— 那兩種的修法完全不同。
+        gaps.append(
+            f"沙盒執行超過時間上限,{len(plan['cases']) - len(ex['case_results'])} 個案例"
+            f"未執行(逾時)")
+    effective = [r for r in ex["case_results"] if not r.get("dropped")]
+    return gaps, bool(effective) and not faults and not gaps
 
 
 # 執行驗證的三個階段。失敗或逾時要看得出是哪一個(#53 review 第 7 點):整段只算一個
@@ -1906,10 +1957,6 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                 "case_results": ex["case_results"], "dropped_cases": dropped_cases,
                 "stage_seconds": stage_seconds, "findings": findings}
 
-    # 標籤一致性的缺口要在仲裁之前就併進去:它講的是「這個案例有沒有驗到它宣稱的
-    # 那一條」,跟仲裁要判的「測資錯還是 SQL 錯」是不同的問題,兩者可以同時成立。
-    coverage_gaps = coverage_gaps + _label_gaps(ex["case_results"])
-
     # 角色三:仲裁(只對 mismatch 逐案出動)
     sql_faults = []
     _t = _enter(STAGE_ARBITRATE)
@@ -1929,12 +1976,7 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                                "arbiter_unparseable": verdict.get("arbiter_unparseable", False)})
     _leave(STAGE_ARBITRATE, _t)
 
-    if ex.get("timed_out"):
-        # 沙盒階段被時間上限停下來:沒跑到的案例由 _unrun_gaps 列成缺口,這裡再加一條
-        # 說明是逾時——不講清楚的話,看報告的人會以為是測資或 SQL 壞了。
-        coverage_gaps.append(
-            f"沙盒執行超過時間上限,{len(plan['cases']) - len(ex['case_results'])} 個案例"
-            f"未執行(逾時)")
+    coverage_gaps, passed = gaps_and_passed(plan, ex, coverage_gaps, sql_faults)
     if sql_faults:
         detail = ";".join(
             f"案例 {f['case_id']}({f.get('note','')}):預期"
@@ -1950,7 +1992,6 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                                  "; ".join(coverage_gaps)))
 
     effective = [r for r in ex["case_results"] if not r.get("dropped")]
-    passed = bool(effective) and not sql_faults and not coverage_gaps
     if passed:
         findings.append(_finding(path, "info",
                                  f"執行驗證:{len(effective)} 個生成測試案例皆符合預期",
