@@ -130,10 +130,11 @@ python eval/run_eval.py --json out.json     # 另存機器可讀結果(給報告
 「負責任的提問」,不影響放行決策,**不計入 precision 分母**;`expect_findings` 指名該出現的
 finding 同理不算誤報。
 
-## 現有 case(32 個,6 層)
+## 現有 case(37 個,8 層)
 
 id 依層分段:`1xx` 注入、`2xx` rule-base、`3xx` binding、`4xx` spec_exec、
-`5xx` 引用白名單、`6xx` 決策閘門。
+`5xx` 引用白名單、`6xx` 決策閘門、`7xx` 真實程式形狀、`86x` 模型輸入(審查模型拿到的東西
+完不完整、對不對:完整內容、受影響 model 的規格、MR 改到的規格,見下方 `86x` 一節)。
 
 > **哪些部分已經不需要靠 golden case 覆蓋了**
 >
@@ -224,6 +225,8 @@ id 依層分段:`1xx` 注入、`2xx` rule-base、`3xx` binding、`4xx` spec_exec
 | `specs/R-140.md` | **排除清單**(沖銷/小額/特定通路)漏做 | 依 `examples/sample` 骨架新寫 |
 | `specs/R-410.md` | **多條件 OR-of-ANDs**、「介於」含兩端 | 依 `examples/sample` 骨架新寫 |
 | `specs/R-520.md` | **比率型指標**:除零、四捨五入 | 依 `examples/sample` 骨架新寫 |
+| `specs/SHARED_A_EVAL.md`、`specs/SHARED_B_EVAL.md` | **共用門檻表**:兩個 model 用同一個 macro、門檻各不相同(`mr_862`) | 依 `examples/sample` 骨架新寫 |
+| `specs/R-863.md` | 修改前的版本;`mr_863` 在 MR 裡把它改掉(規格與程式一起改) | 依 `examples/sample` 骨架新寫 |
 
 > ⚠️ **範本骨架缺一段**:`examples/sample/RETAIL_M1_spec.md` 有基本資料 / 排除資料 /
 > 代碼分類 / 篩選條件 / 待補,但**沒有「資料表定義」段**。執行驗證的測資生成
@@ -308,6 +311,23 @@ id 依層分段:`1xx` 注入、`2xx` rule-base、`3xx` binding、`4xx` spec_exec
 
 > 標記 `known_gap` 的 case(`mr_102`、`mr_403`、`mr_408`)見下方
 > 「三個已知缺口」——斷言照跑照顯示,但不計入失敗,以免有人為了讓套件變綠而刪掉它們。
+
+### 模型輸入(`86x`)
+
+`1xx`~`7xx` 量的是「防線有沒有接住」,這一層量的是**審查模型拿到的東西完不完整、對不對**。
+模型拿到的輸入錯了,後面每一道防線都在錯的基礎上判斷:只有 diff 就會把看不到的條件報成
+「遺漏」;對不到規格就只剩「無規格可驗」;MR 同時改規格與程式時,要看得出規格改了什麼、前後
+是否一致(規格以 MR 的版本為準)。
+
+| case | 驗什麼 |
+|---|---|
+| `mr_861` | **只改註解**:與 `mr_701` 同一份真實形狀的程式,只改第 20、37 行兩行註解;規格要求的條件都在第 149 行以後,離改動處遠超過 diff 的上下文。prompt 有變更後的完整內容,不得出現「遺漏 / 缺少某條件」的 major 或 blocker(`forbid_findings`)。`mr_701` 的已知問題(規格 schema 型別、測資生成規模)與這件事無關,所以不斷言決策 |
+| `mr_862` | **共用門檻表被改、影響兩個各有規格的 model**:`macros/alert_threshold.sql` 被 `mrt_SHARED_A_EVAL`、`mrt_SHARED_B_EVAL` 用到,兩者依檔名各自對到規格(50,000 與 100,000);MR 把 A 的門檻改成 60000。兩份規格都要附上、標明對應哪個 model,審查要指出 60000 與 A 的規格不符;決策 needs_human。**唯一用到 dbt 專案的 case**:base 與 head 兩個 commit 的專案放在 `eval/golden/dbt_archives/<commit>/`,MR 只有 diff,跟真實 GitLab 模式一樣 |
+| `mr_863` | **同時改規格與程式**:規格條件 3 的門檻從「超過 40,000」改成「達 39,999 以上」,程式跟著改;但規格的說明與補充兩段還寫著 40,000。規格以這次 MR 的版本為準,報告最上面要有「本次 MR 修改了規格」,寫出 40,000 → 39,999 並指出舊數字仍出現在哪幾行;決策 needs_human(硬條件) |
+
+> **`eval/golden/dbt_archives/` 也在測資集指紋裡**(`eval/preflight.py` 的 `testset.dbt`):
+> macro 的門檻改了,同一個 case 審的就是另一份程式,但 `mr_862.json` 一個字都沒變。
+> 哪些 case 會取回專案由 `tests/test_dbt_wiring_example.py` 鎖住,其餘 case 的行為與接線前相同。
 
 ## 實測結果的詳細過程
 
@@ -417,8 +437,11 @@ id 依層分段:`1xx` 注入、`2xx` rule-base、`3xx` binding、`4xx` spec_exec
 
 ## 怎麼擴充
 
-1. 在 `eval/golden/` 新增 `mr_<id>.json`,格式同上(id 建議依層分段:
-   `1xx` 注入、`2xx` rule-base、`3xx` binding、`4xx` spec_exec、`6xx` 決策/乾淨對照)。
+1. 在 `eval/golden/` 新增 `mr_<id>.json`,格式同上(id 依層分段:`1xx` 注入、`2xx` rule-base、
+   `3xx` binding、`4xx` spec_exec、`5xx` 引用白名單、`6xx` 決策/乾淨對照、`7xx` 真實程式形狀、
+   `86x` 模型輸入)。要用 dbt 專案的 case,把那個 commit 的專案放在
+   `eval/golden/dbt_archives/<完整 commit 編號>/`,並在 `tests/test_dbt_wiring_example.py` 的
+   `GOLDEN_WITH_DBT_PROJECT` 加上這個 case。
 2. 需要執行驗證的 case,對應規格放 `specs/R-xxx.md`(格式見專案 README §4)。
 3. **每加一層防線,就補一對 case**(該抓的 + 不該吵的)。
 4. 改 prompt / 換模型 / 調門檻前後各跑一次,`--json` 存檔比較——分數不退步才可合併。

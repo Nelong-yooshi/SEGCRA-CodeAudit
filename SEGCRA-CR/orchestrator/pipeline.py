@@ -16,7 +16,10 @@ from pathlib import Path
 from .agent import extract_json, output_truncated, run_agent
 from .config import (DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, env_seconds,
                      estimate_tokens)
-from .dbt_affected import AffectedCheck, check_affected_models, impact_finding
+from .dbt_affected import (
+    AffectedCheck, SpecForModels, check_affected_models, impact_finding, specs_by_priority,
+)
+from .change_view import build_full_text_section
 from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_render import is_dbt_template, render_model_isolated
 from .dbt_config_change import HIGH_RISK_NEW, config_changes, default_relative, is_dbt_yaml
@@ -378,8 +381,9 @@ _CITE_CODE = re.compile(r"r-?\d{2,4}")
 
 
 @_isolated_stage("引用白名單")
-def validate_citations(report: dict, spec_code: str | None) -> dict:
+def validate_citations(report: dict, spec_code) -> dict:
     """引用白名單驗證(簡化版):引用只允許「spec 檔 / 團隊慣例」來源。
+    spec_code 是附上的規格代號:一個字串,或多個(受影響的 model 對到多份規格時)。
     - spec:source 含規則碼(且該規格確實附上);或不指名規則碼的泛稱 + 含「規格/spec」
     - 慣例:source 含「慣例/convention」或對得上知識庫項目 id
     其餘(憑印象的法規、未附上的文件)一律剔除,防捏造。"""
@@ -388,7 +392,8 @@ def validate_citations(report: dict, spec_code: str | None) -> dict:
         kb_ids = {_norm(it.id) for it in load_items()}
     except Exception:
         kb_ids = set()
-    spec_ok = _norm(spec_code) if spec_code else None
+    codes = (spec_code,) if isinstance(spec_code, str) else tuple(spec_code or ())
+    spec_ok = {_norm(code) for code in codes if isinstance(code, str) and code}
     removed = []
     for fd in report.get("findings", []):
         kept = []
@@ -399,7 +404,7 @@ def validate_citations(report: dict, spec_code: str | None) -> dict:
             # 具體依據會因為含 "spec" 字樣而被放行,而防捏造正是白名單的目的。
             named_code = _CITE_CODE.search(src)
             allow = (("convention" in src or "慣例" in src or src in kb_ids)
-                     or (spec_ok and spec_ok in src)
+                     or any(code in src for code in spec_ok)
                      or (spec_ok and not named_code
                          and ("規格" in src or "spec" in src)))
             if allow:
@@ -524,7 +529,15 @@ def _mr_for_spec_exec(mr: dict, dbt_ctx: DbtContext | None) -> dict:
     run_spec_exec 以「檔案內容有沒有樣板標記」決定要不要送沙盒。真實 GitLab 模式拿到的只有
     diff 新增的行:只改了 macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL
     拿去生測資、執行——執行的是不完整的片段,結果沒有意義,萬一通過還會被當成驗證過。
-    帶上完整內容後,既有的判斷就會如實回報「dbt 樣板尚未支援執行驗證」。原本的 MR 不動。"""
+    帶上完整內容後,既有的判斷就會如實回報「dbt 樣板尚未支援執行驗證」。原本的 MR 不動。
+
+    規格檔不是待測的 SQL:run_spec_exec 取最後一個檔案的內容去執行,MR 同時改了規格與
+    程式時,規格檔若排在後面會被當成 SQL。有程式檔時把規格檔拿掉;只有規格檔時不動
+    (沒有東西可以執行,照原本的方式回報)。"""
+    code_only = [f for f in mr.get("files", [])
+                 if not (isinstance(f, dict) and _is_spec_path(f.get("path")))]
+    if code_only and len(code_only) != len(mr.get("files", [])):
+        mr = {**mr, "files": code_only}
     if dbt_ctx is None or dbt_ctx.project is None:
         return mr
     files = []
@@ -678,6 +691,11 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
     dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True
     results = []
     for f in files:
+        if _is_spec_path(f.get("path")):
+            # 規格檔不是 SQL:送進規則層只會得到「無法解析」,訊息還會帶著規格的內容
+            # 回到 prompt 的預掃結果裡。它的變更另由 enforce_spec_change 揭露,注入掃描照常涵蓋
+            results.append({"path": f["path"], "rules": [], "lint": [], "spec_file": True})
+            continue
         sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or f.get("diff", "")
         entry = {"path": f["path"]}
         kind = _non_sql_kind(f.get("path"), _dbt_relative(f.get("path"), dbt_ctx, dbt_cfg))
@@ -740,6 +758,451 @@ def build_diff_section(files: list[dict], budget_tokens: int) -> str:
         used += t
         parts.append(block)
     return "\n\n".join(parts)
+
+
+def _diff_text(mr: dict) -> str:
+    return "\n".join(f.get("diff") or "" for f in mr.get("files", []) if isinstance(f, dict))
+
+
+_AFFECTED_SPECS_HEADER = """這個 MR 沒有對到自己的規格:它改的是共用的 macro / 設定,影響下列 model。\
+以下是這些 model 各自的規格(檔名後面寫的是對到它的 model)。
+- 請逐一核對:這次的變更讓哪個 model 的行為與**它自己的**規格不符(例如門檻、代碼清單、方向條件)。
+- 引用規格時寫出是哪一份(specs/<代號>.md);不要拿 A model 的規格去要求 B model。
+- 下面列為沒有附上規格的 model,不要自行推測它的規格。"""
+
+
+def _affected_spec_section(specs: tuple[SpecForModels, ...], affected: AffectedCheck,
+                           prefix: str, budget_chars: int) -> tuple[str, tuple[str, ...]]:
+    """受影響的 model 對到的規格。回傳(prompt 的規格段, 附上的規格代號)。
+
+    依 specs_by_priority 的順序放,放不下的不截斷、改列在「沒有附上」;第一份放不下時截斷著放,
+    至少給一份。沒有對到規格、沒查、沒檢查到的 model 也列出來:審查要知道哪些沒有規格可比。
+    """
+    def full(rel: str) -> str:
+        return f"{prefix}/{rel}" if prefix else rel
+
+    parts, attached, omitted, left = [_AFFECTED_SPECS_HEADER], [], [], budget_chars
+    for spec in specs:
+        title = f"### specs/{spec.code}.md(受影響的 model:{'、'.join(full(p) for p in spec.models)})"
+        if len(spec.text) <= left or not attached:
+            text = spec.text[:max(left, 0)]
+            parts.append(f"{title}\n{text}")
+            attached.append(spec.code)
+            left -= len(text)
+        else:
+            omitted.append(f"specs/{spec.code}.md(" + "、".join(full(p) for p in spec.models) + ")")
+    missing = []
+    if omitted:
+        missing.append("- 超出預算、沒有附上的規格:" + ";".join(omitted))
+    unmapped = [full(m.path) for m in affected.models if m.spec_looked_up and not m.spec]
+    if unmapped:
+        missing.append("- 沒有對應到規格的 model:" + "、".join(unmapped))
+    not_looked = [full(m.path) for m in affected.models if not m.spec_looked_up]
+    if not_looked:
+        missing.append("- 沒有查規格的 model(超過查詢上限):" + "、".join(not_looked))
+    if affected.unchecked:
+        missing.append("- 沒有檢查的 model(超過數量或時間上限):"
+                       + "、".join(full(p) for p in affected.unchecked))
+    if missing:
+        parts.append("沒有附上規格的受影響 model:\n" + "\n".join(missing))
+    return "\n\n".join(parts), tuple(attached)
+
+
+def _spec_for_exec(spec_code, spec_text, affected_specs: tuple[SpecForModels, ...],
+                   exec_mr: dict) -> tuple:
+    """交給執行驗證的規格。MR 自己的(或受影響的 model 全部對到的同一份)照舊;對到多份時,
+    沒有一份能代表整個 MR,只在交給執行驗證的檔案**全部是 dbt 樣板**時傳第一優先的那份:
+    樣板不會被執行,執行驗證會照實回報「dbt 樣板尚未支援執行驗證」,而不是說成「無規格可驗」。
+    其他情況照舊不傳,避免拿某個 model 的規格去驗不相干的 SQL。"""
+    if spec_text or not affected_specs:
+        return spec_code, spec_text
+    files = [f for f in exec_mr.get("files", []) if isinstance(f, dict)]
+    if files and all(is_dbt_template(f.get("full_content") or _sql_from_diff(f.get("diff", ""))
+                                     or f.get("diff", "")) for f in files):
+        return affected_specs[0].code, affected_specs[0].text
+    return spec_code, spec_text
+
+
+def _full_text_section(files: list[dict], dbt_ctx: DbtContext | None, budget: int) -> str:
+    """prompt 的「變更後的完整內容」段落(見 change_view.build_full_text_section)。"""
+    return build_full_text_section(files, _head_texts(files, dbt_ctx), budget)
+
+
+def _head_texts(files: list[dict], dbt_ctx: DbtContext | None) -> dict:
+    """{路徑: 變更後的完整內容}。mock 模式的 fixture 自帶 full_content;真實模式下,dbt 專案
+    裡的檔案用取回的 head commit 內容。兩者都沒有的檔案不列(prompt 只有它的 diff)。
+
+    **只放 .sql**:完整內容是為了讓模型核對 SQL 的條件才加的。真實模式會取回每個變更檔的完整
+    內容,圖片的文字區塊、SVG 裡看不見的 <text> 這類檔案若也整份放進 prompt,藏在裡面的文字就
+    直接進到審查模型(換個說法的注入句,規則式的掃描器不一定掃得到)。其他檔案只有 diff。"""
+    texts = {}
+    for f in files:
+        if not (isinstance(f, dict) and isinstance(f.get("path"), str)
+                and f["path"].endswith(".sql")):
+            continue
+        text = f.get("full_content")
+        if not (isinstance(text, str) and text) and dbt_ctx is not None:
+            text = dbt_ctx.head_text(f.get("path"))
+        if isinstance(text, str) and text:
+            texts[f.get("path")] = text
+    return texts
+
+
+def _is_spec_path(path) -> bool:
+    """規格檔:repo 裡任何一層 specs/ 目錄底下的 .md(find_spec 讀的是 specs/<代碼>.md)。
+    只認 .md:規格檔不跑規則、不進執行驗證,放在 specs/ 底下的 .sql 不能因此躲過檢查。"""
+    norm = str(path or "").replace("\\", "/").lower()
+    return (norm.startswith("specs/") or "/specs/" in norm) and norm.endswith(".md")
+
+
+def _is_spec_file(f) -> bool:
+    """變更清單的一項是不是規格檔。清單的形狀不可信:不是物件的項目不算(交給其他防線)。"""
+    return isinstance(f, dict) and _is_spec_path(f.get("path"))
+
+
+def _touches_specs(mr: dict) -> bool:
+    return any(_is_spec_file(f) for f in mr.get("files", []))
+
+
+def _root_spec_code(path) -> str | None:
+    """find_spec 讀的位置(repo 根目錄的 specs/<代號>.md)→ 代號;其他位置回 None。"""
+    path = str(path or "").replace("\\", "/")
+    if path.startswith("specs/") and path.endswith(".md") and path.count("/") == 1:
+        return path[len("specs/"):-len(".md")]
+    return None
+
+
+def _spec_versions_in_mr(mr: dict) -> tuple[dict, set]:
+    """這個 MR 改到的規格,以這個 MR 的版本為準。回傳({代號: 內容}, 拿不到內容的代號)。
+    整個規格檔被刪掉時內容是空字串:當成沒有規格(不能用 None——執行驗證收到 None 會自己再找一次,
+    找到的是刪掉之前的版本)。
+
+    只認 find_spec 讀的位置(repo 根目錄的 specs/<代號>.md)。規格和程式由同一個部門整理,規格寫錯
+    在同一個 MR 一起修正是正常流程,所以審查與執行驗證都用這次 MR 的版本;改了什麼由
+    enforce_spec_change 寫在報告最上面、交人工確認。
+
+    拿不到完整內容(沒有 full_content)時無法換成這個 MR 的版本,審查用的是 find_spec 讀到的那一份:
+    真實 GitLab 模式下 find_spec 讀的是正在審的 commit(也就是修改後的版本;讀不到就當成沒有規格),
+    mock 模式讀工具內建的 specs/(修改前的版本)。兩種情況都不能說成「以修改後的規格為準」,
+    在那條 finding 裡寫明拿不到。"""
+    versions, unavailable = {}, set()
+    for f in mr.get("files", []):
+        if not isinstance(f, dict):
+            continue
+        code = _root_spec_code(f.get("path"))
+        if code is None:
+            continue
+        text = f.get("full_content")
+        if _is_deleted(f.get("diff")):
+            versions[code] = ""
+        elif isinstance(text, str) and text:
+            versions[code] = text
+        else:
+            unavailable.add(code)
+    return versions, unavailable
+
+
+def _is_deleted(diff) -> bool:
+    """整個檔案被刪掉:diff 只有一段,變更後是 0 行。"""
+    heads = _HUNK_HEAD.findall(diff) if isinstance(diff, str) else []
+    return len(heads) == 1 and heads[0][2] == "0" and heads[0][3] == "0"
+
+
+def _find_spec_in_mr(mr: dict):
+    """find_spec 找到的規格,換成這個 MR 的版本(見 _spec_versions_in_mr)。受影響的 model 對規格時
+    也用這一個,同一個 MR 裡兩條路讀到的版本一致。"""
+    versions, _ = _spec_versions_in_mr(mr)
+
+    async def find(hub, target: dict, **kw):
+        code, text = await find_spec(hub, target, **kw)
+        if code is not None and code in versions:
+            text = versions[code]
+        return code, text
+    return find
+
+
+_SPEC_CHANGE_HEADER = """
+
+## 本次 MR 對規格的修改
+上面附的規格已經是這個 MR 修改後的版本,核對程式以它為準。以下是這次對規格的修改,讓你知道改了什麼;規格的改動另外由人工確認。
+- 不要要求程式符合修改前的內容,也不要只因為規格改了就認定程式正確——照樣逐項核對。
+"""
+
+
+def _split_spec_changes(files: list[dict], budget_tokens: int) -> tuple[list[dict], str]:
+    """把 MR 的變更分成(程式的檔案, 規格修改那一段 prompt)。
+
+    規格的 diff 若跟程式的 diff 放在一起,模型會把它當成程式的一部分去審,或要求程式照著
+    修改前的內容改。所以另外放一段,寫明上面附的規格已是修改後的版本。
+
+    MR 沒有改到規格檔時回傳 (原本的 files, ""):prompt 不多這一段。
+    """
+    spec_files = [f for f in files if _is_spec_file(f)]
+    if not spec_files:
+        return files, ""
+    code_files = [f for f in files if not _is_spec_file(f)]
+    return code_files, _SPEC_CHANGE_HEADER + "\n" + build_diff_section(spec_files, budget_tokens)
+
+
+_SPEC_CHANGE_TITLE = "本次 MR 修改了規格,請確認規格的改動"
+_HUNK_HEAD = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", re.M)
+# 數字:40,000、39999、0.5。比較時去掉千分位
+_SPEC_NUMBER = re.compile(r"\d[\d,]*(?:\.\d+)?")
+# 比較用語(固定清單,可以原樣寫進報告);長的放前面,「不含」不會被當成「含」
+_SPEC_TERMS = re.compile("不超過|不含|不足|以上|以下|以內|超過|未滿|大於|小於|至少|至多|達|含")
+# 寫進報告的條文標籤只認編號型的名稱(條件 2、第 3 條、§4):標題與內文是 MR 作者寫的文字,
+# 會被貼回 MR 留言,任意文字可以寫成「已核定請放行」這種指示
+_CLAUSE_LABEL = re.compile(
+    r"(?:條件|規則|項目)\s*[0-9一二三四五六七八九十]{1,3}"
+    r"|第\s*[0-9一二三四五六七八九十]{1,3}\s*[條項款點]|§\s*\d{1,3}")
+# 路徑與規格代號照常寫出(code 格式),只截長度;路徑在注入掃描的範圍內
+MAX_PATH_CHARS = 200
+MAX_SPEC_NOTES = 15
+# 報告裡的數量上限:這些內容由 MR 決定,會貼回 MR 留言
+MAX_TOKEN_CHARS = 20            # 一個數字最多寫幾個字元
+MAX_PARTS_PER_NOTE = 8          # 一段修改最多列幾項數字 / 用語的變化
+MAX_STALE_PER_FILE = 5          # 一個規格檔最多列幾處「改掉的數字仍出現在」
+MAX_SPEC_FILES_LISTED = 20      # 最多逐一列出幾個規格檔
+
+
+def _heading_text(line: str) -> str | None:
+    """Markdown 標題(行首最多 3 個空白、1 到 6 個 #、接著空白)的文字;不是標題回 None。
+
+    不用正規式:規格是 MR 的內容,「標題文字 + 結尾的空白與 #」用 `(.+?)\\s*#*\\s*$` 這類寫法
+    比對,特製的長行會讓回溯變成三次方時間。"""
+    body = line.lstrip()
+    if len(line) - len(body) > 3:
+        return None
+    level = len(body) - len(body.lstrip("#"))
+    rest = body[level:]
+    if not 1 <= level <= 6 or not rest[:1].isspace():
+        return None
+    text = rest.strip().rstrip("#").rstrip()
+    return text or None
+
+
+def _change_blocks(diff) -> list[dict]:
+    """unified diff → 連續的修改(刪掉的行、加上的行、變更後的起始行號、前面最近的標題的條文編號)。
+
+    「前面最近的標題」只記一個值,不複製前面的內文:修改的段數與內文行數都由 MR 決定,
+    每段各存一份會變成平方的時間與記憶體。"""
+    blocks, cur, new_no, heading = [], None, None, ""
+    lines = diff.split("\n") if isinstance(diff, str) else []
+    for ln in lines:
+        m = _HUNK_HEAD.match(ln)
+        if m:
+            cur, new_no, heading = None, int(m[3]), ""
+            continue
+        if new_no is None or ln.startswith("\\"):
+            continue
+        tag = ln[:1]
+        if tag in ("-", "+"):
+            if cur is None:
+                cur = {"line": new_no, "removed": [], "added": [], "heading": heading}
+                blocks.append(cur)
+            if tag == "-":
+                cur["removed"].append(ln[1:])
+            else:
+                cur["added"].append(ln[1:])
+                new_no += 1
+        else:
+            cur = None
+            text = _heading_text(ln[1:])
+            if text is not None:
+                heading = _clause_label(text)
+            new_no += 1
+    return blocks
+
+
+def _clause_label(text: str) -> str:
+    m = _CLAUSE_LABEL.search(text)
+    return " ".join(m[0].split()) if m else ""
+
+
+def _code_span(text) -> str:
+    """以 Markdown 的 code 格式寫出 MR 裡的路徑或代號:不可列印的字元換成空白、截長度;
+    內容含反引號時用更長的反引號包住,不會提早結束、變成一般文字。"""
+    text = "".join(ch if ch.isprintable() else " " for ch in str(text))[:MAX_PATH_CHARS]
+    longest = run = 0
+    for ch in text:
+        run = run + 1 if ch == "`" else 0
+        longest = max(longest, run)
+    fence = "`" * (longest + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def _heading_labels(new_lines: list[str]) -> list[str]:
+    """labels[k] = 第 k 行(從 1 起算)**之前**最近的標題的條文編號(沒有是空字串);長度是行數 + 1。
+    一次算好,每段修改直接查,不必各自往前掃。"""
+    labels, label = [""], ""
+    for text in new_lines:
+        heading = _heading_text(text)
+        if heading is not None:
+            label = _clause_label(heading)
+        labels.append(label)
+    return labels
+
+
+def _block_label(block: dict, labels: list[str] | None) -> str:
+    """這段修改屬於哪一條:改到的那一行裡的條文編號(例如「條件 2」),否則是前面最近的標題裡的。
+    都沒有就不寫(只寫行號)。labels 見 _heading_labels;None = 沒有完整內容,用 diff 裡的上下文。"""
+    for text in block["added"] + block["removed"]:
+        label = _clause_label(text)
+        if label:
+            return label
+    if labels is None:
+        return block["heading"]
+    return labels[min(max(block["line"] - 1, 0), len(labels) - 1)]
+
+
+def _changed_tokens(pattern, removed: list[str], added: list[str]) -> list[tuple[str, str]]:
+    """刪掉的行與加上的行之間,換掉的數字或用語(依出現順序配對)。只在一邊出現的,另一邊是 None。"""
+    def norm(t):
+        return t.replace(",", "")
+    old = [t for line in removed for t in pattern.findall(line)]
+    new = [t for line in added for t in pattern.findall(line)]
+    old_left = Counter(map(norm, old)) - Counter(map(norm, new))
+    new_left = Counter(map(norm, new)) - Counter(map(norm, old))
+    old_only, new_only = [], []
+    for token in old:
+        if old_left[norm(token)] > 0:
+            old_left[norm(token)] -= 1
+            old_only.append(token)
+    for token in new:
+        if new_left[norm(token)] > 0:
+            new_left[norm(token)] -= 1
+            new_only.append(token)
+    pairs = list(zip(old_only, new_only))
+    pairs += [(t, None) for t in old_only[len(new_only):]]
+    pairs += [(None, t) for t in new_only[len(old_only):]]
+    return pairs
+
+
+def _describe(kind: str, pairs, quote: bool) -> list[str]:
+    def q(t):
+        t = t if len(t) <= MAX_TOKEN_CHARS else t[:MAX_TOKEN_CHARS] + "…"
+        return f"「{t}」" if quote else t
+    out = []
+    for old, new in pairs:
+        if old is None:
+            out.append(f"新增{kind} {q(new)}")
+        elif new is None:
+            out.append(f"拿掉{kind} {q(old)}")
+        else:
+            out.append(f"{kind} {q(old)} → {q(new)}")
+    return out
+
+
+def _spec_change_notes(f: dict) -> tuple[list[str], list[str]]:
+    """一個規格檔的(改了什麼, 可能前後不一致的地方)。只寫行號、數字、固定清單裡的用語與
+    編號型的條文名稱,不回顯規格內容。"""
+    if _is_deleted(f.get("diff")):
+        return ["整個規格檔被刪除"], []
+    full = f.get("full_content")
+    new_lines = full.split("\n") if isinstance(full, str) and full else None
+    notes, stale = [], []
+    reported: set[str] = set()      # 已經列過「仍出現在」的數字(千分位寫法不同算同一個)
+    labels = _heading_labels(new_lines) if new_lines is not None else None
+    # 數字 → 出現在哪幾行(一次建好、行號遞增:逐個數字整份掃,特製的大檔案會是平方時間)
+    where_is = {}
+    for n, text in enumerate(new_lines or (), 1):
+        for token in _SPEC_NUMBER.findall(text):
+            where_is.setdefault(token.replace(",", ""), []).append(n)
+    for block in _change_blocks(f.get("diff")):
+        label = _block_label(block, labels)
+        where = f"第 {block['line']} 行" + (f"({label})" if label else "")
+        numbers = _changed_tokens(_SPEC_NUMBER, block["removed"], block["added"])
+        terms = _changed_tokens(_SPEC_TERMS, block["removed"], block["added"])
+        parts = _describe("數字", numbers, False) + _describe("用語", terms, True)
+        if not parts:
+            parts = ["刪除內容" if not block["added"] else
+                     "新增內容" if not block["removed"] else "文字修改"]
+        if len(parts) > MAX_PARTS_PER_NOTE:
+            parts = parts[:MAX_PARTS_PER_NOTE] + [f"等共 {len(parts)} 項"]
+        notes.append(f"{where}:" + "、".join(parts))
+        if new_lines is None or len(stale) > MAX_STALE_PER_FILE:
+            continue
+        own = range(block["line"], block["line"] + len(block["added"]))
+        for old, new in numbers:
+            value = (old or "").replace(",", "")
+            if (old is None or new is None or len(value.replace(".", "")) < 3
+                    or value in reported):
+                continue
+            # 只要前 6 個(多的寫「等」):同一個數字出現在很多行、又被改了很多次時,不逐一比對
+            hits = []
+            for n in where_is.get(value, ()):
+                if n not in own and (not hits or hits[-1] != n):
+                    hits.append(n)
+                    if len(hits) > 5:
+                        break
+            if hits:
+                reported.add(value)
+                shown = old if len(old) <= MAX_TOKEN_CHARS else old[:MAX_TOKEN_CHARS] + "…"
+                stale.append(f"改掉的數字 {shown} 仍出現在第 "
+                             + "、".join(map(str, hits[:5])) + (" 等" if len(hits) > 5 else "")
+                             + " 行")
+    if len(stale) > MAX_STALE_PER_FILE:
+        stale = stale[:MAX_STALE_PER_FILE] + ["另有其他處"]
+    return notes, stale
+
+
+@_isolated_stage("規格變更揭露")
+def enforce_spec_change(report: dict, mr: dict) -> dict:
+    """MR 改到規格檔 → 報告最上面固定一條 finding:規格改了哪些條文、改掉的數字是否還留在規格的
+    其他地方(確定性)。決策由 apply_policy 的 spec_changed 硬條件交人工,不靠這條的嚴重度。
+
+    用 info:規格寫錯在同一個 MR 一起修正是正常流程,這是請人確認的事項,不是違規。內容只有
+    路徑(code 格式)、行號、數字、固定清單裡的用語與編號型的條文名稱(見 _spec_change_notes),
+    不回顯規格內容。標題只能由程式產生(見 _put_program_finding)。
+    """
+    spec_files = [f for f in mr.get("files", []) if _is_spec_file(f)]
+    if not spec_files:
+        return report
+    versions, unavailable = _spec_versions_in_mr(mr)
+    parts, shown = [], 0
+    for f in spec_files[:MAX_SPEC_FILES_LISTED]:
+        notes, stale = _spec_change_notes(f)
+        more = max(0, len(notes) - (MAX_SPEC_NOTES - shown))
+        notes = notes[:MAX_SPEC_NOTES - shown]
+        shown += len(notes)
+        name = _code_span(f.get("path"))
+        if notes:
+            text = f"{name}:" + ";".join(notes) + (f";另有 {more} 處" if more else "")
+        elif more:
+            text = f"{name}:有 {more} 處修改(超過逐一列出的上限)"
+        else:
+            text = f"{name}:看不出修改的位置"
+        if stale:
+            text += "。可能前後不一致:" + ";".join(stale) + ",請確認是否也要一起改"
+        elif not (isinstance(f.get("full_content"), str) and f.get("full_content")):
+            text += "。沒有修改後的完整內容,無法檢查規格前後是否一致"
+        parts.append(text + "。")
+    if len(spec_files) > MAX_SPEC_FILES_LISTED:
+        parts.append(f"另有 {len(spec_files) - MAX_SPEC_FILES_LISTED} 個規格檔沒有逐一列出。")
+    also_code = len(spec_files) < len(mr.get("files", []))
+    detail = ("這個 MR 修改了規格" + (",同時也改了程式" if also_code else "") + "。"
+              + "".join(parts))
+    if unavailable:
+        names = sorted(map(_code_span, unavailable))
+        detail += (f"有 {len(unavailable)} 個規格檔拿不到修改後的完整內容({'、'.join(names)})"
+                   + ",無法確認審查讀到的是不是修改後的版本,也沒有檢查規格前後是否一致;")
+    elif versions:
+        detail += "審查與執行驗證以這個 MR 修改後的規格為準;"
+    elsewhere = sum(_root_spec_code(f.get("path")) is None for f in spec_files)
+    if elsewhere:
+        # 只有 repo 根目錄的 specs/<代號>.md 是審查讀的規格;其他位置的不能說成「以修改後的為準」
+        detail += (f"有 {elsewhere} 個規格檔不在審查讀取規格的位置(repo 根目錄的 specs/<代號>.md),"
+                   "審查沒有用到它們;")
+    detail += "規格的改動需要有人確認,這個 MR 不會自動放行。"
+    _put_program_finding(report, {
+        "file": "(MR 內容)", "line": 0, "severity": "info", "title": _SPEC_CHANGE_TITLE,
+        "detail": detail,
+        "suggestion": "請確認規格的改動有業務依據,且規格裡相關的條文都一起改到了。",
+        "citations": []})
+    findings = report["findings"]
+    findings.insert(0, findings.pop())          # 放在報告最上面
+    return report
 
 
 async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
@@ -823,12 +1286,19 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
 
         # 找 spec(確定性;執行驗證與 prompt 的規格段共用)。依檔名對應與展開器
         # 同一個開關:關閉時行為與接線前完全相同。
-        spec_code, spec_text = await find_spec(hub, mr, by_path=cfg.dbt.get("enabled") is True)
+        # MR 改到規格檔時,規格以這個 MR 的版本為準(見 _spec_versions_in_mr)
+        find_spec_mr = _find_spec_in_mr(mr)
+        spec_code, spec_text = await find_spec_mr(hub, mr, by_path=cfg.dbt.get("enabled") is True)
         # MR 改到 macro 等:檢查不在變更清單裡、但受影響的 model(沒有反查結果時是 None)
-        affected = await check_affected_models(hub, mr, cfg.dbt, dbt_ctx, find_spec=find_spec)
+        affected = await check_affected_models(hub, mr, cfg.dbt, dbt_ctx, find_spec=find_spec_mr)
         if spec_code is None and spec_text is None and affected is not None and affected.spec:
             # MR 本身對不到規格(只改了 macro),而受影響的 model 都對到同一份:用它來審
             spec_code, spec_text = affected.spec
+        # 對到多份規格、或只有部分對到:找到的都附上,標明對應哪個 model。排序失敗就當成
+        # 沒有對到(執行驗證照「無規格可驗」處理)並記下未完整,不中斷整份審查
+        affected_specs = (_step(report_stub, "受影響 model 的規格", specs_by_priority, (),
+                                affected, _diff_text(mr))
+                          if spec_code is None and spec_text is None else ())
 
         # 分層知識檢索:依變更內容的 scope + query,
         # 只注入 binding 恆常規範(scope 內全數)+ 相關 guideline top_k。
@@ -853,6 +1323,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         style_codes = set(know.get("style_codes", []))
         if style_codes:
             for f, entry in zip(mr["files"], pre):
+                if entry.get("spec_file"):
+                    continue
                 sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or ""
                 shits = await hub.call_json(
                     "memory__check_style", {"sql": sql, "scope": ",".join(scope)}) or []
@@ -861,6 +1333,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         if capture is not None:
             capture.update({"scope": scope, "kb_query": kb_query, "knowledge": know,
                             "conventions": conventions, "spec_code": spec_code,
+                            "affected_specs": [s.code for s in affected_specs],
                             "prescan_final": copy.deepcopy(pre)})
 
         if dry_run:
@@ -889,11 +1362,22 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         spec_section = (f"### specs/{spec_code}.md\n{spec_text[:spec_budget]}"
                         if spec_text else
                         "(未找到對應規格檔;執行驗證將以「無規格可驗」處理)")
+        cited_codes: tuple[str, ...] = (spec_code,) if spec_code else ()
+        if affected_specs:
+            spec_section, cited_codes = _affected_spec_section(
+                affected_specs, affected, dbt_ctx.prefix if dbt_ctx is not None else "", spec_budget)
+        # MR 改到規格檔時,規格的 diff 不跟程式的 diff 放在一起:見 _split_spec_changes。
+        # 這兩段失敗時退回只有 diff 的 prompt 並記下未完整(決策交人工),不中斷整份審查
+        code_files, spec_changes = _step(report_stub, "規格變更分段", _split_spec_changes,
+                                         (mr["files"], ""), mr["files"], cfg.budget.get("spec", 3000))
+        # 變更後的完整內容:只有 diff 時,不在 hunk 上下文裡的條件會被報成「遺漏」
+        full_text = _step(report_stub, "完整內容段落", _full_text_section, "",
+                          code_files, dbt_ctx, cfg.budget.get("full_content", 6000))
         user = USER_TEMPLATE.format(
             title=mr["title"], description=mr.get("description", ""),
-            diff_section=build_diff_section(mr["files"], cfg.budget["diff"]),
+            diff_section=build_diff_section(code_files, cfg.budget["diff"]) + full_text,
             prescan=json.dumps(pre, ensure_ascii=False),
-            spec_section=spec_section,
+            spec_section=spec_section + spec_changes,
         )
         _attach_statement_lines(pre, mr["files"])   # 給程式補的 finding 用;prompt 已組好,不受影響
 
@@ -923,7 +1407,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 放在 normalize_findings 之後:那一步整理的是**模型**輸出的形狀,
         # 我們自己補的 finding 形狀本來就是對的,不需要也不該被它改寫。
         report.setdefault("findings", []).extend(report_stub["findings"])
-        report = validate_citations(report, spec_code)
+        report = validate_citations(report, cited_codes)
         report = sanitize_findings(report)
         # 檢核點只認模型自己的回應:放在任何程式補報之前(enforce_rules 補的 R004 內文含
         # 「憑證」「密碼」,若先進報告,會被當成模型已回應 H004)
@@ -960,9 +1444,11 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         progress: dict = {}
         deadline = time.monotonic() + SPEC_EXEC_TIMEOUT_SECONDS
         try:
+            # 交給執行驗證的 MR 與規格也在 try 裡:組不出來同樣記成執行驗證未完成
+            exec_mr = _mr_for_spec_exec(mr, dbt_ctx)
+            exec_code, exec_text = _spec_for_exec(spec_code, spec_text, affected_specs, exec_mr)
             spec_result = await asyncio.wait_for(
-                run_spec_exec(cfg, hub, _mr_for_spec_exec(mr, dbt_ctx),
-                              spec_code, spec_text,
+                run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text,
                               progress=progress, deadline=deadline),
                 timeout=SPEC_EXEC_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
@@ -982,6 +1468,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             # 而「逾時那次」正是最需要知道時間花在哪裡的一次。
             report["_spec_exec_stage_seconds"] = progress.get("seconds", {})
         report = enforce_dbt_unexecuted(report, mr, dbt_ctx, cfg.dbt)  # dbt 的變更沒被執行驗證到
+        report = enforce_spec_change(report, mr)  # MR 改到規格檔:改了什麼、前後是否一致
 
         report = apply_rubric(report)
         report = apply_policy(report, mr, cfg.policy)
@@ -1656,6 +2143,8 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
         for f in mr.get("files", []))
     # 執行驗證(spec_exec)是硬條件:沒 spec、測資建不起來、案例不符 → 不得自動放行
     spec_exec_ok = report.get("_spec_exec", {}).get("passed") is True
+    # MR 改到規格檔也是硬條件:規格變更要有人確認業務依據,不看 finding、不可由設定關閉
+    spec_changed = _touches_specs(mr)
     # 有環節沒完成 → 至少 needs_human,**寫死在程式裡**。原本是靠設定檔的
     # allowed_severities 只許 info 擋著(未完成的那條是 major),設定一放寬,
     # 沒跑完的審查就會被當成「沒問題」自動放行。跟執行驗證一樣不可由設定關閉。
@@ -1671,6 +2160,7 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     ok = (diff_lines <= aa.get("max_diff_lines", 0)
           and not new_rule
           and spec_exec_ok
+          and not spec_changed
           and not incomplete
           and report.get("score", 0) >= aa.get("min_score", 101)
           and severities <= set(aa.get("allowed_severities", []))
@@ -1680,6 +2170,7 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
                                  "severities": sorted(severities),
                                  "pending_hints": pending_hints,
                                  "spec_exec_passed": spec_exec_ok,
+                                 "spec_changed": spec_changed,
                                  "incomplete": incomplete}
     return report
 
@@ -1942,6 +2433,7 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
     report = enforce_dbt_config_change(report, mr, dbt_ctx, dbt_cfg)
     report = enforce_dbt_notice(report, pre)   # 與正式路徑一致:表名未驗證的提醒不可少
     report = enforce_dbt_impact(report, affected, dbt_ctx)
+    report = enforce_spec_change(report, mr)
     for fd in report["findings"]:
         await hub.call("gitlab__post_inline_comment",
                        {"mr_id": mr_id, "file": fd["file"], "line": 0,
