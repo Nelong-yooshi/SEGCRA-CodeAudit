@@ -28,6 +28,7 @@ from .security import scan_mr
 from .skills_loader import always_skills, load_skills, skills_index
 from .spec_exec import find_spec, run_spec_exec
 from .tool_hub import ToolHub
+from toolbox.sqltools import LINT_INCOMPLETE_CODE, LINT_MAX_CHARS, LINT_TIMEOUT_SECONDS
 
 SYSTEM_TEMPLATE = """你是資深資料庫工程主管,負責審查 SQL merge request。\
 你的審查將直接決定 MR 能否合入,必須精準、可回溯、給得出修改建議。
@@ -1413,6 +1414,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_hints(report, pre)
         report = enforce_rules(report, pre)    # rule-base 命中不因模型省略而消失
         report = enforce_parse(report, pre)    # 預掃解析失敗 = 確定性規則沒跑,必須看得見
+        report = enforce_lint_incomplete(report, pre)  # lint 逾時或沒跑:同樣要看得見
         report = enforce_style(report, pre)    # 已學會的風格(如前置逗號)確定性補報
         # 放在 enforce_hints / enforce_style 之後:它們以關鍵詞判斷模型是否已回應,
         # 程式補的文字若先進報告,可能被誤當成模型的回應而吞掉檢核點
@@ -1663,6 +1665,30 @@ def enforce_parse(report: dict, pre: list[dict]) -> dict:
             continue
         if entry.get("parse_error"):
             _put_program_finding(report, _parse_fail_finding(entry))
+    return report
+
+
+@_isolated_stage("lint 未完成揭露")
+def enforce_lint_incomplete(report: dict, pre: list[dict]) -> dict:
+    """lint 沒有跑完的檔案(逾時、內容過長、子行程失敗,見 sqltools.lint):每個檔案補一條
+    「審查未完整」。帶 stage 欄位,決策照其他未完成的環節交人工(review_incomplete)。
+
+    lint 的結果不影響決策,但它沒跑完通常代表內容是特製的(一般的 SQL 在時間上限內跑得完);
+    只把那一筆留在預掃結果裡,報告上看不到,MR 仍可能被自動放行。規則層不受影響,照常有效。"""
+    for entry in pre:
+        lint = entry.get("lint")
+        if not (isinstance(lint, list) and any(
+                isinstance(v, dict) and v.get("code") == LINT_INCOMPLETE_CODE for v in lint)):
+            continue
+        report.setdefault("findings", []).append({
+            "file": entry["path"], "line": 0, "severity": "major",
+            "title": f"[lint] {INCOMPLETE_TITLE_PREFIX}",
+            "detail": (f"lint 沒有跑完(超過時間上限 {LINT_TIMEOUT_SECONDS} 秒、內容超過 "
+                       f"{LINT_MAX_CHARS} 字元或執行失敗),這個檔案沒有風格與反模式檢查的結果。"
+                       "規則層的檢查不受影響。"),
+            "stage": "lint",
+            "suggestion": "請人工確認這個檔案的內容;一般的 SQL 在時間上限內跑得完。",
+            "citations": []})
     return report
 
 
@@ -2447,6 +2473,7 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                             "spec_found": bool(spec_text), "spec_code": spec_code,
                             "files_scanned": len(pre)}}
     report = enforce_non_sql(report, pre)      # 與正式路徑一致
+    report = enforce_lint_incomplete(report, pre)
     report = enforce_dbt_config_change(report, mr, dbt_ctx, dbt_cfg)
     report = enforce_dbt_notice(report, pre)   # 與正式路徑一致:表名未驗證的提醒不可少
     report = enforce_dbt_impact(report, affected, dbt_ctx)

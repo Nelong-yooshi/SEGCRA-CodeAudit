@@ -1,7 +1,7 @@
 # 測試/CI 用。刻意**不**引入 requirements.txt:
 # 全裝的話 pymssql 會在 CI 上要求編譯 freetds,平白讓 workflow 失敗。
 #
-# 這裡列的是「import 得起來」的最小集合,不是「測試會用到」的集合——
+# 這裡列的是跑測試需要的最小集合。大部分是「import 得起來」需要的——
 # 測試不呼叫 LLM、不連資料庫,但 import 管線模組時 module 層的 import 就會被執行:
 #   jinja2       orchestrator/dbt_render.py 的樣板展開(#10 的範圍)
 #   sqlglot      規則預掃的 SQL 解析
@@ -13,9 +13,12 @@
 #   json-repair  agent.py 的 extract_json 退路(test_parsing.py 會驗到)
 # 少任何一個,對應的測試檔是**收集階段就 ImportError**,不是某條斷言紅燈。
 #
-# 尚未加 sqlfluff / pymssql:sqlfluff 只有 toolbox/sqltools.lint() 內部才 import
-# (還沒有測試走到那條路徑),pymssql 是 spec_exec.execute_cases() 函式內部才
-# import(module 層不需要)。哪天測試真的用到再加,不要先裝不用的。
+# sqlfluff 不一樣:只有 toolbox/sqltools.lint() 內部才 import,但預掃與整條審查的測試都會
+# 跑到 lint。沒裝時 lint 在子行程裡失敗、記成「沒跑完」並交人工,那些測試是**斷言紅燈**
+# (決策與報告跟著變),不是收集錯誤。
+#
+# 尚未加 pymssql:它是 spec_exec.execute_cases() 函式內部才 import(module 層不需要),
+# 測試不連資料庫。哪天測試真的用到再加,不要先裝不用的。
 #
 # 驗證方式:用乾淨的虛擬環境只裝這份清單,跑 tests/ 應全數通過。
 pytest>=8.0
@@ -25,3 +28,4 @@ openai>=1.60
 pyyaml>=6.0
 httpx>=0.27
 json-repair>=0.30
+sqlfluff>=3.0

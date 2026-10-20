@@ -45,7 +45,7 @@
 
 ### ToolHub 行程內註冊表(`orchestrator/tool_hub.py`)
 
-行程內工具註冊表:把 `toolbox/` 的**純 Python 函式**轉成 OpenAI tool-calling schema 並分派呼叫,不 spawn 子行程、無協定層。工具名格式 `<group>__<tool>`(OpenAI tool name 不允許點號),與舊 MCP 版命名完全相同(`gitlab__get_mr_diff`、`sqltools__run_rules`…),pipeline/prompt 不需改動。
+行程內工具註冊表:把 `toolbox/` 的**純 Python 函式**轉成 OpenAI tool-calling schema 並分派呼叫,註冊表本身不 spawn 子行程、無協定層(`sqltools__lint` 自己在子行程跑,為了有時間上限,見 01 篇)。工具名格式 `<group>__<tool>`(OpenAI tool name 不允許點號),與舊 MCP 版命名完全相同(`gitlab__get_mr_diff`、`sqltools__run_rules`…),pipeline/prompt 不需改動。
 
 - **`TOOL_GROUPS`**:group 名 → 函式清單。三組共 16 個工具(註冊的全部;交給模型的只有白名單,見下一項):
   - `gitlab`(7):`get_mr_diff`、`get_file`、`post_inline_comment`、`post_summary`、`set_commit_status`、`create_rule_mr`、`set_label`
