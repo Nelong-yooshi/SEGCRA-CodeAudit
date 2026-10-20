@@ -11,6 +11,9 @@ import re
 import sqlglot
 from sqlglot import exp
 
+from orchestrator.config import env_seconds
+from orchestrator.isolation import run_isolated
+
 logging.disable(logging.INFO)  # sqlfluff 的 INFO 輸出會灌爆 stderr
 
 # 規則程式跑在 MS SQL 上。用別的方言解析,T-SQL 的方括號識別字、TOP、WITH (NOLOCK)
@@ -45,14 +48,42 @@ def parse_ast(sql: str) -> str:
     return json.dumps(out, ensure_ascii=False)
 
 
+# lint 的耗時隨內容超線性成長,特製的內容(例如反覆的 `/*,`)幾千字元就可能要數十秒。
+# 預掃與模型的工具呼叫都在審查的同一條執行緒上同步呼叫,卡住就是整份審查卡住,外層的
+# asyncio 時間上限也插不進來。所以放進子行程跑,超過時間強制終止(見 orchestrator.isolation)。
+# 超過字數上限的不跑:幾乎一定逾時,先擋下省掉等待。
+LINT_TIMEOUT_SECONDS = env_seconds("LINT_TIMEOUT_SECONDS", 60)
+LINT_MAX_CHARS = 100_000
+LINT_MAX_MEMORY_MB = 1024
+# 沒跑完時回傳的那一筆。不回空清單:空清單代表「檢查過、沒有違規」。
+LINT_INCOMPLETE_CODE = "LINT_INCOMPLETE"
+_LINT_INCOMPLETE = json.dumps(
+    [{"line": 0, "code": LINT_INCOMPLETE_CODE,
+      "description": "lint 沒有跑完(超過時間上限、內容過長或執行失敗),這份內容沒有 lint 結果"}],
+    ensure_ascii=False)
+
+
 def lint(sql: str) -> str:
-    """以 sqlfluff 檢查風格與已知反模式,回傳違規清單。"""
+    """以 sqlfluff 檢查風格與已知反模式,回傳違規清單。
+
+    在子行程執行,有時間上限;沒跑完(逾時、內容過長、子行程失敗、sqlfluff 丟例外)時
+    回傳只有一筆 LINT_INCOMPLETE_CODE 的清單。"""
+    if isinstance(sql, str) and len(sql) > LINT_MAX_CHARS:
+        return _LINT_INCOMPLETE
+    return run_isolated(_lint_in_child, (sql,), timeout_s=LINT_TIMEOUT_SECONDS,
+                        max_memory_mb=LINT_MAX_MEMORY_MB,
+                        on_failure=lambda _message: _LINT_INCOMPLETE)
+
+
+def _lint_in_child(sql: str) -> str:
     import sqlfluff
 
     try:
         results = sqlfluff.lint(sql, dialect=DIALECT)
-    except Exception as e:
-        return json.dumps({"error": f"lint failed: {e}"}, ensure_ascii=False)
+    except Exception:
+        # sqlfluff 對內容本身的問題會回報成違規、不丟例外;會丟的是執行環境(例如方言設錯)。
+        # 當成沒跑完:不然每個檔都靜靜地沒有 lint 結果。例外訊息可能帶原文,不回傳。
+        return _LINT_INCOMPLETE
     slim = [
         {"line": r.get("start_line_no") or r.get("line_no"),
          "code": r.get("code"),

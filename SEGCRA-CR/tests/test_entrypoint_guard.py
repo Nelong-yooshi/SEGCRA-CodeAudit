@@ -1,6 +1,6 @@
 """進入點要有 `if __name__ == "__main__":` 保護(review 列的 dbt.enabled 開啟前條件)。
 
-dbt 的展開、macro 反查、專案資訊整理都在子行程裡做(multiprocessing 的 spawn)。spawn 會在
+dbt 的展開、macro 反查、專案資訊整理與 lint 都在子行程裡做(multiprocessing 的 spawn)。spawn 會在
 子行程重新匯入進入點的模組;進入點把「開始審查」寫在模組最外層的話,每個子行程都會把整支程式
 從頭再跑一次。這種問題只在真的啟動時才出現,所以用靜態檢查鎖住。
 """
@@ -10,7 +10,7 @@ import pathlib
 import pytest
 
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
-ENTRYPOINTS = ["demo.py", "scripts/webhook_server.py"]
+ENTRYPOINTS = ["demo.py", "scripts/webhook_server.py", "tools/prescan.py"]
 
 
 def _is_main_guard(node: ast.AST) -> bool:
