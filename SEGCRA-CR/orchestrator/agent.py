@@ -41,11 +41,13 @@ DUMP_PROMPTS = os.environ.get("SEGCRA_DUMP_PROMPTS", "")
 _dump_seq = 0
 
 
-def _dump(profile_model: str, messages: list, iteration: int) -> None:
-    """把一次呼叫的完整 messages 寫成一個檔。失敗一律吞掉——診斷功能不該弄垮跑批。"""
+def _dump(profile_model: str, messages: list, iteration: int) -> str:
+    """把一次呼叫的完整 messages 寫成一個檔,回傳檔名(供回應接在同一個檔後面)。
+
+    失敗一律吞掉——診斷功能不該弄垮跑批。"""
     global _dump_seq
     if not DUMP_PROMPTS:
-        return
+        return ""
     try:
         from pathlib import Path
         _dump_seq += 1
@@ -59,6 +61,34 @@ def _dump(profile_model: str, messages: list, iteration: int) -> None:
             if m.get("tool_calls"):
                 parts.append(f"----- tool_calls -----\n{json.dumps(m['tool_calls'], ensure_ascii=False, sort_keys=True, indent=2)}")
         f.write_text("\n".join(parts), encoding="utf-8")
+        return str(f)
+    except Exception:
+        return ""
+
+
+def _dump_response(path: str, content: str, finish_reason: str,
+                   completion_tokens, prompt_tokens=None,
+                   estimated_prompt_tokens=None) -> None:
+    """把模型的回應接在同一個落檔後面。
+
+    **為什麼回應也要落檔**:只落請求看不出最關鍵的事——模型到底有沒有照
+    「只補缺的那幾個」做(可能改條件編號、可能整份重寫、可能只回一部分)。
+    那是測資生成唯一只有真端點答得出來的問題,而它每次呼叫動輒數分鐘,
+    沒落檔就得重跑一輪才能回答。純觀測,不改送進模型的任何內容。"""
+    if not path:
+        return
+    try:
+        from pathlib import Path
+        with Path(path).open("a", encoding="utf-8") as fh:
+            # prompt_tokens 與我們的估算一起記:estimate_tokens() 用的是 len/3,
+            # 而實測測資那種「日期+數字」的 JSON 一個 token 不到 0.5 個字元
+            # (completion_tokens=8192 只換到 3923 字元)。輸入側若也差這麼多,
+            # budget.diff 的 8000 就不是真的 8000——這一欄就是為了量它。
+            fh.write(f"\n\n===== response finish_reason={finish_reason} "
+                     f"completion_tokens={completion_tokens} chars={len(content or '')} "
+                     f"prompt_tokens={prompt_tokens} "
+                     f"estimated_prompt_tokens={estimated_prompt_tokens} =====\n")
+            fh.write(content or "")
     except Exception:
         pass
 
@@ -101,7 +131,7 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
     effort_kwargs = ({"reasoning_effort": profile.reasoning_effort}
                      if profile.reasoning_effort else {})
     for i in range(MAX_ITERATIONS):
-        _dump(profile.model, messages, i)
+        dump_path = _dump(profile.model, messages, i)
         resp = await client.chat.completions.create(
             model=profile.model, messages=messages, **tool_kwargs,
             temperature=profile.temperature,
@@ -125,6 +155,10 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
             # 中間輪次的工具呼叫回合即使碰到上限也會繼續跑下去。
             meta["finish_reason"] = resp.choices[0].finish_reason
             meta["completion_tokens"] = getattr(usage, "completion_tokens", None) if usage else None
+        _dump_response(dump_path, msg.content or "", resp.choices[0].finish_reason,
+                       getattr(usage, "completion_tokens", None) if usage else None,
+                       prompt_tokens,
+                       sum(estimate_tokens(m.get("content") or "") for m in messages))
         messages.append(msg.model_dump(exclude_none=True))
 
         if not msg.tool_calls:
@@ -171,10 +205,23 @@ def decode_byte_fallback(text: str) -> str:
     return re.sub(r"(?:<0x[0-9A-Fa-f]{2}>)+", _sub, text)
 
 
-def extract_json(text: str) -> dict | None:
+def extract_json(text: str, meta: dict | None = None) -> dict | None:
     """從模型輸出抽出第一個 JSON 物件(容忍 ```json 圍欄與前後雜訊)。
+
     嚴格解析失敗時退回 json-repair 修復模型常見的「幾乎合法」JSON
-    (未跳脫引號、缺逗號、截斷)——LLM 結構化輸出的通病,整個管線共用。"""
+    (未跳脫引號、缺逗號、截斷)——LLM 結構化輸出的通病,整個管線共用。
+
+    **給了 `meta` 就會回填 `repaired`(bool),說明這份結果是不是靠 repair 救回來的。**
+    呼叫端需要知道這件事,因為 repair 會把壞掉的 JSON **修補成一個合法但語意錯誤的
+    物件**,而不是失敗。實際案例(#23):測資生成少打一個 `]`,
+
+        "rows": [["txn_log", 1, ..., null], "expect_flagged": true, ...},
+
+    repair 把後面所有案例都塞進這一筆的 `rows` 裡,那一筆因為形狀不對被剔除,
+    後面的案例跟著消失。報告上寫的卻是「條件 C5 缺 false 向案例」——
+    **一個標點符號的問題被回報成模型覆蓋不足**,查了很久才發現。
+
+    `meta` 預設 None,既有呼叫端不受影響。"""
     text = decode_byte_fallback(text)  # 修 gemma byte-fallback 亂碼(全形空格等)
     text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.M)
     depth, start = 0, None
@@ -187,9 +234,13 @@ def extract_json(text: str) -> dict | None:
             depth -= 1
             if depth == 0 and start is not None:
                 try:
-                    return json.loads(text[start:i + 1])
+                    parsed = json.loads(text[start:i + 1])
                 except json.JSONDecodeError:
                     start = None
+                else:
+                    if meta is not None:
+                        meta["repaired"] = False
+                    return parsed
     # 嚴格解析失敗 → json-repair 盡力修復
     try:
         import json_repair
@@ -197,6 +248,8 @@ def extract_json(text: str) -> dict | None:
         if m:
             repaired = json_repair.loads(m.group(0))
             if isinstance(repaired, dict) and repaired:
+                if meta is not None:
+                    meta["repaired"] = True
                 return repaired
     except Exception:
         pass

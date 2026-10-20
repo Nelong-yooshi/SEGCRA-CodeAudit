@@ -63,6 +63,28 @@ def testgen_model(cfg, profile_name: str | None = None) -> str:
     return prof.model
 
 
+def stale_reason(spec_code: str, spec_text: str, *, model: str) -> str | None:
+    """凍結檔存在但對不上時,說明是哪一項對不上;對得上或根本沒凍結過回 None。
+
+    **為什麼要講出來**:對不上時呼叫端會靜靜地改成現場生成——變慢(大規則實測
+    54 分鐘)、而且每次結果不同(取樣會飄),但畫面上看不出跟「用凍結檔」有什麼差別。
+    改了 TESTGEN prompt 之後整批凍結檔都會對不上,那正是最需要被告知的時候。
+    """
+    p = _path(spec_code)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        return f"凍結檔讀不起來({type(e).__name__})"
+    for label, got, want in (("規格內容", data.get("spec_sha256"), _sha(spec_text)),
+                             ("TESTGEN prompt", data.get("prompt_sha256"), _prompt_hash()),
+                             ("模型", data.get("model"), model)):
+        if got != want:
+            return f"{label}對不上(凍結檔 {got} / 現在 {want})"
+    return None
+
+
 def load(spec_code: str, spec_text: str, *, model: str) -> dict | None:
     """規格、prompt、模型三者都對得上才回傳凍結的 plan(原樣,未經形狀檢查);
     任一對不上、沒凍結過或檔案壞掉都回 None(呼叫端接下來該照常呼叫真的
@@ -82,13 +104,24 @@ def load(spec_code: str, spec_text: str, *, model: str) -> dict | None:
 
 
 def save(spec_code: str, spec_text: str, plan: dict, gaps: list[str],
-        *, profile: str, model: str, force: bool = False) -> None:
+        *, profile: str, model: str, force: bool = False,
+        cost: dict | None = None) -> None:
     """存檔前檢查覆蓋度:預設拒絕凍結一份有缺口的測資計畫——不然凍住的
     等於把一次不完整的取樣當成「這條規則以後每次 golden set 都只驗這幾個案例」,
     而且不會再重新抽到比較好的版本。`force=True` 才能覆蓋,明確承擔後果。
 
     0 缺口也不代表每個條件都驗到了(缺口只看「每個條件有沒有兩向案例」,不看
-    反向案例是不是真的只讓那一個條件不成立),存檔後仍要有人看過案例內容。"""
+    反向案例是不是真的只讓那一個條件不成立),存檔後仍要有人看過案例內容。
+
+    `cost` 記這一份**生出來花了多少**:幾次模型呼叫、幾秒、資料列幾列、沙盒跑一輪
+    幾秒。為什麼存進檔案而不是只印出來:
+      * 這些數字決定「哪些規格適合在線上現場生」「上限該訂多少」,不該每次要用時
+        都重跑一輪(大規格一輪 70 分鐘)
+      * 黑盒評測要「記下每份規格花多久、有沒有成功」(#45 的討論),凍結檔裡有就
+        不必另外維護一份紀錄
+      * 它也讓「案例數 vs 偵測能力 vs 時間」這個取捨有據可循——實測 R-140 從
+        19 個案例降到 8 個,突變偵測一樣 10/10
+    """
     if gaps and not force:
         raise ValueError(
             f"這份測資計畫有 {len(gaps)} 個覆蓋缺口,預設不凍結:{'; '.join(gaps)}\n"
@@ -103,6 +136,8 @@ def save(spec_code: str, spec_text: str, plan: dict, gaps: list[str],
         "model": model,
         "coverage_gaps": gaps,
         "case_count": len(plan["cases"]),
+        "row_count": sum(len(c.get("rows") or []) for c in plan["cases"]),
+        "cost": cost or {},
         "plan": plan,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -113,9 +148,17 @@ def wrap(generate_cases_fn):
     主動套用,例如 `spec_exec.generate_cases = testdata_cache.wrap(spec_exec.generate_cases)`
     ——不改 spec_exec.py 本身,正式審查(pipeline.py → run_spec_exec)不受影響。"""
     async def wrapped(cfg, spec_code, spec_text, profile_name=None, **kw):
-        cached = load(spec_code, spec_text, model=testgen_model(cfg, profile_name))
+        model = testgen_model(cfg, profile_name)
+        cached = load(spec_code, spec_text, model=model)
         if cached is not None:
             return spec_exec._shape_check(cached)
+        # 有凍結檔但對不上 → 說出來。靜靜地改成現場生成會讓人以為還在用凍結檔,
+        # 而兩者的耗時(大規則 54 分鐘 vs 幾秒)與可重現性完全不同。
+        why = stale_reason(spec_code, spec_text, model=model)
+        if why:
+            print(f"[testdata_cache] {spec_code} 的凍結檔不適用({why})"
+                  f"——改為現場生成,這次會變慢、而且結果每次不同。"
+                  f"要重新凍結:python eval/freeze_testdata.py {spec_code}", flush=True)
         return await generate_cases_fn(cfg, spec_code, spec_text,
                                        profile_name=profile_name, **kw)
     return wrapped

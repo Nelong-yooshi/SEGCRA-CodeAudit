@@ -282,6 +282,46 @@ def test_落檔會寫出實際送出的每一段(tmp_path, monkeypatch):
     assert ":" not in files[0].name
 
 
+def test_回應接在同一個落檔後面(tmp_path, monkeypatch):
+    """只落請求看不出最關鍵的事:模型到底有沒有照「只補缺的那幾個」做。
+    那是測資生成唯一只有真端點答得出來的問題,而一次呼叫動輒數分鐘——
+    沒落檔就得重跑一輪才能回答。
+    """
+    import orchestrator.agent as agent
+    monkeypatch.setattr(agent, "DUMP_PROMPTS", str(tmp_path))
+    monkeypatch.setattr(agent, "_dump_seq", 0)
+    path = agent._dump("m", [{"role": "user", "content": "ASK"}], 0)
+    agent._dump_response(path, '{"cases": []}', "length", 8192)
+    text = (tmp_path / path.rsplit("/", 1)[-1]).read_text(encoding="utf-8")
+    assert "ASK" in text and '{"cases": []}' in text
+    assert "finish_reason=length" in text and "completion_tokens=8192" in text
+
+
+def test_落檔記下端點回報的prompt_tokens與我們的估算(tmp_path, monkeypatch):
+    """`estimate_tokens()` 用 len/3,但實測測資那種「日期+數字」的 JSON
+    一個 token 不到 0.5 個字元(completion_tokens=8192 只換到 3923 字元)。
+    輸入側若也差這麼多,`budget.diff` 的 8000 就不是真的 8000——兩個數字
+    並排記下來才量得到這件事。"""
+    import orchestrator.agent as agent
+    monkeypatch.setattr(agent, "DUMP_PROMPTS", str(tmp_path))
+    monkeypatch.setattr(agent, "_dump_seq", 0)
+    path = agent._dump("m", [{"role": "user", "content": "x"}], 0)
+    agent._dump_response(path, "{}", "stop", 5, prompt_tokens=1234,
+                         estimated_prompt_tokens=400)
+    text = (tmp_path / path.rsplit("/", 1)[-1]).read_text(encoding="utf-8")
+    assert "prompt_tokens=1234" in text and "estimated_prompt_tokens=400" in text
+
+
+def test_沒開落檔時寫回應不會建檔也不會炸(tmp_path, monkeypatch):
+    """預設關閉必須是零影響:_dump 回空字串,_dump_response 就什麼都不做。"""
+    import orchestrator.agent as agent
+    monkeypatch.setattr(agent, "DUMP_PROMPTS", "")
+    path = agent._dump("m", [{"role": "user", "content": "x"}], 0)
+    assert path == ""
+    agent._dump_response(path, "whatever", "stop", 10)
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_落檔失敗不可以弄垮跑批(monkeypatch, tmp_path):
     """診斷功能寫不出去就算了,不該讓一輪十幾小時的跑批中途爆掉。
 
