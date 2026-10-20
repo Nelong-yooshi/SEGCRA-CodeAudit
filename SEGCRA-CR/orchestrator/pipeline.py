@@ -709,6 +709,46 @@ async def _non_sql_entry(hub: ToolHub, text: str, kind: str, path: str) -> dict:
     return {"non_sql": kind, "rules": kept, "lint": []}
 
 
+# 被改到的 model 呼叫的 macro,也要掃一次讀取環境的寫法(#41 第 4 點)。
+#
+# 為什麼展開後的 SQL 不夠:macro 裡的 `DB_NAME()` 會被 inline 進展開結果,那一種本來
+# 就掃得到;但**編譯期**的寫法(`{% if target.name == 'prod' %}`、`env_var()`)決定的是
+# 「展開出哪一段 SQL」,它們自己不會出現在展開結果裡 —— 展開完就看不見了。
+#
+# 用文字層的呼叫圖而不是展開器的追蹤:展開失敗的 model 也要能掃(展開失敗正是最該看的
+# 情況之一),而且不必動展開器。多掃到沒被呼叫的 macro 只是多一條提醒,漏掉才是問題。
+_MACRO_DEF_RE = re.compile(r"\{%-?\s*macro\s+(\w+)\s*\(")
+_MACRO_CALL_RE = re.compile(r"(?<![\w.])(\w+)\s*\(")
+# 只留讀取環境那一家族:macro 裡的 SELECT * 之類由 model 展開後的結果負責,
+# 在這裡重複報會讓同一件事出現兩次,而且指到的是 macro 檔而不是改動的地方。
+_MACRO_SCAN_RULES = ("R005", "H006", "H007", "H008", "H009")
+
+
+def _macro_index(macro_files: dict) -> dict:
+    """{macro 名稱: (專案內路徑, 內容)}。同名時取先讀到的那個(展開器已經會報衝突)。"""
+    index = {}
+    for rel, text in (macro_files or {}).items():
+        for m in _MACRO_DEF_RE.finditer(str(text or "")):
+            index.setdefault(m.group(1), (rel, str(text)))
+    return index
+
+
+def _macros_used(src: str, index: dict) -> dict:
+    """這段樣板用到的 macro(含 macro 再呼叫 macro),{專案內路徑: 內容}。"""
+    out, seen, queue = {}, set(), [str(src or "")]
+    while queue:
+        text = queue.pop()
+        for m in _MACRO_CALL_RE.finditer(text):
+            name = m.group(1)
+            if name in seen or name not in index:
+                continue
+            seen.add(name)
+            rel, body = index[name]
+            out[rel] = body
+            queue.append(body)
+    return out
+
+
 async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
                   dbt_ctx: DbtContext | None = None, rendered: list | None = None) -> list[dict]:
     """對每個變更檔跑 rule-base + lint(不經 LLM)。
@@ -726,6 +766,7 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
     """
     dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True
     results = []
+    used_macros: dict = {}          # 改到的 model/macro 的原始碼,用來找它呼叫了哪些 macro
     for f in files:
         if _is_spec_path(f.get("path")):
             # 規格檔不是 SQL:送進規則層只會得到「無法解析」,訊息還會帶著規格的內容
@@ -789,8 +830,41 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
         # 對、實際上指錯行」的資訊——這正是本專案一貫的原則。
         lint = await hub.call_json("sqltools__lint", {"sql": sql})
         entry["lint"] = lint[:15] if isinstance(lint, list) else []
+        if is_macro:
+            used_macros[f.get("path")] = sql          # 改到的 macro 自己也會呼叫別的
+        elif in_project:
+            used_macros[f.get("path")] = sql
         results.append(entry)
+    results += await _macro_scan(hub, used_macros, dbt_ctx, {e["path"] for e in results})
     return results
+
+
+async def _macro_scan(hub: ToolHub, sources: dict, dbt_ctx, already: set) -> list[dict]:
+    """改到的 model/macro 所呼叫的 macro,掃一次讀取環境的寫法。
+
+    已經在變更清單裡的檔案不重複掃(它自己那一輪就掃過,而且掃的是全部規則)。
+    """
+    if not sources or dbt_ctx is None or getattr(dbt_ctx, "project", None) is None:
+        return []
+    index = _macro_index(getattr(dbt_ctx, "macro_files", None) or {})
+    if not index:
+        return []
+    bodies = {}
+    for src in sources.values():
+        bodies.update(_macros_used(src, index))
+    out = []
+    prefix = (getattr(dbt_ctx, "prefix", "") or "").strip("/")
+    for rel, body in sorted(bodies.items()):
+        path = f"{prefix}/{rel}" if prefix else rel
+        if path in already:
+            continue
+        rules = await hub.call_json("sqltools__run_rules", {"sql": body})
+        hits = rules.get("hits") if isinstance(rules, dict) else rules
+        keep = [h for h in (hits if isinstance(hits, list) else [])
+                if h.get("rule") in _MACRO_SCAN_RULES]
+        if keep:
+            out.append({"path": path, "rules": keep, "lint": [], "called_macro": True})
+    return out
 
 
 def build_diff_section(files: list[dict], budget_tokens: int) -> str:
@@ -1668,7 +1742,8 @@ def enforce_hints(report: dict, pre: list[dict]) -> dict:
 
 
 # 預掃命中這些規則時,secure-sql skill 一律注入 system prompt(不賭模型主動載)
-_SECURE_SQL_RULES = ("R004", "R005", "H004")
+_SECURE_SQL_RULES = ("R004", "R005", "H004",
+                    "R006", "R007", "R008", "R009", "R010")
 
 
 def _needs_secure_sql(pre: list[dict]) -> bool:
@@ -1684,6 +1759,15 @@ _RULE_KEYWORDS = {
     # 「沙盒」刻意不列(#27 review 的建議):它的範圍太廣,同一個檔案裡模型的其他
     # major 只要提到沙盒,R005 就會被當成已經報過而不補報。
     "R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys."],
+    # 危險 SQL 原語:關鍵詞要用那一類**特有**的字。原本這幾種會被報成「語法錯誤」
+    # 「效能問題」,所以泛用的字眼(「外部」「權限」)不能用——模型用它講別的事情時,
+    # 這一條就會被當成已經報過而不補報。
+    "R006": ["OPENROWSET", "OPENDATASOURCE", "OPENQUERY", "BULK INSERT", "linked server",
+             "四段式"],
+    "R007": ["xp_cmdshell", "作業系統指令", "作業系統命令"],
+    "R008": ["GRANT", "REVOKE", "EXECUTE AS", "ALTER ROLE", "授權", "權限授予"],
+    "R009": ["動態 SQL", "sp_executesql", "字串串接", "組出來再執行"],
+    "R010": ["run_query", "編譯期", "compile"],
 }
 
 
