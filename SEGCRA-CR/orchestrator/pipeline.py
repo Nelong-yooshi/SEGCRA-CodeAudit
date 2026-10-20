@@ -454,10 +454,15 @@ _DBT_DATABASE_MISMATCH = (
     "不展開此檔(請檢查環境變數 SEGCRA_DBT_DATABASE)")
 
 
-def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict,
-                            dbt_ctx: DbtContext | None = None) -> tuple[str, str | None, str | None]:
-    """dbt 樣板先展開成純 SQL 再交給規則層(#7)。
-    回傳 (交給規則層的 sql, 展開失敗原因或 None, ref()/source() 精確度提醒或 None)。
+def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict, dbt_ctx: DbtContext | None = None
+                            ) -> tuple[str, str | None, str | None, str | None]:
+    """dbt 樣板先展開成純 SQL 再交給規則層。
+    回傳 (交給規則層的 sql, 展開失敗原因或 None, ref()/source() 精確度提醒或 None,
+    增量分支展開後的 sql 或 None)。
+
+    樣板(含它呼叫的 macro)有呼叫 `is_incremental()` 時,再以增量模式展開一次:增量 model 常把
+    刪改舊資料的語句放在 `{% if is_incremental() %}` 裡,只照 compile(False)展開會掃不到。
+    兩次都要成功才算展開成功;增量那次失敗照展開失敗處理。
 
     展開失敗時**原樣退回未展開的 sql**,不試著猜、不吞掉錯誤;失敗原因記進
     entry["dbt_render_error"],後處理由 enforce_dbt_render_failure 一律補 major。
@@ -479,7 +484,7 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict,
     if dbt_cfg.get("database") != DBT_DATABASE_PLACEHOLDER:
         # 設定載入時已擋過,這裡再擋一次:dbt_cfg 也可能不經 load_config() 直接傳入。
         # 不符就不展開(fail closed),由 enforce_dbt_render_failure 補 major 交人工。
-        return sql, _DBT_DATABASE_MISMATCH, None
+        return sql, _DBT_DATABASE_MISMATCH, None, None
     project = {}
     if dbt_ctx is not None and dbt_ctx.project is not None:
         project = {"macro_files": dbt_ctx.macro_files, "macro_dirs": dbt_ctx.project.macro_paths,
@@ -488,10 +493,40 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict,
                                      database=dbt_cfg["database"], **project)
     if rendered.ok and rendered.macro_conflicts:
         return sql, (f"dbt 專案裡有 {len(rendered.macro_conflicts)} 組同名的 macro"
-                     "(dbt 會編譯失敗),無法確定展開結果"), None
-    if rendered.ok:
-        return rendered.sql, None, rendered.relation_notice
-    return sql, rendered.error, None
+                     "(dbt 會編譯失敗),無法確定展開結果"), None, None
+    if not rendered.ok:
+        return sql, rendered.error, None, None
+    if not rendered.incremental_checked:
+        return rendered.sql, None, rendered.relation_notice, None
+    incremental = render_model_isolated(path or "model.sql", source=sql, incremental=True,
+                                        database=dbt_cfg["database"], **project)
+    if not incremental.ok:
+        return sql, f"增量分支(is_incremental() 為 True)展開失敗:{incremental.error}", None, None
+    return (rendered.sql, None, rendered.relation_notice or incremental.relation_notice,
+            incremental.sql)
+
+
+_INCREMENTAL_BRANCH = "incremental"
+
+
+def _merge_incremental_hits(hits: list, extra: list) -> list:
+    """增量分支多出來的規則命中:增量那次的 SQL 本來就包含非增量的部分,同一條規則在同一句
+    (規則代號、語句相同)只算一次;多出來的標上 branch="incremental"。"""
+    seen: dict = {}
+    for h in hits:
+        if isinstance(h, dict):
+            key = (h.get("rule"), h.get("statement"))
+            seen[key] = seen.get(key, 0) + 1
+    merged = list(hits)
+    for h in extra:
+        if not isinstance(h, dict):
+            continue
+        key = (h.get("rule"), h.get("statement"))
+        if seen.get(key, 0) > 0:
+            seen[key] -= 1
+            continue
+        merged.append({**h, "branch": _INCREMENTAL_BRANCH})
+    return merged
 
 
 _DBT_FETCH_FAILED = "無法取回 dbt 專案:"
@@ -712,17 +747,20 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
         if dbt_enabled and not is_macro:
             sql, dbt_error, in_project = _dbt_head_source(f, sql, dbt_ctx)
         rule_sql = sql
+        incremental_sql = None
         if is_macro:
             entry["dbt_macro"] = True
         elif dbt_error is not None:
             entry["dbt_render_error"] = dbt_error
         elif dbt_enabled and sql and is_dbt_template(sql):
-            rule_sql, dbt_error, dbt_notice = _dbt_expand_for_prescan(
+            rule_sql, dbt_error, dbt_notice, incremental_sql = _dbt_expand_for_prescan(
                 f.get("path", ""), sql, dbt_cfg, dbt_ctx if in_project else None)
             if dbt_error is not None:
                 entry["dbt_render_error"] = dbt_error
             elif rendered is not None:
                 rendered.append({"path": f.get("path"), "full_content": rule_sql})
+                if incremental_sql is not None:
+                    rendered.append({"path": f.get("path"), "full_content": incremental_sql})
             if dbt_notice is not None:
                 entry["dbt_render_notice"] = dbt_notice
         rules = await hub.call_json("sqltools__run_rules", {"sql": rule_sql})
@@ -734,6 +772,14 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
                 entry["parse_error"] = rules["error"]
         else:
             entry["rules"] = rules if isinstance(rules, list) else []
+        if incremental_sql is not None:
+            more = await hub.call_json("sqltools__run_rules", {"sql": incremental_sql})
+            more_hits = more.get("hits") if isinstance(more, dict) else more
+            entry["rules"] = _merge_incremental_hits(
+                entry["rules"], more_hits if isinstance(more_hits, list) else [])
+            if isinstance(more, dict) and more.get("error") and "parse_error" not in entry:
+                # 增量分支解析不了:語法樹規則在那一段沒有執行,不能當成沒有命中
+                entry["parse_error"] = f"增量分支(is_incremental() 為 True):{more['error']}"
         # lint 刻意用**原始**文字,不用展開後的 rule_sql:sqlfluff 的違規結果帶行號
         # (start_line_no),而 LLM 看到的 diff(build_diff_section)是原始行號——
         # 兩者混在同一份 prescan JSON 裡若行號基準不同,LLM 很可能把展開後的行號
@@ -2103,7 +2149,9 @@ def enforce_rules(report: dict, pre: list[dict]) -> dict:
             missing, exact = _coverage(before, entry["path"], _RULE_KEYWORDS.get(code, [code]),
                                        hits)
             for n, h in enumerate(missing, 1):
-                detail = h.get("message", "")
+                detail = h.get("message", "") + (
+                    "(這個命中在 is_incremental() 為 True 的增量分支裡)"
+                    if h.get("branch") == _INCREMENTAL_BRANCH else "")
                 report.setdefault("findings", []).append({
                     "file": entry["path"], "line": _hit_line(h, exact),
                     "severity": h.get("severity", "major"),
