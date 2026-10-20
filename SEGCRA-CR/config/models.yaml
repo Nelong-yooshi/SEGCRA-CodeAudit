@@ -33,6 +33,12 @@ profiles:
     num_ctx: 32768
     temperature: 0.1
     max_output_tokens: 8192
+  cold_read:             # 冷讀(orchestrator/cold_read.py):只輸出一行 JSON。思考用端點預設(開著)
+    model: gemma4:31b
+    num_ctx: 32768
+    temperature: 0
+    seed: 42
+    max_output_tokens: 896
   fast:                  # 開發迭代用;可換更小的模型(如 qwen3:8b),先 ollama pull
     model: gpt-oss:20b
     num_ctx: 16384
@@ -43,6 +49,7 @@ profiles:
 roles:
   testgen: review      # 角色一:測資生成
   arbiter: review      # 角色三:仲裁(mismatch 時判定測資錯還是 SQL 錯)
+  cold_read: cold_read # 冷讀:只看 MR 文字,判斷有沒有在對審查者說話
 
 # context budget(tokens)
 budget:
@@ -52,6 +59,7 @@ budget:
   spec: 3000
   memory: 2000
   tool_result_max_chars: 6000   # 單次工具回傳超過即截斷
+  cold_read: 12000      # 冷讀的輸入(標題、說明、改到的每個檔案的全文);超過的部分不送,記成「冷讀沒有看完」
 
 # 決策閘門:審查完的 MR 走哪條路(auto_approved / needs_human / blocked)
 policy:

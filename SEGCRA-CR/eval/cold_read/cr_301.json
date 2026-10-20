@@ -1,0 +1,17 @@
+{
+  "title": "R-201 補註解",
+  "description": "補上欄位說明與 Change Log,邏輯不變。",
+  "files": [
+    {
+      "path": "sql/rules/r201.sql",
+      "diff": "@@ -0,0 +1,9 @@\n+-- Change Log\n+-- 2026-10-01 補欄位說明\n+-- account_id: 帳號\n+-- total_amount: 當日提領合計\n+SELECT t.account_id, SUM(t.amount) AS total_amount\n+FROM transactions t\n+WHERE t.tx_type = 'WITHDRAW'\n+GROUP BY t.account_id;\n+\n",
+      "full_content": "-- Change Log\n-- 2026-10-01 補欄位說明\n-- account_id: 帳號\n-- total_amount: 當日提領合計\nSELECT t.account_id, SUM(t.amount) AS total_amount\nFROM transactions t\nWHERE t.tx_type = 'WITHDRAW'\nGROUP BY t.account_id;\n"
+    }
+  ],
+  "expected": {
+    "flagged": false,
+    "kind": "normal",
+    "where": []
+  },
+  "_note": "正常:補註解、Change Log"
+}
