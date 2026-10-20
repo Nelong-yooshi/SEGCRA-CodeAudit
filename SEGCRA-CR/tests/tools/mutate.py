@@ -151,8 +151,8 @@ MUTANTS = {
         "        if default is _MISSING:\n            raise DbtRenderError(",
         "        if default is _MISSING:\n            return None\n            raise DbtRenderError("),
     "this 靜靜給假值": (
-        '    env.globals["invocation_id"] = "segcra00"',
-        '    env.globals["invocation_id"] = "segcra00"\n'
+        '    env.globals["invocation_id"] = _invocation_id()',
+        '    env.globals["invocation_id"] = _invocation_id()\n'
         '    env.globals["this"] = "THIS_RELATION"'),
     "target.database 未設定時給 None": (
         '        "database": database if database is not None else StrictUndefined(name="target.database"),',
@@ -186,9 +186,9 @@ MUTANTS = {
         '        return on_failure(f"IsolationError: 無法啟動子行程({type(e).__name__})")',
         "        raise"),
     "ref 改回裸表名": (
-        "        return f'\"{database}\".\"{_check_ident(\"綱要\", rel_schema)}\"."
+        "        text = f'\"{database}\".\"{_check_ident(\"綱要\", rel_schema)}\"."
         "\"{_check_ident(\"表\", name)}\"'",
-        "        return name"),
+        "        text = name"),
     # ---- dbt 一致性
     "不去原始檔頭尾空白": (
         "        body = source.strip()",
@@ -763,10 +763,36 @@ MUTANTS.update({
         + "            _check_ident(\"表\", name)" + NL + "            return _UnavailableRelation("),
     "this:給不出值時當成未定義(is defined 為 False,語句藏得住)": ("dbt_render.py",
         "class _UnavailableRelation:", "class _UnavailableRelation(StrictUndefined):"),
+    # 只拿掉 __str__ 是等價突變:str() 沒有 __str__ 時改呼叫 __repr__,一樣失敗。兩個都拿掉才會輸出記憶體位址
     "this:給不出值時串接與轉字串不失敗(輸出記憶體位址)": ("dbt_render.py",
-        "    __str__ = __html__ = __bool__", "    __html__ = __bool__"),
+        "    __str__ = __repr__ = __bool__", "    __bool__"),
+    "this:給不出值時 repr 不失敗(pprint 輸出記憶體位址)": ("dbt_render.py",
+        "    __str__ = __repr__ = __bool__", "    __str__ = __bool__"),
     "this:給不出值時比較不失敗": ("dbt_render.py",
-        "    __call__ = __eq__ = __ne__", "    __call__ = __ne__"),
+        "    __eq__ = __ne__ = __lt__", "    __ne__ = __lt__"),
+    # 展開器跟 dbt 分得出來的地方:表名物件的型別判斷、invocation_id
+    "型別判斷:不擋": ("dbt_render.py",
+        "    _guard_relation_tests(env)", "    pass"),
+    "型別判斷:defined 也擋(is defined 的語句藏得住)": ("dbt_render.py",
+        '_RELATION_TESTS_ALLOWED = frozenset({"defined", "undefined"})',
+        "_RELATION_TESTS_ALLOWED = frozenset()"),
+    "型別判斷:只看判斷對象、不看參數": ("dbt_render.py",
+        "        if _holds_relation((*args, *kwargs.values())):", "        if _holds_relation(args[:1]):"),
+    "型別判斷:清單裡的表名物件不往下找": ("dbt_render.py",
+        "        elif isinstance(value, (list, tuple, set, frozenset)):" + NL + "            stack.extend(value)",
+        "        elif isinstance(value, (list, tuple, set, frozenset)):" + NL + "            pass"),
+    "型別判斷:dict 裡的表名物件不往下找": ("dbt_render.py",
+        "            stack.extend(value.keys())" + NL + "            stack.extend(value.values())",
+        "            pass"),
+    "型別判斷:容器太大看不完時當成沒有": ("dbt_render.py",
+        "        if seen > _RELATION_SCAN_LIMIT:" + NL + "            return True",
+        "        if seen > _RELATION_SCAN_LIMIT:" + NL + "            return False"),
+    "型別判斷:jinja 的標記沒保留(is filter / is test 壞掉)": ("dbt_render.py",
+        '    guarded.__dict__.update(getattr(test, "__dict__", {}))', "    pass"),
+    "型別判斷:ref() 回傳一般字串(is string 擋不到)": ("dbt_render.py",
+        "        return _Relation(text, database, rel_schema, name)", "        return text"),
+    "invocation_id:固定值": ("dbt_render.py",
+        '    env.globals["invocation_id"] = _invocation_id()', '    env.globals["invocation_id"] = "segcra00"'),
     "this:輸出時的錯誤訊息不說原因": ("dbt_render.py",
         "    if isinstance(value, _UnavailableRelation):" + NL + "        value._fail()",
         "    if False:" + NL + "        value._fail()"),
