@@ -8,6 +8,8 @@
 import importlib.util
 import pathlib
 
+import pytest
+
 _spec = importlib.util.spec_from_file_location(
     "mutate_tool", pathlib.Path(__file__).resolve().parent / "tools" / "mutate.py")
 mutate = importlib.util.module_from_spec(_spec)
@@ -98,3 +100,39 @@ def test_every_mutant_produces_valid_python():
         except SyntaxError as e:
             bad.append(f"{label}(第 {e.lineno} 行)")
     assert bad == []
+
+
+@pytest.mark.parametrize("code, out, verdict", [
+    (0, "5 passed in 1s", "survived"),
+    (1, "FAILED tests/test_x.py::test_a - assert 1\n1 failed", "caught"),
+    (1, "ERROR tests/test_x.py::test_a - fixture\n1 error", "caught"),        # 測試本身出錯(突變造成)
+    (2, "ERROR collecting tests/test_x.py\nInterrupted: 1 error during collection", "error"),
+    (1, "ERROR collecting tests/test_x.py\n1 error", "error"),
+    (4, "ERROR: usage", "error"),
+    (5, "no tests ran", "error"),
+])
+def test_收集錯誤不算抓到(code, out, verdict):
+    assert mutate._verdict(code, out)[0] == verdict
+
+
+def test_逾時不算抓到(tmp_path, monkeypatch):
+    (tmp_path / "orchestrator").mkdir()
+    (tmp_path / "orchestrator" / "m.py").write_text("X = 1\n", encoding="utf-8")
+
+    def stuck(*a, **kw):
+        raise mutate.subprocess.TimeoutExpired("pytest", 1)
+
+    monkeypatch.setattr(mutate.subprocess, "run", stuck)
+    verdict, _ = mutate._run_mutant(tmp_path, ("m.py", "X = 1", "X = 2"), "python", 1, {})
+    assert verdict == "timeout"
+
+
+def test_所有突變點都登記在進入點之前():
+    """mutate.py 以腳本執行時,寫在 `if __name__ == "__main__":` 之後的突變點不會被登記:
+    `--only` 會回報 0 個突變,看起來一切正常。"""
+    text = (pathlib.Path(__file__).resolve().parent / "tools" / "mutate.py").read_text(
+        encoding="utf-8")
+    guard = text.index('if __name__ == "__main__":')
+    assert "MUTANTS.update(" not in text[guard:]
+    assert "MUTANTS[" not in text[guard:]
+    assert text.count("MUTANTS.update(") > 0

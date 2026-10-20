@@ -458,7 +458,7 @@ def _truncating_agent(sequence):
         reason, raw = seq.pop(0)
         if meta is not None:
             meta["finish_reason"] = reason
-            meta["completion_tokens"] = 8192 if reason == "length" else 1234
+            meta["completion_tokens"] = 256 if reason == "length" else 123
         return raw
     return fake, seq
 
@@ -1994,3 +1994,119 @@ def test_只給時間要擋下來而且說明原因():
                                    "2026/06/01"])
 def test_真的不合法的日期照樣擋(value):
     assert not spec_exec._datetime_ok(value)[0]
+
+
+# ───────── 沙盒階段的時間上限(#53 review 第 1 點) ─────────
+
+def test_沙盒過了截止時間就不再開始新案例(monkeypatch):
+    """單一查詢本來就有 120 秒上限,所以「做完手上這個才停」最多超過一個查詢的時間。
+    沒跑到的案例留在 case_results 之外,由 _unrun_gaps 列成覆蓋缺口——不會被當成
+    「驗過而且沒問題」。"""
+    import time as _t
+    _fake_sandbox(monkeypatch)
+    plan = {"schema_ddl": ["CREATE TABLE t (id INT)"], "conditions": [],
+            "cases": [{"case_id": f"K{i}", "condition_id": "C1", "direction": "true",
+                       "expect_flagged": True, "note": "", "rows": [["t", i]]}
+                      for i in range(5)]}
+    out = spec_exec.execute_cases("SELECT id FROM t", plan,
+                                  deadline=_t.monotonic() - 1)      # 已經過期
+    assert out["timed_out"] is True
+    assert out["case_results"] == [], "過了截止時間就不該再開始新的案例"
+    gaps = spec_exec._unrun_gaps(plan, out["case_results"])
+    assert len(gaps) == 5, gaps
+
+
+def test_沒給截止時間就不受限制(monkeypatch):
+    """eval 的腳本與凍結檔檢查都不帶上限,行為要跟以前一樣。"""
+    _fake_sandbox(monkeypatch)
+    plan = {"schema_ddl": ["CREATE TABLE t (id INT)"], "conditions": [],
+            "cases": [{"case_id": "K1", "condition_id": "C1", "direction": "true",
+                       "expect_flagged": True, "note": "", "rows": [["t", 1]]}]}
+    out = spec_exec.execute_cases("SELECT id FROM t", plan)
+    assert out["timed_out"] is False and len(out["case_results"]) == 1
+
+
+def test_各階段的秒數要記進結果(monkeypatch):
+    """上限要照各階段量到的時間訂(#53 review 第 7 點)——沒有這些數字,只能憑感覺調。"""
+    plan = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)])
+
+    async def fake_generate(cfg, code, text, profile_name=None):
+        return plan, [], []
+
+    def fake_execute(sql, plan_, deadline=None):
+        return {"engine": "stub", "sandbox_error": None, "testdata_error": None,
+                "sql_error": None, "mismatches": [], "timed_out": False,
+                "case_results": [{"case_id": "C1-T"}, {"case_id": "C1-F"}]}
+
+    monkeypatch.setattr(spec_exec, "generate_cases", fake_generate)
+    monkeypatch.setattr(spec_exec, "execute_cases", fake_execute)
+    mr = {"files": [{"path": "sql/rules/r201.sql", "full_content": "SELECT 1",
+                     "diff": "@@ -1 +1 @@\n+SELECT 1"}]}
+    progress = {}
+    r = asyncio.run(spec_exec.run_spec_exec(None, None, mr, "R-201", "規格內容",
+                                            progress=progress))
+    assert set(r["stage_seconds"]) == {spec_exec.STAGE_GENERATE, spec_exec.STAGE_SANDBOX,
+                                       spec_exec.STAGE_ARBITRATE}, r["stage_seconds"]
+    assert all(isinstance(v, float) for v in r["stage_seconds"].values())
+    assert progress["stage"] is None, "跑完之後不該還停在某個階段"
+
+
+def test_沙盒逾時中止要在缺口裡說是逾時(monkeypatch):
+    """沒跑到的案例本來就會列成缺口,但不說「逾時」的話,看報告的人會以為是測資或
+    SQL 壞了——那兩種的修法完全不同。"""
+    plan = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)])
+
+    async def fake_generate(cfg, code, text, profile_name=None):
+        return plan, [], []
+
+    def fake_execute(sql, plan_, deadline=None):
+        return {"engine": "stub", "sandbox_error": None, "testdata_error": None,
+                "sql_error": None, "mismatches": [], "timed_out": True,
+                "case_results": [{"case_id": "C1-T"}]}      # 第二個案例沒跑到
+
+    monkeypatch.setattr(spec_exec, "generate_cases", fake_generate)
+    monkeypatch.setattr(spec_exec, "execute_cases", fake_execute)
+    mr = {"files": [{"path": "sql/rules/r201.sql", "full_content": "SELECT 1",
+                     "diff": "@@ -1 +1 @@\n+SELECT 1"}]}
+    r = asyncio.run(spec_exec.run_spec_exec(None, None, mr, "R-201", "規格內容"))
+    assert r["passed"] is False
+    assert any("逾時" in g for g in r["coverage_gaps"]), r["coverage_gaps"]
+
+
+def test_run_spec_exec_的沙盒同步卡住時外層逾時得了(monkeypatch):
+    """走真路徑:`run_spec_exec` 裡的沙盒換成同步卡 5 秒,外層上限 1 秒。
+
+    直接測 `_in_thread` 不夠——呼叫處改回直接呼叫(不丟執行緒)時,那條測試照樣綠,
+    而這正是老闆實測到的壞法:上限 1 秒、沙盒卡 6 秒,跑了 6 秒還不逾時。
+    """
+    import time as _t
+    plan = _plan([_case("C1-T", "C1", "true")])
+
+    async def fake_generate(cfg, code, text, profile_name=None):
+        return plan, [], []
+
+    def blocking_execute(sql, plan_, deadline=None):
+        _t.sleep(5)                      # 同步卡住:事件迴圈會被它整個佔住
+        return {"engine": "stub", "sandbox_error": None, "testdata_error": None,
+                "sql_error": None, "mismatches": [], "timed_out": False,
+                "case_results": [{"case_id": "C1-T"}]}
+
+    monkeypatch.setattr(spec_exec, "generate_cases", fake_generate)
+    monkeypatch.setattr(spec_exec, "execute_cases", blocking_execute)
+    mr = {"files": [{"path": "sql/rules/r201.sql", "full_content": "SELECT 1",
+                     "diff": "@@ -1 +1 @@\n+SELECT 1"}]}
+
+    async def main():
+        t0 = _t.monotonic()
+        progress = {}
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                spec_exec.run_spec_exec(None, None, mr, "R-201", "規格內容",
+                                        progress=progress),
+                timeout=1)
+        return _t.monotonic() - t0, progress
+
+    took, progress = asyncio.run(main())
+    assert took < 2.5, f"沙盒同步卡住時外層沒有準時中止(等了 {took:.1f} 秒)"
+    assert progress["stage"] == spec_exec.STAGE_SANDBOX, \
+        f"逾時的時候要看得出卡在哪個階段:{progress}"

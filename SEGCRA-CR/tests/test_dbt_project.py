@@ -12,7 +12,7 @@ import tarfile
 import pytest
 
 from orchestrator import archive, dbt_project
-from orchestrator.dbt_project import load_dbt_project
+from orchestrator.dbt_project import DbtProjectError, load_dbt_project, read_layout
 from toolbox.gitlab import ArchiveDownloadError
 
 SHA = "0123456789abcdef0123456789abcdef01234567"
@@ -81,9 +81,12 @@ def test_default_paths_from_repo_root():
     dl = _Download(_gz(BASIC))
     p = load_dbt_project(SHA, download=dl)
     assert p.ok, p.error
+    # analyses/ 也取回:MR 改到 analysis 時要用完整內容展開
     assert p.files == {"models/a.sql": "select 1", "models/schema.yml": "version: 2",
-                       "macros/m.sql": "{% macro m() %}1{% endmacro %}"}
+                       "macros/m.sql": "{% macro m() %}1{% endmacro %}",
+                       "analyses/s.sql": "outside"}
     assert p.model_paths == ("models",) and p.macro_paths == ("macros",)
+    assert p.analysis_paths == ("analyses",) and p.test_paths == ("tests",)
     assert p.root_files == {"dbt_project.yml": BASIC["dbt_project.yml"]}   # 沒有套件檔
     assert dl.calls == [(SHA, "", archive.MAX_COMPRESSED_BYTES)]      # 只下載一次
 
@@ -139,7 +142,7 @@ def test_project_in_subdirectory():
     dl = _Download(_gz(files))
     p = load_dbt_project(SHA, "dbt", download=dl)
     assert p.ok, p.error
-    assert set(p.files) == {"models/a.sql", "models/schema.yml", "macros/m.sql"}
+    assert set(p.files) == {"models/a.sql", "models/schema.yml", "macros/m.sql", "analyses/s.sql"}
     assert dl.calls[0][1] == "dbt"
 
 
@@ -535,3 +538,45 @@ def test_default_download_is_the_gitlab_tool(monkeypatch):
     monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", "")
     err = _fails(load_dbt_project(SHA))
     assert "GITLAB_READ_TOKEN" in err
+
+
+# ------------------------------------------------------------------ 哪些檔案屬於 dbt
+def test_layout_comes_from_dbt_project_yml():
+    layout = read_layout("model-paths: [transform]\nmacro-paths: [lib/macros]\n"
+                         "analysis-paths: [adhoc]\ntest-paths: [checks]\n"
+                         "seed-paths: [data]\nsnapshot-paths: [snaps]\n")
+    for rel in ("transform/a.sql", "transform/schema.yml", "lib/macros/m.sql", "adhoc/x.sql",
+                "checks/t.sql", "data/s.csv", "snaps/s.sql", "dbt_project.yml", "packages.yml",
+                "dependencies.yml", "selectors.yml"):
+        assert layout.contains(rel), rel
+    for rel in ("models/a.sql", "macros/m.sql", ".gitlab-ci.yml", "sql/report.sql",
+                "docs/example/dbt_project.yml", "lib/other.sql", "transformx/a.sql", "README.md"):
+        assert not layout.contains(rel), rel
+
+
+def test_layout_defaults_match_dbt():
+    layout = read_layout("name: x\n")
+    for rel in ("models/a.sql", "macros/m.sql", "analyses/a.sql", "tests/t.sql",
+                "seeds/s.csv", "snapshots/s.sql"):
+        assert layout.contains(rel), rel
+    assert not layout.contains("sql/templates/a.sql")
+
+
+@pytest.mark.parametrize("text", ["- a\n", "model-paths: '{{ env_var(\"X\") }}'\n", ": :\n"])
+def test_layout_unreadable_raises(text):
+    with pytest.raises(DbtProjectError):
+        read_layout(text)
+
+
+def test_project_layout_matches_read_layout():
+    p = load_dbt_project(SHA, download=_Download(_gz(BASIC)))
+    assert p.layout == read_layout(BASIC["dbt_project.yml"])
+
+
+def test_analysis與test目錄可以設成空清單():
+    """dbt 允許把這兩個設成空的(不用);以前沒讀這兩個設定,這樣設的專案原本取得回來。"""
+    layout = read_layout("analysis-paths: []\ntest-paths: []\n")
+    assert not layout.contains("analyses/a.sql") and not layout.contains("tests/t.sql")
+    assert layout.contains("models/a.sql")
+    with pytest.raises(DbtProjectError):
+        read_layout("model-paths: []\n")

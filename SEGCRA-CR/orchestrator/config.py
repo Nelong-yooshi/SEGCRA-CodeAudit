@@ -53,6 +53,30 @@ def _env_float(name: str, lo: float, hi: float) -> float:
     return v
 
 
+def env_seconds(name: str, default: int) -> int:
+    """讀「秒數」型的環境變數覆蓋;**讀不懂就退回預設值並印一行警告**。
+
+    跟 _env_float 的取捨刻意不同(那邊是直接擋下):這些是時間上限,而讀它們的是
+    **webhook 伺服器在 import 時**。填錯一個字就 int() 丟例外 → 伺服器根本起不來
+    → 所有 MR 都收不到審查。那比「用預設值跑」糟得多,而且錯誤只會出現在啟動時的
+    終端機上,沒人看。所以這裡往「活著並大聲說」倒。
+
+    0 或負數也退回預設:上限設成 0 等於每次都立刻逾時,不會是誰的本意。
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        v = int(raw)
+        if v <= 0:
+            raise ValueError
+    except ValueError:
+        print(f"[config] 警告:環境變數 {name} 的值不是正整數秒數({raw!r}),"
+              f"改用預設 {default} 秒", flush=True)
+        return default
+    return v
+
+
 # 端點接受的檔位。"none" 是「完全不要思考」,其餘是強度。
 # 空字串另外處理:代表「取消覆蓋,回到不送這個參數」,與「送 none」不同——
 # 前者用端點預設(會思考),後者明確要求不思考。
@@ -171,7 +195,16 @@ def _load_dbt_section(raw: dict) -> dict:
         raise ValueError(
             f"dbt.enabled 開啟時,環境變數 SEGCRA_DBT_DATABASE 必須設為約定的假名 "
             f"{DBT_DATABASE_PLACEHOLDER}(見 docs/09-dbt展開與反查.md);目前未設定或不符。")
-    return {"enabled": enabled, "database": database}
+    # dbt 專案在 repo 裡的目錄(dbt_project.yml 所在;空字串 = repo 根目錄)。會被接進
+    # GitLab 打包下載的路徑,載入時就檢查,不等到審查時每個檔案各自失敗
+    from .dbt_project import DbtProjectError, check_project_dir
+    try:
+        project_dir = check_project_dir(section.get("project_dir", ""))
+    except DbtProjectError as e:
+        raise ValueError(f"{e};只接受 repo 內的相對目錄(英數與 _ . -,以 / 分段)") from None
+    # 只有設了才帶這個鍵(讀的一方用 .get("project_dir", "")):沒設時回傳的內容與接線前相同
+    return {"enabled": enabled, "database": database,
+            **({"project_dir": project_dir} if project_dir else {})}
 
 
 def load_config(path: Path | None = None) -> Config:

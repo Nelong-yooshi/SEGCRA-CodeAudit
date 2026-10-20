@@ -15,6 +15,21 @@ MAX_ITERATIONS = 12
 # 上限 1 小時、不自動重試;可用環境變數 LLM_TIMEOUT(秒)覆蓋。
 REQUEST_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "3600"))
 
+
+def output_truncated(meta: dict, max_output_tokens: int) -> bool:
+    """run_agent 回填的 meta(最後一次回應)是不是被輸出長度上限切斷。
+
+    端點回 `finish_reason == "length"`,或回報的 `completion_tokens` 已達 `max_output_tokens`,
+    任一成立就算:不是每個端點碰到上限都照規格回 `length`,而用量達到上限本身就代表輸出被
+    切斷。兩者都沒回報時判成沒有截斷——沒有依據就報,每一次呼叫都會被當成截斷。
+
+    主審查與測資生成都用這一個判斷。"""
+    if meta.get("finish_reason") == "length":
+        return True
+    used = meta.get("completion_tokens")
+    return used is not None and used >= max_output_tokens
+
+
 # 診斷用:設成一個目錄路徑,就把每一次**實際送出的** messages 原文落檔。
 # 預設空字串 = 完全不啟用,對正式流程沒有任何影響。
 #

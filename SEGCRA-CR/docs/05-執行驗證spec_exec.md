@@ -21,7 +21,11 @@
 1. `extract_rule_codes`:把 MR 的標題、描述、每個檔的路徑與內容(`full_content`,沒有就用 diff)串起來,用 regex `\bR-\d{2,4}\b` 抓規則碼,去重排序。
 2. `find_spec` 兩路:
    - **mock/本地路**:逐碼查本包 `specs/<code>.md`,存在即讀入回傳。
-   - **real 路**:本地沒有時,經 ToolHub 呼叫 `gitlab__get_file` 抓 GitLab repo 內的 `specs/<code>.md`(`toolbox/gitlab.py:get_file`,REST `repository/files/.../raw`);內容須以 `#` 開頭才算拿到(擋 404 佔位訊息)。
+   - **real 路**:**不讀本包的 `specs/`**,一律經 ToolHub 呼叫 `gitlab__get_file` 抓 GitLab repo 內的 `specs/<code>.md`(`toolbox/gitlab.py:get_file`,REST `repository/files/.../raw`);內容須以 `#` 開頭才算拿到(擋 404 佔位訊息)。不指定 `ref` → 讀**這次 MR 的版本**(pipeline 在取完 MR 之後釘住 head sha)。
+
+     > 本包的 `specs/` 是評測與離線開發用的樣本,不是正式環境的規格。real 模式若先讀它,MR 改了 `specs/R-093.md` 時執行驗證拿到的還是樣本那份,而報告上看不出用的是哪一份。
+     >
+     > 規格讀 MR 的版本是刻意的:規格與程式會在同一個 MR 裡一起修正,鎖在目標分支會讓「規格寫錯、跟程式一起修」的 MR 被拿舊規格判成不符。代價是一個 MR 可以同時改規格與程式,這一點由「讓審查的人看見規格被改了」處理(見 #38 第 3 點),不是靠鎖版本。
    - 都找不到 → 回 `(第一個規則碼|None, None)`。
 3. `run_spec_exec` 收到 `spec_text=None` 時,直接產出 **major「無規格可驗,無法執行驗證」**(`no_spec: True`、`passed: False`)並要求先補規格再送審;MR 完全抓不到規則碼也是同一條 major(措辭不同)。另一個早退:MR 還原不出 SQL(`_sql_from_diff` 只收 diff 的 `+` 行)→ major「MR 無可執行的 SQL」。
 
@@ -212,6 +216,30 @@ passed = bool(effective) and not sql_faults and not coverage_gaps
 ```
 
 三個條件缺一不可:**至少有一個有效案例**(全被剔光不算通過)、**零 SQL 側不符**、**零覆蓋缺口**(含生成階段缺向與仲裁剔除造成的缺口)。通過時補一條 info「執行驗證通過(N 案例全數相符)」;有缺口時補 info「執行驗證覆蓋缺口」逐條列出。
+
+### 時間上限與各階段耗時(#45 / #53 review)
+
+整段有一個上限 `SPEC_EXEC_TIMEOUT_SECONDS`(預設 1200 秒,由 `orchestrator/pipeline.py`
+讀;讀不懂退回預設並印警告)。三個階段各自計時,結果放在 `_spec_exec.stage_seconds`
+(`{"測資生成": 秒, "沙盒執行": 秒, "仲裁": 秒}`),**逾時那次也會留下**
+(`report["_spec_exec_stage_seconds"]`)—— 上限要照這些數字訂,而逾時那一次正是最需要
+知道時間花在哪裡的一次。
+
+失敗或逾時的 finding 會標出是哪個階段(`[執行驗證/沙盒執行] 審查未完整(逾時)`,
+並在 finding 上附 `stage` 欄位):三件事的修法完全不同,測資生成要調 prompt 或換做法、
+沙盒要看環境、仲裁是另一次模型呼叫。
+
+**沙盒階段是同步呼叫,所以不能只靠 `asyncio.wait_for`**:`execute_cases` 用 pymssql,
+它在跑的時候事件迴圈整個卡住,`wait_for` 插不進去(實測:上限 1 秒、沙盒卡 6 秒 →
+跑了 6 秒、沒有逾時、結果照常回傳)。現在的做法是兩道:
+
+1. `execute_cases` 收一個截止時間,**過了就不再開始新的案例**(手上那個照跑完 —— 單一
+   查詢本來就有 120 秒上限,所以最多超過一個查詢的時間);沒跑到的案例由 `_unrun_gaps`
+   列成覆蓋缺口,不會被當成「驗過而且沒問題」。
+2. 它被丟到一條 **daemon 背景執行緒**(`spec_exec._in_thread`),外層的 await 才能準時
+   回來。不用 `asyncio.to_thread` 的預設執行緒池:`asyncio.run` 結束時會等池子裡的工作
+   做完,等於逾時又被拖回去(跟 #33 的 `_wait_in_thread` 同一個理由)。`contextvars`
+   會帶進去 —— 審查用的 ref 釘在 ContextVar 裡(#31),不帶的話背景那邊讀到預設值。
 
 ### 為什麼要仲裁——測資生成也會幻覺(mr_003 實測)
 

@@ -23,14 +23,16 @@ MR 的 SQL 不只要「看起來對」,還要「跑起來對」。流程:
 產出 {passed, conditions, coverage_gaps, case_results, dropped_cases, findings},
 全程記錄進 report["_spec_exec"] 供稽核。
 """
+import asyncio
 import json
 import os
 import re
+import time
 import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from .agent import extract_json, run_agent
+from .agent import extract_json, output_truncated, run_agent
 from .config import Config, PKG_ROOT
 
 SPECS_DIR = PKG_ROOT / "specs"
@@ -52,9 +54,16 @@ def extract_rule_codes(mr: dict) -> list[str]:
     return sorted(set(_RULE_CODE.findall(text)))
 
 
+def _real_mode() -> bool:
+    """現在是不是真實 GitLab 模式。延遲匯入,不讓無關的呼叫端多背一個相依。"""
+    from toolbox import gitlab
+    return bool(gitlab.REAL_MODE)
+
+
 async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None, str | None]:
-    """回傳 (rule_code, spec_text)。mock 模式讀本地 specs/;real 模式用
-    gitlab get_file 抓 repo 內 specs/<code>.md。都找不到 → (code|None, None)。
+    """回傳 (rule_code, spec_text)。mock 模式讀本地 specs/;real 模式**只**用
+    gitlab get_file 抓 repo 內 specs/<code>.md(讀正在審的那一版)。
+    都找不到 → (code|None, None)。
 
     R 編號的比對邏輯不變(即使多個編號都對到既有規格,一律取第一個找到的)。
     by_path 為 True **且完全沒有** R 編號時,才改依 model 檔名對應規格:
@@ -64,13 +73,25 @@ async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None
         這種需要如實回報成「無規格」的情況
     """
     codes = extract_rule_codes(mr)
-    for code in codes:
-        local = SPECS_DIR / f"{code}.md"
-        if local.exists():
-            return code, local.read_text(encoding="utf-8")
+    # **real 模式不讀工具內建的 specs/**:那份是評測與離線開發用的樣本,不是
+    # 正式環境的規格。先讀本地的話,MR 改了 specs/R-093.md 時執行驗證拿到的
+    # 還是內建那份——與「規格讀正在審的那一版」的決定互相矛盾,而且報告上
+    # 看不出用的是哪一份。
+    if not _real_mode():
+        for code in codes:
+            local = SPECS_DIR / f"{code}.md"
+            if local.exists():
+                return code, local.read_text(encoding="utf-8")
     if hub is not None:
         for code in codes:
             try:
+                # 不指定 ref → 讀「正在審的那一版」。規格與程式是我們自己整理的,
+                # 會在同一個 MR 裡一起修正;鎖在目標分支的話,「規格寫錯、跟程式
+                # 一起修」的 MR 會被拿舊規格生測資,把正確的修正判成不符。
+                #
+                # 代價是一個 MR 可以同時改規格與程式、讓執行驗證拿改過的規格驗
+                # 自己。這一點改由**讓審查的人看見規格被改了**來處理(#38 第 3 點),
+                # 不是靠鎖版本——鎖版本會讓正常的修正無法通過。
                 txt = await hub.call("gitlab__get_file",
                                      {"path": f"specs/{code}.md"}, truncate=False)
             except Exception:
@@ -116,7 +137,9 @@ async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
     for path in paths:
         for candidate in resolve_spec(path, ()).candidates:   # 只要候選路徑,不比對存在與否
             try:
-                txt = await hub.call("gitlab__get_file", {"path": candidate}, truncate=False)
+                # 同上:不指定 ref,讀正在審的那一版
+                txt = await hub.call("gitlab__get_file",
+                                     {"path": candidate}, truncate=False)
             except Exception:
                 continue
             if txt and txt.lstrip().startswith("#"):
@@ -964,7 +987,7 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
         # 它其實是被硬切的殘骸。實測 RETAIL_M1:finish_reason=length、
         # completion_tokens 剛好 8192、輸出斷在一個數字中間,但照樣解析成功,
         # 案例從應有的 46 個掉到 9 個——而那 9 個會被當成正常結果收下。
-        if meta.get("finish_reason") == "length":
+        if output_truncated(meta, profile.max_output_tokens):
             truncated += 1
             if filling and best is not None:
                 # **補缺的回應被截斷 → 這一批要得太多,下次少要一點。**
@@ -1218,20 +1241,26 @@ def _eval_conditions(cursor, conds: list[dict]) -> tuple[dict[str, bool] | None,
     return out, ""
 
 
-def execute_cases(sql: str, plan: dict) -> dict:
+def execute_cases(sql: str, plan: dict, deadline: float | None = None) -> dict:
     """角色二:確定性執行(非 LLM)。
 
     每次呼叫在沙盒建一個專用資料庫(與其他同時進行的審查互不干擾),每個案例在
     獨立交易裡建表、灌資料、執行 MR 的 SQL,比對「是否有輸出列」與 expect_flagged,
     結束一律 rollback(下一個案例從乾淨狀態開始)。最後刪掉整個資料庫。
-    回傳 {case_results, mismatches, sql_error, testdata_error, sandbox_error, engine}。"""
+    `deadline`(`time.monotonic()` 的時間點)給定時,**過了就不再開始新的案例**,
+    已經開始的那一個照跑完(單一查詢本來就有 120 秒上限,所以最多超過一個查詢的時間)。
+    沒跑到的案例由 `_unrun_gaps` 列成覆蓋缺口,不會被當成「驗過了」。
+
+    回傳 {case_results, mismatches, sql_error, testdata_error, sandbox_error, engine,
+          timed_out}。"""
     import pymssql
     params = _sandbox_params()
     prepared = prepare_sql(sql)
     results, mismatches = [], []
     truth: dict[str, dict] = {}       # {case_id: 每個條件在這個案例裡的真假}
     out = {"case_results": results, "mismatches": mismatches, "sql_error": None,
-           "testdata_error": None, "sandbox_error": None, "engine": None}
+           "testdata_error": None, "sandbox_error": None, "engine": None,
+           "timed_out": False}
 
     if not params["password"]:
         out["sandbox_error"] = "未設定 SANDBOX_MSSQL_PASSWORD(見 config/sandbox.env.example)"
@@ -1255,6 +1284,11 @@ def execute_cases(sql: str, plan: dict) -> dict:
         con = pymssql.connect(**params, database=dbname, autocommit=False)
 
         for case in plan["cases"]:
+            if deadline is not None and time.monotonic() >= deadline:
+                # 時間到就停在這裡。中止本身不是結論:沒跑到的案例會被列成覆蓋缺口,
+                # 所以不會變成「驗過而且沒問題」。
+                out["timed_out"] = True
+                break
             c = con.cursor()
             try:
                 try:
@@ -1691,12 +1725,74 @@ def _unrun_gaps(plan: dict, case_results: list[dict]) -> list[str]:
             f"{c.get('direction')} 向)因執行中止而未驗證" for c in missing]
 
 
+# 執行驗證的三個階段。失敗或逾時要看得出是哪一個(#53 review 第 7 點):整段只算一個
+# 環節時,報告上只寫「執行驗證未完成」,而這三件事的修法完全不同——測資生成要調 prompt
+# 或換做法、沙盒要看環境、仲裁是另一次模型呼叫。
+STAGE_GENERATE = "測資生成"
+STAGE_SANDBOX = "沙盒執行"
+STAGE_ARBITRATE = "仲裁"
+
+
+async def _in_thread(fn, *args):
+    """把同步函式丟到背景執行緒跑,讓外層的 await 能準時回來。
+
+    為什麼需要(#53 review 第 1 點):`execute_cases` 是同步的 pymssql 呼叫,它在跑的
+    時候事件迴圈整個卡住,外面的 `asyncio.wait_for` **插不進去**。實測:上限設 1 秒、
+    沙盒卡 6 秒,結果跑了 6 秒、沒有逾時、結果照常回傳——時間上限對沙盒階段等於不存在。
+
+    不用 `asyncio.to_thread`(預設執行緒池):`asyncio.run` 結束時會等池子裡的工作做完,
+    等於逾時又被拖回去(跟 #33 的 `_wait_in_thread` 同一個理由)。自己開 daemon 執行緒,
+    逾時就讓它自己跑完自己結束,外層不等它。
+
+    `contextvars` 要帶進去:審查用的 ref 釘在 ContextVar 裡(#31),不帶進去的話背景
+    執行緒讀到的是預設值。
+    """
+    import contextvars
+    import threading
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future = loop.create_future()
+    ctx = contextvars.copy_context()
+
+    def runner():
+        try:
+            out = ctx.run(fn, *args)
+        except BaseException as e:            # noqa: BLE001 — 原樣交回給 await 端
+            loop.call_soon_threadsafe(lambda: fut.cancelled() or fut.set_exception(e))
+        else:
+            loop.call_soon_threadsafe(lambda: fut.cancelled() or fut.set_result(out))
+
+    threading.Thread(target=runner, name="spec-exec-sandbox", daemon=True).start()
+    return await fut
+
+
+def _execute(sql: str, plan: dict, deadline: float | None):
+    """呼叫 execute_cases,吃不吃 deadline 由它的簽名決定。
+
+    測試與 eval 的腳本常把 execute_cases 換成只有 (sql, plan) 的替身(它要連資料庫),
+    多傳一個參數會直接 TypeError。看簽名而不是 try/except TypeError:後者會把替身
+    自己內部真的型別錯誤一起吞掉。
+    """
+    import inspect
+    try:
+        takes = "deadline" in inspect.signature(execute_cases).parameters
+    except (TypeError, ValueError):          # 看不出簽名就當作不吃
+        takes = False
+    return execute_cases(sql, plan, deadline) if takes else execute_cases(sql, plan)
+
+
 async def run_spec_exec(cfg: Config, hub, mr: dict,
                         spec_code: str | None = None,
-                        spec_text: str | None = None) -> dict:
+                        spec_text: str | None = None,
+                        progress: dict | None = None,
+                        deadline: float | None = None) -> dict:
     """執行驗證主流程。spec_code/spec_text 可由 pipeline 先找好傳入(避免重找)。
+
+    `progress` 給定時,逐階段寫進去({"stage": 現在在哪個階段, "seconds": {階段: 秒}}),
+    **外層逾時中止時才看得出是卡在哪一個階段**(逾時是外層丟的,它看不到裡面)。
+    `deadline` 是 `time.monotonic()` 的時間點:沙盒階段過了就不再開始新的案例。
+
     回傳 {passed, spec_code, conditions, coverage_gaps, case_results,
-          dropped_cases, findings}。"""
+          dropped_cases, stage_seconds, findings}。"""
     path = mr.get("files", [{}])[0].get("path", "(MR)")
     sql = ""
     for f in mr.get("files", []):
@@ -1744,7 +1840,24 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
     findings, dropped_cases = [], []
 
     # 角色一:測資生成 + 確定性形狀/覆蓋檢查
-    plan, coverage_gaps, malformed = await generate_cases(cfg, spec_code, spec_text)
+    stage_seconds: dict[str, float] = {}
+    prog = progress if progress is not None else {}
+    prog.setdefault("seconds", stage_seconds)
+
+    def _enter(stage: str) -> float:
+        prog["stage"] = stage
+        return time.monotonic()
+
+    def _leave(stage: str, t0: float) -> None:
+        # 只記時間,**不清掉 stage**:外層逾時時 finally 也會跑,清掉的話「卡在哪個
+        # 階段」就剛好在最需要它的那一刻消失。正常跑完時才在最後清。
+        stage_seconds[stage] = round(time.monotonic() - t0, 1)
+
+    _t = _enter(STAGE_GENERATE)
+    try:
+        plan, coverage_gaps, malformed = await generate_cases(cfg, spec_code, spec_text)
+    finally:
+        _leave(STAGE_GENERATE, _t)
     dropped_cases += [{"case_id": (d.get("case") or {}).get("case_id", "?"),
                        "by": "shape-check", "reason": d["reason"]} for d in malformed]
     if not plan["cases"]:
@@ -1753,10 +1866,17 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                                  "; ".join(coverage_gaps) + "。無法自動驗證,需人工執行驗證。"))
         return {"passed": False, "spec_code": spec_code,
                 "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
-                "case_results": [], "dropped_cases": dropped_cases, "findings": findings}
+                "case_results": [], "dropped_cases": dropped_cases,
+                "stage_seconds": stage_seconds, "findings": findings}
 
     # 角色二:確定性執行
-    ex = execute_cases(sql, plan)
+    _t = _enter(STAGE_SANDBOX)
+    try:
+        # 同步的 pymssql 呼叫丟到背景執行緒,外層的時間上限才插得進來(見 _in_thread);
+        # deadline 讓它自己也會在上限前停下來,不要留一個還在灌資料的執行緒。
+        ex = await _in_thread(_execute, sql, plan, deadline)
+    finally:
+        _leave(STAGE_SANDBOX, _t)
     if ex["sandbox_error"]:
         # 沙盒不可用 ≠ 驗證通過:照樣不得自動放行,並講清楚是環境問題而非程式問題
         findings.append(_finding(path, "major", "執行驗證無法完成(沙盒不可用)",
@@ -1765,7 +1885,8 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                                  "啟動沙盒(scripts/sandbox.sh start)後重新觸發審查。"))
         return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],
                 "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
-                "case_results": [], "dropped_cases": dropped_cases, "findings": findings}
+                "case_results": [], "dropped_cases": dropped_cases,
+                "stage_seconds": stage_seconds, "findings": findings}
     if ex["testdata_error"]:
         findings.append(_finding(path, "major", "執行驗證無法完成(測資無法建置)",
                                  f"測資生成 agent 產出的 schema/資料無法建置:"
@@ -1774,7 +1895,7 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                 "conditions": plan["conditions"],
                 "coverage_gaps": coverage_gaps + _unrun_gaps(plan, ex["case_results"]),
                 "case_results": ex["case_results"], "dropped_cases": dropped_cases,
-                "findings": findings}
+                "stage_seconds": stage_seconds, "findings": findings}
     if ex["sql_error"]:
         findings.append(_finding(path, "major", "執行驗證:SQL 無法在測資上執行",
                                  f"執行錯誤(語法/欄位):{ex['sql_error']}",
@@ -1783,7 +1904,7 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                 "conditions": plan["conditions"],
                 "coverage_gaps": coverage_gaps + _unrun_gaps(plan, ex["case_results"]),
                 "case_results": ex["case_results"], "dropped_cases": dropped_cases,
-                "findings": findings}
+                "stage_seconds": stage_seconds, "findings": findings}
 
     # 標籤一致性的缺口要在仲裁之前就併進去:它講的是「這個案例有沒有驗到它宣稱的
     # 那一條」,跟仲裁要判的「測資錯還是 SQL 錯」是不同的問題,兩者可以同時成立。
@@ -1791,6 +1912,7 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
 
     # 角色三:仲裁(只對 mismatch 逐案出動)
     sql_faults = []
+    _t = _enter(STAGE_ARBITRATE)
     for mm in ex["mismatches"]:
         verdict = await arbitrate(cfg, spec_text, sql, mm)
         if verdict["who_is_wrong"] == "testdata":
@@ -1805,7 +1927,14 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
         else:
             sql_faults.append({**mm, "arbiter_reason": verdict["reason"],
                                "arbiter_unparseable": verdict.get("arbiter_unparseable", False)})
+    _leave(STAGE_ARBITRATE, _t)
 
+    if ex.get("timed_out"):
+        # 沙盒階段被時間上限停下來:沒跑到的案例由 _unrun_gaps 列成缺口,這裡再加一條
+        # 說明是逾時——不講清楚的話,看報告的人會以為是測資或 SQL 壞了。
+        coverage_gaps.append(
+            f"沙盒執行超過時間上限,{len(plan['cases']) - len(ex['case_results'])} 個案例"
+            f"未執行(逾時)")
     if sql_faults:
         detail = ";".join(
             f"案例 {f['case_id']}({f.get('note','')}):預期"
@@ -1829,11 +1958,12 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                                  f"兩種情況,以及門檻邊界值;再於沙盒實際編譯執行。"
                                  f"執行本身是確定性的,但測資與驗證出自模型,AI 可能有幻覺。"
                                  + _unverified_note(ex["case_results"])))
+    prog["stage"] = None        # 跑完了,沒有「卡在哪裡」這件事
     return {"passed": passed, "spec_code": spec_code, "engine": ex["engine"],
             "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
             "case_results": ex["case_results"], "dropped_cases": dropped_cases,
             "label_unverified": _unverified(ex["case_results"]),
-            "findings": findings}
+            "stage_seconds": stage_seconds, "findings": findings}
 
 
 def _sql_from_diff(diff: str) -> str:
