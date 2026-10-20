@@ -194,8 +194,7 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
     #
     # **不可以回傳最後一則工具結果**:那則內容是工具回來的、而工具看的是 MR,所以內容
     # 由 MR 決定。它是 JSON 物件時 extract_json 會把它當成審查報告收下,而最後一次模型
-    # 呼叫的 finish_reason 是 "stop" —— 呼叫端從 meta 完全看不出發生了這件事,實測會
-    # 一路走到 auto_approved。
+    # 呼叫的 finish_reason 是 "stop" —— 呼叫端從 meta 完全看不出發生了這件事。
     #
     # 兩道一起上:回固定文字(就算呼叫端忘了看 meta,也拿不到工具結果),並標記
     # exhausted(呼叫端據此比照截斷處理:不解析輸出、補一條 major、不得自動放行)。
