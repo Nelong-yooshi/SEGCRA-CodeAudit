@@ -1877,9 +1877,10 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
     if meta.get("exhausted"):
         exhausted = {
             "file": "(MR 內容)", "line": 0, "severity": "major", "title": _EXHAUSTED_TITLE,
-            "detail": f"審查模型連續 {MAX_ITERATIONS} 輪都在呼叫工具,用完回合上限,沒有產出審查結果;"
-                      "最後拿到的是工具的回傳內容,不採用。這次只有程式確定性檢查的結果,需人工確認。",
-            "suggestion": "重新觸發審查;若持續發生,確認 MR 的描述或內容是否引導模型一直讀檔。",
+            "detail": f"審查模型連續 {MAX_ITERATIONS} 輪都沒有產出審查結果(一直呼叫工具,或回應是空的),"
+                      "用完回合上限;最後拿到的不是審查報告,不採用。這次只有程式確定性檢查的結果,需人工確認。",
+            "suggestion": "重新觸發審查;若持續發生,確認 MR 的描述或內容是否引導模型一直讀檔,"
+                          "或模型的輸出上限是否被思考用完。",
             "citations": []}
         _put_program_finding(report, exhausted)
     if not output_truncated(meta, max_output_tokens):
