@@ -2211,3 +2211,28 @@ def test_腳本不自己算一份缺口與passed():
            / "eval" / "check_frozen_testdata.py").read_text(encoding="utf-8")
     assert "gaps_and_passed(" in src
     assert "passed = bool(" not in src, "腳本又自己算了一份 passed"
+
+def test_標籤缺口要出現在run_spec_exec的覆蓋缺口裡(monkeypatch):
+    """標籤對不上 = 那一向沒有真的被驗到,必須併進 `coverage_gaps` 並讓 passed 變 False。
+    只測 `_label_gaps` 自己的話,把併進去那一步拿掉也不會紅。"""
+    plan = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)])
+
+    async def fake_generate(cfg, code, text, profile_name=None):
+        return plan, [], []
+
+    def fake_execute(sql, plan_, deadline=None):
+        return {"engine": "stub", "sandbox_error": None, "testdata_error": None,
+                "sql_error": None, "mismatches": [], "timed_out": False,
+                "case_results": [
+                    {"case_id": "C1-T", "condition_id": "C1", "direction": "true",
+                     "label_ok": False, "label_mismatch": ["條件 C1 其實不成立"]},
+                    {"case_id": "C1-F", "label_ok": True}]}
+
+    monkeypatch.setattr(spec_exec, "generate_cases", fake_generate)
+    monkeypatch.setattr(spec_exec, "execute_cases", fake_execute)
+    mr = {"files": [{"path": "sql/rules/r201.sql", "full_content": "SELECT 1",
+                     "diff": "@@ -1 +1 @@\n+SELECT 1"}]}
+    r = asyncio.run(run_spec_exec(None, None, mr, "R-201", "規格內容"))
+    assert any("C1-T" in g and "資料與標籤不符" in g for g in r["coverage_gaps"]), \
+        r["coverage_gaps"]
+    assert r["passed"] is False
