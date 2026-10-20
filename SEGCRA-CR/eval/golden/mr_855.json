@@ -12,7 +12,7 @@
   "expected": [],
   "_golden": {
     "layer": "calibration",
-    "intent": "把實測到的三種誤報放在同一個 MR 上:(1) 行銷活動排除改成反連接 (LEFT JOIN + IS NULL,右表是單列常數,被排除的列不會進輸出)曾被報「LEFT JOIN 造成列數膨脹」;(2) 小額入帳的過濾在條件聚合裡,曾被報 major 而 finding 自己寫「最終結果相同」;(3) CTE 裡算出的欄位在外層 WHERE 使用,T-SQL 合法,曾被報 blocker「別名不可在 WHERE 使用」。三者都與 mr_408 (依核定規格實作)行為相同,不得有 major/blocker,決策不得是 blocked。",
+    "intent": "把實測到的三種誤報放在同一個 MR 上:(1) 行銷活動排除改成反連接 (LEFT JOIN + IS NULL,右表是單列常數,被排除的列不會進輸出)曾被報「LEFT JOIN 造成列數膨脹」;(2) 小額入帳的過濾在條件聚合裡,曾被報 major 而 finding 自己寫「最終結果相同」;(3) CTE 裡算出的欄位在外層 WHERE 使用,T-SQL 合法,曾被報 blocker「別名不可在 WHERE 使用」。驗收看的是**決策不是 blocked**、而且沒有 blocker 留著:模型多報的 major 照實留著交人工是現在要的行為,唯一能降的是「無法執行」類的指控在沙盒實際跑成功之後(blocker → major,仍交人工)。",
     "expect_decision": [
       "auto_approved",
       "needs_human"
@@ -21,8 +21,7 @@
       "spec_found": true
     },
     "forbid_severities": [
-      "blocker",
-      "major"
+      "blocker"
     ]
   }
 }

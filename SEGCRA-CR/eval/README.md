@@ -115,8 +115,8 @@ python eval/run_eval.py --json out.json     # 另存機器可讀結果(給報告
 | `arbiter_dropped` | `_spec_exec.dropped_cases[].by == "arbiter"` | 角色三仲裁判過「測資錯」並剔除案例 |
 | `spec_exec_sql_fault` | findings 含「執行驗證失敗」 | **執行驗證自己**抓到實作與規格不符(分得出不是靜態審查抓的) |
 | `needs_human_marked` | `_needs_human` | 判斷校準記下「必須有人看」的理由(無規格可對照、規格未載明)——這些 finding 刻意是 info,看 severity 分不出來 |
-| `calibration_downgraded` | `_calibration.downgraded` | 模型的「規格不符」指控被執行驗證的正反兩向案例否證,降成 info |
-| `calibration_dropped` | `_calibration.dropped` | 「語法錯誤/無法執行」的斷言被 sqlglot 解析否證,整條移除 |
+| `calibration_downgraded` | `_calibration.downgraded` | 校準降過嚴重度(只有「無法執行」類的指控在沙盒實際跑成功後才可以,blocker → major)。要求「沒有偷偷降級」時斷言它是 `false` |
+| `calibration_annotated` | `_calibration.annotated` | 校準加過註(規格待補、執行驗證未重現)。加註是常態動作,沒有它分不出「校準沒被走到」與「走到了但沒事可做」 |
 
 ## 為什麼要 `_golden`,`expected` 不夠嗎
 

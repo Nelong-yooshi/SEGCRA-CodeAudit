@@ -12,25 +12,16 @@
   "expected": [],
   "_golden": {
     "layer": "calibration",
-    "intent": "實作與 specs/R-201.md 等價(每組 SUM 必非 NULL,`NOT (x < 100000)` 等於 `x >= 100000`;`IN ('TWD')` 等於 `= 'TWD'`),但寫法迂迴,實測容易被報成「實作與核定規格不符:門檻用了嚴格不等於」。執行驗證會對規格的每個條件跑正反兩向案例並全部通過——同一份報告不該並列「案例皆符合預期」與一條規格不符的 major;那條指控要降成 info 並註明執行驗證未重現。",
+    "intent": "實作與 specs/R-201.md 等價(每組 SUM 必非 NULL,`NOT (x < 100000)` 等於 `x >= 100000`;`IN ('TWD')` 等於 `= 'TWD'`),但寫法迂迴,實測容易被報成「實作與核定規格不符:門檻用了嚴格不等於」。執行驗證對每個條件跑正反兩向且全部通過——兩向都通過只證明「生成的那幾筆資料上沒有差異」,不足以否證指控,所以那條指控的**嚴重度不動**,只加註「執行驗證未重現」並交人工。這個 case 量的就是「加註了、而且沒有降級」。",
     "expect_decision": [
-      "auto_approved",
       "needs_human"
     ],
     "expect_signals": {
       "spec_found": true,
-      "spec_exec_passed": true
+      "spec_exec_passed": true,
+      "calibration_annotated": true,
+      "calibration_downgraded": false
     },
-    "forbid_findings": [
-      {
-        "severity": "major",
-        "title_contains_any": [
-          "不符",
-          "門檻",
-          "閾值"
-        ]
-      }
-    ],
-    "gap_note": "模型本來就沒報規格不符時,這個 case 會以「沒有該 major」通過——它量的是上限(不得誤報),不保證校準那一步被走到;校準自己的對照由 tests/test_judgement_calibration.py 與 tests/test_pipeline_integration.py 守。"
+    "gap_note": "模型本來就沒報規格不符時,calibration_annotated 會是 false 而這個 case 失敗——那是對的:沒有東西可加註,就代表這一輪沒有量到校準。"
   }
 }

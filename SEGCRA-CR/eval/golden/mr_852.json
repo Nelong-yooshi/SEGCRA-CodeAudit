@@ -12,12 +12,13 @@
   "expected": [],
   "_golden": {
     "layer": "calibration",
-    "intent": "801 的對照組:同樣沒有規格,但這次只有命名/風格可說。「不確定就 info」只適用在這種沒有任何依據的地方——命名類的 finding 不得升到 major。(無規格本身仍會由管線補一條 major「無規格可驗」並走 needs_human,所以這裡只禁風格類的 major,不禁整份報告的 major。)",
+    "intent": "851 的對照組:同樣沒有規格,但這次只有命名/風格可說。「不確定就 info」只適用在這種沒有任何依據的地方——**程式**不得把命名或風格類的問題補成 major。模型自己要報 major 是它的判斷,照實留著、由決策層交人工,不在這裡擋(現在的方向是寧可多報,再用證據過濾)。",
     "expect_decision": [
       "needs_human"
     ],
     "forbid_findings": [
       {
+        "source": "program",
         "severity": "major",
         "title_contains_any": [
           "命名",
@@ -27,6 +28,10 @@
           "排版"
         ]
       }
-    ]
+    ],
+    "expect_signals": {
+      "needs_human_marked": true,
+      "calibration_downgraded": false
+    }
   }
 }
