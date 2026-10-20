@@ -1820,6 +1820,13 @@ MUTANTS.update({
      '"R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys.", "沙盒"],'),
 })
 
+# ---- 注入掃描的總量上限:放得下一份展開結果
+MUTANTS.update({
+    "掃描上限:改回放不下一份展開結果": ("pipeline.py",
+        "MAX_EXTRA_SCAN_CHARS = 5_000_000",
+        "MAX_EXTRA_SCAN_CHARS = 200_000"),
+})
+
 # ---- 確定性防線不能被模型關掉(#16 review):程式專用標題、規則命中不可被降級
 MUTANTS.update({
  "後處理:不移除模型同標題的輸出": ("pipeline.py",

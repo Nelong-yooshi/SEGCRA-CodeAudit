@@ -897,6 +897,15 @@ def test_同一份內容在別的路徑_照樣加():
     assert [x["path"] for x in out["files"][2:]] == ["models/mrt_big.sql"]
 
 
+def test_掃描上限放得下一份展開結果():
+    """展開結果的上限以內,單一 model 的展開一定掃得到;放不下就一定會多一條「沒有掃描」的 major。"""
+    from orchestrator.dbt_render import MAX_OUTPUT_CHARS
+    assert pipeline.MAX_EXTRA_SCAN_CHARS >= MAX_OUTPUT_CHARS
+    rendered = [{"path": "models/a.sql", "full_content": "x" * MAX_OUTPUT_CHARS}]
+    out = pipeline._mr_with_head_text(_mr([_f("models/a.sql")]), None, rendered)
+    assert out["files"][1:] == rendered and "_scan_skipped" not in out
+
+
 def test_沒有掃完時補major():
     report = pipeline.enforce_scan_skipped({"findings": []}, 2)
     [fd] = report["findings"]
