@@ -9,7 +9,7 @@
 - **防「忘了審」**:審查若靠人手動觸發,漏跑一次就等於該 MR 完全沒有 AI 防線(漏報的最上游形態)。webhook 把觸發變成事件驅動,MR 一動就審。
 - **防外部亂打**:server 監聽 `0.0.0.0`,任何能連到這台機器的人都打得到 endpoint。沒有 token 驗證的話,攻擊者可以偽造 payload 對任意 MR 觸發審查(浪費 GPU 資源)、甚至藉由灌事件干擾正常審查節奏。這裡用密鑰比對確定性擋掉,不是靠「應該沒人知道這個 URL」。
 - **防自我觸發迴圈**:審查完成會回寫留言,留言又會發 note webhook——若 note 事件無條件重審,就是無限迴圈燒 GPU。所以 note 事件只認明確的 `/review` 指令,且 bot 帳號(username 以 `ai-` 或 `root` 開頭)的留言一律忽略。這是機制擋,不是期待模型或人「小心一點」。
-- **防重複觸發**:GitLab 對同一 MR 短時間可能連發多個 update 事件(推多個 commit、改標題),每發都起一輪審查會把單機資源打爆。`_inflight` 集合做 debounce,同一 MR 審查中就略過。
+- **防重複觸發**:GitLab 對同一 MR 短時間可能連發多個 update 事件。只有**真的推了新 commit**(事件帶 `oldrev`)才會重審,其餘 update(改 label、標題、描述、指派人 —— 包括審查自己最後加 label 那一下)一律忽略。推了新 commit 時取消進行中的那次、改審新的:舊的那次審的是舊程式,結論貼到新 commit 上是錯的。
 
 ## 怎麼建的
 
@@ -23,13 +23,13 @@
 2. `note`:必須同時滿足四個條件才重審——`noteable_type == "MergeRequest"`、payload 帶 `merge_request.iid`、留言文字含 `/review`、留言者 username 不以 `ai-`/`root` 開頭(`author_bot` 判斷)。最後一條就是防迴圈:審查器自己回寫的留言不會再觸發自己。
 3. 其他 kind 回 `ignored (kind=...)`,一律 200(GitLab 收到非 2xx 會標記 webhook 失敗並重試/停用)。
 
-**Debounce(`_trigger`)**:模組層一個 `_inflight: set` 配 `threading.Lock`。`_trigger(mr_iid)` 先在鎖內檢查 iid 是否在集合中,在就回 `already running` 不重複起審;不在就加入集合再開 thread。
+**取消舊審查(`_trigger` / `_cancel`)**:模組層一個 `_inflight: dict`({mr_iid: (event_loop, task)})配 `threading.Lock`。`_trigger(mr_iid, head_sha)` 先試著取消同一個 MR 進行中的那次(跨執行緒要用 `loop.call_soon_threadsafe(task.cancel)`,task 屬於那個執行緒的迴圈),再開一條新的 thread。取消只會在下一個真正的等待點生效,所以舊的那次有可能一路走到回寫 —— `review_mr` 在回寫前會比對 MR 目前的 head sha,發現已被取代就不貼(見 `orchestrator/pipeline.py:_superseded`)。
 
 **背景執行(`_trigger` → `_run_review`)**:審查耗時數十秒到數分鐘,而 GitLab webhook 有逾時限制,所以 `_trigger` 起一個 `threading.Thread(daemon=True)` 跑 `_run_review` 後**立刻**回 200。`_run_review` 內用 `asyncio.run(review_mr(_cfg, str(mr_iid), profile_name=PROFILE))` 跑完整管線(profile 由 `REVIEW_PROFILE` 環境變數決定,預設 `review`)。HTTP 服務本身用 `ThreadingHTTPServer`,審查進行中仍能收後續事件。
 
 **Graceful 失敗(`_run_review`)**:整段包在 try/except——模型連不上、fixture 不存在、管線任何 exception 都只印 `[webhook] MR !N 審查失敗:...` 到 stdout,server 不死;`finally` 保證把 iid 從 `_inflight` 移除,失敗的 MR 之後還能再觸發。payload 不是合法 JSON 回 400。`log_message` 覆寫為靜音,stdout 只留自己的結構化 print。
 
-**資料流**:GitLab 事件 → `POST /gitlab-webhook`(驗 token)→ 路由抽出 `mr_iid` → debounce → 背景 thread 跑 `review_mr` → 管線經 `toolbox/gitlab.py` 回寫 GitLab:逐條 finding 行內留言、總評留言(決策文字)、`ai-review::<decision>` label、commit status `segcra/review`(`auto_approved` → success,`needs_human`/`blocked` → failed,description 帶原因;見 `orchestrator/pipeline.py` 決策回寫段)。
+**資料流**:GitLab 事件 → `POST /gitlab-webhook`(驗 token)→ 路由抽出 `mr_iid`(update 事件另外看 `oldrev`)→ 取消同 MR 進行中的審查 → 背景 thread 跑 `review_mr` → 管線經 `toolbox/gitlab.py` 回寫 GitLab:逐條 finding 行內留言、總評留言(決策文字)、`ai-review::<decision>` label、commit status `segcra/review`(`auto_approved` → success,`needs_human`/`blocked` → failed,description 帶原因;見 `orchestrator/pipeline.py` 決策回寫段)。
 
 **GitLab 端對應設定**(README 第 6 節有實測步驟):
 
@@ -43,7 +43,7 @@ webhook server 本身不產生 finding、不動 severity、不參與三態決策
 
 ## 怎麼驗證它在動
 
-不需要 GitLab、不需要模型就能驗證路由/驗證/debounce 三件事(mock 模式,`GITLAB_URL` 不設):
+不需要 GitLab、不需要模型就能驗證路由/token 驗證/取消重審三件事(mock 模式,`GITLAB_URL` 不設):
 
 ```bash
 cd SEGCRA-CR
@@ -64,8 +64,8 @@ curl -s -X POST http://127.0.0.1:8000/gitlab-webhook \
   -d '{"object_kind":"merge_request","object_attributes":{"action":"open","iid":1}}'
 # → "review triggered for MR !1";server 印「→ 觸發審查 MR !1」
 
-# 4. 立刻重發同一事件 → debounce
-#(重跑上一條 curl)→ "already running";server 印「MR !1 審查中,略過(debounce)」
+# 4. 立刻重發同一事件(帶 oldrev)→ 取消舊的、改審新的
+#(重跑上一條 curl)→ server 印「MR !1 取消進行中的舊審查,改審新的」
 
 # 5. 不觸發的 action
 curl -s -X POST http://127.0.0.1:8000/gitlab-webhook \
@@ -80,12 +80,33 @@ curl -s -X POST http://127.0.0.1:8000/gitlab-webhook \
 # → "ignored (note)"
 ```
 
-步驟 3 的背景審查在 mock 模式會去讀 `fixtures/mr_1.json`——該檔不存在,所以 server 會印「MR !1 審查失敗:...」後把 iid 從 `_inflight` 移除,這同時驗證了 graceful 失敗與 debounce 解除(再發一次事件又能觸發)。要跑完整審查:`cp fixtures/mr_001.json fixtures/mr_1.json` 且模型 profile 可用,審完 stdout 會印「MR !1 審完:決策=... 分數=... findings=...」,結果落在 `review_output/mr_1_review.json`。接真 GitLab 則用 webhook 設定頁的 Test 按鈕。
+步驟 3 的背景審查在 mock 模式會去讀 `fixtures/mr_1.json`——該檔不存在,所以 server 會印「MR !1 審查失敗:...」後把 iid 從 `_inflight` 移除,這同時驗證了 graceful 失敗與 `_inflight` 的清理(再發一次事件又能觸發)。要跑完整審查:`cp fixtures/mr_001.json fixtures/mr_1.json` 且模型 profile 可用,審完 stdout 會印「MR !1 審完:決策=... 分數=... findings=...」,結果落在 `review_output/mr_1_review.json`。接真 GitLab 則用 webhook 設定頁的 Test 按鈕。
+
+## 時間上限與未完成的處理(#45 / #53 review)
+
+| 環境變數 | 預設 | 單位 | 管什麼 | 什麼時候要調 |
+|---|---|---|---|---|
+| `REVIEW_TIMEOUT_SECONDS` | 2400 | 秒 | **一份審查的總上限**(`_run_review` 的 `asyncio.wait_for`) | 要比執行驗證那一段的上限大。模型變慢、或規格變大而生成時間拉長時往上調 |
+| `SPEC_EXEC_TIMEOUT_SECONDS` | 1200 | 秒 | 執行驗證整段(測資生成 + 沙盒執行 + 仲裁)的上限,見 `orchestrator/pipeline.py` | 照 `_spec_exec.stage_seconds` 量到的各階段時間訂。實測大規格的測資生成要 26–70 分鐘,目前這個預設值在現在的機器上幾乎一定會逾時 |
+
+兩個都是「讀不懂就退回預設值並印一行警告」(`orchestrator/config.py:env_seconds`),
+**不是**直接丟例外:讀它們的是 webhook 伺服器在 import 的時候,填錯一個字就起不來 →
+所有 MR 都收不到審查,那比用預設值跑糟得多。0 或負數也退回預設(上限設成 0 等於每次
+都立刻逾時,不會是誰的本意)。
+
+審查沒跑完時,webhook 會做兩件事(`_notify_incomplete`):在 MR 上留言,**並把
+`segcra/review` 這個 commit status 設成失敗**。留言只是給人看的,擋合併的是 commit
+status(專案設定「Pipelines must succeed」);只留言不設狀態,等於審查沒跑完卻沒有
+東西擋著合併。
 
 ## 擴充與注意
 
 - **加/減觸發動作**:改 `TRIGGER_ACTIONS`(`scripts/webhook_server.py` 模組層)。
+  注意 `update` 另有一道判斷:**只有 `object_attributes.oldrev` 有值(= 真的推了新
+  commit)才會重審**。GitLab 改 label、標題、描述、指派人都送 `action=update`,包括
+  審查自己最後 `set_label` 那一下——不分辨的話每個 MR 至少多跑一次完整審查,而且兩次
+  決策不同時 label 又變、再觸發一次。
 - **改 bot 判斷**:目前用 username 前綴 `("ai-", "root")` 硬編碼在 note 分支，換 bot 帳號命名時要同步改,否則可能迴圈或誤擋真人。
 - **改審查 profile / 密鑰**:環境變數 `REVIEW_PROFILE`、`GITLAB_WEBHOOK_SECRET`，不用改碼。
-- **已知限制(單機、無佇列)**:事件只存在 `_inflight` 記憶體集合裡，server 重啟即遺失;審查中收到同 MR 的新 commit 事件會被 debounce **丟棄而不是排隊**，審完不會補審最新版(需要再推一次 commit 或留言 `/review`);多 MR 同時觸發就同時起多條管線，沒有併發上限，單機 GPU 可能被打滿;server 掛掉期間的事件不會重放(GitLab 端有重試但次數有限)。要上量得換成佇列(如一個簡單的 job queue + worker)並把 in-flight 狀態持久化。
+- **已知限制(單機、無佇列)**:事件只存在 `_inflight` 記憶體集合裡，server 重啟即遺失;審查中收到同 MR 的**新 commit** 事件會取消舊的那次、改審新的(舊的那次審的是舊程式,結論貼到新 commit 上是錯的),而舊的那次若較晚走到回寫,`review_mr` 會比對 MR 目前的 head sha、發現已被取代就不回寫;多 MR 同時觸發就同時起多條管線，沒有併發上限，單機 GPU 可能被打滿;server 掛掉期間的事件不會重放(GitLab 端有重試但次數有限)。要上量得換成佇列(如一個簡單的 job queue + worker)並把 in-flight 狀態持久化。
 - **安全邊界**:token 驗證只擋「誰能觸發」，MR 內容本身的提示注入是管線內 `scan_mr` + `enforce_injection` 的事(見 `orchestrator/pipeline.py`)，兩層互不取代。

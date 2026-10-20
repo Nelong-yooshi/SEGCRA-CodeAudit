@@ -217,6 +217,30 @@ passed = bool(effective) and not sql_faults and not coverage_gaps
 
 三個條件缺一不可:**至少有一個有效案例**(全被剔光不算通過)、**零 SQL 側不符**、**零覆蓋缺口**(含生成階段缺向與仲裁剔除造成的缺口)。通過時補一條 info「執行驗證通過(N 案例全數相符)」;有缺口時補 info「執行驗證覆蓋缺口」逐條列出。
 
+### 時間上限與各階段耗時(#45 / #53 review)
+
+整段有一個上限 `SPEC_EXEC_TIMEOUT_SECONDS`(預設 1200 秒,由 `orchestrator/pipeline.py`
+讀;讀不懂退回預設並印警告)。三個階段各自計時,結果放在 `_spec_exec.stage_seconds`
+(`{"測資生成": 秒, "沙盒執行": 秒, "仲裁": 秒}`),**逾時那次也會留下**
+(`report["_spec_exec_stage_seconds"]`)—— 上限要照這些數字訂,而逾時那一次正是最需要
+知道時間花在哪裡的一次。
+
+失敗或逾時的 finding 會標出是哪個階段(`[執行驗證/沙盒執行] 審查未完整(逾時)`,
+並在 finding 上附 `stage` 欄位):三件事的修法完全不同,測資生成要調 prompt 或換做法、
+沙盒要看環境、仲裁是另一次模型呼叫。
+
+**沙盒階段是同步呼叫,所以不能只靠 `asyncio.wait_for`**:`execute_cases` 用 pymssql,
+它在跑的時候事件迴圈整個卡住,`wait_for` 插不進去(實測:上限 1 秒、沙盒卡 6 秒 →
+跑了 6 秒、沒有逾時、結果照常回傳)。現在的做法是兩道:
+
+1. `execute_cases` 收一個截止時間,**過了就不再開始新的案例**(手上那個照跑完 —— 單一
+   查詢本來就有 120 秒上限,所以最多超過一個查詢的時間);沒跑到的案例由 `_unrun_gaps`
+   列成覆蓋缺口,不會被當成「驗過而且沒問題」。
+2. 它被丟到一條 **daemon 背景執行緒**(`spec_exec._in_thread`),外層的 await 才能準時
+   回來。不用 `asyncio.to_thread` 的預設執行緒池:`asyncio.run` 結束時會等池子裡的工作
+   做完,等於逾時又被拖回去(跟 #33 的 `_wait_in_thread` 同一個理由)。`contextvars`
+   會帶進去 —— 審查用的 ref 釘在 ContextVar 裡(#31),不帶的話背景那邊讀到預設值。
+
 ### 為什麼要仲裁——測資生成也會幻覺(mr_003 實測)
 
 如果把每個 mismatch 都直接當 SQL 錯,測資的幻覺就會變成假 major。以下是本機對 `fixtures/mr_003.json`(R-093,埋雷:`HAVING COUNT(*) >= 20` 被改成 `>= 2`)完整跑一次的實際輸出(`demo.py --mr 003`,--profile fast / gpt-oss:20b):
