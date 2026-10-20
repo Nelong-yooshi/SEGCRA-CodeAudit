@@ -776,6 +776,53 @@ def test_沒凍結任何測資時不影響既有的可比性():
     assert not [d for d in preflight.compare_fingerprint(base, same) if "frozen" in d]
 
 
+def test_golden_case用的dbt專案改了_兩份baseline就不可比(tmp_path):
+    """mock 模式從 eval/golden/dbt_archives/<commit>/ 取回 MR 那個 commit 的專案。macro 的門檻
+    改了,同一個 case 審的就是另一份程式,但 mr_*.json 一個字都沒變——golden 的雜湊擋不住。"""
+    d = tmp_path / "dbt_archives"
+    for sha in ("a" * 40, "b" * 40):
+        (d / sha / "macros").mkdir(parents=True)
+        (d / sha / "dbt_project.yml").write_text("name: x\n", encoding="utf-8")
+        (d / sha / "macros" / "m.sql").write_text("{% macro m() %}1{% endmacro %}", encoding="utf-8")
+    h1, n1 = preflight._dir_digest(d, "**/*")
+    assert n1 == 4                                       # 只算檔案,不算目錄
+    (d / ("a" * 40) / "macros" / "m.sql").write_text("{% macro m() %}2{% endmacro %}", encoding="utf-8")
+    h2, _ = preflight._dir_digest(d, "**/*")
+    assert h2 != h1
+    # 同名檔案放在不同的 commit 底下要分得開(雜湊用相對路徑,不是檔名)
+    e = tmp_path / "swapped"
+    for sha, text in (("a" * 40, "x"), ("b" * 40, "y")):
+        (e / sha).mkdir(parents=True)
+        (e / sha / "f.sql").write_text(text, encoding="utf-8")
+    f = tmp_path / "swapped2"
+    for sha, text in (("a" * 40, "y"), ("b" * 40, "x")):
+        (f / sha).mkdir(parents=True)
+        (f / sha / "f.sql").write_text(text, encoding="utf-8")
+    assert preflight._dir_digest(e, "**/*")[0] != preflight._dir_digest(f, "**/*")[0]
+
+    base = _fp()
+    base["testset"] = {"golden": "aaaaaaaaaaaa", "golden_count": 37, "specs": "bbbbbbbbbbbb",
+                       "specs_count": 10, "dbt": h1, "dbt_count": 4}
+    changed = {**base, "testset": {**base["testset"], "dbt": h2}}
+    assert any("dbt" in line for line in preflight.compare_fingerprint(base, changed))
+
+
+def test_不遞迴時雜湊與以前相同(tmp_path):
+    """雜湊改用相對路徑之後,原本非遞迴的那三組(golden、specs、凍結測資)相對路徑就是檔名,
+    雜湊不變——否則所有既有的 baseline 都會被判成不可比。"""
+    import hashlib
+
+    d = tmp_path / "golden"
+    d.mkdir()
+    (d / "mr_101.json").write_text('{"a": 1}', encoding="utf-8")
+    (d / "mr_102.json").write_text('{"b": 2}', encoding="utf-8")
+    h = hashlib.sha256()
+    for name in ("mr_101.json", "mr_102.json"):
+        h.update(name.encode())
+        h.update((d / name).read_bytes())
+    assert preflight._dir_digest(d, "mr_*.json") == (h.hexdigest()[:12], 2)
+
+
 def test_凍結目錄不存在時不炸():
     """凍結是選用功能,絕大多數 repo 狀態下這個目錄根本不存在;
     preflight 是跑批的前置檢查,不能因為一個選用功能沒用就中止整輪。"""

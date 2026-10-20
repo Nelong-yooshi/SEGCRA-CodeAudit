@@ -30,6 +30,8 @@ DEFAULT_MODEL_PATHS = ("models",)
 DEFAULT_MACRO_PATHS = ("macros",)
 DEFAULT_SEED_PATHS = ("seeds",)
 DEFAULT_SNAPSHOT_PATHS = ("snapshots",)
+DEFAULT_ANALYSIS_PATHS = ("analyses",)
+DEFAULT_TEST_PATHS = ("tests",)
 MAX_PATHS = 20                          # 單一設定項最多幾個目錄
 CACHE_MAX_ENTRIES = 8
 CACHE_MAX_BYTES = 100 * 1024 * 1024     # 快取內所有檔案內容合計(字元數,近似位元組)
@@ -40,6 +42,8 @@ MAX_SNAPSHOT_YML_CHARS = 1_000_000
 # 專案根目錄要取回的設定檔。packages.yml / dependencies.yml 決定專案有沒有用 dbt 套件:
 # 套件的 model / source 不在 repo 裡,有用套件時 ref() / source() 找不到不代表不存在
 ROOT_FILES = ("dbt_project.yml", "packages.yml", "dependencies.yml")
+# 專案根目錄裡 dbt 會讀的檔案(selectors.yml 決定排程選到哪些 model;不取回內容)
+LAYOUT_ROOT_FILES = ROOT_FILES + ("selectors.yml",)
 
 _SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 # snapshot 的名稱寫在區塊上({% snapshot 名稱 %}),不是檔名
@@ -66,6 +70,41 @@ class DbtProject:
     snapshot_paths: tuple[str, ...] = ()
     # model / seed / snapshot 目錄下所有檔案的路徑(任何副檔名、只有名稱),已排序
     names: tuple[str, ...] = ()
+    analysis_paths: tuple[str, ...] = ()
+    test_paths: tuple[str, ...] = ()
+
+    @property
+    def resource_paths(self) -> tuple[str, ...]:
+        """seed / snapshot / analysis / test 目錄(不是 model 也不是 macro 的 dbt 資源)。"""
+        return self.seed_paths + self.snapshot_paths + self.analysis_paths + self.test_paths
+
+    @property
+    def layout(self) -> "DbtLayout":
+        return DbtLayout(self.model_paths + self.macro_paths + self.analysis_paths
+                         + self.test_paths + self.seed_paths + self.snapshot_paths)
+
+
+@dataclass(frozen=True)
+class DbtLayout:
+    """dbt 會讀的目錄(dbt_project.yml 的 model-paths、macro-paths…,相對專案根目錄)。
+
+    判斷一個變更檔屬不屬於 dbt 用這個,不看檔名或內容:專案就在 repo 根目錄時,CI 設定、
+    一般的 SQL 範本、說明文件裡的範例 dbt_project.yml 都不是 dbt 的檔案。"""
+    dirs: tuple[str, ...] = ()
+
+    def contains(self, rel: str) -> bool:
+        return rel in LAYOUT_ROOT_FILES or _under(rel, self.dirs)
+
+
+def read_layout(text: str) -> DbtLayout:
+    """dbt_project.yml 的內容 → DbtLayout。看不懂丟 DbtProjectError(規則同取回專案)。"""
+    model, macro, analysis, test, seed, snapshot = _read_paths(text)
+    return DbtLayout(model + macro + analysis + test + seed + snapshot)
+
+
+# dbt 的預設目錄(dbt_project.yml 沒有另外設定時);沒有取回專案、不知道實際設定時用
+DEFAULT_LAYOUT = DbtLayout(DEFAULT_MODEL_PATHS + DEFAULT_MACRO_PATHS + DEFAULT_ANALYSIS_PATHS
+                           + DEFAULT_TEST_PATHS + DEFAULT_SEED_PATHS + DEFAULT_SNAPSHOT_PATHS)
 
 
 class DbtProjectError(Exception):
@@ -114,10 +153,11 @@ def _parse(data: bytes, prefix: str) -> DbtProject:
     text = root_files.get("dbt_project.yml")
     if text is None:
         raise DbtProjectError("專案目錄裡沒有 dbt_project.yml(請檢查設定檔的 dbt.project_dir)")
-    model_paths, macro_paths, seed_paths, snapshot_paths = _read_paths(text)
-    # 收內容:model / macro / snapshot(名稱寫在檔案內容裡)/ seed(屬性檔可能設 alias)。
-    # 列檔名:model(.py model)/ seed(.csv)/ snapshot
-    wanted = tuple(dict.fromkeys(f"{base}{p}" for p in
+    (model_paths, macro_paths, analysis_paths, test_paths,
+     seed_paths, snapshot_paths) = _read_paths(text)
+    # 收內容:model / macro / snapshot(名稱寫在檔案內容裡)/ seed(屬性檔可能設 alias)/
+    # analysis 與 test(MR 改到時要用完整內容展開)。列檔名:model(.py model)/ seed(.csv)/ snapshot
+    wanted = tuple(dict.fromkeys(f"{base}{p}" for p in analysis_paths + test_paths +
                                  model_paths + macro_paths + seed_paths + snapshot_paths))
     listed = tuple(dict.fromkeys(f"{base}{p}" for p in model_paths + seed_paths + snapshot_paths))
     got = archive.extract_archive(data, wanted, list_prefixes=listed)
@@ -127,7 +167,8 @@ def _parse(data: bytes, prefix: str) -> DbtProject:
     names = tuple(rel[len(base):] for rel in got.names)
     return DbtProject(ok=True, files=files, model_paths=model_paths, macro_paths=macro_paths,
                       root_files=root_files, seed_paths=seed_paths,
-                      snapshot_paths=snapshot_paths, names=names)
+                      snapshot_paths=snapshot_paths, names=names,
+                      analysis_paths=analysis_paths, test_paths=test_paths)
 
 
 def _read_paths(text: str) -> tuple[tuple[str, ...], ...]:
@@ -142,15 +183,20 @@ def _read_paths(text: str) -> tuple[tuple[str, ...], ...]:
     seed_key = "seed-paths" if "seed-paths" in raw else "data-paths"
     return (_path_list(raw, model_key, DEFAULT_MODEL_PATHS),
             _path_list(raw, "macro-paths", DEFAULT_MACRO_PATHS),
+            _path_list(raw, "analysis-paths", DEFAULT_ANALYSIS_PATHS, allow_empty=True),
+            _path_list(raw, "test-paths", DEFAULT_TEST_PATHS, allow_empty=True),
             _path_list(raw, seed_key, DEFAULT_SEED_PATHS),
             _path_list(raw, "snapshot-paths", DEFAULT_SNAPSHOT_PATHS))
 
 
-def _path_list(raw: dict, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+def _path_list(raw: dict, key: str, default: tuple[str, ...], *,
+               allow_empty: bool = False) -> tuple[str, ...]:
+    """allow_empty:analysis-paths / test-paths 可以設成空清單(dbt 允許,等於不用);
+    model / macro / seed / snapshot 不行。"""
     if key not in raw:
         return default
     value = raw[key]
-    if not isinstance(value, list) or not value or len(value) > MAX_PATHS:
+    if not isinstance(value, list) or (not value and not allow_empty) or len(value) > MAX_PATHS:
         raise DbtProjectError(f"dbt_project.yml 的 {key} 必須是 1 到 {MAX_PATHS} 個目錄的清單")
     paths = []
     for p in value:
@@ -277,6 +323,7 @@ def _copy(project: DbtProject) -> DbtProject:
                       model_paths=project.model_paths, macro_paths=project.macro_paths,
                       error=project.error, root_files=dict(project.root_files),
                       seed_paths=project.seed_paths, snapshot_paths=project.snapshot_paths,
+                      analysis_paths=project.analysis_paths, test_paths=project.test_paths,
                       names=project.names)
 
 

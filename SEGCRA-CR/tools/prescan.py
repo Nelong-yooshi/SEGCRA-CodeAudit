@@ -56,15 +56,13 @@ def main():
         gate = 1
 
     if not args.no_lint:
+        # 沒跑完(逾時、內容過長、執行失敗)時只有一筆 LINT_INCOMPLETE,照一般項目印出
         issues = json.loads(lint(sql))
-        if isinstance(issues, dict) and issues.get("error"):
-            print(f"\n[lint] 失敗:{issues['error']}")
-        else:
-            print(f"\n[lint] {len(issues)} 項(風格/反模式定位線索,不擋 gate)")
-            for it in issues[:20]:
-                print(f"  L{it.get('line')}: {it.get('code')} {it.get('description')}")
-            if len(issues) > 20:
-                print(f"  …(其餘 {len(issues) - 20} 項略)")
+        print(f"\n[lint] {len(issues)} 項(風格/反模式定位線索,不擋 gate)")
+        for it in issues[:20]:
+            print(f"  L{it.get('line')}: {it.get('code')} {it.get('description')}")
+        if len(issues) > 20:
+            print(f"  …(其餘 {len(issues) - 20} 項略)")
 
     print(f"\n結果:{'未通過(有 blocker/major,請修正後重跑)' if gate else '通過(無 blocker/major)'}")
     sys.exit(gate)

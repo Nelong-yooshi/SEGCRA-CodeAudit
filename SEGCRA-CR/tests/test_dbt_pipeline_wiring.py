@@ -84,7 +84,7 @@ def test_pipeline_passes_dbt_flag_to_find_spec():
     import inspect
     import orchestrator.pipeline as pipeline_mod
     src = inspect.getsource(pipeline_mod.review_mr)
-    assert 'find_spec(hub, mr, by_path=cfg.dbt.get("enabled") is True)' in src
+    assert 'find_spec_mr(hub, mr, by_path=cfg.dbt.get("enabled") is True)' in src
 
 
 # --------------------------------------------------- 開啟後:先查本機 specs/
@@ -434,7 +434,7 @@ def test_prescan_model_path_with_traversal_does_not_touch_filesystem():
     真實檔案(讀到的話結果會明顯不同,或直接失敗)。"""
     hub = _FakePrescanHub()
     src = "SELECT {{ 1 + 1 }} AS two"
-    entries = _run(prescan(hub, _files("../../../../etc/passwd", src),
+    entries = _run(prescan(hub, _files("../../../../etc/passwd.sql", src),
                            {"enabled": True, "database": "DBT_PLACEHOLDER"}))
     assert hub.rules_calls == ["SELECT 2 AS two"]
     assert "dbt_render_error" not in entries[0]
