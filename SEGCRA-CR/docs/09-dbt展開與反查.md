@@ -44,12 +44,15 @@
    - `ref()` / `source()` 展開成 `"<資料庫>"."<綱要>"."<表>"`(資料庫名由呼叫端傳入,不猜);
      沒有專案資訊時綱要固定為 `dbo`,有專案資訊時見下方「`ref()` / `source()` 的精確度」
    - `config()` 回傳空字串、`var()` 取呼叫端給的值、`execute` 為 True、
-     `is_incremental()` 預設為 False(比照 compile 期)。以 `incremental=True` 展開時回 True,
-     並提供 `this`(這個 model 自己的表,規則與 `ref()` 相同、一律帶表名提醒);
+     `is_incremental()` 預設為 False(比照 compile 期)。以 `incremental=True` 展開時回 True;
      `RenderResult.incremental_checked` 說明樣板(含它呼叫的 macro)有沒有呼叫 `is_incremental()`
-   - `env_var` **刻意不定義**,`this` 在非增量模式也不定義:給錯值會靜靜產出錯的 SQL,或把審查機
-     的環境變數寫進 SQL;未定義則由 `StrictUndefined` 大聲失敗。`target.database` 在未提供
-     database 時同理
+   - `this`:跟 dbt 一樣兩種模式都提供(這個 model 自己的表,規則與 `ref()` 相同),所以
+     `{% if this is defined %}` 裡的 SQL 一般模式就展開得出來,非增量的 model 直接寫 `{{ this }}`
+     (例如自我 join)也不會展開失敗。沒有 database、或 model 名稱不能當表名時是未定義值,用到才失敗。
+     用到時帶表名提醒:增量模式一律算;一般模式看 model 本身有沒有寫到 `this`(只看語法樹,寫在
+     沒進去的分支裡也算),或呼叫了定義裡寫到 `this` 的 macro(macro 檔最外層的程式碼不算)
+   - `env_var` **刻意不定義**:會把審查機的環境變數寫進 SQL;未定義則由 `StrictUndefined` 大聲失敗。
+     `target.database` 在未提供 database 時同理
    - **所有 macro 檔共用同一個命名空間**:dbt 解析 macro 與檔案順序無關,逐檔各自展開
      會讓「呼叫排在後面檔案的 macro」找不到名稱(跨檔互相呼叫在真實專案很常見)
    - **`adapter.dispatch('x')`**:比照 dbt,先找 `<轉接器>__x`,再退回 `default__x`;
@@ -398,8 +401,8 @@ review_mr
 專案裡被改到的 `.sql`(與其他確定是樣板的檔案)一律記成展開失敗 → major;macro 反查當成
 「全部 model 可能受影響」→ major。不退回「沒有 macro」繼續展開。
 
-**增量 model**:樣板(含它呼叫的 macro)有呼叫 `is_incremental()` 時,預掃再以增量模式(`is_incremental()` 為 True、
-提供 `{{ this }}`)展開一次,兩次的規則命中合併:同一條規則在同一句只算一次,只在增量那次出現的命中標
+**增量 model**:樣板(含它呼叫的 macro)有呼叫 `is_incremental()` 時,預掃再以增量模式(`is_incremental()` 為 True)
+展開一次,兩次的規則命中合併:同一條規則在同一句只算一次,只在增量那次出現的命中標
 `branch: "incremental"`,補報的說明會寫明它在增量分支裡。增量那次展開失敗照展開失敗處理(major);解析不了記成
 「無法解析」(major)。兩份展開結果都進注入掃描。
 

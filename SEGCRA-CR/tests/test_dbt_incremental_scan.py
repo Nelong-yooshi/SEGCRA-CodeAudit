@@ -68,6 +68,20 @@ def test_沒有呼叫is_incremental時只展開一次(_render_in_process):
     assert [h["rule"] for h in entry["rules"]] == ["R002"]
 
 
+def test_this_is_defined_裡的語句一般模式就掃得到(_render_in_process):
+    """dbt 每次執行都有 this;展開器只在增量模式定義它的話,這句 DELETE 兩種模式都看不到。"""
+    entry, _ = _prescan("select 1 as x\n{% if this is defined %}\n;DELETE FROM important_table\n"
+                        "{% endif %}")
+    assert _render_in_process == [False]
+    assert [(h["rule"], h.get("branch")) for h in entry["rules"]] == [("R001", None)]
+    assert "dbt_render_error" not in entry
+
+
+def test_非增量model直接寫this_不會展開失敗():
+    entry, _ = _prescan("select a.id from {{ ref('txn') }} a join {{ this }} b on a.id = b.id")
+    assert "dbt_render_error" not in entry, entry.get("dbt_render_error")
+
+
 def test_兩次都有的命中只算一次():
     entry, _ = _prescan("select * from {{ ref('txn') }};\n"
                         "{% if is_incremental() %}delete from {{ this }};{% endif %}")

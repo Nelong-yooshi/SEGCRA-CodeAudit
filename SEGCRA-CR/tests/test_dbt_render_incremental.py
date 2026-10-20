@@ -48,10 +48,29 @@ def test_this的字串操作與屬性都是真的值():
                      f"{DB}.dbo.mrt_daily.mrt_daily.mrt_daily")
 
 
-def test_預設模式不提供this():
-    """非增量模式照舊:{{ this }} 未定義,大聲失敗(不猜值)。"""
+def test_一般模式也提供this_跟dbt一樣():
+    """dbt 每次執行都有 this:非增量的 model 直接寫 {{ this }}(例如自我 join)是合法的。"""
     r = _render("select * from {{ this }}")
-    assert not r.ok and "this" in r.error
+    assert r.ok, r.error
+    assert r.sql == f'select * from "{DB}"."dbo"."mrt_daily"'
+    assert r.incremental_checked is False
+
+
+def test_this_is_defined_裡的SQL在一般模式也展開得出來():
+    """只在增量模式定義 this 的話,這段 DELETE 兩種模式都看不到(樣板沒呼叫 is_incremental(),
+    不會再以增量模式展開),dbt 執行時卻一定會跑。"""
+    src = "select 1 as x\n{% if this is defined %}\n;DELETE FROM important_table\n{% endif %}"
+    r = _render(src)
+    assert r.ok, r.error
+    assert "DELETE FROM important_table" in r.sql
+    assert r.incremental_checked is False
+
+
+def test_model名稱不合規時_用到this才失敗_不回顯名稱():
+    ok = _render("select 1", path="models/mrt-daily.sql")
+    assert ok.ok, ok.error
+    r = _render("select * from {{ this }}", path="models/mrt-daily.sql")
+    assert not r.ok and "this" in r.error and "mrt-daily" not in r.error
 
 
 def test_沒有database時_用到this才失敗():
@@ -62,7 +81,7 @@ def test_沒有database時_用到this才失敗():
     assert plain.ok and plain.sql == "select 1"
 
 
-def test_model名稱不合規時增量模式失敗():
+def test_model名稱不合規時增量模式用到this失敗():
     r = _render(incremental=True, path="models/mrt-daily.sql")
     assert not r.ok
 
@@ -112,8 +131,38 @@ def test_專案資訊說這個model表名無法確定時_帶無法確定的提�
     assert "mrt_daily" in info.uncertain_models
     r = _render(incremental=True, project=info)
     assert r.ok and r.relation_notice == _RELATION_UNCERTAIN_NOTICE
+    # 一般模式:樣板寫到 this(寫在增量分支裡也算,只看語法樹)就帶同一句提醒
     plain = _render(project=info)
-    assert plain.ok and plain.relation_notice is None      # 非增量模式沒有用到 this
+    assert plain.ok and plain.relation_notice == _RELATION_UNCERTAIN_NOTICE
+    # 沒寫到 this 的 model 不帶(它用的 ref() 都確定)
+    no_this = _render("select id from {{ ref('stg_txn') }}", project=info)
+    assert no_this.ok and no_this.relation_notice is None
+
+
+def test_一般模式用到this時帶表名提醒():
+    r = _render("select * from {{ this }}")
+    assert r.ok and r.relation_notice == _RELATION_NOTICE
+    assert _render("select 1").relation_notice is None
+
+
+def test_呼叫了寫到this的macro才算用到():
+    """macro 檔寫到 this 不代表每個 model 都用到:被呼叫了才算,沒呼叫的 model 不帶提醒。"""
+    files = {"macros/self.sql": "{% macro latest() %}(select max(id) from {{ this }}){% endmacro %}"
+                                "{% macro plain() %}1{% endmacro %}"}
+    called = _render("select {{ latest() }}", macro_files=files)
+    assert called.ok and called.relation_notice == _RELATION_NOTICE
+    assert f'"{DB}"."dbo"."mrt_daily"' in called.sql
+    other = _render("select {{ plain() }}", macro_files=files)
+    assert other.ok and other.relation_notice is None
+
+
+def test_macro檔最外層寫到this不算用到():
+    """dbt 不執行 macro 檔最外層的程式碼:載入時呼叫到寫了 this 的 macro,不代表 model 用了。"""
+    # b.sql 在 a.sql 之後載入:它最外層呼叫的 latest() 已經是包好、會記錄的版本
+    files = {"macros/a.sql": "{% macro latest() %}{{ this }}{% endmacro %}",
+             "macros/b.sql": "{% set t = this %}{% set x = latest() %}{% macro m() %}1{% endmacro %}"}
+    r = _render("select {{ m() }}", macro_files=files)
+    assert r.ok and r.relation_notice is None
 
 
 # ─────────────────── 隔離子行程 ───────────────────

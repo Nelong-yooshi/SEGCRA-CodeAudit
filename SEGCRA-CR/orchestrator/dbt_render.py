@@ -63,14 +63,14 @@
 
 設計底線:**寧可展開失敗,也不要產出看似成功、實則錯誤的 SQL**。
 所以未定義的 dbt 內建(StrictUndefined)、沒有預設值又沒被提供的 var、
-未設定 database 卻用到 ref/source,一律是硬失敗;絕不猜值。`{{ this }}` 只在以增量模式
-展開時(incremental=True)提供,其餘時候未定義、硬失敗。
+未設定 database 卻用到 ref/source,一律是硬失敗;絕不猜值。`{{ this }}` 跟 dbt 一樣兩種模式
+都提供(這個 model 自己的表);沒有 database 或 model 名稱不合法時是未定義值,用到才失敗。
 
 已知限制:
   * `is_incremental()` 預設比照 compile 回 False,`{% if is_incremental() %}` 裡的 SQL 不在
     輸出裡。呼叫端可以再以 incremental=True 展開一次取得增量分支;`RenderResult.incremental_checked`
     說明樣板(含它呼叫的 macro)有沒有呼叫 `is_incremental()`,沒有就不必展開第二次。
-    增量模式的 `{{ this }}` 是這個 model 自己的表名,規則與 ref() 相同(見 _make_relations)。
+    `{{ this }}` 是這個 model 自己的表名,規則與 ref() 相同(見 _make_relations)。
   * 記憶體上限依賴作業系統(Linux 的 RLIMIT_AS);Windows 上只有逾時與上述上限。
   * `ref()` / `source()` 的精確度取決於呼叫端有沒有給 `project`(DbtProjectInfo,
     由 dbt_relations.project_info_from_files() 從專案檔案整理):
@@ -104,7 +104,7 @@ import types
 from dataclasses import dataclass, field
 
 import jinja2
-from jinja2 import StrictUndefined, Undefined
+from jinja2 import StrictUndefined, Undefined, nodes
 from jinja2.defaults import DEFAULT_NAMESPACE
 from jinja2.ext import Extension
 from jinja2.sandbox import SandboxedEnvironment
@@ -226,10 +226,13 @@ def _return(value):
     raise _Return(value)
 
 
-def _wrap(macro):
-    """把 jinja Macro 包成 Python 函式:有 return() 就取物件,否則取渲染字串。"""
+def _wrap(macro, on_call=None):
+    """把 jinja Macro 包成 Python 函式:有 return() 就取物件,否則取渲染字串。
+    on_call 給定時,每次被呼叫先執行它(記下「用到了 {{ this }}」等)。"""
 
     def call(*args, **kwargs):
+        if on_call is not None:
+            on_call()
         try:
             return macro(*args, **kwargs)
         except _Return as r:
@@ -483,11 +486,14 @@ def _make_relations(database: str | None, schema: str, usage: dict,
         return relation(identifier or table_name, declared_schema or source_name)
 
     def this(name: str):
-        """增量模式的 {{ this }}:這個 model 自己的表,展開規則與 ref(自己) 相同。
+        """{{ this }}:這個 model 自己的表,展開規則與 ref(自己) 相同。
 
-        沒有 database 時給未定義值,用到就大聲失敗(不猜值)。不在這裡記「用到 ref()」:
-        macro 載入完會把紀錄歸零,由 render_model 在環境建好之後記(見 _mark_this_used)。"""
-        _check_ident("表", name)
+        沒有 database、或 model 名稱不能當表名時給未定義值,用到才大聲失敗(不猜值;沒用到
+        的 model 照常展開)。不在這裡記「用到表名」:由 render_model 判斷這次有沒有用到
+        再記(見 _mark_this_used)。"""
+        if not isinstance(name, str) or not _IDENT.fullmatch(name):
+            return StrictUndefined(hint="model 名稱不合法(只接受英數與底線),無法提供 {{ this }}",
+                                   name="this")
         if database is None:
             return StrictUndefined(hint="未設定 database,無法提供 {{ this }}", name="this")
         text = f'"{database}"."{_check_ident("綱要", schema)}"."{name}"'
@@ -497,11 +503,16 @@ def _make_relations(database: str | None, schema: str, usage: dict,
 
 
 def _mark_this_used(usage: dict, project: "DbtProjectInfo | None", name: str) -> None:
-    """增量模式一律當成用到這個 model 的表名(比照 ref(自己)):表名會改變的設定記 uncertain。
-    樣板沒有用到 {{ this }} 時,relation_notice 只會多帶一句提醒,不影響判斷。"""
+    """記下用到這個 model 的表名(比照 ref(自己)):表名會改變的設定記 uncertain。
+    什麼時候算用到見 render_model;多記只會多帶一句提醒,不影響判斷。"""
     usage["used"] = True
     if project is not None and (project.global_uncertain or name in project.uncertain_models):
         usage["uncertain"] = True
+
+
+def _uses_this(tree) -> bool:
+    """語法樹裡有沒有出現 `this` 這個名稱(含參數名稱;寧可多算)。"""
+    return any(n.name == "this" for n in tree.find_all(nodes.Name))
 
 
 class _Relation(str):
@@ -674,8 +685,8 @@ def build_env(code_root=None, variables: dict | None = None,
     macro_dirs  專案的 macro 目錄(dbt 的 macro-paths;預設 macros/)
     adapter     dbt 轉接器名稱,決定 adapter.dispatch 先找哪個前綴的實作
     project     專案層級資訊;給了才驗證 ref()/source() 的對象、套用 sources.yml
-    incremental `is_incremental()` 的回傳值;True 時另外提供 `{{ this }}`(需要 model_name)
-    model_name  這次展開的 model 名稱({{ this }} 的表名)
+    incremental `is_incremental()` 的回傳值;True 時需要 model_name
+    model_name  這次展開的 model 名稱({{ this }} 的表名;沒給時不提供 {{ this }})
 
     回傳 (env, macro 名稱清單, 同名衝突清單)。
     """
@@ -704,9 +715,11 @@ def build_env(code_root=None, variables: dict | None = None,
     ref, source, this = _make_relations(database, schema, env.segcra_relation_usage, project)
     env.globals["ref"] = ref
     env.globals["source"] = source
-    if incremental:
-        if model_name is None:
-            raise DbtRenderError("以增量模式展開需要 model 名稱({{ this }} 的表名)")
+    if incremental and model_name is None:
+        raise DbtRenderError("以增量模式展開需要 model 名稱({{ this }} 的表名)")
+    # 跟 dbt 一樣兩種模式都有 {{ this }}(dbt 每次執行都有):只在增量模式提供的話,
+    # `{% if this is defined %}` 裡的 SQL 在一般模式展開不出來、也不會觸發增量模式,規則層掃不到。
+    if model_name is not None:
         env.globals["this"] = this(model_name)
     env.globals["config"] = _Config()
     env.globals["return"] = _return
@@ -732,8 +745,9 @@ def build_env(code_root=None, variables: dict | None = None,
         "database": database if database is not None else StrictUndefined(name="target.database"),
         "schema": schema,
     })
-    # `this` 與 `env_var` 刻意不定義:前者給錯值會靜靜產出錯的 SQL,後者會把審查機
-    # 的環境變數寫進 SQL。未定義則由 StrictUndefined 大聲失敗。
+    # `env_var` 刻意不定義:會把審查機的環境變數寫進 SQL。未定義則由 StrictUndefined 大聲失敗。
+    # 有沒有用到 {{ this }}:定義裡寫到 this 的 macro 被呼叫時記下(見 render_model)
+    env.segcra_this_called = {"called": False}
 
     macros: list[str] = []
     conflicts: list[str] = []
@@ -784,7 +798,9 @@ def build_env(code_root=None, variables: dict | None = None,
         try:
             # 模組層的 {% set %} 只寫進該模組自己的名稱空間,不會汙染 shared(已驗證);
             # 進入 shared 的只有下面逐一檢查過的 macro。
-            module = env.from_string(text).make_module(vars=shared, shared=True)
+            tree = env.parse(text)
+            uses_this = {m.name for m in tree.find_all(nodes.Macro) if _uses_this(m)}
+            module = env.from_string(tree).make_module(vars=shared, shared=True)
         except DbtRenderError:
             raise                       # 資源上限等我們自己的硬失敗照舊往上拋
         except Exception as e:
@@ -810,16 +826,24 @@ def build_env(code_root=None, variables: dict | None = None,
             else:
                 macros.append(name)
             seen[name] = rel
-            shared[name] = env.globals[name] = _wrap(obj)
+            shared[name] = env.globals[name] = _wrap(obj, on_call=_mark_called(
+                env.segcra_this_called) if name in uses_this else None)
     # macro 檔的模組層(例如檔案開頭的 {% set t = ref('x') %})在載入時就會跑到
     # ref()/source();那是 macro 檔的事,不代表 model 本身用了——歸零,之後只記
     # model 展開(含它呼叫到的 macro)時真的用到的。
     env.segcra_relation_usage["used"] = False
     env.segcra_relation_usage["uncertain"] = False
     env.segcra_relation_usage["loading_macros"] = False
+    env.segcra_this_called["called"] = False
     env.segcra_incremental["called"] = False
     env.segcra_macro_phase = False
     return env, sorted(macros), conflicts, problems
+
+
+def _mark_called(flag: dict):
+    def mark():
+        flag["called"] = True
+    return mark
 
 
 # ------------------------------------------------------------- 哨兵行號對應
@@ -997,7 +1021,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
                 套用 sources.yml,且只在真的無法確定時才帶 relation_notice
     macro_files 專案的檔案 {相對路徑: 內容},macro 從這裡讀而不讀磁碟(見 build_env);
                 與 code_root 只能擇一
-    incremental 以 `is_incremental()` 為 True 展開(增量分支),並提供 `{{ this }}`(這個 model
+    incremental 以 `is_incremental()` 為 True 展開(增量分支);`{{ this }}`(這個 model
                 自己的表名,檔名去掉副檔名)。預設 False,與 dbt compile 相同
 
     任何失敗都收斂成 ok=False 而不丟例外。
@@ -1018,14 +1042,17 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
         env, macros, conflicts, problems = build_env(root, variables, database, schema,
                                                      macro_dirs, adapter, project, macro_files,
                                                      model_path.stem, incremental)
-        if incremental and database is not None:
-            # 在 macro 載入、紀錄歸零之後才記(build_env 沒有 macro 時會提早回傳,所以不放在那裡)
-            _mark_this_used(env.segcra_relation_usage, project, model_path.stem)
         # dbt 讀檔時會去掉頭尾空白再渲染(開頭空行不會出現在編譯結果裡)
         body = source.strip()
-        clean = _render_capped(env.from_string(body), MAX_OUTPUT_CHARS)
+        tree = env.parse(body)
+        clean = _render_capped(env.from_string(tree), MAX_OUTPUT_CHARS)
         # 哨兵渲染會再呼叫一次;只算乾淨的那一次
         incremental_checked = env.segcra_incremental["called"]
+        # 用到這個 model 的表名:增量模式一律算;一般模式看 model 本身有沒有寫到 this(只看
+        # 語法樹,寫在沒進去的分支裡也算),或呼叫了定義裡寫到 this 的 macro
+        if database is not None and (incremental or _uses_this(tree)
+                                     or env.segcra_this_called["called"]):
+            _mark_this_used(env.segcra_relation_usage, project, model_path.stem)
     except Exception as e:
         return RenderResult(ok=False, error=_safe_error(e))
 

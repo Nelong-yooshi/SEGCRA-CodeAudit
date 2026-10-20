@@ -161,8 +161,8 @@ MUTANTS = {
         "        if kwargs:\n            # dbt 的 ref('model', version=2)",
         "        if False:\n            # dbt 的 ref('model', version=2)"),
     "macro 檔逐一展開(跨檔呼叫會失敗)": (
-        "        module = env.from_string(text).make_module(vars=shared, shared=True)",
-        "        module = env.from_string(text).module"),
+        "        module = env.from_string(tree).make_module(vars=shared, shared=True)",
+        "        module = env.from_string(tree).module"),
     "dispatch 不先找轉接器實作": (
         '        for candidate in (f"{self._adapter}__{macro_name}", f"default__{macro_name}"):',
         '        for candidate in (f"default__{macro_name}", f"{self._adapter}__{macro_name}"):'),
@@ -180,8 +180,8 @@ MUTANTS = {
         '                or any(part in ("", ".", "..") for part in posix.split("/"))):',
         "                or False):"),
     "macro 未進共用命名空間(跨檔呼叫找不到)": (
-        "            shared[name] = env.globals[name] = _wrap(obj)",
-        "            env.globals[name] = _wrap(obj)"),
+        "            shared[name] = env.globals[name] = _wrap(obj, on_call=",
+        "            env.globals[name] = _wrap(obj, on_call="),
     "隔離:啟動失敗不收斂": ("isolation.py",
         '        return on_failure(f"IsolationError: 無法啟動子行程({type(e).__name__})")',
         "        raise"),
@@ -591,6 +591,23 @@ MUTANTS.update({
     "增量:結果不帶有沒有呼叫": ("dbt_render.py",
         "        incremental_checked=incremental_checked,",
         "        incremental_checked=False,"),
+    "this:只在增量模式提供": ("dbt_render.py",
+        "    if model_name is not None:" + NL + "        env.globals[\"this\"] = this(model_name)",
+        "    if incremental:" + NL + "        env.globals[\"this\"] = this(model_name)"),
+    "this:model 名稱不合法時整份展開失敗": ("dbt_render.py",
+        "        if not isinstance(name, str) or not _IDENT.fullmatch(name):" + NL
+        + "            return StrictUndefined(",
+        "        if not isinstance(name, str) or not _IDENT.fullmatch(name):" + NL
+        + "            _check_ident(\"表\", name)" + NL + "            return StrictUndefined("),
+    "this:一般模式寫到 this 不記表名": ("dbt_render.py",
+        "        if database is not None and (incremental or _uses_this(tree)",
+        "        if database is not None and (incremental"),
+    "this:呼叫寫到 this 的 macro 不記": ("dbt_render.py",
+        "                env.segcra_this_called) if name in uses_this else None)",
+        "                env.segcra_this_called) if False else None)"),
+    "this:macro 檔最外層呼叫的也算": ("dbt_render.py",
+        "    env.segcra_this_called[\"called\"] = False" + NL + "    env.segcra_incremental",
+        "    env.segcra_incremental"),
 })
 
 # ---- 取回 MR 那個 commit 的 dbt 專案並接進預掃(dbt_context)
