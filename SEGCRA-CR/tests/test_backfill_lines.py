@@ -235,7 +235,7 @@ def review(monkeypatch, tmp_path):
 
         monkeypatch.setattr(pipeline, "run_agent", fake_run_agent)
         if not attach:
-            monkeypatch.setattr(pipeline, "_attach_statement_lines", lambda pre, files: None)
+            monkeypatch.setattr(pipeline, "_attach_statement_lines", lambda *args: None)
         report = asyncio.run(pipeline.review_mr(load_config(), "900"))
         return report, seen["user"]
 
