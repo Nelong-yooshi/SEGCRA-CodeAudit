@@ -468,6 +468,122 @@ MUTANTS.update({
      "    report[\"findings\"].append(major)\n    return report\n\n\n# 引用來源裡指名的規則碼"),
 })
 
+# ---- 環節隔離(#45):內層出事,外層要照常產出審查結果
+MUTANTS.update({
+ "隔離:環節丟例外時不補「審查未完整」": ("pipeline.py",
+     '                report.setdefault("findings", []).append(_incomplete_finding(stage, e))' + NL
+     + '                return report',
+     '                return report'),
+ "隔離:環節失敗記成 info(不影響決策)": ("pipeline.py",
+     '    return {"file": "", "line": 0, "severity": "major", "title": title,',
+     '    return {"file": "", "line": 0, "severity": "info", "title": title,'),
+ "隔離:把例外訊息寫進報告(可能回顯 MR 內容)": ("pipeline.py",
+     '        detail = (f"{stage} 執行時發生 {type(exc).__name__},已跳過。"',
+     '        detail = (f"{stage} 執行時發生 {exc},已跳過。"'),
+ # dbt 專案的取回:prepare_dbt_context 自己有 catch-all,但讀 dbt_project.yml 的那一步
+ # (_head_layout)在那之外。照 #45 的原則包起來,出錯當成取回失敗、交人工,
+ # 不要讓整份審查沒有輸出。這一步不是 report = X(report, ...) 的形狀,掃原始碼的測試
+ # 看不到它(#53 review 指出的),所以要有自己的突變點。
+ # 同步環節的隔離(取回 dbt 專案、注入掃描):那種形狀不吃 report,@_isolated_stage
+ # 套不上、掃原始碼的測試也看不到,而它們丟例外一樣會讓整份審查沒有輸出
+ "隔離:同步環節的例外往外丟(會中斷整份審查)": ("pipeline.py",
+     "    except Exception as e:                  # noqa: BLE001 — 任何例外都不得往外丟" + NL
+     + '        report.setdefault("findings", []).append(_incomplete_finding(stage, e))' + NL
+     + "        return default",
+     "    except Exception:" + NL + "        raise"),
+ "隔離:取回失敗不當成取回失敗(回 None = 不適用)": ("pipeline.py",
+     '                        DbtContext(prefix="", error="取回 dbt 專案時發生非預期錯誤"),',
+     "                        None,"),
+ # dry-run 也要看得到環節未完整:那幾條在 report 存在之前就產生了,不帶過去的話
+ # 這條路看起來一切正常 —— 而它正是用來檢查「確定性那半有沒有跑成」的
+ "隔離:dry-run 丟掉環節未完整的記錄": ("pipeline.py",
+     "    findings = list(incomplete or [])",
+     "    findings = []"),
+ "隔離:dry-run 不帶未完整過去": ("pipeline.py",
+     "                                         affected, dbt_ctx, cfg.dbt," + NL
+     + '                                         incomplete=report_stub["findings"])',
+     "                                         affected, dbt_ctx, cfg.dbt)"),
+ "隔離:注入掃描失敗時當成沒有注入(不記未完整)": ("pipeline.py",
+     '        injection_hits = _step(report_stub, "注入掃描", scan_mr, [], scan_target)',
+     "        injection_hits = scan_mr(scan_target)"),
+ "隔離:執行驗證不設時間上限": ("pipeline.py",
+     "            spec_result = await asyncio.wait_for(" + NL
+     + "                run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text," + NL
+     + "                              progress=progress, deadline=deadline)," + NL
+     + "                timeout=SPEC_EXEC_TIMEOUT_SECONDS)",
+     "            spec_result = await run_spec_exec(" + NL
+     + "                cfg, hub, exec_mr, exec_code, exec_text)"),
+})
+
+# ---- #53 review:時間上限要擋得住同步卡住的沙盒、未完成是硬條件、階段要分得出來
+MUTANTS.update({
+ # 第 1 點:execute_cases 是同步的 pymssql 呼叫,事件迴圈被它卡住,wait_for 插不進去。
+ # 老闆實測:上限 1 秒、沙盒卡 6 秒 → 跑了 6 秒、沒有逾時、結果照常回傳。
+ "逾時:沙盒不丟背景執行緒(事件迴圈被卡住)": ("spec_exec.py",
+     "        ex = await _in_thread(_execute, sql, plan, deadline)",
+     "        ex = _execute(sql, plan, deadline)"),
+ "逾時:背景執行緒不是 daemon(結束時會被拖住)": ("spec_exec.py",
+     '    threading.Thread(target=runner, name="spec-exec-sandbox", daemon=True).start()',
+     '    threading.Thread(target=runner, name="spec-exec-sandbox").start()'),
+ "逾時:背景執行緒不帶 contextvars(釘住的版本讀不到)": ("spec_exec.py",
+     "            out = ctx.run(fn, *args)",
+     "            out = fn(*args)"),
+ "逾時:沙盒不看截止時間(照跑完所有案例)": ("spec_exec.py",
+     "            if deadline is not None and time.monotonic() >= deadline:",
+     "            if False:"),
+ "逾時:沙盒中止不說是逾時": ("spec_exec.py",
+     '    if ex.get("timed_out"):',
+     "    if False:"),
+ # 第 5 點:沒跑完就至少交人工要寫死,不能只靠設定檔的 allowed_severities
+ "決策:未完成不是硬條件(設定一放寬就放行)": ("pipeline.py",
+     "          and not incomplete",
+     "          and True"),
+ "決策:注入命中不先寫進報告(注入防線丟例外就只剩 major)": ("pipeline.py",
+     "        if injection_hits:" + NL
+     + '            report["_injection_scan"] = injection_hits',
+     "        if False:" + NL
+     + '            report["_injection_scan"] = injection_hits'),
+ # 第 6、8 點:隔離清單改成裝飾器自己登記,呼叫處有沒有漏靠測試掃原始碼
+ "隔離:裝飾器不登記(掃原始碼的測試就失效)": ("pipeline.py",
+     "        _ISOLATED_STAGES[fn.__name__] = stage",
+     "        pass"),
+ "隔離:enforce_format 沒包進隔離(原本漏掉的那個)": ("pipeline.py",
+     '@_isolated_stage("輸出格式檢查")' + NL + "def enforce_format(report: dict) -> dict:",
+     "def enforce_format(report: dict) -> dict:"),
+ # 第 7 點:未完成的 finding 要標出階段,而且判斷要看欄位不是標題
+ "隔離:未完成的 finding 不標階段": ("pipeline.py",
+     '            "detail": detail, "stage": stage,',
+     '            "detail": detail,'),
+ "隔離:未完成的判斷改回比對標題開頭": ("pipeline.py",
+     '            if isinstance(f, dict) and f.get("stage")]',
+     '            if str(f.get("title", "")).startswith(INCOMPLETE_TITLE_PREFIX)]'),
+ "隔離:執行驗證逾時不說是哪個階段": ("pipeline.py",
+     "    stage = progress.get(\"stage\")" + NL
+     + '    return f"執行驗證/{stage}" if stage else "執行驗證"',
+     "    stage = None" + NL
+     + '    return f"執行驗證/{stage}" if stage else "執行驗證"'),
+ "隔離:各階段秒數不記進結果": ("spec_exec.py",
+     '        stage_seconds[stage] = round(time.monotonic() - t0, 1)',
+     "        pass"),
+ # 第 3 點:舊審查不得把結論貼上去
+ "回寫:不確認是不是最新的那次審查": ("pipeline.py",
+     '        if await _superseded(hub, mr_id, mr.get("head_sha") or mr.get("sha")):',
+     "        if False:"),
+ "回寫:問不出目前的 sha 就不回寫(變成另一種無聲失敗)": ("pipeline.py",
+     "    except Exception:                        # noqa: BLE001 — 問不出來就當作沒被取代" + NL
+     + "        return False",
+     "    except Exception:" + NL
+     + "        return True"),
+ # 第 9 點:參數讀不懂要退回預設值,不可以讓 webhook 起不來
+ "設定:秒數讀不懂就讓程式起不來": ("config.py",
+     "        print(f\"[config] 警告:環境變數 {name} 的值不是正整數秒數({raw!r}),\"" + NL
+     + '              f"改用預設 {default} 秒", flush=True)' + NL
+     + "        return default",
+     "        raise"),
+ "設定:0 或負數的秒數也照收": ("config.py",
+     "        if v <= 0:" + NL + "            raise ValueError",
+     "        if False:" + NL + "            raise ValueError"),
+})
 # ---- 取回整份新檔的四道防線:唯讀 token、單檔上限、不退回舊版、取不到要交人工
 MUTANTS.update({
  "完整檔:讀程式碼用有寫入權的 token": ("../toolbox/gitlab.py",
@@ -623,13 +739,16 @@ MUTANTS.update({
      "        if dbt_enabled and not is_macro:",
      "        if not is_macro:"),
  "專案接線:review_mr 不取回專案": ("pipeline.py",
-     "        dbt_ctx = prepare_dbt_context(mr, cfg.dbt)", "        dbt_ctx = None"),
+     "        dbt_ctx = _step(report_stub, \"dbt 專案取回\", prepare_dbt_context," + NL
+     + '                        DbtContext(prefix="", error="取回 dbt 專案時發生非預期錯誤"),' + NL
+     + "                        mr, cfg.dbt)",
+     "        dbt_ctx = None"),
  '專案接線:review_mr 沒把專案交給預掃': ('pipeline.py',
-     '        pre = await prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered)',
-     '        pre = await prescan(hub, mr["files"], cfg.dbt, None, rendered)'),
+     '                           prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered), [])',
+     '                           prescan(hub, mr["files"], cfg.dbt, None, rendered), [])'),
  '專案接線:注入掃描不掃取回的完整內容': ('pipeline.py',
-     '        scan_target = _mr_with_head_text(mr, dbt_ctx, rendered)',
-     '        scan_target = _mr_with_head_text(mr, None, rendered)'),
+     '                            _mr_with_head_text, dict(mr), mr, dbt_ctx, rendered)',
+     '                            _mr_with_head_text, dict(mr), mr, None, rendered)'),
  '專案接線:注入掃描只掃完整內容、漏掉原本的 diff': ('pipeline.py',
      '    out = {**mr, "files": [*mr["files"], *kept]}',
      '    out = {**mr, "files": kept}'),
@@ -782,8 +901,8 @@ MUTANTS.update({
      "        is_macro = dbt_enabled and dbt_ctx is not None and dbt_ctx.is_macro(f.get(\"path\"))",
      "        is_macro = dbt_ctx is not None and dbt_ctx.is_macro(f.get(\"path\"))"),
  "未執行:執行驗證拿到的是只有片段的 MR": ("pipeline.py",
-     '        exec_mr = _mr_for_spec_exec(mr, dbt_ctx)',
-     '        exec_mr = mr'),
+     '            exec_mr = _mr_for_spec_exec(mr, dbt_ctx)',
+     '            exec_mr = mr'),
  "未執行:不是樣板的檔也帶完整內容": ("pipeline.py",
      "if head is not None and is_dbt_template(head) else f)", "if head is not None else f)"),
  "未執行:review_mr 不補": ("pipeline.py",
@@ -1686,6 +1805,53 @@ MUTANTS.update({
      "from .dbt_impact import analyze_macro_impact as analyze_macro_impact_isolated"),
 })
 
+# ---- macro 反查以 macro 為單位判斷哪些被改
+# 失效有兩個方向:判得太寬只是多報;判得太窄(把有改的當成沒改)會安靜地漏掉受影響的 model。
+MUTANTS.update({
+    "macro 粒度:一律整個檔案(退回舊做法)": ("dbt_impact.py",
+        "        return {name for name in new_macros.keys() | old_macros.keys()",
+        "        return whole_file or {name for name in new_macros.keys() | old_macros.keys()"),
+    "macro 粒度:內容完全相同時不退回整個檔案": ("dbt_impact.py",
+        "        if new_text == old_text:" + NL + "            return whole_file" + NL,
+        ""),
+    "macro 粒度:頂層內容有變也逐一比較": ("dbt_impact.py",
+        "        if new is None or old is None or new[0] != old[0]:",
+        "        if new is None or old is None:"),
+    "macro 粒度:同名的 macro 不退回整個檔案": ("dbt_impact.py",
+        "            if node.name in macros:" + NL + "                return None" + NL,
+        ""),
+    "macro 粒度:超過節點上限時整個反查失敗": ("dbt_impact.py",
+        "        except (TemplateSyntaxError, RecursionError, _LimitExceeded):" + NL + "            return whole_file",
+        "        except (TemplateSyntaxError, RecursionError):" + NL + "            return whole_file"),
+    "macro 粒度:找 macro 時不計節點數": ("dbt_impact.py",
+        "        node = stack.pop()" + NL + "        budget[0] -= 1",
+        "        node = stack.pop()" + NL + "        budget[0] -= 0"),
+    "macro 粒度:頂層的空行也算內容": ("dbt_impact.py",
+        "    return isinstance(node, nodes.Output) and all(",
+        "    return False and all("),
+    "macro 粒度:指紋不看欄位的值": ("dbt_impact.py",
+        '                children.append(f"value:{value!r}")',
+        '                children.append("value")'),
+    "macro 粒度:指紋不看清單裡的值": ("dbt_impact.py",
+        '                children.extend(v if isinstance(v, nodes.Node) else f"value:{v!r}" for v in value)',
+        '                children.extend(v for v in value if isinstance(v, nodes.Node))'),
+    "macro 粒度:巢狀的 macro 併進外層比較": ("dbt_impact.py",
+        "        if isinstance(item, nodes.Macro) and item is not root:",
+        "        if False:"),
+    "macro 粒度:補報不寫內容有變的 macro": ("dbt_affected.py",
+        "        if impact.changed_macros:" + NL + "            parts.append(",
+        "        if False:" + NL + "            parts.append("),
+    "macro 粒度:沒有 macro 被改時不寫明": ("dbt_affected.py",
+        "        elif not impact.all_models_possibly_affected:" + NL + "            parts.append(",
+        "        elif False:" + NL + "            parts.append("),
+    "macro 粒度:補報的名稱不用 code 格式": ("dbt_affected.py",
+        '    return f"`{_clip(name)}`"',
+        "    return _clip(name)"),
+    "macro 粒度:補報的名稱不截長度": ("dbt_affected.py",
+        '    return f"`{_clip(name)}`"',
+        '    return f"`{name}`"'),
+})
+
 # ---- get_mr_diff 帶出 diff_refs 的三個 sha(#15 接線與 #22 共用)
 MUTANTS.update({
  # #22 把 real 模式的 _diff_refs(mr) 先存成 refs(補 full_content 時要用 head_sha),
@@ -1708,6 +1874,37 @@ MUTANTS.update({
  "diff_refs:少帶 start_sha": ("../toolbox/gitlab.py",
      '_DIFF_REF_KEYS = ("base_sha", "head_sha", "start_sha")',
      '_DIFF_REF_KEYS = ("base_sha", "head_sha")'),
+})
+
+# ---- R004 的訊息不得回顯比對到的憑證原文(#42)。憑證本來就在 diff 裡,但訊息會被
+# 複製進 finding、貼回 MR 留言、寫進 review_output/ —— 作者改掉那一行之後,留言裡還留著。
+MUTANTS.update({
+ # 解析錯誤訊息帶著出錯位置附近的原文,而「預掃無法解析此檔的 SQL」那條 finding 的
+ # 內文就是它 —— 一樣會貼回 MR 留言、寫進 review_output/。要防的是「帶出原文」,
+ # 跟那段原文像不像密碼無關,所以只留位置(用樣式遮只遮得到樣式認得的寫法)。
+ "解析失敗:錯誤訊息照用 sqlglot 的原文": ("../toolbox/sqltools.py",
+     "        statements, parse_error = [], parse_error_text(e)",
+     '        statements, parse_error = [], f"parse failed: {e}"'),
+ "解析失敗:連 sqlglot 的描述一起帶出來": ("../toolbox/sqltools.py",
+     '            spots.append(f"第 {d[\'line\']} 行第 {d.get(\'col\', \'?\')} 欄")',
+     '            spots.append(f"第 {d[\'line\']} 行 {d.get(\'description\', \'\')}")'),
+ "解析失敗:其他例外照用訊息(不只留類型)": ("../toolbox/sqltools.py",
+     '    where = "、".join(dict.fromkeys(spots))[:120] if spots else type(e).__name__',
+     '    where = "、".join(dict.fromkeys(spots))[:120] if spots else str(e)'),
+ "解析失敗:連位置都不留(看不出哪裡壞了)": ("../toolbox/sqltools.py",
+     '    for d in getattr(e, "errors", None) or []:',
+     "    for d in []:"),
+ "R004:訊息回顯比對到的原文": ("../toolbox/sqltools.py",
+     'f"疑似硬編碼憑證/密碼/金鑰於 SQL:{_secret_kind(m)}——"',
+     'f"疑似硬編碼憑證/密碼/金鑰於 SQL:「{m.group(0)[:40]}」——"'),
+ "R004:回顯鍵名原文(大小寫與寫法是作者的文字)": ("../toolbox/sqltools.py",
+     '    key = re.sub(r"[_-]", "", m.group("key") or "").lower()' + NL
+     + "    return f\"{_SECRET_KINDS.get(key, '憑證')}類的鍵指定了字串常值\"",
+     '    key = m.group("key") or ""' + NL
+     + '    return f"{key} 指定了字串常值"'),
+ "R004:連線字串那一支也報成鍵": ("../toolbox/sqltools.py",
+     '    if m.group("url"):' + NL + '        return "連線字串含帳號與密碼"',
+     "    if False:" + NL + '        return "連線字串含帳號與密碼"'),
 })
 
 # ---- R005 讀取執行環境(#26 第 7 項):規則層命中後,模型一定看得到 secure-sql 的說明
@@ -1738,6 +1935,13 @@ MUTANTS.update({
  "R005:已報判定關鍵詞含「沙盒」(範圍過廣)": ("pipeline.py",
      '"R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys."],',
      '"R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys.", "沙盒"],'),
+})
+
+# ---- 注入掃描的總量上限:放得下一份展開結果
+MUTANTS.update({
+    "掃描上限:改回放不下一份展開結果": ("pipeline.py",
+        "MAX_EXTRA_SCAN_CHARS = 5_000_000",
+        "MAX_EXTRA_SCAN_CHARS = 200_000"),
 })
 
 # ---- 確定性防線不能被模型關掉(#16 review):程式專用標題、規則命中不可被降級
@@ -1883,8 +2087,8 @@ MUTANTS.update({
      'if isinstance(f, dict) and (text := dbt_ctx.head_text(f.get("path"))) is not None]',
      'if (text := dbt_ctx.head_text(f.get("path"))) is not None]'),
  '專案接線:注入掃描不掃展開後的 SQL': ('pipeline.py',
-     '        scan_target = _mr_with_head_text(mr, dbt_ctx, rendered)',
-     '        scan_target = _mr_with_head_text(mr, dbt_ctx)'),
+     '                            _mr_with_head_text, dict(mr), mr, dbt_ctx, rendered)',
+     '                            _mr_with_head_text, dict(mr), mr, dbt_ctx)'),
  '專案接線:預掃不收集展開後的 SQL': ('pipeline.py',
      '            elif rendered is not None:\n                rendered.append(',
      '            elif False:\n                rendered.append('),
@@ -1984,6 +2188,19 @@ MUTANTS.update({
  '專案接線:沒掃完只給 info': ('pipeline.py',
      '"severity": "major", "title": _SCAN_SKIPPED_TITLE',
      '"severity": "info", "title": _SCAN_SKIPPED_TITLE'),
+})
+
+# ---- 注入掃描:跟 MR 檔案本身相同的內容不重複加
+MUTANTS.update({
+    "掃描去重:相同內容照樣重複加(佔掉上限)": ("pipeline.py",
+        "        if _path_and_text(item) in scanned:" + NL + "            continue" + NL,
+        ""),
+    "掃描去重:只看內容不看路徑": ("pipeline.py",
+        "        if _path_and_text(item) in scanned:",
+        "        if item.get(\"full_content\") in {c for _, c in scanned}:"),
+    "掃描去重:形狀不對的項目也拿去當鍵": ("pipeline.py",
+        "    return (path, text) if isinstance(path, str) and isinstance(text, str) else None",
+        "    return (path, text)"),
 })
 
 
@@ -2581,8 +2798,8 @@ MUTANTS.update({
      '            diff_section=build_diff_section(code_files, cfg.budget["diff"]) + full_text,',
      '            diff_section=build_diff_section(code_files, cfg.budget["diff"]),'),
  "完整內容:預算設定不生效": ("pipeline.py",
-     '                                            cfg.budget.get("full_content", 6000))',
-     '                                            6000)'),
+     '                          code_files, dbt_ctx, cfg.budget.get("full_content", 6000))',
+     '                          code_files, dbt_ctx, 6000)'),
  "完整內容:fixture 有內容時仍用 dbt 取回的": ("pipeline.py",
      '        if not (isinstance(text, str) and text) and dbt_ctx is not None:',
      '        if dbt_ctx is not None:'),
@@ -2688,8 +2905,26 @@ MUTANTS.update({
 # ---- 受影響的 model 對到多份規格
 MUTANTS.update({
  "多份規格:不附上(回到只有同一份才用)": ("pipeline.py",
-     '        affected_specs = (specs_by_priority(affected, _diff_text(mr))',
-     '        affected_specs = (()'),
+     '        affected_specs = (_step(report_stub, "受影響 model 的規格", specs_by_priority, (),',
+     '        affected_specs = (_step(report_stub, "受影響 model 的規格", lambda *a: (), (),'),
+ "隔離:受影響 model 的規格整理失敗時中斷審查": ("pipeline.py",
+     '        affected_specs = (_step(report_stub, "受影響 model 的規格", specs_by_priority, (),' + NL
+     + '                                affected, _diff_text(mr))',
+     '        affected_specs = (specs_by_priority(' + NL
+     + '                                affected, _diff_text(mr))'),
+ "隔離:規格變更分段失敗時中斷審查": ("pipeline.py",
+     '        code_files, spec_changes = _step(report_stub, "規格變更分段", _split_spec_changes,' + NL
+     + '                                         (mr["files"], ""), mr["files"], cfg.budget.get("spec", 3000))',
+     '        code_files, spec_changes = _split_spec_changes(' + NL
+     + '                                         mr["files"], cfg.budget.get("spec", 3000))'),
+ "隔離:規格變更分段失敗時 prompt 沒有 diff": ("pipeline.py",
+     '                                         (mr["files"], ""), mr["files"], cfg.budget.get("spec", 3000))',
+     '                                         ([], ""), mr["files"], cfg.budget.get("spec", 3000))'),
+ "隔離:完整內容段落失敗時中斷審查": ("pipeline.py",
+     '        full_text = _step(report_stub, "完整內容段落", _full_text_section, "",' + NL
+     + '                          code_files, dbt_ctx, cfg.budget.get("full_content", 6000))',
+     '        full_text = _full_text_section(' + NL
+     + '                          code_files, dbt_ctx, cfg.budget.get("full_content", 6000))'),
  "多份規格:MR 自己有規格時也附上": ("pipeline.py",
      '                          if spec_code is None and spec_text is None else ())',
      '                          )'),

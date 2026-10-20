@@ -338,6 +338,40 @@ def test_放在_specs_底下的_SQL_檔照樣被檢查(review):
     assert _spec_findings(report) == []
 
 
+# ─────────────────── 組 prompt 的步驟失敗時不中斷審查 ───────────────────
+
+def _boom(*a, **kw):
+    raise RuntimeError("內部爆掉:這段訊息不可以出現在報告裡")
+
+
+def test_規格變更分段失敗時_diff_照舊全部放進去並記下未完整(review, monkeypatch):
+    monkeypatch.setattr(pipeline, "_split_spec_changes", _boom)
+    report, user = review(_mr(SQL_FILE, SPEC_FILE))
+    assert any("規格變更分段" in t for t in pipeline.review_incomplete(report))
+    # 退回沒有分段的 prompt:程式與規格的 diff 都還在,不是空的
+    assert "+HAVING SUM(t.amount) >= 100000;" in user and "ZZ_SPEC_MARKER" in user
+    assert "爆掉" not in json.dumps(report, ensure_ascii=False)
+    assert report["decision"] != "auto_approved"
+
+
+def test_完整內容段落失敗時_退回只有_diff_並記下未完整(review, monkeypatch):
+    monkeypatch.setattr(pipeline, "build_full_text_section", _boom)
+    report, user = review(_mr(SQL_FILE))
+    assert any("完整內容段落" in t for t in pipeline.review_incomplete(report))
+    assert "+HAVING SUM(t.amount) >= 100000;" in user
+    assert "爆掉" not in json.dumps(report, ensure_ascii=False)
+    # 同一個 MR 在正常情況會自動放行(見對照組):是未完整讓它交人工
+    assert report["decision"] != "auto_approved"
+
+
+def test_交給執行驗證的規格組不出來時_記成執行驗證未完成(review, monkeypatch):
+    monkeypatch.setattr(pipeline, "_spec_for_exec", _boom)
+    report, _ = review(_mr(SQL_FILE))
+    assert any("執行驗證" in t for t in pipeline.review_incomplete(report))
+    assert "爆掉" not in json.dumps(report, ensure_ascii=False)
+    assert report["decision"] != "auto_approved"
+
+
 # ─────────────────── 規格以這次 MR 的版本為準 ───────────────────
 
 MR_SPEC = "# R-201 單日 ATM 現金提領通報\n\n## 條件 1\n累計達 100000(含)ZZ_MR_VERSION\n"

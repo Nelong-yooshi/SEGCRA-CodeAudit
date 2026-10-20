@@ -870,7 +870,8 @@ def test_isolated_failure_fails_closed():
 
 
 @pytest.mark.parametrize("module, allowed", [
-    ("dbt_impact.py", {"dataclasses", "jinja2", ".dbt_builtin_macros", ".dbt_render", ".isolation"}),
+    ("dbt_impact.py", {"dataclasses", "hashlib", "jinja2", ".dbt_builtin_macros", ".dbt_render",
+                       ".isolation"}),
     ("dbt_builtin_macros.py", set()),
 ])
 def test_module_imports_are_allowlisted(module, allowed):

@@ -368,6 +368,13 @@ def _hits_text(m: CheckedModel) -> str:
     return "、".join(out)
 
 
+def _code(name: str) -> str:
+    """macro 名稱以 code 格式寫出,標明它是被引用的識別字。名稱是 Jinja 的識別字,不含反引號;
+    長度由 MR 決定,跟其他說明一樣截長度(補報會貼回 MR 留言)。名稱裡寫了指示性的文字時,
+    由注入掃描判斷要不要擋。"""
+    return f"`{_clip(name)}`"
+
+
 def _listed(items: list[str]) -> str:
     more = f" 等共 {len(items)} 個" if len(items) > _MAX_LISTED else ""
     return "、".join(items[:_MAX_LISTED]) + more
@@ -403,6 +410,10 @@ def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None
     parts = []
     if impact.changed_macro_files:
         parts.append(f"改到的 macro 檔:{_listed([full(p) for p in impact.changed_macro_files])}。")
+        if impact.changed_macros:
+            parts.append(f"內容有變的 macro:{_listed([_code(n) for n in impact.changed_macros])}。")
+        elif not impact.all_models_possibly_affected:
+            parts.append("這些檔案裡沒有任何 macro 被新增、刪除或改變內容(例如只改了註解或空行)。")
     if impact.all_models_possibly_affected:
         raise_to("major")
         parts.append("影響範圍無法確定,**全部 model 都可能受影響**,沒有逐一檢查。")
@@ -460,7 +471,8 @@ def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None
     if unmapped:
         parts.append("沒有對應到規格:" + _listed(unmapped) + "。")
     if impact.unreferenced_macros:
-        parts.append(f"沒有任何 model 呼叫的 macro:{_listed(list(impact.unreferenced_macros))}。")
+        parts.append("沒有任何 model 呼叫的 macro:"
+                     f"{_listed([_code(n) for n in impact.unreferenced_macros])}。")
     if severity == "info":
         parts.append("沒有檢查出問題;清單供人工確認影響範圍。")
     return {"file": "(MR 內容)", "line": 0, "severity": severity, "title": IMPACT_TITLE,
