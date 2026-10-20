@@ -22,6 +22,7 @@ from .dbt_affected import (
 from .change_view import build_full_text_section
 from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_render import is_dbt_template, render_model_isolated
+from .dbt_asset_names import Layout as _AssetLayout, check_file as _check_asset_names
 from .dbt_config_change import HIGH_RISK_NEW, config_changes, default_relative, is_dbt_yaml
 from .dbt_project import DbtProjectError, check_project_dir
 from .security import scan_mr
@@ -1422,6 +1423,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_dbt_impact(report, affected, dbt_ctx)  # macro 等變更影響的其他 model
         report = enforce_non_sql(report, pre)  # 非 SQL 檔沒跑 SQL 規則:說明文件 info,其他 major
         report = enforce_dbt_config_change(report, mr, dbt_ctx, cfg.dbt)  # 只改設定時展開結果不變
+        report = enforce_dbt_asset_names(report, mr, dbt_ctx, cfg.dbt)  # 名稱不合 Dagster 規則:部署失敗
         report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
         report = enforce_format(report)        # 模型輸出有格式錯誤 → major;須在 sanitize 之後
         # 注入掃描的命中先寫進報告,再走 enforce_injection:那一步自己丟例外時,
@@ -1776,6 +1778,67 @@ def enforce_dbt_config_change(report: dict, mr: dict, dbt_ctx: DbtContext | None
                 "suggestion": ("請確認對排程、重跑與歷史資料的影響;必要時以 dbt ls --select 與 "
                                "dbt compile 比對變更前後。" if major else "")}
         _put_program_finding(report, item)
+    return report
+
+
+_DBT_ASSET_NAME_TITLE = "dbt 名稱不符合 Dagster 的命名規則,部署時會載入失敗"
+_DBT_ASSET_NAME_UNKNOWN_TITLE = "無法確認 dbt 名稱是否符合 Dagster 的命名規則"
+# 一個檔案最多列幾個不符合的名稱(屬性檔可以有很多 source)
+MAX_LISTED_ASSET_NAMES = 20
+
+
+def _asset_layout(dbt_ctx: DbtContext | None) -> _AssetLayout:
+    """有取回專案時照 dbt_project.yml 的目錄設定,沒有時用 dbt 的預設目錄。"""
+    project = dbt_ctx.project if dbt_ctx is not None else None
+    if project is None or not project.ok:
+        return _AssetLayout()
+    return _AssetLayout(project.model_paths, project.seed_paths, project.snapshot_paths)
+
+
+@_isolated_stage("dbt 名稱規則")
+def enforce_dbt_asset_names(report: dict, mr: dict, dbt_ctx: DbtContext | None = None,
+                            dbt_cfg: dict | None = None) -> dict:
+    """會變成 Dagster 資產名稱的 dbt 名稱(model、seed 的檔名,source 名稱與表名,snapshot 名稱)
+    不符合 Dagster 的命名規則時,每個檔案補一條 blocker:合併後部署端的 Dagster 整個載入失敗
+    (規則見 dbt_asset_names)。看不出名稱(拿不到內容、屬性檔解析不了、名稱是樣板)時補 major。
+
+    被刪掉的檔案不檢查。哪些檔案是 dbt 的檔案看位置(_dbt_relative),不看 dbt 開關:檢查的是
+    名稱,不需要展開。名稱以 code 格式列出(去掉不可列印字元、截長度,見 _code_span)。
+    標題只能由程式產生(見 _put_program_finding)。"""
+    layout = _asset_layout(dbt_ctx)
+    for f in mr.get("files", []):
+        if not isinstance(f, dict) or not isinstance(f.get("path"), str) or _is_deleted(f.get("diff")):
+            continue
+        rel = _dbt_relative(f["path"], dbt_ctx, dbt_cfg)
+        if rel is None:
+            continue
+        text = dbt_ctx.head_text(f["path"]) if dbt_ctx is not None else None
+        if not isinstance(text, str):
+            text = f.get("full_content")
+        result = _check_asset_names(f["path"], rel, layout, text)
+        if result is None:
+            continue
+        if result.bad:
+            listed = "、".join(f"{kind} {_code_span(name)}"
+                              for kind, name in result.bad[:MAX_LISTED_ASSET_NAMES])
+            more = (f" 等 {len(result.bad)} 個" if len(result.bad) > MAX_LISTED_ASSET_NAMES else "")
+            blocker = {
+                "file": f["path"], "line": 0, "severity": "blocker", "citations": [],
+                "title": _DBT_ASSET_NAME_TITLE,
+                "detail": (f"不符合的名稱:{listed}{more}。Dagster 的資產名稱只接受英數字與底線"
+                           "(`^[A-Za-z0-9_]+$`,Dagster 1.13);`-` 與 `.` 會先被 dagster-dbt 換成底線,"
+                           "可以使用。合併後部署端的 Dagster 整個載入失敗,影響的不只這個檔案。"),
+                "suggestion": ("把名稱改成只用英數字、底線、`-` 或 `.`。目錄名稱、alias、欄位名稱、"
+                               "說明文字不受這條規則限制。")}
+            _put_program_finding(report, blocker)
+        if result.unknown:
+            unknown = {
+                "file": f["path"], "line": 0, "severity": "major", "citations": [],
+                "title": _DBT_ASSET_NAME_UNKNOWN_TITLE,
+                "detail": (f"{result.unknown},看不出這個檔案定義的名稱。不符合 Dagster 命名規則的"
+                           "名稱會讓部署端整個載入失敗,需人工確認。"),
+                "suggestion": "確認 source、snapshot 的名稱只用英數字、底線、`-` 或 `.`。"}
+            _put_program_finding(report, unknown)
     return report
 
 
@@ -2432,6 +2495,7 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
     report = enforce_non_sql(report, pre)      # 與正式路徑一致
     report = enforce_dbt_config_change(report, mr, dbt_ctx, dbt_cfg)
     report = enforce_dbt_notice(report, pre)   # 與正式路徑一致:表名未驗證的提醒不可少
+    report = enforce_dbt_asset_names(report, mr, dbt_ctx, dbt_cfg)
     report = enforce_dbt_impact(report, affected, dbt_ctx)
     report = enforce_spec_change(report, mr)
     for fd in report["findings"]:
