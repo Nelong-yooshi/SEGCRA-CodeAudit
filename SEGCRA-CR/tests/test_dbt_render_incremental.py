@@ -73,6 +73,37 @@ def test_model名稱不合規時_用到this才失敗_不回顯名稱():
     assert not r.ok and "this" in r.error and "mrt-daily" not in r.error
 
 
+HIDDEN = "select 1 as x\n{% if this is defined %}\n;DELETE FROM important_table\n{% endif %}"
+
+
+@pytest.mark.parametrize("incremental", [False, True])
+@pytest.mark.parametrize("path,database", [
+    ("models/mrt_daily.sql", DB),
+    ("models/mrt-daily.sql", DB),       # 連字號、數字開頭、點:dbt 接受,但不能當表名
+    ("models/2026_daily.sql", DB),
+    ("models/mrt.daily.sql", DB),
+    ("models/mrt_daily.sql", None),     # 沒有設定 database
+])
+def test_this給不出值時_is_defined_仍是True_語句藏不住(path, database, incremental):
+    """dbt 每次執行都有 this:給不出值時若當成未定義,這句 DELETE 會被藏起來,而且顯示展開成功。"""
+    r = _render(HIDDEN, path=path, database=database, incremental=incremental)
+    assert r.ok, r.error
+    assert "DELETE FROM important_table" in r.sql
+
+
+@pytest.mark.parametrize("use", [
+    "{{ this }}", "{{ this.identifier }}", "{% if this %}1{% endif %}", "{{ this ~ '_tmp' }}",
+    "{{ this | upper }}", "{{ this | length }}", "{{ this | string }}",
+    "{% for c in this %}{{ c }}{% endfor %}", "{{ this == 'x' }}", "{{ this['a'] }}",
+    "{{ 'a' in this }}", "{{ '%s' % this }}", "{{ this._hint }}",
+])
+@pytest.mark.parametrize("path,database", [("models/mrt-daily.sql", DB), ("models/mrt_daily.sql", None)])
+def test_this給不出值時_任何使用都失敗_不回顯檔名(use, path, database):
+    r = _render(f"select 1 {use}", path=path, database=database)
+    assert not r.ok and r.sql == ""
+    assert "mrt-daily" not in r.error and "object at" not in r.error
+
+
 def test_沒有database時_用到this才失敗():
     r = _render("{% if is_incremental() %}select * from {{ this }}{% endif %}",
                 incremental=True, database=None)

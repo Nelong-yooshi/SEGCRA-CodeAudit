@@ -48,7 +48,7 @@
      `RenderResult.incremental_checked` 說明樣板(含它呼叫的 macro)有沒有呼叫 `is_incremental()`
    - `this`:跟 dbt 一樣兩種模式都提供(這個 model 自己的表,規則與 `ref()` 相同),所以
      `{% if this is defined %}` 裡的 SQL 一般模式就展開得出來,非增量的 model 直接寫 `{{ this }}`
-     (例如自我 join)也不會展開失敗。沒有 database、或 model 名稱不能當表名時是未定義值,用到才失敗。
+     (例如自我 join)也不會展開失敗。沒有 database、或 model 名稱不能當表名(例如有連字號、點、數字開頭,dbt 都接受)時給不出值:仍然算有定義(`this is defined` 為 True,跟 dbt 一樣,否則寫在裡面的語句會被藏起來),但任何使用都失敗,錯誤訊息不帶檔名;沒用到的 model 照常展開。
      用到時帶表名提醒:增量模式一律算;一般模式看 model 本身有沒有寫到 `this`(只看語法樹,寫在
      沒進去的分支裡也算),或呼叫了定義裡寫到 `this` 的 macro(macro 檔最外層的程式碼不算)
    - `env_var` **刻意不定義**:會把審查機的環境變數寫進 SQL;未定義則由 `StrictUndefined` 大聲失敗。

@@ -64,7 +64,8 @@
 設計底線:**寧可展開失敗,也不要產出看似成功、實則錯誤的 SQL**。
 所以未定義的 dbt 內建(StrictUndefined)、沒有預設值又沒被提供的 var、
 未設定 database 卻用到 ref/source,一律是硬失敗;絕不猜值。`{{ this }}` 跟 dbt 一樣兩種模式
-都提供(這個 model 自己的表);沒有 database 或 model 名稱不合法時是未定義值,用到才失敗。
+都提供(這個 model 自己的表);沒有 database 或 model 名稱不合法時仍然算有定義(`this is defined`
+為 True),但任何使用都失敗(見 _UnavailableRelation)。
 
 已知限制:
   * `is_incremental()` 預設比照 compile 回 False,`{% if is_incremental() %}` 裡的 SQL 不在
@@ -106,6 +107,7 @@ from dataclasses import dataclass, field
 import jinja2
 from jinja2 import StrictUndefined, Undefined, nodes
 from jinja2.defaults import DEFAULT_NAMESPACE
+from jinja2.exceptions import UndefinedError
 from jinja2.ext import Extension
 from jinja2.sandbox import SandboxedEnvironment
 
@@ -267,6 +269,8 @@ def _is_plain(value, depth: int = 0) -> bool:
 def _finalize(value):
     if isinstance(value, Undefined):
         return value            # 交給 StrictUndefined 大聲失敗
+    if isinstance(value, _UnavailableRelation):
+        value._fail()           # 錯誤訊息寫給不出值的原因,不是「輸出了物件」
     if not _is_plain(value):
         raise DbtRenderError(
             f"樣板直接輸出了 {type(value).__name__} 物件(例如 {{{{ ref }}}} 少了括號)。"
@@ -488,14 +492,13 @@ def _make_relations(database: str | None, schema: str, usage: dict,
     def this(name: str):
         """{{ this }}:這個 model 自己的表,展開規則與 ref(自己) 相同。
 
-        沒有 database、或 model 名稱不能當表名時給未定義值,用到才大聲失敗(不猜值;沒用到
-        的 model 照常展開)。不在這裡記「用到表名」:由 render_model 判斷這次有沒有用到
-        再記(見 _mark_this_used)。"""
+        沒有 database、或 model 名稱不能當表名時給 _UnavailableRelation:跟 dbt 一樣「有定義」,
+        用到才大聲失敗(不猜值;沒用到的 model 照常展開)。不在這裡記「用到表名」:由 render_model
+        判斷這次有沒有用到再記(見 _mark_this_used)。"""
         if not isinstance(name, str) or not _IDENT.fullmatch(name):
-            return StrictUndefined(hint="model 名稱不合法(只接受英數與底線),無法提供 {{ this }}",
-                                   name="this")
+            return _UnavailableRelation("model 名稱不合法(只接受英數與底線),無法提供 {{ this }}")
         if database is None:
-            return StrictUndefined(hint="未設定 database,無法提供 {{ this }}", name="this")
+            return _UnavailableRelation("未設定 database,無法提供 {{ this }}")
         text = f'"{database}"."{_check_ident("綱要", schema)}"."{name}"'
         return _Relation(text, database, schema, name)
 
@@ -513,6 +516,25 @@ def _mark_this_used(usage: dict, project: "DbtProjectInfo | None", name: str) ->
 def _uses_this(tree) -> bool:
     """語法樹裡有沒有出現 `this` 這個名稱(含參數名稱;寧可多算)。"""
     return any(n.name == "this" for n in tree.find_all(nodes.Name))
+
+
+class _UnavailableRelation:
+    """給不出值的 {{ this }}。dbt 每次執行都有 this,所以 `this is defined` 要跟 dbt 一樣是 True:
+    給未定義值的話,`{% if this is defined %}` 裡的語句兩種模式都展開不出來,規則層掃不到,也沒有
+    任何提示。任何使用(輸出、取屬性、比較、串接、當條件、走訪)都失敗,錯誤訊息是固定文字,
+    不帶檔名。"""
+    __slots__ = ("_hint",)
+
+    def __init__(self, hint: str):
+        object.__setattr__(self, "_hint", hint)
+
+    def _fail(self, *args, **kwargs):
+        raise UndefinedError(self._hint)
+
+    __str__ = __html__ = __bool__ = __iter__ = __len__ = __getattr__ = __getitem__ = _fail
+    __call__ = __eq__ = __ne__ = __lt__ = __le__ = __gt__ = __ge__ = _fail
+    __add__ = __radd__ = __mul__ = __rmul__ = __mod__ = __rmod__ = __contains__ = _fail
+    __hash__ = object.__hash__
 
 
 class _Relation(str):

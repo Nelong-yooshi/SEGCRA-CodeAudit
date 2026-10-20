@@ -68,10 +68,13 @@ def test_沒有呼叫is_incremental時只展開一次(_render_in_process):
     assert [h["rule"] for h in entry["rules"]] == ["R002"]
 
 
-def test_this_is_defined_裡的語句一般模式就掃得到(_render_in_process):
-    """dbt 每次執行都有 this;展開器只在增量模式定義它的話,這句 DELETE 兩種模式都看不到。"""
+@pytest.mark.parametrize("path", ["models/mrt_inc.sql", "models/mrt-inc.sql",
+                                  "models/2026_inc.sql", "models/mrt.inc.sql"])
+def test_this_is_defined_裡的語句一般模式就掃得到(_render_in_process, path):
+    """dbt 每次執行都有 this;展開器只在增量模式定義它、或給不出值時當成未定義的話,這句 DELETE
+    兩種模式都看不到。檔名不能當表名(連字號、數字開頭、點)時也一樣要看得到。"""
     entry, _ = _prescan("select 1 as x\n{% if this is defined %}\n;DELETE FROM important_table\n"
-                        "{% endif %}")
+                        "{% endif %}", path=path)
     assert _render_in_process == [False]
     assert [(h["rule"], h.get("branch")) for h in entry["rules"]] == [("R001", None)]
     assert "dbt_render_error" not in entry
