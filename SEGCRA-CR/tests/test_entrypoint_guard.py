@@ -10,7 +10,34 @@ import pathlib
 import pytest
 
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
-ENTRYPOINTS = ["demo.py", "scripts/webhook_server.py", "tools/prescan.py"]
+# 一定要有 main 保護的進入點(會啟動審查或 lint 的服務與 CLI)
+RUNNABLE = ["demo.py", "scripts/webhook_server.py", "tools/prescan.py", "eval/run_eval.py"]
+SCRIPT_DIRS = ("scripts", "tools", "eval")
+
+
+def _imports_pipeline(tree: ast.AST) -> bool:
+    """有沒有 import 管線或工具的模組(用得到就可能開子行程)。"""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            names = [node.module]
+        elif isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        else:
+            continue
+        if any(n.split(".")[0] in ("orchestrator", "toolbox") for n in names):
+            return True
+    return False
+
+
+def _scripts() -> list[str]:
+    """demo.py 與 scripts/、tools/、eval/ 底下 import 了管線或工具的檔案。自動找,不靠手動清單:
+    每次審查都會開子行程,新增的腳本漏了保護就會整支重跑。"""
+    found = ["demo.py"]
+    for d in SCRIPT_DIRS:
+        for path in sorted((PKG_ROOT / d).rglob("*.py")):
+            if _imports_pipeline(ast.parse(path.read_text(encoding="utf-8"))):
+                found.append(path.relative_to(PKG_ROOT).as_posix())
+    return found
 
 
 def _is_main_guard(node: ast.AST) -> bool:
@@ -32,9 +59,27 @@ def _is_sys_path_setup(node: ast.AST) -> bool:
             and isinstance(func.value.value, ast.Name) and func.value.value.id == "sys")
 
 
+def _is_idempotent_setup(node: ast.AST) -> bool:
+    """重跑也無害的設定:`os.environ.setdefault(...)`,以及
+    `if hasattr(sys.stdout, ...):`(把主控台輸出改成 UTF-8 的固定寫法,不能有 else)。"""
+    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+        func = node.value.func
+        return (isinstance(func, ast.Attribute) and func.attr == "setdefault"
+                and isinstance(func.value, ast.Attribute) and func.value.attr == "environ"
+                and isinstance(func.value.value, ast.Name) and func.value.value.id == "os")
+    if isinstance(node, ast.If) and isinstance(node.test, ast.Call):
+        call = node.test
+        return (isinstance(call.func, ast.Name) and call.func.id == "hasattr" and bool(call.args)
+                and isinstance(call.args[0], ast.Attribute) and call.args[0].attr == "stdout"
+                and isinstance(call.args[0].value, ast.Name) and call.args[0].value.id == "sys"
+                and not node.orelse)
+    return False
+
+
 def _unguarded_calls(source: str) -> list[int]:
     """模組最外層、不在 main 保護裡、而且會執行東西的敘述所在的行號。
-    允許:匯入、函式 / 類別定義、指派(常數、設定)、docstring、sys.path 的設定。"""
+    允許:匯入、函式 / 類別定義、指派(常數、設定)、docstring、sys.path 的設定、
+    重跑也無害的設定(見 _is_idempotent_setup)。"""
     lines = []
     for node in ast.parse(source).body:
         if isinstance(node, (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef,
@@ -42,17 +87,27 @@ def _unguarded_calls(source: str) -> list[int]:
             continue
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
             continue                         # docstring
-        if _is_sys_path_setup(node):
+        if _is_sys_path_setup(node) or _is_idempotent_setup(node):
             continue
         lines.append(node.lineno)
     return lines
 
 
-@pytest.mark.parametrize("rel", ENTRYPOINTS)
-def test_進入點有main保護_最外層不直接執行(rel):
+@pytest.mark.parametrize("rel", _scripts())
+def test_腳本的最外層不直接執行(rel):
+    source = (PKG_ROOT / rel).read_text(encoding="utf-8")
+    assert _unguarded_calls(source) == [], f"{rel} 的最外層有會直接執行的敘述"
+
+
+@pytest.mark.parametrize("rel", RUNNABLE)
+def test_進入點有main保護(rel):
     source = (PKG_ROOT / rel).read_text(encoding="utf-8")
     assert any(_is_main_guard(n) for n in ast.parse(source).body), f"{rel} 沒有 main 保護"
-    assert _unguarded_calls(source) == [], f"{rel} 的最外層有會直接執行的敘述"
+
+
+def test_自動找得到已知的進入點():
+    """自動找的清單是空的(例如目錄改名)時,上面那條會靜靜地什麼都不檢查。"""
+    assert set(RUNNABLE) <= set(_scripts())
 
 
 def test_檢查本身抓得到沒有保護的寫法():
@@ -67,3 +122,9 @@ def test_檢查本身抓得到沒有保護的寫法():
     assert _unguarded_calls(other_if) == [2]
     setup = "import sys\nsys.path.insert(0, '.')\nsys.path.append('x')\nsys.exit(1)\nserve()\n"
     assert _unguarded_calls(setup) == [4, 5]          # 只放行 sys.path 的設定
+    idem = ("import os, sys\nos.environ.setdefault('A', '1')\n"
+            "if hasattr(sys.stdout, 'reconfigure'):\n    sys.stdout.reconfigure(encoding='utf-8')\n"
+            "os.environ.update(A='1')\n"
+            "if hasattr(sys.stdout, 'x'):\n    pass\nelse:\n    serve()\n"
+            "if hasattr(os, 'x'):\n    serve()\n")
+    assert _unguarded_calls(idem) == [5, 6, 10]       # 只放行 setdefault 與 stdout 的設定

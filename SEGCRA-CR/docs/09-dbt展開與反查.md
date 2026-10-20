@@ -466,7 +466,7 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 |---|---|
 | `relation_notice` 改成確定性揭露 | 完成(#14):`enforce_dbt_notice` |
 | macro 目錄的取檔方式決定並實作 | 完成:依 commit 打包下載(#20),接進管線(本節) |
-| 進入點有 `if __name__ == "__main__":` 保護 | `demo.py` 與 `scripts/webhook_server.py` 都有,由 `tests/test_entrypoint_guard.py` 鎖住。展開、macro 反查、專案資訊都開子行程(spawn);進入點少了保護時,子行程會把整支程式從頭重跑一次。實際踩到時的結果是專案資訊整理失敗 → 當成取不回專案 → 交人工 |
+| 進入點有 `if __name__ == "__main__":` 保護 | `demo.py`、`scripts/webhook_server.py`、`tools/prescan.py`、`eval/run_eval.py` 都有;`tests/test_entrypoint_guard.py` 另外自動找出 `scripts/`、`tools/`、`eval/` 底下用到管線的腳本,檢查最外層不直接執行。展開、macro 反查、專案資訊與 lint 都開子行程(spawn);進入點少了保護時,子行程會把整支程式從頭重跑一次。實際踩到時的結果是專案資訊整理失敗 → 當成取不回專案 → 交人工 |
 | 資料庫假名確定並寫進文件,設錯要擋下 | 完成(#16):固定為 `DBT_PLACEHOLDER`,載入設定與展開前各檢查一次 |
 
 開啟與回復的步驟、以及不接 GitLab 就能跑的範例,見 README「開啟 dbt 接線」與 `examples/dbt_wiring/`。
