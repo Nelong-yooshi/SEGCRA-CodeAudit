@@ -2236,3 +2236,17 @@ def test_標籤缺口要出現在run_spec_exec的覆蓋缺口裡(monkeypatch):
     assert any("C1-T" in g and "資料與標籤不符" in g for g in r["coverage_gaps"]), \
         r["coverage_gaps"]
     assert r["passed"] is False
+
+def test_計畫沒有cases也不能炸():
+    """`gaps_and_passed` 是共用函式,呼叫端不只 run_spec_exec。這裡炸掉的話,整個
+    執行驗證會變成「審查未完整」,而不是一份說得出缺口的報告。"""
+    gaps, passed = spec_exec.gaps_and_passed({}, {"case_results": [], "timed_out": True})
+    assert passed is False and any("逾時" in g for g in gaps), gaps
+
+
+def test_DDL_的型別小寫也吃得到小數秒上限():
+    """型別上限是用大寫的鍵查的,`_ddl_columns` 負責正規化 —— 只用手寫的 col dict
+    測的話,DDL 寫 `datetime` 這條路就沒被釘住。"""
+    cols = spec_exec._ddl_columns(["CREATE TABLE t (tx_time datetime);"])
+    why = spec_exec._value_fits(cols["t"][0], "2026-06-01 22:00:00.1234")
+    assert "3 位" in why, why

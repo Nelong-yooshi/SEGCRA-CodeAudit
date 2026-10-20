@@ -1769,9 +1769,8 @@ def gaps_and_passed(plan: dict, ex: dict, base_gaps=(),
     if ex.get("timed_out"):
         # 沒跑到的案例本身也是缺口,但不說「逾時」的話,看報告的人會以為是測資或
         # SQL 壞了 —— 那兩種的修法完全不同。
-        gaps.append(
-            f"沙盒執行超過時間上限,{len(plan['cases']) - len(ex['case_results'])} 個案例"
-            f"未執行(逾時)")
+        unrun = len(plan.get("cases") or []) - len(ex["case_results"])
+        gaps.append(f"沙盒執行超過時間上限,{unrun} 個案例未執行(逾時)")
     effective = [r for r in ex["case_results"] if not r.get("dropped")]
     return gaps, bool(effective) and not faults and not gaps
 
