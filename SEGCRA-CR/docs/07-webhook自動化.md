@@ -84,11 +84,13 @@ curl -s -X POST http://127.0.0.1:8000/gitlab-webhook \
 
 ## 時間上限與未完成的處理(#45 / #53 review)
 
-| 環境變數 | 預設 | 單位 | 管什麼 | 什麼時候要調 |
-|---|---|---|---|---|
-| `REVIEW_TIMEOUT_SECONDS` | 2400 | 秒 | **一份審查的總上限**(`_run_review` 的 `asyncio.wait_for`) | 要比執行驗證那一段的上限大。模型變慢、或規格變大而生成時間拉長時往上調 |
-| `LINT_TIMEOUT_SECONDS` | 60 | 秒 | 單一份內容的 lint 上限(預掃每個 `.sql` 檔各一次,模型的 `sqltools__lint` 工具呼叫每次一次),見 `toolbox/sqltools.py` | 一般的 SQL 在預設值內跑得完;逾時的檔案在報告記「審查未完整」並交人工。正常的大檔也逾時時往上調 |
-| `SPEC_EXEC_TIMEOUT_SECONDS` | 1200 | 秒 | 執行驗證整段(測資生成 + 沙盒執行 + 仲裁)的上限,見 `orchestrator/pipeline.py` | 照 `_spec_exec.stage_seconds` 量到的各階段時間訂。實測大規格的測資生成要 26–70 分鐘,目前這個預設值在現在的機器上幾乎一定會逾時 |
+預設值與單位見 **[設定參數一覽](10-設定參數.md)**,這裡只寫各管什麼、什麼時候要調。
+
+| 環境變數 | 管什麼 | 什麼時候要調 |
+|---|---|---|
+| `REVIEW_TIMEOUT_SECONDS` | **一份審查的總上限**(`_run_review` 的 `asyncio.wait_for`) | 要比執行驗證那一段的上限大。模型變慢、或規格變大而生成時間拉長時往上調 |
+| `LINT_TIMEOUT_SECONDS` | 單一份內容的 lint 上限(預掃每個 `.sql` 檔各一次,模型的 `sqltools__lint` 工具呼叫每次一次),見 `toolbox/sqltools.py` | 一般的 SQL 在預設值內跑得完;逾時的檔案在報告記「審查未完整」並交人工。正常的大檔也逾時時往上調 |
+| `SPEC_EXEC_TIMEOUT_SECONDS` | 執行驗證整段(測資生成 + 沙盒執行 + 仲裁)的上限,見 `orchestrator/pipeline.py` | 照 `_spec_exec.stage_seconds` 量到的各階段時間訂。大規格的測資生成在現在的機器上幾乎一定會逾時 |
 
 都是「讀不懂就退回預設值並印一行警告」(`orchestrator/config.py:env_seconds`),
 **不是**直接丟例外:讀它們的是 webhook 伺服器在 import 的時候,填錯一個字就起不來 →

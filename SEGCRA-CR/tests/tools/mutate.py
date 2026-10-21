@@ -3573,5 +3573,31 @@ MUTANTS.update({
 })
 
 
+# ---- 設定參數一覽與程式要對得上(#58)。掃漏一種讀法,一致性檢查就變成永遠綠的。
+E = "env_registry.py"
+MUTANTS.update({
+ "設定表:掃描漏掉 helper 讀的(env_seconds 那幾個)": (E,
+     "                or _helper_name(func) in ENV_HELPERS):",
+     "                or False):"),
+ "設定表:掃描只認 os.environ.get,漏掉 os.getenv": (E,
+     '        if (func.endswith("os.environ.get") or func.endswith("os.getenv")' + NL
+     + '                or func == "getenv" or setter',
+     '        if (func.endswith("os.environ.get")' + NL
+     + "                or setter"),
+ "設定表:掃描漏掉 os.environ[\"X\"] 的下標寫法": (E,
+     '        if (isinstance(node, ast.Subscript)',
+     "        if (False and isinstance(node, ast.Subscript)"),
+ "設定表:setdefault 設的值當成程式的預設值": (E,
+     "        return None if self.is_setter else const_value(self.default)",
+     "        return const_value(self.default)"),
+ "設定表:算不出 str(1024 * 1024) 這種預設值": (E,
+     '                and node.func.id in ("str", "int", "float") and len(node.args) == 1):',
+     "                and False):"),
+ "設定表:掃描範圍少一個目錄": (E,
+     'SCAN_DIRS = ("orchestrator", "toolbox", "scripts", "eval")',
+     'SCAN_DIRS = ("orchestrator", "toolbox", "eval")'),
+})
+
+
 if __name__ == "__main__":
     sys.exit(main())

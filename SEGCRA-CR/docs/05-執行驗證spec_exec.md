@@ -223,8 +223,8 @@ passed = bool(effective) and not sql_faults and not coverage_gaps
 
 ### 時間上限與各階段耗時(#45 / #53 review)
 
-整段有一個上限 `SPEC_EXEC_TIMEOUT_SECONDS`(預設 1200 秒,由 `orchestrator/pipeline.py`
-讀;讀不懂退回預設並印警告)。三個階段各自計時,結果放在 `_spec_exec.stage_seconds`
+整段有一個上限 `SPEC_EXEC_TIMEOUT_SECONDS`(由 `orchestrator/pipeline.py` 讀;讀不懂
+退回預設並印警告。預設值見 [設定參數一覽](10-設定參數.md))。三個階段各自計時,結果放在 `_spec_exec.stage_seconds`
 (`{"測資生成": 秒, "沙盒執行": 秒, "仲裁": 秒}`),**逾時那次也會留下**
 (`report["_spec_exec_stage_seconds"]`)—— 上限要照這些數字訂,而逾時那一次正是最需要
 知道時間花在哪裡的一次。
