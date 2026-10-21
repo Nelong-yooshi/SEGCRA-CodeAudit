@@ -81,9 +81,10 @@ def scan_file(path: pathlib.Path, rel: str | None = None) -> list[EnvRead]:
         return []
     out = []
     for node in ast.walk(tree):
-        # os.environ["X"]
+        # os.environ["X"](`from os import environ` 的 environ["X"] 也算:比對結尾就好,
+        # 寫死 "os.environ" 的話,換個 import 寫法就整個掃不到)
         if (isinstance(node, ast.Subscript)
-                and ast.unparse(node.value).endswith("os.environ")
+                and ast.unparse(node.value).split(".")[-1] == "environ"
                 and isinstance(node.slice, ast.Constant)
                 and isinstance(node.slice.value, str)):
             out.append(EnvRead(node.slice.value, f"{rel}:{node.lineno}", None))
@@ -97,9 +98,11 @@ def scan_file(path: pathlib.Path, rel: str | None = None) -> list[EnvRead]:
         if not isinstance(name, str):
             continue
         default = ast.unparse(node.args[1]) if len(node.args) > 1 else None
-        setter = func.endswith("os.environ.setdefault")
-        if (func.endswith("os.environ.get") or func.endswith("os.getenv")
-                or func == "getenv" or setter
+        # 取結尾比對,不寫死 "os." 開頭:`from os import environ`、`import os as o`
+        # 都還是同一件事,而寫死前綴的話換個 import 寫法就整個掃不到。
+        tail = ".".join(func.split(".")[-2:])
+        setter = tail == "environ.setdefault"
+        if (tail == "environ.get" or func.split(".")[-1] == "getenv" or setter
                 or _helper_name(func) in ENV_HELPERS):
             out.append(EnvRead(name, f"{rel}:{node.lineno}", default, setter))
     return out

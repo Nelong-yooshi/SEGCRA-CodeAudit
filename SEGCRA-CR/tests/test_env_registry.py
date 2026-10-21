@@ -81,6 +81,17 @@ def test_真實模式必填的參數在文件裡標出來():
     assert all(f"`{n}`" in section for n in required), section
 
 
+def test_同一個參數在不同地方的預設值要一致():
+    """多處讀同一個參數卻寫了不同的預設值,是程式本身的不一致:實際用到哪一個要看
+    誰先被 import,而文件只能寫一個。現在沒有這種情況,有了就要先修程式。"""
+    bad = []
+    for name, reads in scan_repo().items():
+        values = {r.default_value for r in reads if r.default_value is not None}
+        if len(values) > 1:
+            bad.append(f"{name}:{values}({[r.where for r in reads]})")
+    assert bad == [], "\n".join(bad)
+
+
 def test_掃描範圍不是空的():
     """路徑算錯時上面每一條都會變成永遠綠的斷言。"""
     found = scan_repo()
@@ -94,6 +105,12 @@ def test_掃描範圍不是空的():
     ('import os\nx = os.environ.get("B_VAR", "d")', "B_VAR"),
     ('import os\nx = os.getenv("C_VAR")', "C_VAR"),
     ('from os import getenv\nx = getenv("D_VAR")', "D_VAR"),
+    # import 的寫法換一種就掃不到的話,新增的參數會靜悄悄繞過文件要求
+    ('from os import environ\nx = environ.get("D1_VAR")', "D1_VAR"),
+    ('from os import environ\nx = environ["D2_VAR"]', "D2_VAR"),
+    ('import os as o\nx = o.environ.get("D3_VAR")', "D3_VAR"),
+    ('import os as o\nx = o.getenv("D4_VAR")', "D4_VAR"),
+    ('import os as o\nx = o.environ["D5_VAR"]', "D5_VAR"),
     ('import os\nos.environ.setdefault("E_VAR", "1")', "E_VAR"),
     ('x = env_seconds("F_VAR", 60)', "F_VAR"),          # helper:檔案裡沒有 os.environ
     ('x = _env_float("G_VAR", 0, 1)', "G_VAR"),
