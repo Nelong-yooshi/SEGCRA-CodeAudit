@@ -231,7 +231,10 @@ _MASKED_KEY_RE = re.compile(
 # 會連真正會執行的呼叫一起被當成註解去掉);寫在註解裡的誤報只是多一次人工確認。
 # 函式名與括號之間可以夾空白**或註解**:`DB_NAME/**/()` 在 T-SQL 是合法的,
 # 只容許空白就漏掉了(#27 review)。`--` 到行尾的註解同理。
-_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/))*\*/|--[^\n]*\n)*"
+# 長度有上限:沒有上限的話,`DB_NAME /*` 這種**不閉合**的註解開頭,每一個出現位置都會
+# 一路掃到檔尾才宣告失敗,整體是平方時間(實測 8 萬字元要 14 秒)。而這些內容由 MR
+# 決定。函式名與括號之間的空白或註解本來就很短,給得很寬也只是常數。
+_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/)){0,500}\*/|--[^\n]*\n){0,30}"
 # 需要括號的環境函式。分三類只是為了讀起來分得清,比對時三條都跑。
 _ENV_FUNC_RE = re.compile(
     r"(?i)(?<![\w.@\[])("
@@ -367,12 +370,15 @@ _LOCALE_RE = re.compile(r"(?i)@@(LANGUAGE|DATEFIRST|LANGID|DATEFORMAT)\b")
 # `MERGE` 的慣用別名就叫 target(`target.id`),而 `VAR()` 是變異數聚合函式。
 # `env_var(` 是 dbt 專有的名字,不受這個限制。
 _JINJA = r"\{\{|\{%"
+# 從 `{{`/`{%` 往後找關鍵字的範圍也要有上限:`{{` 開頭而**沒有閉合**的內容,每一個
+# `{{` 都會掃到檔尾,整體是平方時間(實測 4 萬字元要 35 秒)。Jinja 的表達式很短。
+_IN_JINJA = r"[^}]{0,200}?"
 # 命中的「寫法」只取關鍵字本身(具名群組 tok):比對需要前面那段 Jinja 當界線,
 # 但把 `{% set target_date = var` 整段印進訊息只會讓人看不懂命中的是什麼。
 _DBT_ENV_RE = re.compile(
-    r"(?i)(?:" + _JINJA + r")[^}]*?(?<![\w.])(?P<tok>target" + _GAP + r"\." + _GAP
+    r"(?i)(?:" + _JINJA + r")" + _IN_JINJA + r"(?<![\w.])(?P<tok>target" + _GAP + r"\." + _GAP
     + r"(?:name|database|schema|type|user))(?!\w)"
-    r"|(?:" + _JINJA + r")[^}]*?(?<![\w.])(?P<tok2>var)" + _GAP + r"\("
+    r"|(?:" + _JINJA + r")" + _IN_JINJA + r"(?<![\w.])(?P<tok2>var)" + _GAP + r"\("
     r"|(?<![\w.])(?P<tok3>env_var)" + _GAP + r"\("
     r"|(?P<tok4>\{%" + _GAP + r"if" + _GAP + r"execute)(?!\w)")
 

@@ -344,3 +344,34 @@ def test_沒開dbt時不掃macro():
     mr = DBT._mr([DBT._f("models/mrt_big.sql", full_content=CALLER)])
     pre = asyncio.run(prescan(_RealRulesHub(), mr["files"], None, None))
     assert not [e for e in pre if e.get("called_macro")]
+
+
+# ─────────────────── 7. 特製內容不得讓規則層變成平方時間 ───────────────────
+#
+# 這些內容由 MR 決定。沒有上限的話,「開頭、但不閉合」的寫法每一個出現位置都會一路
+# 掃到檔尾才宣告失敗:`{{` 不閉合 4 萬字元要 35 秒、`DB_NAME /*` 8 萬字元要 14 秒
+# (後者是 R005 本來就有的,新規則重用同一個 _GAP,等於把常數放大)。
+#
+# 門檻給得很寬:平方的版本在這個長度要幾百秒,所以慢機器也不會偽紅。
+
+import time  # noqa: E402
+
+
+@pytest.mark.parametrize("payload,label", [
+    ("{{" * 50_000, "不閉合的 Jinja 開頭"),
+    ("DB_NAME /*" * 20_000, "不閉合的註解開頭"),
+    ("EXEC /*" * 20_000, "不閉合的註解接在 EXEC 後面"),
+    ("a.b.c." * 20_000, "大量的點分隔名稱"),
+])
+def test_特製內容不會讓規則層卡住(payload, label):
+    t = time.perf_counter()
+    run_rules(payload)
+    took = time.perf_counter() - t
+    assert took < 5, f"{label}({len(payload):,} 字元)花了 {took:.1f} 秒"
+
+
+def test_長度上限不影響正常的寫法():
+    """收斂的是「掃多遠」,不是「抓不抓得到」。"""
+    assert _hits("SELECT * FROM OPENROWSET/* 說明 */('x')", "R006")
+    assert _hits("{{ var('window_days') }}", "H008")
+    assert _hits("{% if  target.name == 'prod' %}x{% endif %}", "H008")

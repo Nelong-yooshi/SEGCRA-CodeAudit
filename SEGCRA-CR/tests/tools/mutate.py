@@ -2069,7 +2069,7 @@ MUTANTS.update({
      r'+ _GAP + r"\." + _GAP + r"\[?\w+\]?"',
      r'+ _GAP + r"\." + _GAP + r"\[?(databases|objects|tables)\]?"'),
  "R005:函式名與括號之間只容許空白(夾註解就漏抓)": ("../toolbox/sqltools.py",
-     r'_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/))*\*/|--[^\n]*\n)*"',
+     r'_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/)){0,500}\*/|--[^\n]*\n){0,30}"',
      r'_GAP = r"\s*"'),
  "R005:不抓不帶括號的身分函式": ("../toolbox/sqltools.py",
      r'(SYSTEM_USER|CURRENT_USER|SESSION_USER)\b"',
@@ -3623,8 +3623,8 @@ MUTANTS.update({
      "    locale = dict.fromkeys(m.group(0).upper() for m in _LOCALE_RE.finditer(sql))",
      "    locale = {}"),
  "提醒:dbt 的 target 與 var 不限定在 Jinja 區段裡": (T,
-     r'    r"(?i)(?:" + _JINJA + r")[^}]*?(?<![\w.])(?P<tok>target" + _GAP + r"\." + _GAP',
-     r'    r"(?i)(?:" + r"" + r")[^}]*?(?<![\w.])(?P<tok>target" + _GAP + r"\." + _GAP'),
+     r'    r"(?i)(?:" + _JINJA + r")" + _IN_JINJA + r"(?<![\w.])(?P<tok>target" + _GAP + r"\." + _GAP',
+     r'    r"(?i)(?:" + r"" + r")" + _IN_JINJA + r"(?<![\w.])(?P<tok>target" + _GAP + r"\." + _GAP'),
  "提醒:命中的寫法把整段 Jinja 前綴也印出來": (T,
      "    dbt_env = dict.fromkeys(_dbt_env_token(m) for m in _DBT_ENV_RE.finditer(sql))",
      '    dbt_env = dict.fromkeys(" ".join(m.group(0).split())' + NL
@@ -3640,6 +3640,13 @@ MUTANTS.update({
      "    for src in sources.values():" + NL
      + "        bodies.update(_macros_used(src, index))",
      "    bodies.update(getattr(dbt_ctx, \"macro_files\", None) or {})"),
+ # 特製內容不得讓規則層變成平方時間(內容由 MR 決定)
+ "上限:函式名與括號之間的空白/註解不設上限": (T,
+     r'_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/)){0,500}\*/|--[^\n]*\n){0,30}"',
+     r'_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/))*\*/|--[^\n]*\n)*"'),
+ "上限:Jinja 區段裡往後找的範圍不設上限": (T,
+     r'_IN_JINJA = r"[^}]{0,200}?"',
+     r'_IN_JINJA = r"[^}]*?"'),
  "提醒:寫死日期的比較不報": (T,
      "    if _TIME_BOMB_RE.search(sql):",
      "    if False:"),
