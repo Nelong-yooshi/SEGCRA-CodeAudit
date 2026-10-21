@@ -1417,9 +1417,12 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 這兩段失敗時退回只有 diff 的 prompt 並記下未完整(決策交人工),不中斷整份審查
         code_files, spec_changes = _step(report_stub, "規格變更分段", _split_spec_changes,
                                          (mr["files"], ""), mr["files"], cfg.budget.get("spec", 3000))
-        # 變更後的完整內容:只有 diff 時,不在 hunk 上下文裡的條件會被報成「遺漏」
-        full_text = _step(report_stub, "完整內容段落", _full_text_section, "",
-                          code_files, dbt_ctx, cfg.budget.get("full_content", 6000))
+        # 變更後的完整內容:只有 diff 時,不在 hunk 上下文裡的條件會被報成「遺漏」。
+        # 實驗分支:只有對到規格(含受影響 model 的規格)時才放,比較全文的價值是不是集中在核對規格
+        has_spec = bool(spec_text) or bool(affected_specs)
+        full_text = (_step(report_stub, "完整內容段落", _full_text_section, "",
+                           code_files, dbt_ctx, cfg.budget.get("full_content", 6000))
+                     if has_spec else "")
         user = USER_TEMPLATE.format(
             title=mr["title"], description=mr.get("description", ""),
             diff_section=build_diff_section(code_files, cfg.budget["diff"]) + full_text,

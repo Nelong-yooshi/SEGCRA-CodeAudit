@@ -3065,10 +3065,10 @@ MUTANTS.update({
      '                                         (mr["files"], ""), mr["files"], cfg.budget.get("spec", 3000))',
      '                                         ([], ""), mr["files"], cfg.budget.get("spec", 3000))'),
  "隔離:完整內容段落失敗時中斷審查": ("pipeline.py",
-     '        full_text = _step(report_stub, "完整內容段落", _full_text_section, "",' + NL
-     + '                          code_files, dbt_ctx, cfg.budget.get("full_content", 6000))',
-     '        full_text = _full_text_section(' + NL
-     + '                          code_files, dbt_ctx, cfg.budget.get("full_content", 6000))'),
+     '        full_text = (_step(report_stub, "完整內容段落", _full_text_section, "",' + NL
+     + '                           code_files, dbt_ctx, cfg.budget.get("full_content", 6000))',
+     '        full_text = (_full_text_section(' + NL
+     + '                           code_files, dbt_ctx, cfg.budget.get("full_content", 6000))'),
  "多份規格:MR 自己有規格時也附上": ("pipeline.py",
      '                          if spec_code is None and spec_text is None else ())',
      '                          )'),
