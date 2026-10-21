@@ -3573,5 +3573,23 @@ MUTANTS.update({
 })
 
 
+# ---- 背景執行緒的收尾(#53 的 _in_thread)
+MUTANTS.update({
+ "收尾:例外不先綁到自己的變數(lambda 跑的時候 e 已經被刪掉 → 永遠掛著)": (S,
+     "            exc = e" + NL
+     + "            settle(lambda: fut.cancelled() or fut.set_exception(exc))",
+     "            settle(lambda: fut.cancelled() or fut.set_exception(e))"),
+ "收尾:迴圈關掉之後照樣硬丟回去": (S,
+     "        try:" + NL
+     + "            loop.call_soon_threadsafe(apply)" + NL
+     + "        except RuntimeError:                  # 迴圈已經關了" + NL
+     + "            pass",
+     "        loop.call_soon_threadsafe(apply)"),
+ "收尾:連正常的結果也安靜丟掉": (S,
+     "        settle(lambda: fut.cancelled() or fut.set_result(out))",
+     "        pass"),
+})
+
+
 if __name__ == "__main__":
     sys.exit(main())
