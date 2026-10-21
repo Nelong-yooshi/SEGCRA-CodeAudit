@@ -2409,8 +2409,11 @@ def _output_meta_record(meta: dict, max_output_tokens: int) -> dict:
     """寫進報告 `_output_meta` 的稽核紀錄:主審查最後一次回應的結束原因與用量。
 
     評測存下來的報告靠它統計截斷發生的次數(run_eval 不傳 capture,只有報告會留下來)。
-    `prompt_tokens` 是最後一次呼叫讀入的量;`*_total` 是整份審查每一輪的加總(有工具呼叫時
-    每一輪都把整串對話重讀一遍,總量遠大於最後一次)。run_agent 沒有回填的欄位是 None。
+    `prompt_tokens` 是最後一次呼叫讀入的量;`*_total` 是主審查這次 run_agent 每一輪的加總(有工具
+    呼叫時每一輪都把整串對話重讀一遍,總量遠大於最後一次)。run_agent 沒有回填的欄位是 None。
+
+    **只含主審查**,不是整份 MR 打到端點的總量:測資生成、仲裁、風格基準各自呼叫 run_agent,
+    它們的用量不在這裡。
     """
     reason = meta.get("finish_reason")
     return {
