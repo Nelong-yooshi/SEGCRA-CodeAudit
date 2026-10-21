@@ -69,7 +69,7 @@ roles:
 # context budget(tokens)
 budget:
   diff: 8000
-  full_content: 6000    # 變更檔「變更後的完整內容」;設成 0 就不放(prompt 只有 diff)。
+  full_content: 0       # 實驗分支:不放變更後的完整內容(prompt 只有 diff),比較全文段落的成本與效果。main 是 6000
                         # num_ctx 含輸出:輸入最多約 24,500,其他段落最壞約 16,000,留一點餘裕
   spec: 3000
   memory: 2000
