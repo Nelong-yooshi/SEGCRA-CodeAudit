@@ -3725,5 +3725,28 @@ MUTANTS.update({
 })
 
 
+# ---- 評測用的 token 用量(#84)。數字錯了不會有人發現,只會得到錯的結論。
+A = "agent.py"
+MUTANTS.update({
+ "用量:只記最後一次、不累加": (A,
+     "            for key, value in ((\"prompt_tokens_total\", prompt_tokens)," + NL
+     + "                               (\"completion_tokens_total\", completion)):" + NL
+     + "                if value is not None:" + NL
+     + "                    meta[key] = (meta.get(key) or 0) + value",
+     "            meta[\"prompt_tokens_total\"] = prompt_tokens" + NL
+     + "            meta[\"completion_tokens_total\"] = completion"),
+ "用量:沒回報的那一輪當成 0 加進去(總量變成有值)": (A,
+     "                if value is not None:" + NL
+     + "                    meta[key] = (meta.get(key) or 0) + value",
+     "                meta[key] = (meta.get(key) or 0) + (value or 0)"),
+ "用量:讀入的量不記": (A,
+     "            meta[\"prompt_tokens\"] = prompt_tokens",
+     "            meta[\"prompt_tokens\"] = None"),
+ "用量:生成的總量跟著最後一次走": (A,
+     "                               (\"completion_tokens_total\", completion)):",
+     "                               (\"completion_tokens_total\", None)):"),
+})
+
+
 if __name__ == "__main__":
     sys.exit(main())
