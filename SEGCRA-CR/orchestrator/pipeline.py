@@ -14,6 +14,11 @@ from typing import NamedTuple
 
 from pathlib import Path
 
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import SqlglotError
+from sqlglot.tokens import TokenType
+
 from .agent import MAX_ITERATIONS, extract_json, output_truncated, run_agent
 from .config import (DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, env_seconds,
                      estimate_tokens)
@@ -30,6 +35,7 @@ from .skills_loader import always_skills, load_skills, skills_index
 from .spec_exec import find_spec, run_spec_exec
 from .tool_hub import ToolHub
 from toolbox.sqltools import LINT_INCOMPLETE_CODE, LINT_MAX_CHARS, LINT_TIMEOUT_SECONDS
+from toolbox.sqltools import DIALECT, _parse
 
 SYSTEM_TEMPLATE = """你是資深資料庫工程主管,負責審查 SQL merge request。\
 你的審查將直接決定 MR 能否合入,必須精準、可回溯、給得出修改建議。
@@ -825,13 +831,9 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
             if isinstance(more, dict) and more.get("error") and "parse_error" not in entry:
                 # 增量分支解析不了:語法樹規則在那一段沒有執行,不能當成沒有命中
                 entry["parse_error"] = f"增量分支(is_incremental() 為 True):{more['error']}"
-        # lint 刻意用**原始**文字,不用展開後的 rule_sql:sqlfluff 的違規結果帶行號
-        # (start_line_no),而 LLM 看到的 diff(build_diff_section)是原始行號——
-        # 兩者混在同一份 prescan JSON 裡若行號基準不同,LLM 很可能把展開後的行號
-        # 誤植進 finding,指向原始檔案中錯誤的位置。規則命中的行號雖然對得回原始檔
-        # (_attach_rendered_lines),那是在組好 prompt 之後、只對語句開頭做的;lint 的違規
-        # 可以落在任何位置,用不了同一套判斷。寧可讓 lint 對 Jinja 文字跑出較少或較不準的
-        # 結果,也不要送出「看起來對、實際上指錯行」的資訊。
+        # lint 用**原始**文字,不用展開後的 rule_sql:lint 管的是開發者寫的程式長什麼樣子,
+        # 展開後的 SQL 不是他們寫、也不會看到的東西,本來就不該對它做 lint。行號也因此跟
+        # LLM 看到的 diff(原始行號)一致。
         lint = await hub.call_json("sqltools__lint", {"sql": sql})
         entry["lint"] = lint[:15] if isinstance(lint, list) else []
         results.append(entry)
@@ -2095,43 +2097,6 @@ def _coverage(findings: list[dict], path: str, keywords: list[str],
 MAX_LINE_SOURCE_CHARS = 200_000
 
 
-def _statement_starts(sql: str) -> dict | None:
-    """{語句文字(與預掃命中的 statement 同一個寫法): [(起始行, 完整語句), ...]}。
-
-    用預掃同一個 sqlglot 方言把檔案切成語句:token 帶行號,分號是邊界;語句文字由同一個函式產生,
-    所以能和命中的 statement 逐字比對,不必在原文裡猜(sqlglot 產生的文字跟原文的大小寫、空白、
-    寫法都不同)。只有註解的「語句」(檔尾分號之後的註解)不算。切出來的數量對不上就回 None。
-    """
-    import sqlglot
-    from sqlglot import exp
-    from sqlglot.tokens import TokenType
-    from toolbox.sqltools import DIALECT, _parse
-
-    try:
-        tokens = sqlglot.tokenize(sql, read=DIALECT)
-        statements = [st for st in _parse(sql)
-                      if st is not None and not isinstance(st, exp.Semicolon)]
-    except Exception:                        # noqa: BLE001 — 切不出來就不寫行號
-        return None
-    starts, start = [], None
-    for tok in tokens:
-        if tok.token_type == TokenType.SEMICOLON:
-            if start is not None:
-                starts.append(start)
-            start = None
-        elif start is None:
-            start = tok.line
-    if start is not None:
-        starts.append(start)
-    if len(starts) != len(statements):
-        return None
-    by_text: dict[str, list] = {}
-    for first, st in zip(starts, statements):
-        full = st.sql(dialect=DIALECT)
-        by_text.setdefault(full[:200], []).append((first, full))
-    return by_text
-
-
 def _attach_statement_lines(pre: list[dict], files: list[dict], line_maps: dict | None = None) -> None:
     """在預掃命中上加 line(那句在檔案裡的起始行),給程式補的 finding 寫行號用
     (只有數字,沒有回顯的風險)。
@@ -2158,36 +2123,47 @@ def _attach_statement_lines(pre: list[dict], files: list[dict], line_maps: dict 
         hits = [h for h in entry.get("rules", []) if isinstance(h, dict) and h.get("statement")]
         if not hits:
             continue
-        starts = _statement_starts(text)
+        starts = _rendered_starts(text)
         if starts is None:
             continue
-        used: Counter = Counter()
-        for h in hits:
-            found = starts.get(h["statement"])
-            if not found or len({full for _, full in found}) > 1:
-                continue
-            key = (h.get("rule"), h["statement"])
-            if used[key] < len(found):
-                h["line"] = found[used[key]][0]
-            used[key] += 1
+        for h, (line, *_) in _matched_statements(hits, starts):
+            h["line"] = line
+
+
+def _matched_statements(hits: list[dict], starts: dict):
+    """為每個命中找對應的語句(_rendered_starts 的一項),產生 (命中, 語句)。純 SQL 與展開後的 SQL 共用。
+
+    相同文字的語句出現多次時,第 k 個命中對第 k 句;前 200 字相同、後面不同的語句分不出來,跳過。"""
+    used: Counter = Counter()
+    for h in hits:
+        found = starts.get(h["statement"])
+        if not found or len({full for _, full, _, _ in found}) > 1:
+            continue
+        key = (h.get("rule"), h["statement"])
+        if used[key] < len(found):
+            yield h, found[used[key]]
+        used[key] += 1
 
 
 def _rendered_starts(sql: str) -> dict | None:
-    """展開後的 SQL 切成語句:{語句文字: [(起始行, 完整語句, 是不是該行的第一段內容, 第幾句), ...]}。
+    """SQL 切成語句:{語句文字: [(起始行, 完整語句, 是不是該行的第一段內容, 第幾句), ...]}。
+    純 SQL 檔與 dbt 樣板展開後的 SQL 共用這一個切法。
 
-    跟 _statement_starts 同一個切法,另外記兩件事:語句的第一個 token 前面在同一行是不是只有空白
-    (空白控制 `{%- -%}` 會把幾個原始行接成同一個展開後的行,第二句的起始行對不回它真正的那一行),
-    以及它是展開後的第幾句(對不回行號時寫在說明裡,分得出是哪一句)。"""
-    import sqlglot
-    from sqlglot import exp
-    from sqlglot.tokens import TokenType
-    from toolbox.sqltools import DIALECT, _parse
+    用預掃同一個 sqlglot 方言切:token 帶行號,分號是邊界;語句文字由同一個函式產生,所以能和命中的
+    statement 逐字比對,不必在原文裡猜(sqlglot 產生的文字跟原文的大小寫、空白、寫法都不同)。只有
+    註解的「語句」(檔尾分號之後的註解)不算。切出來的數量對不上就回 None。
 
+    另外記兩件事(給展開後的 SQL 用,純 SQL 檔用不到):語句的第一個 token 前面在同一行是不是只有
+    空白(空白控制 `{%- -%}` 會把幾個原始行接成同一個展開後的行,第二句的起始行對不回它真正的那一行),
+    以及它是第幾句(對不回行號時寫在說明裡,分得出是哪一句)。
+
+    只有「切不出語句」(解析錯誤、tokenizer 錯誤、巢狀太深)回 None、不寫行號;其他例外是程式的錯,
+    往外丟,由呼叫端的環節隔離記成未完整,不默默變成 0。"""
     try:
         tokens = sqlglot.tokenize(sql, read=DIALECT)
         statements = [st for st in _parse(sql) if st is not None
                       and not isinstance(st, exp.Semicolon)]
-    except Exception:                        # noqa: BLE001 — 切不出來就不寫行號
+    except (SqlglotError, RecursionError):   # 切不出來就不寫行號
         return None
     firsts, first = [], None
     for tok in tokens:
@@ -2258,19 +2234,11 @@ def _attach_rendered_lines(entry: dict, line_maps: dict) -> None:
         if starts is None:
             continue
         rendered_lines, source_lines = rendered_sql.split("\n"), source.split("\n")
-        used: Counter = Counter()
-        for h in hits:
-            found = starts.get(h["statement"])
-            if not found or len({full for _, full, _, _ in found}) > 1:
-                continue
-            key = (h.get("rule"), h["statement"])
-            if used[key] < len(found):
-                line, _, alone, n = found[used[key]]
-                h["statement_index"] = n
-                src = _source_line(line, alone, line_map, rendered_lines, source_lines)
-                if src:
-                    h["line"] = src
-            used[key] += 1
+        for h, (line, _, alone, n) in _matched_statements(hits, starts):
+            h["statement_index"] = n
+            src = _source_line(line, alone, line_map, rendered_lines, source_lines)
+            if src:
+                h["line"] = src
 
 
 def _statement_note(hit: dict, exact: bool) -> str:
