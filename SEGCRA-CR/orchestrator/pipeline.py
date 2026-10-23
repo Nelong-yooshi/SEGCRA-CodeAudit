@@ -1431,7 +1431,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             # 「有環節沒跑完」——而那正是這條路最常用來檢查的事。
             return await _dry_run_report(hub, mr_id, mr, pre, spec_code, spec_text,
                                          affected, dbt_ctx, cfg.dbt,
-                                         incomplete=report_stub["findings"])
+                                         incomplete=report_stub["findings"],
+                                         affected_specs=affected_specs)
 
         # 路徑觸發的 skill 自動注入:異常交易規則檔一律載入領域知識,不賭模型主動載
         always_block = always_skills(skills)
@@ -1504,6 +1505,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 放在 normalize_findings 之後:那一步整理的是**模型**輸出的形狀,
         # 我們自己補的 finding 形狀本來就是對的,不需要也不該被它改寫。
         report.setdefault("findings", []).extend(report_stub["findings"])
+        # 對到哪幾份規格:跟執行驗證分開記(執行驗證逾時或失敗時規格其實有找到)。
+        # 放在模型的輸出解析之後,模型自己輸出的同名欄位會被蓋掉
+        report["_spec_lookup"] = _spec_lookup(spec_code, affected_specs)
         report = validate_citations(report, cited_codes)
         report = sanitize_findings(report)
         # 檢核點只認模型自己的回應:放在任何程式補報之前(enforce_rules 補的 R004 內文含
@@ -2487,15 +2491,37 @@ _EXHAUSTED_SUMMARY = "審查模型用完工具呼叫回合、沒有產出審查�
 _FINISH_REASON_MAX = 64
 
 
+def _spec_lookup(spec_code, affected_specs) -> dict:
+    """寫進報告 `_spec_lookup`:這次審查對到的規格代號。MR 本身對到的排第一,只改 macro 時
+    對到的受影響 model 的規格接在後面;沒對到是空清單。
+
+    跟執行驗證分開記:執行驗證逾時或失敗時沒有 `_spec_exec`,但規格其實有找到,所以評測判斷
+    「有沒有找到規格」看這個欄位。只有代號,不放規格內容:報告會寫進 review_output/。"""
+    codes = [spec_code] if isinstance(spec_code, str) and spec_code else []
+    for spec in affected_specs or ():
+        code = getattr(spec, "code", None)
+        if isinstance(code, str) and code and code not in codes:
+            codes.append(code)
+    return {"spec_codes": codes}
+
+
 def _output_meta_record(meta: dict, max_output_tokens: int) -> dict:
     """寫進報告 `_output_meta` 的稽核紀錄:主審查最後一次回應的結束原因與用量。
 
     評測存下來的報告靠它統計截斷發生的次數(run_eval 不傳 capture,只有報告會留下來)。
+    `prompt_tokens` 是最後一次呼叫讀入的量;`*_total` 是主審查這次 run_agent 每一輪的加總(有工具
+    呼叫時每一輪都把整串對話重讀一遍,總量遠大於最後一次)。run_agent 沒有回填的欄位是 None。
+
+    **只含主審查**,不是整份 MR 打到端點的總量:測資生成、仲裁、風格基準各自呼叫 run_agent,
+    它們的用量不在這裡。
     """
     reason = meta.get("finish_reason")
     return {
         "finish_reason": None if reason is None else str(reason)[:_FINISH_REASON_MAX],
         "completion_tokens": meta.get("completion_tokens"),
+        "prompt_tokens": meta.get("prompt_tokens"),
+        "prompt_tokens_total": meta.get("prompt_tokens_total"),
+        "completion_tokens_total": meta.get("completion_tokens_total"),
         "max_output_tokens": max_output_tokens,
         "truncated": output_truncated(meta, max_output_tokens),
         "exhausted": bool(meta.get("exhausted")),
@@ -2591,13 +2617,14 @@ def _format_comment(fd: dict) -> str:
 async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                           spec_code, spec_text, affected: AffectedCheck | None = None,
                           dbt_ctx: DbtContext | None = None, dbt_cfg: dict | None = None,
-                          incomplete: list[dict] | None = None) -> dict:
+                          incomplete: list[dict] | None = None,
+                          affected_specs: tuple = ()) -> dict:
     """不經 LLM 的管線煙霧測試:預掃結果直接轉 findings,並驗證 memory/spec 可用。
     (執行驗證需要 LLM 生成測資,dry-run 不跑;只回報 spec 是否找得到。)
 
     `incomplete` 是在 report 存在之前就產生的「環節未完整」finding(預掃、dbt 取回、
     注入掃描),一律帶進報告:這條路最常被用來檢查「確定性那半有沒有跑成」,
-    看不到環節失敗就失去意義。"""
+    看不到環節失敗就失去意義。`_spec_lookup` 跟正式路徑一樣記(見 _spec_lookup)。"""
     mem_sample = await hub.call_json("memory__lookup_similar_reviews",
                                      {"text": "SELECT *"})
     findings = list(incomplete or [])
@@ -2617,6 +2644,7 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                            - 5 * sum(f["severity"] == "minor" for f in findings)),
               "verdict": "dry_run", "summary": "(dry-run:僅 rule-base 預掃,未經 LLM)",
               "findings": findings,
+              "_spec_lookup": _spec_lookup(spec_code, affected_specs),
               "_plumbing": {"memory_ok": mem_sample is not None,
                             "spec_found": bool(spec_text), "spec_code": spec_code,
                             "files_scanned": len(pre)}}

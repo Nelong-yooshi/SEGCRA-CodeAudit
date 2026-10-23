@@ -44,12 +44,34 @@ profiles:
     num_ctx: 16384
     temperature: 0.1
     max_output_tokens: 8192
+  testgen:               # 測資生成:同一顆模型,但輸出上限較高(理由見下)
+    model: gemma4:31b
+    num_ctx: 32768
+    temperature: 0.1
+    max_output_tokens: 12288
 
 # 執行驗證的兩個 agent 角色各自可指定 profile;預設同 review
 roles:
-  testgen: review      # 角色一:測資生成
+  testgen: testgen     # 角色一:測資生成(輸出上限 12288,不是 review 的 8192)
   arbiter: review      # 角色三:仲裁(mismatch 時判定測資錯還是 SQL 錯)
   cold_read: cold_read # 冷讀:只看 MR 文字,判斷有沒有在對審查者說話
+
+# 為什麼測資生成要單獨一個 profile:
+#   8192 是**我們寫的**上限,不是模型的。實測(2026-10-13,gemma4:31b via gate):
+#   max_tokens=20000 要它逐行輸出 1..2500 → finish_reason=stop、
+#   completion_tokens=11533(自己寫完才停,沒撞上限)。
+#   一個測資案例約 790 tokens,再扣掉思考(約 1500,每次不同):
+#     上限 8192  → 一次約 6 個案例(實測 6 成功 2 次、截斷 1 次)
+#     上限 12288 → 一次約 13 個案例
+#   RETAIL_M1_EVAL 要 46 個,8192 下跑了 13 次呼叫 151 分鐘仍只到 30/46。
+#
+#   取 12288 而不是更高:11533 是**實測寫得出來**的量,再往上沒有驗過
+#   (而且 prompt + 輸出要一起塞進 context,上游實際的 num_ctx 我們沒有量到——
+#   models.yaml 的 num_ctx 目前根本沒送出去,見本檔開頭的註解)。
+#
+#   **不動 review 的 8192**:主審查的輸出被截斷時會補一條 major 轉人工
+#   (#26 第 1 點),那條防線用 completion_tokens 是否達上限當後備判斷,
+#   改動上限會連帶影響它的校準;而且主審查要的是一份報告,不是大量資料。
 
 # context budget(tokens)
 budget:
