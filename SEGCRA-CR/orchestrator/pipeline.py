@@ -1265,8 +1265,11 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
     scripts/webhook_server.py 都已經這樣寫,寫新的進入點時比照辦理。
     """
     import copy
+    from .dbt_render import start_review_invocation
     profile = cfg.profile(profile_name)
     skills = load_skills()
+    # 這份審查的 dbt 展開(預掃的一般與增量、受影響 model 的前後)共用一個 invocation_id
+    start_review_invocation()
 
     async with ToolHub(tool_result_max_chars=cfg.budget["tool_result_max_chars"]) as hub:
         hub.register_local(

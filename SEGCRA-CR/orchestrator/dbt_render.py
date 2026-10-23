@@ -55,9 +55,10 @@
   * 樣板不得直接輸出函式或物件(例如 `{{ ref }}` 少了括號):其字串表示含記憶體
     位址與內部名稱。
   * 展開器跟真正執行時分得出來的地方,樣板可以拿來把語句藏在只有真正執行時才會進的分支:
-    `invocation_id` 每次展開都不同(dbt 也是);`this` / `ref()` / `source()` 在 dbt 是 Relation
-    物件,這裡是字串子類別(`_Relation`),型別判斷的結果不一定一致,所以對它們做 `defined` /
-    `undefined` 以外的 `is` 判斷一律展開失敗(見 _guard_relation_tests)。
+    `invocation_id` 每份審查不同、同一份審查裡共用(dbt 是一次執行一個,見 _REVIEW_INVOCATION_ID);
+    `this` / `ref()` / `source()` 在 dbt 是 Relation 物件,這裡是字串子類別(`_Relation`),型別
+    判斷的結果與有哪些屬性都不一定一致,所以對它們做 `defined` / `undefined` 以外的 `is` 判斷、取
+    沒有照實模擬的屬性或索引,一律展開失敗(見 _guard_relation_tests、_guard_relation_access)。
   * 呼叫端傳入的變數每次取用都給複本,樣板無法改到呼叫端的資料;`target` 唯讀。
   * 錯誤訊息不含檔案路徑、不含控制字元(防日誌注入),長度有上限。
   * 資源上限:原始碼、macro 總量、輸出長度,以及 `*` / `+` / `**` 的結果大小。
@@ -100,6 +101,7 @@
   * 載入失敗的 macro 檔會被略過並記進 `macro_problems`,其餘檔案照常可用。
     用到被略過檔案裡的 macro 時,該 model 會因名稱未定義而展開失敗(fail closed)。
 """
+import contextvars
 import copy
 import difflib
 import pathlib
@@ -109,10 +111,11 @@ import types
 from dataclasses import dataclass, field
 
 import jinja2
-from jinja2 import StrictUndefined, Undefined, nodes
+from jinja2 import StrictUndefined, Undefined, nodes, pass_environment
 from jinja2.defaults import DEFAULT_NAMESPACE
 from jinja2.exceptions import UndefinedError
 from jinja2.ext import Extension
+from jinja2.filters import do_attr
 from jinja2.sandbox import SandboxedEnvironment
 
 from .isolation import run_isolated
@@ -326,6 +329,15 @@ class _DbtSandbox(SandboxedEnvironment):
 
     intercepted_binops = frozenset({"*", "+", "**"})
 
+    def getattr(self, obj, attribute):
+        _guard_relation_access(obj, attribute)
+        return super().getattr(obj, attribute)
+
+    def getitem(self, obj, argument):
+        # `this['x']`、`map(attribute='x')`、`sort(attribute='x')` 都走這裡
+        _guard_relation_access(obj, argument)
+        return super().getitem(obj, argument)
+
     def call_binop(self, context, operator, left, right):
         both_int = isinstance(left, int) and isinstance(right, int)
         if operator == "**":
@@ -534,6 +546,67 @@ def _invocation_id() -> str:
     """每次不同、格式跟 dbt 一樣(uuid4 的寫法)的 invocation_id。"""
     h = secrets.token_hex(16)
     return f"{h[:8]}-{h[8:12]}-4{h[13:16]}-{'89ab'[int(h[16], 16) % 4]}{h[17:20]}-{h[20:32]}"
+
+
+_INVOCATION_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+
+# 一份審查共用一個 invocation_id(dbt 也是一次執行一個):一般、增量兩次展開,以及受影響 model 的
+# 前後展開都用同一個值。每次展開都不同的話,語句裡有 invocation_id 時同一句兩次展開的原文不同,
+# 會被當成兩句(增量分支的命中合併看的是語句原文)。樣板一樣猜不到這個值。
+# ContextVar 在每條執行緒(以及每個 async task)各有自己的值,同時跑的審查不會共用。
+_REVIEW_INVOCATION_ID: contextvars.ContextVar = contextvars.ContextVar(
+    "segcra_review_invocation_id", default=None)
+
+
+def start_review_invocation() -> str:
+    """一份審查開始時呼叫一次:之後這份審查的展開(render_model_isolated)都用同一個 invocation_id。
+    沒有呼叫時(單獨展開一個 model),每次展開產生新的值。"""
+    value = _invocation_id()
+    _REVIEW_INVOCATION_ID.set(value)
+    return value
+
+
+def _checked_invocation_id(value) -> str:
+    """呼叫端給的 invocation_id 要是 uuid4 的格式(會原樣出現在展開結果裡);沒給時產生新的。"""
+    if value is None:
+        return _invocation_id()
+    if not isinstance(value, str) or not _INVOCATION_ID_RE.fullmatch(value):
+        raise DbtRenderError("invocation_id 的格式不對(要是 uuid4 的寫法)")
+    return value
+
+
+# 表名物件(this / ref() / source())只放行這幾個屬性:我們照實模擬了它們的值。dbt 的 Relation
+# 是另一種物件,其他屬性(字串的 startswith、mapping 的 keys…)有沒有、是什麼都跟我們不同,樣板
+# 可以拿「有沒有這個屬性」當條件把語句藏起來,所以取其他屬性或取索引一律展開失敗、交人工。
+_RELATION_ATTRS_ALLOWED = frozenset({"database", "schema", "identifier", "name", "table"})
+_RELATION_ACCESS_ERROR = ("樣板對表名物件(this / ref() / source())取了展開器沒有照實模擬的屬性或"
+                          "索引,展開結果可能與 dbt 不同")
+
+
+def _guard_relation_access(obj, name) -> None:
+    """取屬性(`this.x`、`attr`)與取索引(`this['x']`、`map(attribute='x')`)共用:放行的只有
+    _RELATION_ATTRS_ALLOWED 裡的名稱(取索引時 Jinja 會退回取同名屬性,結果相同)。"""
+    if isinstance(obj, (_Relation, _UnavailableRelation)) and not (
+            isinstance(name, str) and name in _RELATION_ATTRS_ALLOWED):
+        raise DbtRenderError(_RELATION_ACCESS_ERROR)
+
+
+def _string_filter(original):
+    """`string` 濾器:表名物件轉成一般字串,跟 dbt 一樣(Relation 經過 string 就是一般字串)。
+    Jinja 內建的寫法遇到字串子類別會原樣回傳,轉完仍是表名物件,字串方法就會被上面的規則擋下。
+    給不出值的 this 照樣失敗(它的 __str__ 會失敗)。"""
+    def string(value):
+        if isinstance(value, _Relation):
+            return str.__str__(value)
+        return original(value)
+    return string
+
+
+@pass_environment
+def _attr_filter(environment, obj, name):
+    """`attr` 濾器不經過 environment.getattr,屬性不存在時也不會檢查,所以另外擋。"""
+    _guard_relation_access(obj, name)
+    return do_attr(environment, obj, name)
 
 
 def _guard_relation_tests(env) -> None:
@@ -759,7 +832,8 @@ def build_env(code_root=None, variables: dict | None = None,
               database: str | None = None, schema: str = DEFAULT_SCHEMA,
               macro_dirs=DEFAULT_MACRO_DIRS, adapter: str = DEFAULT_ADAPTER,
               project: DbtProjectInfo | None = None, macro_files: dict | None = None,
-              model_name: str | None = None, incremental: bool = False):
+              model_name: str | None = None, incremental: bool = False,
+              invocation_id: str | None = None):
     """建好含 dbt 樁與 macro 的 Environment。code_root 與 macro_files 都沒給時不載入任何 macro。
 
     macro_files 專案的檔案 {相對專案根的路徑: 內容}(從 GitLab 取回、不在磁碟上的專案用)。
@@ -770,6 +844,7 @@ def build_env(code_root=None, variables: dict | None = None,
     project     專案層級資訊;給了才驗證 ref()/source() 的對象、套用 sources.yml
     incremental `is_incremental()` 的回傳值;True 時需要 model_name
     model_name  這次展開的 model 名稱({{ this }} 的表名;沒給時不提供 {{ this }})
+    invocation_id 這次展開的 invocation_id(uuid4 的寫法);沒給時產生新的
 
     回傳 (env, macro 名稱清單, 同名衝突清單)。
     """
@@ -789,6 +864,8 @@ def build_env(code_root=None, variables: dict | None = None,
         finalize=_finalize,
     )
     _guard_relation_tests(env)
+    env.filters["attr"] = _attr_filter
+    env.filters["string"] = _string_filter(env.filters["string"])
 
     # 是否用到 ref()/source() 記在這裡,render_model() 展開成功後讀出來決定
     # relation_notice 要不要帶上。掛在 env 上是既有作法(見 segcra_macro_phase),
@@ -817,9 +894,9 @@ def build_env(code_root=None, variables: dict | None = None,
         return incremental
 
     env.globals["is_incremental"] = is_incremental
-    # dbt 每次執行都會產生新的 invocation_id(uuid4)。這裡也每次不同:固定值的話,樣板可以拿
-    # `{% if invocation_id != '固定值' %}` 把語句藏在只有真正執行時才會進的分支。
-    env.globals["invocation_id"] = _invocation_id()
+    # dbt 每次執行都會產生新的 invocation_id(uuid4)。這裡也每份審查不同(見 _REVIEW_INVOCATION_ID):
+    # 固定值的話,樣板可以拿 `{% if invocation_id != '固定值' %}` 把語句藏在只有真正執行時才會進的分支。
+    env.globals["invocation_id"] = _checked_invocation_id(invocation_id)
     _check_ident("轉接器", adapter)
     # macro 在這之後才載入,dispatch 是呼叫時才查表,所以拿得到全部 macro
     env.globals["adapter"] = _Adapter(env.globals, adapter)
@@ -1089,7 +1166,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
                  schema: str = DEFAULT_SCHEMA, macro_dirs=DEFAULT_MACRO_DIRS,
                  adapter: str = DEFAULT_ADAPTER,
                  project: DbtProjectInfo | None = None,
-                 macro_files: dict | None = None, incremental: bool = False) -> RenderResult:
+                 macro_files: dict | None = None, incremental: bool = False,
+                 invocation_id: str | None = None) -> RenderResult:
     """在同一行程內展開一份 dbt model。**待審的 MR 內容請改用 render_model_isolated()。**
 
     model_path  model 檔路徑(相對 code_root 或絕對路徑皆可)
@@ -1107,6 +1185,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
                 與 code_root 只能擇一
     incremental 以 `is_incremental()` 為 True 展開(增量分支);`{{ this }}`(這個 model
                 自己的表名,檔名去掉副檔名)。預設 False,與 dbt compile 相同
+    invocation_id 這次展開的 invocation_id(uuid4 的寫法);沒給時產生新的
 
     任何失敗都收斂成 ok=False 而不丟例外。
     """
@@ -1125,7 +1204,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
             raise DbtRenderError(f"原始碼超過 {MAX_SOURCE_CHARS} 字元上限")
         env, macros, conflicts, problems = build_env(root, variables, database, schema,
                                                      macro_dirs, adapter, project, macro_files,
-                                                     model_path.stem, incremental)
+                                                     model_path.stem, incremental,
+                                                     invocation_id=invocation_id)
         # dbt 讀檔時會去掉頭尾空白再渲染(開頭空行不會出現在編譯結果裡)
         body = source.strip()
         tree = env.parse(body)
@@ -1201,6 +1281,10 @@ def render_model_isolated(model_path, *, timeout_s: float = DEFAULT_ISOLATED_TIM
 
     呼叫端程式的進入點需有 `if __name__ == "__main__":` 保護(multiprocessing spawn 的要求)。
     """
+    # 一份審查裡的展開共用一個 invocation_id(見 _REVIEW_INVOCATION_ID);呼叫端指定時照用
+    review_id = _REVIEW_INVOCATION_ID.get()
+    if review_id is not None:
+        kwargs.setdefault("invocation_id", review_id)
     result = run_isolated(render_model, (model_path,), kwargs, timeout_s=timeout_s,
                           max_memory_mb=max_memory_mb, on_failure=_render_failure)
     if not isinstance(result, RenderResult):

@@ -192,7 +192,7 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 | 指向錯誤的關聯 | `ref('t', version=2)` 在 dbt 是另一張表,我們忽略參數 | 拒絕展開(沒有 manifest 可解析版本) |
 | 偽造行號標記 | MR 放入仿冒標記,行號對應降級 | 標記使用每次隨機產生的權杖 |
 | 資訊洩漏 | 錯誤訊息帶出審查機完整路徑;`{{ ref }}` 輸出記憶體位址 | 錯誤訊息不含路徑、不含控制字元、有長度上限;不輸出函式物件;給不出值的 `this` 連 `repr`(`pprint`)都失敗 |
-| 樣板辨認自己在展開器裡,把語句藏起來 | `{% if invocation_id != '固定值' %}`、`{% if this is not string %}` 裡的 DELETE 審查時不出現、執行時照跑 | `invocation_id` 每次展開都不同(格式同 dbt 的 uuid4);`this` / `ref()` / `source()` 回傳表名物件(`_Relation`),對它們做 `defined` / `undefined` 以外的 `is` 判斷(含放在判斷的參數、清單、dict 裡)一律展開失敗、交人工——dbt 的 Relation 物件跟字串的型別判斷結果不同,逐個模擬模擬不完 |
+| 樣板辨認自己在展開器裡,把語句藏起來 | `{% if invocation_id != '固定值' %}`、`{% if this is not string %}`、`{% if this.keys is defined %}` 裡的 DELETE 審查時不出現、執行時照跑 | `invocation_id` 每份審查不同(格式同 dbt 的 uuid4);同一份審查裡的展開(預掃的一般與增量、受影響 model 的前後)共用一個值,跟 dbt 一次執行一個一樣,兩種模式的同一句才不會被算成兩句。`this` / `ref()` / `source()` 回傳表名物件(`_Relation`):對它們做 `defined` / `undefined` 以外的 `is` 判斷(含放在判斷的參數、清單、dict 裡),或取 `database`、`schema`、`identifier`、`name`、`table` 以外的屬性與索引(含 `attr`、`map(attribute=…)`),一律展開失敗、交人工——dbt 的 Relation 物件跟字串的型別判斷結果、有哪些屬性都不同,逐個模擬模擬不完。`string` 濾器把表名物件轉成一般字串,跟 dbt 一樣 |
 | 樣板改到呼叫端資料 | `{% do var('x').append(...) %}` 改到呼叫端的 list | 變數每次取用都給複本;`target` 唯讀 |
 | ReDoS | 內部正規表達式是平方時間,40 萬字元約 40 分鐘 | 改為線性時間掃描 |
 | 資源耗盡 | `((9**256)**256)**256`、超大字串、無窮迴圈 | 原始碼 / macro / 輸出 / 整數運算上限;子行程隔離 |
