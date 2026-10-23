@@ -2027,10 +2027,10 @@ MUTANTS.update({
  # 內文就是它 —— 一樣會貼回 MR 留言、寫進 review_output/。要防的是「帶出原文」,
  # 跟那段原文像不像密碼無關,所以只留位置(用樣式遮只遮得到樣式認得的寫法)。
  "解析失敗:錯誤訊息照用 sqlglot 的原文": ("../toolbox/sqltools.py",
-     "        statements, parse_error = [], parse_error_text(e)",
-     '        statements, parse_error = [], f"parse failed: {e}"'),
+     "            return [], parse_error_text(e)",
+     '            return [], f"parse failed: {e}"'),
  "解析失敗:連 sqlglot 的描述一起帶出來": ("../toolbox/sqltools.py",
-     '            spots.append(f"第 {d[\'line\']} 行第 {d.get(\'col\', \'?\')} 欄")',
+     '            spots.append(f"第 {d[\'line\'] + line_offset} 行第 {d.get(\'col\', \'?\')} 欄")',
      '            spots.append(f"第 {d[\'line\']} 行 {d.get(\'description\', \'\')}")'),
  "解析失敗:其他例外照用訊息(不只留類型)": ("../toolbox/sqltools.py",
      '    where = "、".join(dict.fromkeys(spots))[:120] if spots else type(e).__name__',
@@ -3637,6 +3637,35 @@ MUTANTS.update({
  "設定表:掃描範圍少一個目錄": (E,
      'SCAN_DIRS = ("orchestrator", "toolbox", "scripts", "eval")',
      'SCAN_DIRS = ("orchestrator", "toolbox", "eval")'),
+})
+
+
+# ---- 一句解析失敗不可以吃掉整個檔案的命中(#90 第 1 點)
+TOOLS = "../toolbox/sqltools.py"
+MUTANTS.update({
+ "逐句:整份一次解析(一句壞掉就全部不檢查)": (TOOLS,
+     "    chunks = _statement_chunks(sql)" + NL
+     + "    if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析",
+     "    chunks = []" + NL
+     + "    if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析"),
+ "逐句:一句壞掉就放棄其餘的句子": (TOOLS,
+     "        except Exception as e:           # noqa: BLE001" + NL
+     + "            errors.append(parse_error_text(e, line_offset))",
+     "        except Exception as e:           # noqa: BLE001" + NL
+     + "            return statements, parse_error_text(e, line_offset)"),
+ "逐句:用字串 split 切句(字串與註解裡的分號會切錯)": (TOOLS,
+     "    cuts = [t.end + 1 for t in tokens if t.token_type == TokenType.SEMICOLON]",
+     '    cuts = [i + 1 for i, ch in enumerate(sql) if ch == ";"]'),
+ "逐句:行號不加上這一句的起始行": (TOOLS,
+     "            errors.append(parse_error_text(e, line_offset))",
+     "            errors.append(parse_error_text(e))"),
+ "逐句:解析失敗的句子不記成解析錯誤": (TOOLS,
+     "    if not errors:" + NL + "        return statements, None",
+     "    return statements, None" + NL + "    if not errors:" + NL
+     + "        return statements, None"),
+ "逐句:錯誤訊息不設則數上限": (TOOLS,
+     "    shown = list(dict.fromkeys(errors))[:_MAX_PARSE_ERRORS]",
+     "    shown = list(dict.fromkeys(errors))"),
 })
 
 
