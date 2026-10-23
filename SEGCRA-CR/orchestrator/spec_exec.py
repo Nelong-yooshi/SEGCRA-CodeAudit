@@ -32,6 +32,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
+from toolbox.gitlab import unavailable_reason as gitlab_unavailable_reason
 from .agent import extract_json, output_truncated, run_agent
 from .config import Config, PKG_ROOT
 
@@ -60,10 +61,42 @@ def _real_mode() -> bool:
     return bool(gitlab.REAL_MODE)
 
 
-async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None, str | None]:
-    """回傳 (rule_code, spec_text)。mock 模式讀本地 specs/;real 模式**只**用
-    gitlab get_file 抓 repo 內 specs/<code>.md(讀正在審的那一版)。
-    都找不到 → (code|None, None)。
+# 「拿不到規格」的代碼 → 給人看的說法。訊息只說**哪一種設定**出了問題,不帶原始
+# 錯誤、主機位址或內部類別名稱:它會貼回 MR(#89 第 3 點的對照表之後會併進來)。
+_SPEC_UNAVAILABLE = {
+    "no_read_token": "規格檔取不回來:未設定唯讀的 GITLAB_READ_TOKEN。",
+    "no_review_ref": "規格檔取不回來:這次審查沒有釘住 commit。",
+    "too_large": "規格檔取不回來:超過單檔大小上限。",
+    "fetch_failed": "規格檔取不回來:向 GitLab 取檔失敗。",
+}
+
+
+class SpecLookup(tuple):
+    """`find_spec` 的結果:`(code, text)` 再加一個 `unavailable` 代碼。
+
+    **為什麼不是三欄位的型別**:`code, text = await find_spec(...)` 這個解法在 25 處
+    被用著(含 dbt 反查與大量測試)。改成三欄位會同時動到兩邊在途的改動,衝突成本
+    遠大於這件事本身。所以保持二元組、把第三態掛成屬性;等呼叫端都改用屬性之後,
+    再收斂成一般的具名元組。
+
+    `unavailable` 是 None 代表正常(找到規格,或**確定它不存在**);非 None 時是固定
+    的代碼(`no_read_token` / `no_review_ref` / `too_large` / `fetch_failed`),代表這次
+    **拿不到**——環境的問題,不是 MR 的問題。兩者混在一起的話,報告會叫開發者去補
+    一份其實已經存在的規格,維運也看不出是 token 設錯了(#90 第 2 點)。
+
+    代碼只放固定的英文短字串:它會被轉成給人看的訊息、貼回 MR,不可以帶原始錯誤。
+    """
+
+    def __new__(cls, code, text, unavailable=None):
+        obj = super().__new__(cls, (code, text))
+        obj.unavailable = unavailable
+        return obj
+
+
+async def find_spec(hub, mr: dict, *, by_path: bool = False) -> SpecLookup:
+    """回傳 SpecLookup(rule_code, spec_text, unavailable)。mock 模式讀本地 specs/;
+    real 模式**只**用 gitlab get_file 抓 repo 內 specs/<code>.md(讀正在審的那一版)。
+    都找不到 → (code|None, None);**拿不到**(環境問題)另外記在 `unavailable`。
 
     R 編號的比對邏輯不變(即使多個編號都對到既有規格,一律取第一個找到的)。
     by_path 為 True **且完全沒有** R 編號時,才改依 model 檔名對應規格:
@@ -82,6 +115,7 @@ async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None
             local = SPECS_DIR / f"{code}.md"
             if local.exists():
                 return code, local.read_text(encoding="utf-8")
+    unavailable = None          # 第一個遇到的「拿不到」,照實帶出去
     if hub is not None:
         for code in codes:
             try:
@@ -95,14 +129,18 @@ async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None
                 txt = await hub.call("gitlab__get_file",
                                      {"path": f"specs/{code}.md"}, truncate=False)
             except Exception:
+                # 取檔本身失敗(連線、HTTP 錯誤)。**不要當成沒有規格**:那會叫
+                # 開發者去補一份可能已經存在的規格。原始錯誤不帶出去。
+                unavailable = unavailable or "fetch_failed"
                 continue
             if txt and txt.lstrip().startswith("#"):
-                return code, txt
+                return SpecLookup(code, txt)
+            unavailable = unavailable or gitlab_unavailable_reason(txt)
     if by_path and not codes:
         found = await _find_spec_by_path(hub, mr)
         if found is not None:
-            return found
-    return (codes[0] if codes else None), None
+            return SpecLookup(found[0], found[1])
+    return SpecLookup(codes[0] if codes else None, None, unavailable)
 
 
 async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
@@ -1848,10 +1886,26 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
     for f in mr.get("files", []):
         sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or sql
 
+    unavailable = None
     if spec_text is None:
         # getattr:呼叫端可能傳測試用的替身 cfg(沒有 dbt 欄位),視為未開啟
-        spec_code, spec_text = await find_spec(
+        lookup = await find_spec(
             hub, mr, by_path=(getattr(cfg, "dbt", None) or {}).get("enabled") is True)
+        spec_code, spec_text = lookup
+        unavailable = getattr(lookup, "unavailable", None)
+
+    if not spec_text and unavailable:
+        # **拿不到 ≠ 沒有**:環境出了問題,卻叫開發者去補一份其實可能已經存在的規格,
+        # 而維運也看不出是 token 設錯了——每張 MR 都只說「沒有規格」(#90 第 2 點)。
+        return {"passed": False, "spec_code": spec_code, "conditions": [],
+                "coverage_gaps": [], "case_results": [], "dropped_cases": [],
+                "spec_unavailable": unavailable,
+                "findings": [_finding(path, "major", "執行驗證沒有完成:取不到規格",
+                                      f"{_SPEC_UNAVAILABLE[unavailable]}"
+                                      "這是驗證環境的問題,不是這個 MR 的問題:"
+                                      "不需要補規格。處理之後重新觸發審查;"
+                                      "在那之前本 MR 不得自動放行。",
+                                      "通知維運確認上述設定後重新觸發審查。")]}
 
     if not spec_text:
         detail = (f"MR 涉及規則 {spec_code},但找不到對應的規格檔 specs/{spec_code}.md。"

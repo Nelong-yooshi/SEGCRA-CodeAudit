@@ -3640,5 +3640,31 @@ MUTANTS.update({
 })
 
 
+# ---- 取不到規格 ≠ 沒有規格(#90 第 2 點)。混在一起的話,報告會叫開發者去補一份
+# 其實已經存在的規格,而維運看不出是 token 設錯了。
+G = "../toolbox/gitlab.py"
+MUTANTS.update({
+ "規格:取檔失敗當成沒有規格": (S,
+     '                unavailable = unavailable or "fetch_failed"',
+     "                pass"),
+ "規格:get_file 的訊息不分類(一律當成拿得到)": (S,
+     "            unavailable = unavailable or gitlab_unavailable_reason(txt)",
+     "            pass"),
+ "規格:拿不到時照樣叫人補規格": (S,
+     "    if not spec_text and unavailable:",
+     "    if False:"),
+ "規格:檔案不存在也算拿不到": (G,
+     '    if text.startswith("(") and _TOO_LARGE_MARK in text:' + NL
+     + '        return "too_large"' + NL
+     + "    return None",
+     '    if text.startswith("(") and _TOO_LARGE_MARK in text:' + NL
+     + '        return "too_large"' + NL
+     + '    return "fetch_failed" if text.startswith("(") else None'),
+ "規格:沒 token 與沒釘 commit 分不出來": (G,
+     '    if text == _NO_REVIEW_REF:' + NL + '        return "no_review_ref"',
+     '    if text == _NO_REVIEW_REF:' + NL + '        return "no_read_token"'),
+})
+
+
 if __name__ == "__main__":
     sys.exit(main())

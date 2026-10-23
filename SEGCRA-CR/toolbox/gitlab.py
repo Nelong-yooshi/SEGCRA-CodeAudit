@@ -412,6 +412,44 @@ def get_mr_diff(mr_id: str) -> str:
 #
 # 拿不到釘住的版本時**不退回目標分支**,而是明講取不到——退回去就是 #22 原本的
 # bug,而且沒有任何徵兆。
+# get_file 取不到檔案時回的訊息。**分類的知識放在產生訊息的地方**:呼叫端要分得出
+# 「檔案確實不存在」與「這次拿不到」(環境問題),而用字串比對訊息內容很脆弱——
+# 訊息改一個字,呼叫端就會安靜地把環境問題當成檔案不存在(#90 第 2 點)。
+#
+# 代碼是固定的英文短字串:它會進報告、貼回 MR,不可以帶原始錯誤或主機位址。
+_NO_REVIEW_REF = ("(無法取得審查中的版本:這次審查沒有釘住 commit。"
+                  "請依 diff 判斷,或交人工確認。)")
+_NO_READ_TOKEN = ("(無法讀取檔案:未設定唯讀的 GITLAB_READ_TOKEN。"
+                  "請依 diff 判斷,或交人工確認。)")
+_ABSENT_PREFIX = "(repo 內無 "
+_MOCK_ABSENT_PREFIX = "(mock 模式無 "
+_TOO_LARGE_MARK = "超過單檔上限"
+
+
+def unavailable_reason(text) -> str | None:
+    """`get_file` 的回傳值 → 「拿不到」的固定代碼;拿到內容、或檔案確實不存在回 None。
+
+    **檔案不存在不算拿不到**:那是 repo 的事實,呼叫端該照實說「沒有這個檔」;
+    拿不到則是環境問題(token 沒設、沒釘住 commit、檔案太大、取檔失敗),不該叫
+    開發者去補一個其實存在的檔案。
+    """
+    if not isinstance(text, str):
+        return None
+    if text == _NO_REVIEW_REF:
+        return "no_review_ref"
+    if text == _NO_READ_TOKEN:
+        return "no_read_token"
+    if text.startswith("(") and _TOO_LARGE_MARK in text:
+        return "too_large"
+    return None
+
+
+def is_absent(text) -> bool:
+    """`get_file` 說這個檔案不存在(repo 裡沒有,或 mock 模式沒收這個檔)。"""
+    return isinstance(text, str) and (text.startswith(_ABSENT_PREFIX)
+                                      or text.startswith(_MOCK_ABSENT_PREFIX))
+
+
 def get_file(path: str, ref: str = "", mr_id: str = "") -> str:
     """取得 repo 內檔案的完整內容(看 diff 不夠時用)。"""
     if REAL_MODE:
@@ -419,21 +457,19 @@ def get_file(path: str, ref: str = "", mr_id: str = "") -> str:
         import httpx
         ref = ref or review_ref() or ""
         if not ref:
-            return ("(無法取得審查中的版本:這次審查沒有釘住 commit。"
-                    "請依 diff 判斷,或交人工確認。)")
+            return _NO_REVIEW_REF
         token = _read_token()
         if not token:
-            return ("(無法讀取檔案:未設定唯讀的 GITLAB_READ_TOKEN。"
-                    "請依 diff 判斷,或交人工確認。)")
+            return _NO_READ_TOKEN
         r = httpx.get(
             f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}/repository/files/"
             f"{urllib.parse.quote(path, safe='')}/raw",
             headers={"PRIVATE-TOKEN": token}, params={"ref": ref}, timeout=30)
         if r.status_code == 404:
-            return f"(repo 內無 {path})"
+            return f"{_ABSENT_PREFIX}{path})"
         r.raise_for_status()
         if len(r.content) > MAX_FILE_BYTES:
-            return (f"({path} 超過單檔上限 {MAX_FILE_BYTES} bytes,未取回完整內容。"
+            return (f"({path} {_TOO_LARGE_MARK} {MAX_FILE_BYTES} bytes,未取回完整內容。"
                     f"請依 diff 判斷,或交人工確認。)")
         return r.text
     mr = _mock_mr(mr_id) if mr_id else None
@@ -441,7 +477,7 @@ def get_file(path: str, ref: str = "", mr_id: str = "") -> str:
         for f in mr["files"]:
             if f["path"] == path and "full_content" in f:
                 return f["full_content"]
-    return f"(mock 模式無 {path} 的完整內容,請依 diff 判斷)"
+    return f"{_MOCK_ABSENT_PREFIX}{path} 的完整內容,請依 diff 判斷)"
 
 
 def post_inline_comment(mr_id: str, file: str, line: int, body: str,
