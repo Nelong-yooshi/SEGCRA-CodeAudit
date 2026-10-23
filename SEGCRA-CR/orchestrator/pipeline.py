@@ -1473,12 +1473,19 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
 
         trace = [] if capture is not None else None
         output_meta: dict = {}
-        # 冷讀跟主審查平行跑;主審查丟例外時一起取消,不留下沒人等的工作
+        # 冷讀跟主審查平行跑;主審查被取消時一起取消,不留下沒人等的工作
         cold_task = asyncio.create_task(_cold_read_stage(cfg, mr, dbt_ctx))
         try:
             raw = await run_agent(cfg, profile, system, user, hub, trace=trace,
                                   meta=output_meta)
+        except Exception as e:
+            # 模型呼叫失敗(連不上、逾時、端點錯誤…):確定性的結果不跟著消失。用空報告走完後處理,
+            # 由 enforce_truncation 補 major;冷讀照常等。只記問題類型,不記例外訊息(含主機位址等)
+            raw = None
+            output_meta["failed"] = _model_failure_kind(e)
+            print(f"[pipeline] MR !{mr_id} 主審查模型呼叫失敗({output_meta['failed']})", flush=True)
         except BaseException:
+            # 取消(webhook 的總時間上限、新 commit 取消舊審查)照樣往外傳
             cold_task.cancel()
             raise
         cold, cold_incomplete = await _await_cold_read(cold_task)
@@ -1493,8 +1500,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         import os as _os
         _raw_dir = Path(_os.environ.get("REVIEW_OUTPUT", PKG_ROOT / "review_output"))
         try:
-            _raw_dir.mkdir(parents=True, exist_ok=True)
-            (_raw_dir / f"mr_{mr_id}_raw.txt").write_text(raw, encoding="utf-8")
+            if raw is not None:             # 模型呼叫失敗時沒有輸出,不寫
+                _raw_dir.mkdir(parents=True, exist_ok=True)
+                (_raw_dir / f"mr_{mr_id}_raw.txt").write_text(raw, encoding="utf-8")
         except Exception:
             pass
         report = _parse_model_output(raw, output_meta, profile.max_output_tokens)
@@ -2485,6 +2493,35 @@ _TRUNCATED_TITLE = "審查模型的輸出被截斷,審查結果可能不完整"
 _TRUNCATED_SUMMARY = "審查模型的輸出被截斷、無法解析;以下只有程式確定性檢查的結果。"
 _EXHAUSTED_TITLE = "審查模型用完工具呼叫回合,沒有產出審查結果"
 _EXHAUSTED_SUMMARY = "審查模型用完工具呼叫回合、沒有產出審查結果;以下只有程式確定性檢查的結果。"
+_FAILED_TITLE = "審查模型沒有完成,這次只有程式確定性檢查的結果"
+_FAILED_SUMMARY = "呼叫審查模型失敗、沒有產出審查結果;以下只有程式確定性檢查的結果。"
+# 模型呼叫失敗的問題類型 → 給人看的說明。只有這幾種固定文字,不放例外訊息(含主機位址、端點回應)
+_MODEL_FAILURE_TEXT = {
+    "timeout": "等待審查模型的回應逾時",
+    "connection": "連不上審查模型的端點",
+    "rate_limited": "審查模型的端點忙碌中(請求過多)",
+    "rejected": "審查模型的端點拒絕了這次請求(例如輸入超過模型的上限,或權限、設定不符)",
+    "server_error": "審查模型的端點發生錯誤",
+    "other": "呼叫審查模型時發生非預期的錯誤",
+}
+
+
+def _model_failure_kind(error: BaseException) -> str:
+    """模型呼叫失敗的問題類型(_MODEL_FAILURE_TEXT 的鍵)。由細到粗判斷:逾時是連線錯誤的子類別,
+    請求過多是狀態錯誤的子類別。"""
+    import openai
+    if isinstance(error, (openai.APITimeoutError, asyncio.TimeoutError, TimeoutError)):
+        return "timeout"
+    if isinstance(error, openai.APIConnectionError):
+        return "connection"
+    if isinstance(error, openai.RateLimitError):
+        return "rate_limited"
+    if isinstance(error, openai.APIStatusError):
+        status = getattr(error, "status_code", None)
+        if isinstance(status, int) and status >= 500:
+            return "server_error"
+        return "rejected"
+    return "other"
 
 
 # 稽核紀錄裡結束原因的長度上限(端點回的字串原樣記,只截長度)
@@ -2523,14 +2560,25 @@ def _output_meta_record(meta: dict, max_output_tokens: int) -> dict:
         "prompt_tokens_total": meta.get("prompt_tokens_total"),
         "completion_tokens_total": meta.get("completion_tokens_total"),
         "max_output_tokens": max_output_tokens,
-        "truncated": output_truncated(meta, max_output_tokens),
+        # 模型呼叫失敗時沒有最終輸出:meta 裡的用量是前幾輪的,不算截斷
+        "truncated": _failure_kind(meta) is None and output_truncated(meta, max_output_tokens),
         "exhausted": bool(meta.get("exhausted")),
+        # 模型呼叫失敗時的問題類型(見 _MODEL_FAILURE_TEXT);沒有失敗是 None
+        "failed": _failure_kind(meta),
     }
 
 
-def _parse_model_output(raw: str, meta: dict, max_output_tokens: int) -> dict | None:
+def _failure_kind(meta: dict) -> str | None:
+    failed = meta.get("failed")
+    if failed is None:
+        return None
+    return failed if failed in _MODEL_FAILURE_TEXT else "other"
+
+
+def _parse_model_output(raw: str | None, meta: dict, max_output_tokens: int) -> dict | None:
     """解析主審查模型的輸出。沒有產出完整的結果時回一份空報告,讓審查繼續走完。
 
+    - 模型呼叫失敗(`meta["failed"]`):沒有輸出可以解析。
     - 用完工具呼叫回合(`meta["exhausted"]`):raw 不是模型的報告,一律不解析。最後拿到的是工具
       的回傳(例如 MR 裡的檔案原文,內容由 MR 決定),裡面的 JSON 不能當成審查結果。
     - 被截斷又解析不出來:截斷的位置在第一個 `}` 之前時,extract_json 沒有東西可以修補。
@@ -2540,6 +2588,8 @@ def _parse_model_output(raw: str, meta: dict, max_output_tokens: int) -> dict | 
 
     沒有截斷卻解析不出來時回 None,由呼叫端丟例外。
     """
+    if _failure_kind(meta) is not None:
+        return {"summary": _FAILED_SUMMARY, "findings": []}
     if meta.get("exhausted"):
         return {"summary": _EXHAUSTED_SUMMARY, "findings": []}
     report = extract_json(raw)
@@ -2550,8 +2600,8 @@ def _parse_model_output(raw: str, meta: dict, max_output_tokens: int) -> dict | 
 
 @_isolated_stage("截斷揭露")
 def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict:
-    """主審查沒有產出完整的結果 → 補 major(確定性,不得自動放行):輸出被截斷、或用完工具呼叫
-    回合(後者的輸出已由 _parse_model_output 換成空報告)。
+    """主審查沒有產出完整的結果 → 補 major(確定性,不得自動放行):輸出被截斷、用完工具呼叫
+    回合,或模型呼叫失敗(後兩者的輸出已由 _parse_model_output 換成空報告)。
 
     extract_json 的修補退路會把被切斷的 JSON 補成合法物件:後半的 finding 不見了,報告
     看起來卻一切正常,只是比較短;不見的可能正是該擋下 MR 的那一條。已解析出來的 finding
@@ -2565,6 +2615,17 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
     同名欄位會被蓋掉)。
     """
     report["_output_meta"] = _output_meta_record(meta, max_output_tokens)
+    failed = _failure_kind(meta)
+    if failed is not None:
+        model_failed = {
+            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _FAILED_TITLE,
+            "detail": f"{_MODEL_FAILURE_TEXT[failed]},審查模型沒有產出結果。程式的確定性檢查照常報出;"
+                      "審查模型負責的部分沒有結果,需人工確認。這是審查環境的問題,不是這個 MR 的問題。",
+            "suggestion": "請通知維運確認審查模型的端點狀態,恢復後重新觸發審查。",
+            "citations": []}
+        _put_program_finding(report, model_failed)
+        # 沒有最終輸出:meta 裡的結束原因與用量是前幾輪的,不能拿來判斷截斷或用完回合
+        return report
     if meta.get("exhausted"):
         exhausted = {
             "file": "(MR 內容)", "line": 0, "severity": "major", "title": _EXHAUSTED_TITLE,

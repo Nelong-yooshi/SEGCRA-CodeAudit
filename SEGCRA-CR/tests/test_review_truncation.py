@@ -127,6 +127,8 @@ STOP = {"finish_reason": "stop", "completion_tokens": 500}
 LENGTH = {"finish_reason": "length", "completion_tokens": LIMIT}
 # run_agent 沒有回填讀入量與總量時,這三個欄位是 None
 NO_USAGE = {"prompt_tokens": None, "prompt_tokens_total": None, "completion_tokens_total": None}
+# 模型呼叫沒有失敗時,failed 是 None
+NOT_FAILED = {"failed": None}
 
 
 # ─────────────────── 對照組:沒有截斷時行為不變 ───────────────────
@@ -138,7 +140,7 @@ def test_沒有截斷時不補任何東西而且照常自動放行(review):
     assert report["_output_meta"] == {"finish_reason": "stop", "completion_tokens": 500,
                                       "max_output_tokens": LIMIT, "truncated": False,
                                       "exhausted": False,
-                                      **NO_USAGE}
+                                      **NO_USAGE, **NOT_FAILED}
 
 
 def test_端點什麼都沒回報時當成沒有截斷(review):
@@ -148,7 +150,7 @@ def test_端點什麼都沒回報時當成沒有截斷(review):
     assert report["_output_meta"] == {"finish_reason": None, "completion_tokens": None,
                                       "max_output_tokens": LIMIT, "truncated": False,
                                       "exhausted": False,
-                                      **NO_USAGE}
+                                      **NO_USAGE, **NOT_FAILED}
 
 
 @pytest.mark.parametrize("meta", [
@@ -183,7 +185,7 @@ def test_截斷時補一條_major_並擋下自動放行(review):
     assert report["_output_meta"] == {"finish_reason": "length", "completion_tokens": LIMIT,
                                       "max_output_tokens": LIMIT, "truncated": True,
                                       "exhausted": False,
-                                      **NO_USAGE}
+                                      **NO_USAGE, **NOT_FAILED}
 
 
 def test_加這一步不會改到其他_finding(review):
@@ -379,7 +381,7 @@ def test_稽核紀錄照端點回報的記_結束原因截到固定長度():
     record = pipeline._output_meta_record({"finish_reason": "eos", "completion_tokens": 500}, LIMIT)
     assert record == {"finish_reason": "eos", "completion_tokens": 500,
                       "max_output_tokens": LIMIT, "truncated": False, "exhausted": False,
-                      **NO_USAGE}
+                      **NO_USAGE, **NOT_FAILED}
     long = pipeline._output_meta_record({"finish_reason": "x" * 1000}, LIMIT)["finish_reason"]
     assert long == "x" * pipeline._FINISH_REASON_MAX
     json.dumps(record)      # 一定能序列化(評測會把整份報告寫成檔)

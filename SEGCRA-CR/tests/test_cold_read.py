@@ -382,7 +382,8 @@ def test_review_mr_冷讀輸出壞掉_記成未完整並交人工(monkeypatch, t
     assert report["decision"] != "auto_approved"
 
 
-def test_review_mr_主審查丟例外時_冷讀一起取消(monkeypatch, tmp_path, real_cold_read):
+def test_review_mr_主審查被取消時_冷讀一起取消(monkeypatch, tmp_path, real_cold_read):
+    """webhook 的總時間上限、新 commit 取消舊審查都靠取消往外傳;冷讀不能留下來佔著端點。"""
     cancelled = []
 
     async def slow_cold(cfg, mr, head_texts=None):
@@ -392,20 +393,35 @@ def test_review_mr_主審查丟例外時_冷讀一起取消(monkeypatch, tmp_pat
             cancelled.append(True)
             raise
 
-    async def main_fails():
+    async def main_cancelled():
         await asyncio.sleep(0)
-        raise RuntimeError("主審查失敗")
+        raise asyncio.CancelledError()
 
     async def runner(review):
-        with pytest.raises(RuntimeError, match="主審查失敗"):
+        with pytest.raises(asyncio.CancelledError):
             await review
         await asyncio.sleep(0)                  # 讓取消送進去
         # 在 asyncio.run 收尾之前看:收尾時它會自己取消還沒完成的工作,在那之後看分不出來
         return list(cancelled)
 
     monkeypatch.setattr(pipeline, "_cold_read", slow_cold)
-    seen, _, _ = _review(monkeypatch, tmp_path, {}, mr_id="956", main=main_fails, runner=runner)
-    assert seen == [True], "主審查失敗時沒有取消冷讀:那個請求會一直佔著端點"
+    seen, _, _ = _review(monkeypatch, tmp_path, {}, mr_id="956", main=main_cancelled,
+                         runner=runner)
+    assert seen == [True], "主審查被取消時沒有取消冷讀:那個請求會一直佔著端點"
+
+
+def test_review_mr_主審查的模型呼叫失敗時_冷讀照常等_結果照常算進來(monkeypatch, tmp_path,
+                                                         real_cold_read):
+    """模型呼叫失敗不再讓整份審查消失(確定性結果照常報出),冷讀也是確定性之外的一道防線,照常採用。"""
+    async def main_fails():
+        await asyncio.sleep(0)
+        raise RuntimeError("端點壞了")
+
+    report, order, _ = _review(monkeypatch, tmp_path, {"flagged": True, "quotes": [INSTRUCTION]},
+                               mr_id="957", main=main_fails)
+    titles = [f["title"] for f in report["findings"]]
+    assert _COLD_READ_TITLE in titles and pipeline._FAILED_TITLE in titles
+    assert report["decision"] != "auto_approved"
 
 
 def test_單獨入口(monkeypatch, tmp_path, capsys, real_cold_read):

@@ -103,6 +103,10 @@ curl -s -X POST http://127.0.0.1:8000/gitlab-webhook \
 status(專案設定「Pipelines must succeed」);只留言不設狀態,等於審查沒跑完卻沒有
 東西擋著合併。
 
+審查模型的端點連不上、逾時或回錯誤時,管線**不會**丟例外到這裡:它照常產出報告(程式確定性檢查的
+結果加上一條「審查模型沒有完成」的 major),照常回寫,決策是交人工,commit status 一樣是失敗
+(見 04 篇 enforce_truncation)。走到這裡的「審查沒跑完」是總時間上限、或管線本身的錯誤。
+
 ## 擴充與注意
 
 - **加/減觸發動作**:改 `TRIGGER_ACTIONS`(`scripts/webhook_server.py` 模組層)。
