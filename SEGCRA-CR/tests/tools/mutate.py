@@ -3585,9 +3585,13 @@ MUTANTS.update({
      + "        except RuntimeError:                  # 迴圈已經關了" + NL
      + "            pass",
      "        loop.call_soon_threadsafe(apply)"),
- "收尾:連正常的結果也安靜丟掉": (S,
+ # 原本這條是「連正常的結果也安靜丟掉」(把 settle 換成 pass)。那個改法會讓**每一個**
+ # 碰到沙盒的測試都掛住(20 個檔、900 多條),整個套件撐到工具的逾時 —— 偵測得到,
+ # 但不是乾淨的失敗,而逐條加上限不可行。換成同樣有意義、但會立刻失敗的形狀:
+ # 結果交回去了,內容卻是空的。
+ "收尾:正常的結果換成 None(呼叫端拿到空的)": (S,
      "        settle(lambda: fut.cancelled() or fut.set_result(out))",
-     "        pass"),
+     "        settle(lambda: fut.cancelled() or fut.set_result(None))"),
 })
 
 

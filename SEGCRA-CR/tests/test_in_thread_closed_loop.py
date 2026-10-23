@@ -65,8 +65,15 @@ def test_函式自己丟例外時也一樣():
 
 
 def test_沒逾時的時候結果照常回來():
-    """收尾改安靜之後,正常那條路不能跟著被吃掉。"""
-    assert asyncio.run(_in_thread(lambda: "ok")) == "ok"
+    """收尾改安靜之後,正常那條路不能跟著被吃掉。
+
+    上限不能省:收尾真的把結果丟掉時,沒有上限就是整個測試套件掛到工具的逾時,
+    而逾時不算乾淨的失敗(#87 review)。
+    """
+    async def main():
+        return await asyncio.wait_for(_in_thread(lambda: "ok"), timeout=3)
+
+    assert asyncio.run(main()) == "ok"
 
 
 def test_沙盒丟例外時不得卡住():
@@ -77,22 +84,30 @@ def test_沙盒丟例外時不得卡住():
     而那是二十分鐘。現有的測試抓不到:它們用的替身都是「回傳錯誤值」,不是真的丟。
     """
     def boom():
+        time.sleep(0.05)
         raise ValueError("沙盒掛了")
 
     async def main():
-        # 真的卡住的話這一行會等到逾時;上限給得很短,卡住就是紅的
+        # **要讓迴圈在執行緒丟例外的那段時間保持忙碌**:這個 bug 是競態,迴圈偶爾會在
+        # e 被刪掉之前就先把 lambda 跑掉,那時例外照樣傳得回來。把 bug 放回去直接連跑,
+        # 大約三次才紅一次 —— 靠運氣的測試等於沒釘住(#87 review)。
+        task = asyncio.ensure_future(asyncio.wait_for(_in_thread(boom), timeout=3))
+        await asyncio.sleep(0)          # 讓 _in_thread 先把背景執行緒開起來
+        time.sleep(0.3)                 # 迴圈忙著:執行緒離開 except 之後迴圈才回得來
         with pytest.raises(ValueError, match="沙盒掛了"):
-            await asyncio.wait_for(_in_thread(boom), timeout=5)
+            await task
 
     asyncio.run(main())
 
 
 def test_沒逾時的時候例外照常往外丟():
-    async def main():
-        with pytest.raises(ValueError, match="沙盒掛了"):
-            await _in_thread(_raise)
-
+    """這條也要有上限:沒有的話,收尾壞掉時它會先卡住,後面那些有上限的測試根本跑不到,
+    整個套件掛到工具的逾時 —— 而逾時不算乾淨的失敗(#87 review)。"""
     def _raise():
         raise ValueError("沙盒掛了")
+
+    async def main():
+        with pytest.raises(ValueError, match="沙盒掛了"):
+            await asyncio.wait_for(_in_thread(_raise), timeout=3)
 
     asyncio.run(main())
