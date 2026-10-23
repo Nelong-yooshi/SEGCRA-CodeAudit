@@ -238,9 +238,87 @@ MUTANTS = {
         "    env.segcra_macro_phase = False" + NL + "    return env, sorted(macros), conflicts, problems",
         "    return env, sorted(macros), conflicts, problems"),
     "壞掉的 macro 檔略過但不記錄": (
-        '            problems.append(f"{rel}:{_safe_error(e)}")' + NL + "            continue" + NL
+        '            problems.append(f"{rel}:{_safe_error(e)}")' + NL
+        + "            env.segcra_macro_issues.append(macro_issue(rel, e))" + NL + "            continue" + NL
+        + "        for name in dir(module):",
+        "            env.segcra_macro_issues.append(macro_issue(rel, e))" + NL + "            continue" + NL
+        + "        for name in dir(module):"),
+    # ── MR 改到的 macro 檔:Jinja 語法錯誤補 blocker、其他載入失敗補 major ──
+    "macro 檢查:載入失敗不分類記下": (
+        "            env.segcra_macro_issues.append(macro_issue(rel, e))" + NL + "            continue" + NL
         + "        for name in dir(module):",
         "            continue" + NL + "        for name in dir(module):"),
+    "macro 檢查:讀檔失敗不分類記下": (
+        "            env.segcra_macro_issues.append(macro_issue(rel, e))" + NL + "            continue" + NL
+        + "        total += len(text)",
+        "            continue" + NL + "        total += len(text)"),
+    "macro 檢查:不認得的濾器當成語法錯誤": (
+        "        if isinstance(error, jinja2.TemplateAssertionError):" + NL
+        + "            kind = MACRO_UNSUPPORTED",
+        "        if False:" + NL + "            kind = MACRO_UNSUPPORTED"),
+    "macro 檢查:不認得的標籤當成語法錯誤": (
+        "            if found is not None and not _is_nesting_tag(found.group(1)):",
+        "            if False:"),
+    "macro 檢查:巢狀寫錯當成不認得的標籤(結束標籤)": (
+        '    return tag.startswith("end") or tag in ("elif", "else")',
+        '    return tag in ("elif", "else")'),
+    "macro 檢查:巢狀寫錯當成不認得的標籤(else)": (
+        '    return tag.startswith("end") or tag in ("elif", "else")',
+        '    return tag.startswith("end")'),
+    "macro 檢查:巢狀太深不另外分類": (
+        "    elif isinstance(error, RecursionError):", "    elif False:"),
+    "macro 檢查:不記行號": (
+        "        line = lineno if isinstance(lineno, int) and not isinstance(lineno, bool) and lineno > 0 else 0",
+        "        line = 0"),
+    "macro 檢查:檢查沒做完時當成沒問題": (
+        "    except Exception:                  # noqa: BLE001 — 資源上限、與內建同名等:檢查沒做完" + NL
+        + "        return MacroCheck(ok=False)",
+        "    except Exception:" + NL + "        return MacroCheck(ok=True)"),
+    "macro 檢查:結果不帶回載入失敗的檔": (
+        "    return MacroCheck(ok=True, issues=tuple(env.segcra_macro_issues))",
+        "    return MacroCheck(ok=True)"),
+    "macro 檢查:不用跟展開一樣的資料庫名": (
+        "        env, _, _, _ = build_env(database=database, macro_dirs=macro_dirs, adapter=adapter,",
+        "        env, _, _, _ = build_env(database=None, macro_dirs=macro_dirs, adapter=adapter,"),
+    "macro 檢查:子行程回傳不對時照用": (
+        "    return result if isinstance(result, MacroCheck) else MacroCheck(ok=False)",
+        "    return result"),
+    "macro 檢查:刪除的檔也檢查": ("pipeline.py",
+        '        if not dbt_ctx.is_macro(path) or f.get("deleted"):',
+        "        if not dbt_ctx.is_macro(path):"),
+    "macro 檢查:專案裡沒有的檔也檢查": ("pipeline.py",
+        "        if rel is not None and rel in dbt_ctx.macro_files:",
+        "        if rel is not None:"),
+    "macro 檢查:資料庫名不符也照樣載入": ("pipeline.py",
+        '    if not dbt_cfg or dbt_cfg.get("database") != DBT_DATABASE_PLACEHOLDER:' + NL
+        + "        return unchecked                    # 跟展開一樣",
+        "    if not dbt_cfg:" + NL + "        return unchecked                    # 跟展開一樣"),
+    "macro 檢查:檢查沒做完時當成沒有問題(管線)": ("pipeline.py",
+        "    if not result.ok:" + NL + "        return unchecked" + NL,
+        ""),
+    "macro 檢查:回報相對專案根的路徑": ("pipeline.py",
+        '    return [{"path": path, "kind": by_rel[rel]["kind"], "line": by_rel[rel]["line"]}',
+        '    return [{"path": rel, "kind": by_rel[rel]["kind"], "line": by_rel[rel]["line"]}'),
+    "macro 檢查:語法錯誤只給 major": ("pipeline.py",
+        '        return {"file": issue["path"], "line": line, "severity": "blocker",',
+        '        return {"file": issue["path"], "line": line, "severity": "major",'),
+    "macro 檢查:無法確認只給 info": ("pipeline.py",
+        '        return {"file": issue["path"], "line": line, "severity": "major",' + NL
+        + "                \"title\": _MACRO_UNCERTAIN_TITLE,",
+        '        return {"file": issue["path"], "line": line, "severity": "info",' + NL
+        + "                \"title\": _MACRO_UNCERTAIN_TITLE,"),
+    "macro 檢查:finding 的行號不檢查": ("pipeline.py",
+        "    line = line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else 0",
+        "    line = line if line else 0"),
+    "macro 檢查:正式路徑不補": ("pipeline.py",
+        "        report = enforce_dbt_macro_problems(report, macro_issues)  # macro 檔語法錯誤、載入失敗",
+        "        pass"),
+    "macro 檢查:dry-run 不補": ("pipeline.py",
+        "    report = enforce_dbt_macro_problems(report, macro_issues or [])  # 與正式路徑一致",
+        "    pass"),
+    "macro 檢查:dry-run 拿不到檢查結果": ("pipeline.py",
+        "                                         macro_issues=macro_issues)",
+        "                                         macro_issues=[])"),
     "config.get 讀不到就拿預設值頂替(猜值)": (
         "        raise DbtRenderError(" + NL + "            f\"config.get('{name}') 讀不到值",
         "        return \"\" if default is _MISSING else default" + NL
@@ -3602,8 +3680,8 @@ MUTANTS.update({
     "量測:dry-run 不記對到的規格": (P,
         '              "_spec_lookup": _spec_lookup(spec_code, affected_specs),' + NL, ""),
     "量測:dry-run 拿不到受影響 model 的規格": (P,
-        "                                         affected_specs=affected_specs)",
-        "                                         affected_specs=())"),
+        "                                         affected_specs=affected_specs,",
+        "                                         affected_specs=(),"),
     "用完回合:稽核紀錄不記": (P,
         '        "exhausted": bool(meta.get("exhausted")),' + NL,
         ""),

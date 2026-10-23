@@ -774,6 +774,8 @@ def build_env(code_root=None, variables: dict | None = None,
     macros: list[str] = []
     conflicts: list[str] = []
     problems: list[str] = []
+    # 同樣的失敗,另外分類記下(見 macro_issue):給 check_macro_files 用
+    env.segcra_macro_issues = []
     if code_root is None and macro_files is None:
         return env, macros, conflicts, problems
     if code_root is not None and macro_files is not None:
@@ -813,6 +815,7 @@ def build_env(code_root=None, variables: dict | None = None,
             text = origin if isinstance(origin, str) else origin.read_bytes().decode("utf-8")
         except UnicodeDecodeError as e:
             problems.append(f"{rel}:{_safe_error(e)}")
+            env.segcra_macro_issues.append(macro_issue(rel, e))
             continue
         total += len(text)
         if total > MAX_MACRO_CHARS:
@@ -830,6 +833,7 @@ def build_env(code_root=None, variables: dict | None = None,
             # 略過它並記錄。真的需要它的 model 仍會因為名稱未定義而大聲失敗,
             # 不會靜靜產出少了那段邏輯的 SQL。
             problems.append(f"{rel}:{_safe_error(e)}")
+            env.segcra_macro_issues.append(macro_issue(rel, e))
             continue
         for name in dir(module):
             if name.startswith("_"):
@@ -1121,6 +1125,82 @@ def _relation_notice(usage: dict, project: DbtProjectInfo | None) -> str | None:
     if project is None:
         return _RELATION_NOTICE if usage["used"] else None
     return _RELATION_UNCERTAIN_NOTICE if usage["uncertain"] else None
+
+
+# ------------------------------------------------------------------ macro 檔檢查
+# macro 檔載入失敗的種類。只有 SYNTAX 是「dbt 一樣解析不了、整個專案編譯失敗」;其餘可能是展開器
+# 的限制(dbt 有、我們沒有的標籤、濾器、內建函式),dbt 不一定有問題。
+MACRO_SYNTAX = "syntax"              # Jinja 語法錯誤(未閉合的區塊、寫錯的運算式…)
+MACRO_UNSUPPORTED = "unsupported"    # 不認得的標籤、濾器、判斷(dbt 可能有)
+MACRO_TOO_DEEP = "too_deep"          # 巢狀太深(Python 的遞迴上限不一定跟 dbt 相同)
+MACRO_LOAD_FAILED = "load_failed"    # 解析得過,載入時失敗(模組層用到展開器沒提供的東西、讀檔失敗)
+
+
+_UNKNOWN_TAG_RE = re.compile(r"Encountered unknown tag '([^']*)'")
+
+
+def _is_nesting_tag(tag: str) -> bool:
+    """結束標籤或 elif / else:Jinja 認得的區塊寫錯巢狀時才會被說成「不認得」。"""
+    return tag.startswith("end") or tag in ("elif", "else")
+
+
+def macro_issue(rel: str, error: BaseException) -> dict:
+    """macro 檔載入失敗的分類:{path, kind, line}。只有種類與行號,不帶錯誤訊息(含樣板內容)。
+
+    「不認得的標籤」與 TemplateAssertionError(不認得的濾器 `as_bool`、重複定義的 block…)都是
+    Jinja 語法錯誤的子類別,但 dbt 自己加了標籤與濾器,展開器沒有的不代表 dbt 也沒有,所以分開。
+    例外:Jinja 對巢狀寫錯(`{% if %}` 沒閉合就遇到 `{% endmacro %}`)也說「不認得的標籤」,
+    那個標籤是結束標籤或 elif / else——這是真的語法錯誤。"""
+    line = 0
+    if isinstance(error, jinja2.TemplateSyntaxError):
+        lineno = getattr(error, "lineno", None)
+        line = lineno if isinstance(lineno, int) and not isinstance(lineno, bool) and lineno > 0 else 0
+        if isinstance(error, jinja2.TemplateAssertionError):
+            kind = MACRO_UNSUPPORTED
+        else:
+            found = _UNKNOWN_TAG_RE.match(str(getattr(error, "message", "") or ""))
+            kind = MACRO_SYNTAX
+            if found is not None and not _is_nesting_tag(found.group(1)):
+                kind = MACRO_UNSUPPORTED
+    elif isinstance(error, RecursionError):
+        kind = MACRO_TOO_DEEP
+    else:
+        kind = MACRO_LOAD_FAILED
+    return {"path": rel, "kind": kind, "line": line}
+
+
+@dataclass(frozen=True)
+class MacroCheck:
+    """check_macro_files 的結果。ok=False:檢查本身沒做完(逾時、資源上限、子行程失敗),
+    不能當成沒問題。"""
+    ok: bool
+    issues: tuple = ()               # (macro_issue 的結果, ...)
+
+
+def check_macro_files(*, macro_files: dict, database: str | None = None,
+                      macro_dirs=DEFAULT_MACRO_DIRS, adapter: str = DEFAULT_ADAPTER,
+                      project: DbtProjectInfo | None = None) -> MacroCheck:
+    """照展開時的方式載入專案的 macro 檔(參數同 render_model),回傳每個載入失敗的檔與原因。
+    **待審的 MR 內容請改用 check_macro_files_isolated()。**"""
+    try:
+        env, _, _, _ = build_env(database=database, macro_dirs=macro_dirs, adapter=adapter,
+                                 project=project, macro_files=macro_files)
+    except Exception:                  # noqa: BLE001 — 資源上限、與內建同名等:檢查沒做完
+        return MacroCheck(ok=False)
+    return MacroCheck(ok=True, issues=tuple(env.segcra_macro_issues))
+
+
+def _macro_check_failure(message: str) -> MacroCheck:
+    return MacroCheck(ok=False)
+
+
+def check_macro_files_isolated(*, timeout_s: float = DEFAULT_ISOLATED_TIMEOUT_S,
+                               max_memory_mb: int = DEFAULT_ISOLATED_MEMORY_MB,
+                               **kwargs) -> MacroCheck:
+    """在獨立子行程中做 check_macro_files(理由同 render_model_isolated)。不丟例外。"""
+    result = run_isolated(check_macro_files, (), kwargs, timeout_s=timeout_s,
+                          max_memory_mb=max_memory_mb, on_failure=_macro_check_failure)
+    return result if isinstance(result, MacroCheck) else MacroCheck(ok=False)
 
 
 # ------------------------------------------------------------------ 隔離展開

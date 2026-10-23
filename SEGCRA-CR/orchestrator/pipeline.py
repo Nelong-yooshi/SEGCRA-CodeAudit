@@ -24,6 +24,8 @@ from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_render import is_dbt_template, render_model_isolated
 from .dbt_config_change import HIGH_RISK_NEW, config_changes, default_relative, is_dbt_yaml
 from .dbt_project import DbtProjectError, check_project_dir
+from .dbt_render import (MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, MACRO_SYNTAX,
+                         check_macro_files_isolated)
 from .security import scan_mr
 from .skills_loader import always_skills, load_skills, skills_index
 from .spec_exec import find_spec, run_spec_exec
@@ -1338,6 +1340,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         spec_code, spec_text = await find_spec_mr(hub, mr, by_path=cfg.dbt.get("enabled") is True)
         # MR 改到 macro 等:檢查不在變更清單裡、但受影響的 model(沒有反查結果時是 None)
         affected = await check_affected_models(hub, mr, cfg.dbt, dbt_ctx, find_spec=find_spec_mr)
+        # MR 改到的 macro 檔載入得了嗎:Jinja 語法錯誤時 dbt 整個專案都編譯不了
+        macro_issues = _step(report_stub, "macro 檔檢查", _macro_file_issues, [],
+                             mr, dbt_ctx, cfg.dbt)
         if spec_code is None and spec_text is None and affected is not None and affected.spec:
             # MR 本身對不到規格(只改了 macro),而受影響的 model 都對到同一份:用它來審
             spec_code, spec_text = affected.spec
@@ -1390,7 +1395,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             return await _dry_run_report(hub, mr_id, mr, pre, spec_code, spec_text,
                                          affected, dbt_ctx, cfg.dbt,
                                          incomplete=report_stub["findings"],
-                                         affected_specs=affected_specs)
+                                         affected_specs=affected_specs,
+                                         macro_issues=macro_issues)
 
         # 路徑觸發的 skill 自動注入:異常交易規則檔一律載入領域知識,不賭模型主動載
         always_block = always_skills(skills)
@@ -1471,6 +1477,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_dbt_notice(report, pre)  # 展開成功但表名未驗證,不靠模型轉述
         report = enforce_scan_skipped(report, scan_target.get("_scan_skipped", 0))  # 內容太多沒掃完
         report = enforce_dbt_impact(report, affected, dbt_ctx)  # macro 等變更影響的其他 model
+        report = enforce_dbt_macro_problems(report, macro_issues)  # macro 檔語法錯誤、載入失敗
         report = enforce_non_sql(report, pre)  # 非 SQL 檔沒跑 SQL 規則:說明文件 info,其他 major
         report = enforce_dbt_config_change(report, mr, dbt_ctx, cfg.dbt)  # 只改設定時展開結果不變
         report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
@@ -1905,6 +1912,90 @@ def enforce_dbt_impact(report: dict, affected: AffectedCheck | None,
     impact = impact_finding(affected, dbt_ctx.prefix if dbt_ctx is not None else "")
     if impact is not None:
         _put_program_finding(report, impact)
+    return report
+
+
+_MACRO_SYNTAX_TITLE = "macro 檔有 Jinja 語法錯誤,dbt 整個專案會編譯失敗"
+_MACRO_UNCERTAIN_TITLE = "展開器載入不了這個 macro 檔,無法確認 dbt 能不能編譯"
+_MACRO_CHECK_FAILED = "check_failed"      # 檢查本身沒做完(逾時、資源上限、設定不符)
+_MACRO_UNCERTAIN_REASONS = {
+    MACRO_UNSUPPORTED: "用到展開器不認得的標籤、濾器或判斷(dbt 自己加了一些,這裡沒有的不代表 dbt 也沒有)",
+    MACRO_TOO_DEEP: "巢狀太深,展開器解析不完",
+    MACRO_LOAD_FAILED: "解析得過,但載入時失敗(檔案開頭用到展開器沒有提供的東西,或讀不到內容)",
+    _MACRO_CHECK_FAILED: "檢查沒有做完(逾時、超過資源上限,或 dbt 的設定與預期不符)",
+}
+
+
+def _changed_macro_files(mr: dict, dbt_ctx: DbtContext | None) -> list[tuple[str, str]]:
+    """MR 改到、變更後還在的 macro 檔:[(MR 裡的路徑, 相對專案根的路徑)]。"""
+    if dbt_ctx is None or dbt_ctx.project is None:
+        return []
+    found = []
+    for f in mr.get("files", []) if isinstance(mr, dict) else []:
+        path = f.get("path") if isinstance(f, dict) else None
+        if not dbt_ctx.is_macro(path) or f.get("deleted"):
+            continue
+        rel = dbt_ctx.relative(path)
+        if rel is not None and rel in dbt_ctx.macro_files:
+            found.append((path, rel))
+    return found
+
+
+def _macro_file_issues(mr: dict, dbt_ctx: DbtContext | None, dbt_cfg: dict | None) -> list[dict]:
+    """MR 改到的 macro 檔,照展開時的方式載入一次(隔離子行程),回傳載入失敗的:
+    [{path(MR 裡的路徑), kind, line}]。沒改到 macro 檔時不跑。
+
+    只看改到的檔:專案裡本來就壞的檔不是這個 MR 造成的,用到它的 model 展開失敗時已經會報。
+    檢查本身沒做完時,改到的檔一律記成無法確認,不當成沒問題。"""
+    changed = _changed_macro_files(mr, dbt_ctx)
+    if not changed:
+        return []
+    unchecked = [{"path": path, "kind": _MACRO_CHECK_FAILED, "line": 0} for path, _ in changed]
+    if not dbt_cfg or dbt_cfg.get("database") != DBT_DATABASE_PLACEHOLDER:
+        return unchecked                    # 跟展開一樣:資料庫名不是約定的假名就不載入
+    result = check_macro_files_isolated(macro_files=dbt_ctx.macro_files,
+                                        database=dbt_cfg["database"],
+                                        macro_dirs=dbt_ctx.project.macro_paths,
+                                        project=dbt_ctx.info)
+    if not result.ok:
+        return unchecked
+    by_rel = {i["path"]: i for i in result.issues}
+    return [{"path": path, "kind": by_rel[rel]["kind"], "line": by_rel[rel]["line"]}
+            for path, rel in changed if rel in by_rel]
+
+
+def _macro_problem_finding(issue) -> dict | None:
+    if not isinstance(issue, dict) or not isinstance(issue.get("path"), str):
+        return None
+    kind, line = issue.get("kind"), issue.get("line")
+    line = line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else 0
+    where = f"{_code_span(issue['path'])}" + (f" 第 {line} 行附近" if line else "")
+    if kind == MACRO_SYNTAX:
+        return {"file": issue["path"], "line": line, "severity": "blocker",
+                "title": _MACRO_SYNTAX_TITLE,
+                "detail": (f"{where}有 Jinja 語法錯誤(區塊沒有閉合、運算式寫錯等)。dbt 解析專案時"
+                           "會失敗,部署端也會整個載入失敗,影響的不只用到這個 macro 的 model。"),
+                "suggestion": "修正語法後,用 dbt parse 確認整個專案解析得過。",
+                "citations": []}
+    if kind in _MACRO_UNCERTAIN_REASONS:
+        return {"file": issue["path"], "line": line, "severity": "major",
+                "title": _MACRO_UNCERTAIN_TITLE,
+                "detail": (f"{where}:{_MACRO_UNCERTAIN_REASONS[kind]}。用到這個檔裡 macro 的 model "
+                           "都檢查不到,也無法確認 dbt 能不能編譯,不得自動放行。"),
+                "suggestion": "用 dbt parse 確認整個專案解析得過,再人工確認用到這些 macro 的 model。",
+                "citations": []}
+    return None
+
+
+@_isolated_stage("macro 檔問題揭露")
+def enforce_dbt_macro_problems(report: dict, issues) -> dict:
+    """MR 改到的 macro 檔載入失敗時補 finding(見 _macro_file_issues):Jinja 語法錯誤是 blocker
+    (dbt 一樣解析不了,整個專案編譯失敗);其他可能是展開器的限制,補 major。
+    確定性補報;標題只能由程式產生;只寫種類與行號,不帶錯誤訊息(含樣板內容)。"""
+    for issue in issues if isinstance(issues, list) else []:
+        problem = _macro_problem_finding(issue)
+        if problem is not None:
+            _put_program_finding(report, problem)
     return report
 
 
@@ -2518,7 +2609,7 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                           spec_code, spec_text, affected: AffectedCheck | None = None,
                           dbt_ctx: DbtContext | None = None, dbt_cfg: dict | None = None,
                           incomplete: list[dict] | None = None,
-                          affected_specs: tuple = ()) -> dict:
+                          affected_specs: tuple = (), macro_issues: list | None = None) -> dict:
     """不經 LLM 的管線煙霧測試:預掃結果直接轉 findings,並驗證 memory/spec 可用。
     (執行驗證需要 LLM 生成測資,dry-run 不跑;只回報 spec 是否找得到。)
 
@@ -2550,6 +2641,7 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                             "files_scanned": len(pre)}}
     report = enforce_non_sql(report, pre)      # 與正式路徑一致
     report = enforce_lint_incomplete(report, pre)
+    report = enforce_dbt_macro_problems(report, macro_issues or [])  # 與正式路徑一致
     report = enforce_dbt_config_change(report, mr, dbt_ctx, dbt_cfg)
     report = enforce_dbt_notice(report, pre)   # 與正式路徑一致:表名未驗證的提醒不可少
     report = enforce_dbt_impact(report, affected, dbt_ctx)
