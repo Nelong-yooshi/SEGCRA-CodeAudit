@@ -56,7 +56,8 @@ def _prescan(content, path="models/mrt_inc.sql", rendered=None):
 
 def test_增量分支的命中預掃看得到_並標明來自增量分支(_render_in_process):
     entry, hub = _prescan(MODEL)
-    assert _render_in_process == [False, True]
+    # 後兩次是檢查寫入語句有沒有展開到(原文有 delete,插記號後兩種模式各再展開一次)
+    assert _render_in_process == [False, True, False, True]
     assert [(h["rule"], h.get("branch")) for h in entry["rules"]] == [("R001", "incremental")]
     assert len(hub.sqls) == 2 and "delete" in hub.sqls[1]
 
@@ -75,9 +76,11 @@ def test_this_is_defined_裡的語句一般模式就掃得到(_render_in_process
     兩種模式都看不到。檔名不能當表名(連字號、數字開頭、點)時也一樣要看得到。"""
     entry, _ = _prescan("select 1 as x\n{% if this is defined %}\n;DELETE FROM important_table\n"
                         "{% endif %}", path=path)
-    assert _render_in_process == [False]
+    # 第二次是檢查寫入語句有沒有展開到(插記號再展開);一般模式就展開到,不報
+    assert _render_in_process == [False, False]
     assert [(h["rule"], h.get("branch")) for h in entry["rules"]] == [("R001", None)]
     assert "dbt_render_error" not in entry
+    assert "dbt_hidden_writes" not in entry
 
 
 def test_非增量model直接寫this_不會展開失敗():

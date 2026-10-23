@@ -22,6 +22,7 @@ from .dbt_affected import (
 )
 from .change_view import build_full_text_section
 from .dbt_context import DbtContext, prepare_dbt_context
+from .dbt_hidden_writes import IN_TAGS, UNREACHED, UNVERIFIED, WRITE_KEYWORDS, find_hidden_writes
 from .dbt_render import is_dbt_template, render_model_isolated
 from .dbt_config_change import HIGH_RISK_NEW, config_changes, default_relative, is_dbt_yaml
 from .dbt_project import DbtProjectError, check_project_dir
@@ -486,6 +487,33 @@ class _Expanded(NamedTuple):
     incremental_line_map: dict | None = None
 
 
+def _render_project(dbt_ctx: DbtContext | None) -> dict:
+    """展開時要帶的專案資訊(macro 與 ref()/source() 的驗證);沒有專案時是空的。"""
+    if dbt_ctx is None or dbt_ctx.project is None:
+        return {}
+    return {"macro_files": dbt_ctx.macro_files, "macro_dirs": dbt_ctx.project.macro_paths,
+            "project": dbt_ctx.info}
+
+
+def _hidden_writes(path: str, sql: str, expanded: "_Expanded", dbt_cfg: dict,
+                   dbt_ctx: DbtContext | None) -> dict:
+    """樣板原文有寫入語句、規則層卻看不到的地方(見 dbt_hidden_writes)。用跟這次展開一樣的
+    展開器與專案資訊再展開一次。檢查本身出錯時記成無法確認(交人工),不當成沒有。"""
+    clean = {False: expanded.sql}
+    if expanded.incremental_sql is not None:
+        clean[True] = expanded.incremental_sql
+    project = _render_project(dbt_ctx)
+
+    def render(source: str, incremental: bool):
+        return render_model_isolated(path or "model.sql", source=source,
+                                     database=dbt_cfg["database"], **project,
+                                     **({"incremental": True} if incremental else {}))
+    try:
+        return find_hidden_writes(sql, clean, render)
+    except Exception as e:                   # noqa: BLE001 — 檢查沒做完不能當成沒有
+        return {UNVERIFIED: f"檢查寫入語句時發生非預期錯誤({type(e).__name__})"}
+
+
 def _sentinel_map(rendered) -> dict | None:
     return rendered.line_map if rendered.map_method == "sentinel" and rendered.line_map else None
 
@@ -521,10 +549,7 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict, dbt_ctx: DbtCont
         # 設定載入時已擋過,這裡再擋一次:dbt_cfg 也可能不經 load_config() 直接傳入。
         # 不符就不展開(fail closed),由 enforce_dbt_render_failure 補 major 交人工。
         return _Expanded(sql, _DBT_DATABASE_MISMATCH, None)
-    project = {}
-    if dbt_ctx is not None and dbt_ctx.project is not None:
-        project = {"macro_files": dbt_ctx.macro_files, "macro_dirs": dbt_ctx.project.macro_paths,
-                   "project": dbt_ctx.info}
+    project = _render_project(dbt_ctx)
     rendered = render_model_isolated(path or "model.sql", source=sql,
                                      database=dbt_cfg["database"], **project)
     if rendered.ok and rendered.macro_conflicts:
@@ -795,11 +820,16 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
         elif dbt_error is not None:
             entry["dbt_render_error"] = dbt_error
         elif dbt_enabled and sql and is_dbt_template(sql):
-            expanded = _dbt_expand_for_prescan(
-                f.get("path", ""), sql, dbt_cfg, dbt_ctx if in_project else None)
+            render_ctx = dbt_ctx if in_project else None      # 專案外的檔案不給專案的 macro
+            expanded = _dbt_expand_for_prescan(f.get("path", ""), sql, dbt_cfg, render_ctx)
             rule_sql, dbt_error, dbt_notice, incremental_sql = expanded[:4]
             if dbt_error is None and line_maps is not None and _is_full_text(f, sql, dbt_ctx):
                 _keep_line_maps(line_maps, f.get("path"), sql, expanded)
+            if dbt_error is None:
+                # 用跟上面同一份專案資訊再展開(插記號),見 _hidden_writes
+                hidden = _hidden_writes(f.get("path", ""), sql, expanded, dbt_cfg, render_ctx)
+                if hidden:
+                    entry["dbt_hidden_writes"] = hidden
             if dbt_error is not None:
                 entry["dbt_render_error"] = dbt_error
             elif rendered is not None:
@@ -1517,6 +1547,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_non_sql(report, pre)  # 非 SQL 檔沒跑 SQL 規則:說明文件 info,其他 major
         report = enforce_dbt_config_change(report, mr, dbt_ctx, cfg.dbt)  # 只改設定時展開結果不變
         report = enforce_dbt_render_failure(report, pre)  # 展開失敗:規則掃的是原文
+        report = enforce_dbt_hidden_writes(report, pre)  # 寫入語句沒有展開到、寫在標記字串裡
         report = enforce_format(report)        # 模型輸出有格式錯誤 → major;須在 sanitize 之後
         # 注入掃描的命中先寫進報告,再走 enforce_injection:那一步自己丟例外時,
         # 隔離只補一條 major(= needs_human),而 apply_policy 的硬條件看的是
@@ -1933,6 +1964,65 @@ def enforce_dbt_render_failure(report: dict, pre: list[dict]) -> dict:
     for entry in pre:
         if entry.get("dbt_render_error"):
             _put_program_finding(report, _render_fail_finding(entry))
+    return report
+
+
+_HIDDEN_WRITE_TITLE = "dbt 樣板有寫入語句沒有經過規則檢查"
+_HIDDEN_WRITE_LIST_MAX = 10
+
+
+def _hidden_write_list(items) -> tuple[str, list[int]]:
+    """[{line, keyword}] → 「DELETE(第 2 行)、…」與行號。只寫固定集合的關鍵字與行號,不帶原文。"""
+    shown, lines = [], []
+    for it in items if isinstance(items, list) else []:
+        line = it.get("line") if isinstance(it, dict) else None
+        kw = it.get("keyword") if isinstance(it, dict) else None
+        if kw not in WRITE_KEYWORDS or not isinstance(line, int) or isinstance(line, bool):
+            continue
+        lines.append(line)
+        if len(shown) < _HIDDEN_WRITE_LIST_MAX:
+            shown.append(f"{kw}(第 {line} 行)")
+    more = len(lines) - len(shown)
+    return "、".join(shown) + (f" 等 {len(lines)} 處" if more > 0 else ""), lines
+
+
+def _hidden_write_finding(entry: dict) -> dict | None:
+    hidden = entry.get("dbt_hidden_writes")
+    if not isinstance(hidden, dict) or not hidden:
+        return None
+    parts, lines = [], []
+    unreached, at = _hidden_write_list(hidden.get(UNREACHED))
+    if unreached:
+        lines += at
+        parts.append("這些寫入語句在這次審查的展開結果裡沒有出現(一般模式、增量模式都沒有),"
+                     f"可能寫在只有真正執行時才會進的分支:{unreached}。")
+    in_tags, at = _hidden_write_list(hidden.get(IN_TAGS))
+    if in_tags:
+        lines += at
+        parts.append("這些寫入語句寫在 Jinja 標記的字串裡(例如 post_hook、set 的字串),"
+                     f"展開結果裡看不到:{in_tags}。")
+    reason = hidden.get(UNVERIFIED)
+    if isinstance(reason, str) and reason:
+        parts.append(reason[:200] + "。")
+    if not parts:
+        return None
+    return {"file": entry["path"], "line": min(lines) if lines else 0, "severity": "major",
+            "title": _HIDDEN_WRITE_TITLE,
+            "detail": "".join(parts) + "規則層只檢查展開後的 SQL,這些寫入語句沒有經過規則檢查,"
+                      "不得自動放行。",
+            "suggestion": "人工確認這些寫入語句在什麼情況下會執行;以 dbt compile 取得實際會執行的 SQL"
+                          "(含 hook)再檢查。",
+            "citations": []}
+
+
+@_isolated_stage("寫入語句沒有展開到")
+def enforce_dbt_hidden_writes(report: dict, pre: list[dict]) -> dict:
+    """樣板原文有寫入語句、規則層卻看不到時補 major(預掃記下的 dbt_hidden_writes,見
+    dbt_hidden_writes 模組)。確定性補報,不看模型有沒有提到;標題只能由程式產生。"""
+    for entry in pre:
+        hidden = _hidden_write_finding(entry)
+        if hidden is not None:
+            _put_program_finding(report, hidden)
     return report
 
 
@@ -2686,6 +2776,7 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
     report = enforce_dbt_config_change(report, mr, dbt_ctx, dbt_cfg)
     report = enforce_dbt_notice(report, pre)   # 與正式路徑一致:表名未驗證的提醒不可少
     report = enforce_dbt_impact(report, affected, dbt_ctx)
+    report = enforce_dbt_hidden_writes(report, pre)
     report = enforce_spec_change(report, mr)
     for fd in report["findings"]:
         await hub.call("gitlab__post_inline_comment",
