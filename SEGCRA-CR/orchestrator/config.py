@@ -222,3 +222,25 @@ def load_config(path: Path | None = None) -> Config:
 def estimate_tokens(text: str) -> int:
     """粗估 token 數(中文 ~1 token/1.5字、英文 ~1 token/4字,取保守值 len/3)。"""
     return max(1, len(text) // 3)
+
+
+def token_units(ch: str) -> int:
+    """estimate_tokens_upper 的計算單位(1/3 token):一般字元 1;中日韓字、注音、韓文與全形符號 3
+    (每字至少 1 token);BMP 以外的字元(emoji、罕用漢字)6。"""
+    o = ord(ch)
+    if o > 0xFFFF:
+        return 6
+    if (0x1100 <= o <= 0x11FF or 0x2E80 <= o <= 0x9FFF or 0xA960 <= o <= 0xA97F
+            or 0xAC00 <= o <= 0xD7FF or 0xF900 <= o <= 0xFAFF or 0xFE30 <= o <= 0xFE4F
+            or 0xFF00 <= o <= 0xFFEF):
+        return 3
+    return 1
+
+
+def estimate_tokens_upper(text: str) -> int:
+    """偏高的 token 估計:給「超過就會被端點靜靜截掉」的地方用,寧可高估。
+
+    estimate_tokens 是 len/3,中文一個字常常就是一個以上的 token,會低估好幾倍;這裡依字元種類算
+    (見 token_units)。只用在需要上限的地方,不取代 estimate_tokens(主審查的預算還在用它)。"""
+    units = sum(token_units(ch) for ch in text)
+    return -(-units // 3)

@@ -33,9 +33,10 @@ profiles:
     num_ctx: 32768
     temperature: 0.1
     max_output_tokens: 8192
-  cold_read:             # 冷讀(orchestrator/cold_read.py):只輸出一行 JSON。思考用端點預設(開著)
+  cold_read:             # 冷讀(orchestrator/cold_read.py):只輸出一行 JSON。思考用端點預設(開著);
+                         # 要關掉思考加 reasoning_effort: none(不要用 LLM_REASONING_EFFORT,它會改到所有 profile)
     model: gemma4:31b
-    num_ctx: 32768
+    num_ctx: 32768       # 冷讀拿它當端點實際的上下文(送出前的上限、送出後判斷有沒有被截掉):要跟端點的設定一致
     temperature: 0
     seed: 42
     max_output_tokens: 896
@@ -81,7 +82,8 @@ budget:
   spec: 3000
   memory: 2000
   tool_result_max_chars: 6000   # 單次工具回傳超過即截斷
-  cold_read: 12000      # 冷讀的輸入(標題、說明、改到的每個檔案的全文);超過的部分不送,記成「冷讀沒有看完」
+  cold_read: 12000      # 冷讀的輸入(標題、說明、每個檔案的改動,最後是全文;用偏高的估計算,中文一字至少 1 token)。
+                        # 超過的部分不送,記成「冷讀沒有看完」;實際用量也不超過 cold_read 的 num_ctx 扣掉輸出與 system prompt
 
 # 決策閘門:審查完的 MR 走哪條路(auto_approved / needs_human / blocked)
 policy:
