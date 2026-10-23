@@ -689,11 +689,13 @@ def test_查規格卡住_只等剩下的時間(monkeypatch):
     assert impact_finding(check)["severity"] == "major"
 
 
-def test_查規格丟例外_當成沒對到_不中斷():
+def test_查規格丟例外_記成取不到_不中斷():
+    """不知道規格存不存在:不是「沒有規格」(取不到的處理見 test_affected_spec_unavailable)。"""
     async def boom(hub, mr, *, by_path=False):
         raise ConnectionError("x")
     check, *_ = _check("SELECT 1 AS id", find_spec=boom)
     assert _only(check).spec is None and check.spec is None
+    assert _only(check).spec_unavailable == "fetch_failed"
 
 
 @pytest.mark.parametrize("result", [("BIG", None), ("BIG", ""), (None, "# x"), ("", "# x")])

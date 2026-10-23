@@ -841,9 +841,14 @@ def _affected_spec_section(specs: tuple[SpecForModels, ...], affected: AffectedC
     missing = []
     if omitted:
         missing.append("- 超出預算、沒有附上的規格:" + ";".join(omitted))
-    unmapped = [full(m.path) for m in affected.models if m.spec_looked_up and not m.spec]
+    unmapped = [full(m.path) for m in affected.models
+                if m.spec_looked_up and not m.spec and not m.spec_unavailable]
     if unmapped:
         missing.append("- 沒有對應到規格的 model:" + "、".join(unmapped))
+    unavailable = [full(m.path) for m in affected.models if m.spec_unavailable]
+    if unavailable:
+        missing.append("- 取不到規格的 model(環境問題,規格可能存在,不要當成沒有規格):"
+                       + "、".join(unavailable))
     not_looked = [full(m.path) for m in affected.models if not m.spec_looked_up]
     if not_looked:
         missing.append("- 沒有查規格的 model(超過查詢上限):" + "、".join(not_looked))
