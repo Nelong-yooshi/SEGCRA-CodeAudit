@@ -3645,11 +3645,27 @@ MUTANTS.update({
 G = "../toolbox/gitlab.py"
 MUTANTS.update({
  "規格:取檔失敗當成沒有規格": (S,
-     '                unavailable = unavailable or "fetch_failed"',
-     "                pass"),
+     "                # 開發者去補一份可能已經存在的規格。原始錯誤不帶出去。" + NL
+     + '                unavailable = unavailable or "fetch_failed"',
+     "                # 開發者去補一份可能已經存在的規格。原始錯誤不帶出去。" + NL
+     + "                pass"),
  "規格:get_file 的訊息不分類(一律當成拿得到)": (S,
-     "            unavailable = unavailable or gitlab_unavailable_reason(txt)",
-     "            pass"),
+     "            unavailable = unavailable or gitlab_unavailable_reason(txt)" + NL
+     + "    if by_path and not codes:",
+     "    if by_path and not codes:"),
+ # R 編號那條的 except 底下隔著註解,所以「except 緊接著賦值」只有依檔名這條
+ "規格:依檔名找規格時取檔失敗當成沒有規格": (S,
+     "            except Exception:" + NL
+     + '                unavailable = unavailable or "fetch_failed"',
+     "            except Exception:" + NL
+     + '                unavailable = None'),
+ "規格:依檔名找規格時不分類 get_file 的訊息": (S,
+     "            unavailable = unavailable or gitlab_unavailable_reason(txt)" + NL
+     + "    return None, unavailable",
+     "    return None, unavailable"),
+ "規格:依檔名那條路拿不到的記號不往上帶": (S,
+     "        unavailable = unavailable or by_path_unavailable",
+     "        pass"),
  "規格:拿不到時照樣叫人補規格": (S,
      "    if not spec_text and unavailable:",
      "    if False:"),

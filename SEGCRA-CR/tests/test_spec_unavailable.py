@@ -103,3 +103,46 @@ def test_每個代碼都有給人看的說法():
     """新增代碼忘了寫說法的話,組訊息時會 KeyError,而那是在審查跑到一半的時候。"""
     assert set(spec_exec._SPEC_UNAVAILABLE) == {
         "no_read_token", "no_review_ref", "too_large", "fetch_failed"}
+
+
+# ─────────────── 依檔名對應規格那條路(dbt 的 model 沒有 R 編號)───────────────
+
+DBT_MR = {"title": "調整", "description": "", "files": [
+    {"path": "models/mrt_RETAIL_M1.sql", "diff": "@@\n+SELECT 1",
+     "full_content": "SELECT 1"}]}
+
+
+@pytest.mark.parametrize("reply,code", [
+    (gitlab._NO_READ_TOKEN, "no_read_token"),
+    (RuntimeError("連線掛了"), "fetch_failed"),
+])
+def test_依檔名找規格時拿不到也要分出來(reply, code, monkeypatch, tmp_path):
+    """dbt 的 model 沒有 R 編號,走的是這條路。只回 None 的話,token 沒設一樣會
+    變成「沒有規格」—— 跟 R 編號那條是同一個病。"""
+    monkeypatch.setattr(spec_exec, "SPECS_DIR", tmp_path)   # 本機沒有規格,才會問 GitLab
+    lookup = asyncio.run(find_spec(_Hub(reply), DBT_MR, by_path=True))
+    assert lookup.unavailable == code
+    assert lookup == (None, None)
+
+
+def test_依檔名找規格_檔案不存在不算拿不到(monkeypatch, tmp_path):
+    monkeypatch.setattr(spec_exec, "SPECS_DIR", tmp_path)
+    lookup = asyncio.run(find_spec(_Hub("(repo 內無 specs/RETAIL_M1.md)"),
+                                   DBT_MR, by_path=True))
+    assert lookup.unavailable is None
+
+
+# ─────────────────── 端到端:決策真的變成交人工 ───────────────────
+
+def test_取不到規格時不得自動放行(tmp_path, monkeypatch):
+    """`passed: False` 只是結果欄位;決策那一端要真的擋下來才算數。"""
+    from orchestrator.pipeline import apply_policy
+    out = _run(gitlab._NO_READ_TOKEN)
+    report = {"score": 100, "findings": out["findings"],
+              "_spec_exec": {"passed": out["passed"]}}
+    mr = {"files": [{"path": "sql/rules/r201.sql", "diff": "@@\n+SELECT 1"}]}
+    policy = {"auto_approve": {"max_diff_lines": 30, "min_score": 95,
+                               "allowed_severities": ["info"],
+                               "forbid_pending_hints": True},
+              "block": {"min_blockers": 1}}
+    assert apply_policy(report, mr, policy)["decision"] == "needs_human"

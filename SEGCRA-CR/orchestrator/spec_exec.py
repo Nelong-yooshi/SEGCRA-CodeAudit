@@ -137,15 +137,19 @@ async def find_spec(hub, mr: dict, *, by_path: bool = False) -> SpecLookup:
                 return SpecLookup(code, txt)
             unavailable = unavailable or gitlab_unavailable_reason(txt)
     if by_path and not codes:
-        found = await _find_spec_by_path(hub, mr)
+        found, by_path_unavailable = await _find_spec_by_path(hub, mr)
         if found is not None:
             return SpecLookup(found[0], found[1])
+        unavailable = unavailable or by_path_unavailable
     return SpecLookup(codes[0] if codes else None, None, unavailable)
 
 
-async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
+async def _find_spec_by_path(hub, mr: dict) -> tuple[tuple[str, str] | None, str | None]:
     """依 model 檔名對應規格(dbt_impact.resolve_spec)。只由 find_spec() 在完全
-    沒有 R 編號時呼叫,找不到回 None。
+    沒有 R 編號時呼叫。回傳 ((code, text) 或 None, 「拿不到」的代碼或 None)。
+
+    **拿不到也要分出來**:dbt 的 model 沒有 R 編號,走的就是這條路;只回 None 的話,
+    token 沒設一樣會變成「沒有規格」—— 跟 R 編號那條是同一個病(#90 第 2 點)。
 
     查找順序與上面 R 編號那段相同:**先查本機 specs/,再問 GitLab**。管線呼叫時
     hub 一定存在,所以本機這段不能只在 hub 為 None 時才走,否則 mock 模式(demo、
@@ -159,7 +163,7 @@ async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
 
     paths = [f["path"] for f in mr.get("files", []) if f.get("path")]
     if not paths:
-        return None
+        return None, None
 
     available = ([f"specs/{p.name}" for p in SPECS_DIR.glob("*.md") if p.is_file()]
                  if SPECS_DIR.is_dir() else [])
@@ -168,10 +172,11 @@ async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
         if match.spec_path:
             local = SPECS_DIR / match.spec_path.rsplit("/", 1)[-1]
             if local.is_file():   # available 就是列這個目錄得來的,理論上必成立
-                return local.stem, local.read_text(encoding="utf-8")
+                return (local.stem, local.read_text(encoding="utf-8")), None
 
     if hub is None:
-        return None
+        return None, None
+    unavailable = None
     for path in paths:
         for candidate in resolve_spec(path, ()).candidates:   # 只要候選路徑,不比對存在與否
             try:
@@ -179,10 +184,12 @@ async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
                 txt = await hub.call("gitlab__get_file",
                                      {"path": candidate}, truncate=False)
             except Exception:
+                unavailable = unavailable or "fetch_failed"
                 continue
             if txt and txt.lstrip().startswith("#"):
-                return candidate.rsplit("/", 1)[-1][:-len(".md")], txt
-    return None
+                return (candidate.rsplit("/", 1)[-1][:-len(".md")], txt), None
+            unavailable = unavailable or gitlab_unavailable_reason(txt)
+    return None, unavailable
 
 
 # ------------------------------------------------------------------ 1. 測資生成
