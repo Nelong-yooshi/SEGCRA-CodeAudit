@@ -1422,8 +1422,12 @@ async def arbitrate(cfg: Config, spec_text: str, sql: str, mismatch: dict,
 
 # ------------------------------------------------------------------ 主流程
 def _finding(path: str, severity: str, title: str, detail: str, suggestion: str = "") -> dict:
+    # _source:這條是程式(執行驗證)自己產生的,不是模型講的。後處理的校準只對
+    # 模型的指控動作,拿證據去對照證據會把唯一真的跑過的那條降級。
+    # 字串直接寫、不從 pipeline import:pipeline 匯入 spec_exec,反向會變成循環匯入。
     return {"file": path, "line": 0, "severity": severity, "title": title,
-            "detail": detail, "suggestion": suggestion, "citations": []}
+            "detail": detail, "suggestion": suggestion, "citations": [],
+            "_source": "program"}
 
 
 def _other_branch_satisfied(conds: list[dict], actual: dict[str, bool],
@@ -1844,9 +1848,15 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
     回傳 {passed, spec_code, conditions, coverage_gaps, case_results,
           dropped_cases, stage_seconds, findings}。"""
     path = mr.get("files", [{}])[0].get("path", "(MR)")
-    sql = ""
+    # 一個 MR 可能改好幾個檔,但執行驗證只跑**最後一個有內容的 SQL 檔**。
+    # 跑了哪一個要記下來(executed_file):後處理拿執行結果去對照模型的指控時,
+    # 只能對照同一個檔案的 finding——別的檔根本沒被執行,拿這份結果說它「未重現」
+    # 是錯的(#39 review 第 2 點)。
+    sql, executed_file = "", ""
     for f in mr.get("files", []):
-        sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or sql
+        got = f.get("full_content") or _sql_from_diff(f.get("diff", ""))
+        if got:
+            sql, executed_file = got, f.get("path", "")
 
     if spec_text is None:
         # getattr:呼叫端可能傳測試用的替身 cfg(沒有 dbt 欄位),視為未開啟
@@ -2000,6 +2010,7 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                                  + _unverified_note(ex["case_results"])))
     prog["stage"] = None        # 跑完了,沒有「卡在哪裡」這件事
     return {"passed": passed, "spec_code": spec_code, "engine": ex["engine"],
+            "executed_file": executed_file,
             "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
             "case_results": ex["case_results"], "dropped_cases": dropped_cases,
             "label_unverified": _unverified(ex["case_results"]),
