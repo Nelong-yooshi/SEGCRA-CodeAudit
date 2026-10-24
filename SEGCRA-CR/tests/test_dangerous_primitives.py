@@ -189,7 +189,6 @@ def test_每條新規則都有已報判定的關鍵詞():
     ("SELECT @@LANGUAGE", "H007"),
     ("SET DATEFIRST 1; SELECT @@DATEFIRST", "H007"),
     ("{% if target.name == 'prod' %}SELECT 1{% endif %}", "H008"),
-    ("{{ var('window_days') }}", "H008"),
     ("SELECT env_var('DBT_ENV')", "H008"),
     ("{% if execute %}SELECT 1{% endif %}", "H008"),
     ("SELECT 1 WHERE GETDATE() > '2026-12-31'", "H009"),
@@ -207,10 +206,12 @@ def test_暫存表的存在性檢查不誤報():
 
 
 @pytest.mark.parametrize("sql", [
-    "MERGE txn AS target USING stg AS s ON target.id = s.id",   # target 是 MERGE 的慣用別名
-    "SELECT VAR(amount), VARP(amount) FROM txn",                # VAR() 是變異數聚合函式
+    "MERGE txn AS target USING stg AS s ON target.name = s.name",  # target 是 MERGE 的慣用別名
+    "SELECT VAR(amount), VARP(amount) FROM txn",                   # VAR() 是變異數聚合函式
+    "{{ var('window_days') }}",            # var() 是帶參數的一般寫法,幾乎每個 model 都用
+    "{% set d = var('days') %}SELECT 1",
 ])
-def test_不在Jinja區段裡的target與var不算dbt環境(sql):
+def test_這些寫法不算dbt編譯期的環境資訊(sql):
     assert not _hits(sql, "H008"), sql
 
 
@@ -285,10 +286,9 @@ def test_權限關鍵字後面要接空白():
 
 
 def test_dbt環境的提醒只印關鍵字不印整段Jinja():
-    """比對需要前面那段 Jinja 當界線,但把 `{% set target_date = var` 整段印進訊息,
-    看留言的人不會知道命中的是什麼。"""
-    msg = _hits("{% set target_date = var('d') %}SELECT 1", "H008")[0]["message"]
-    assert "var" in msg
+    """比對需要前面那段 Jinja 當界線,但把整段印進訊息,看留言的人不會知道命中的是什麼。"""
+    msg = _hits("{% set env = target.schema %}SELECT 1", "H008")[0]["message"]
+    assert "target.schema" in msg
     assert "{%" not in msg and "set" not in msg, msg
 
 
@@ -314,6 +314,16 @@ ENV_MACRO = ("{% macro pick_schema() %}"
              "{% if target.name == 'prod' %}mart{% else %}dev{% endif %}{% endmacro %}")
 CALLER = ("{{ config(materialized='table') }}\n"
           "SELECT id FROM {{ ref('stg_txn') }} WHERE 1=1 -- {{ pick_schema() }}\n")
+
+
+@pytest.fixture(autouse=True)
+def _fresh_dbt_cache():
+    """dbt 專案依 sha 快取。兩條測試用同一個 sha、不同的專案內容,不清的話第二條
+    拿到的是第一條的專案 —— 單獨跑會過、整檔跑會紅。"""
+    from orchestrator import dbt_project
+    dbt_project.clear_cache()
+    yield
+    dbt_project.clear_cache()
 
 
 class _RealRulesHub:
@@ -373,5 +383,82 @@ def test_特製內容不會讓規則層卡住(payload, label):
 def test_長度上限不影響正常的寫法():
     """收斂的是「掃多遠」,不是「抓不抓得到」。"""
     assert _hits("SELECT * FROM OPENROWSET/* 說明 */('x')", "R006")
-    assert _hits("{{ var('window_days') }}", "H008")
     assert _hits("{% if  target.name == 'prod' %}x{% endif %}", "H008")
+    assert _hits("{% if  target.name == 'prod' %}x{% endif %}", "H008")
+
+
+# ─────────────── R009 的漏網寫法(#85 review 第 1 點)───────────────
+
+@pytest.mark.parametrize("sql", [
+    "EXEC sp_executesql N'SELECT 1'",
+    "EXEC sys.sp_executesql N'SELECT 1'",          # Microsoft 文件建議的寫法
+    "EXEC master.dbo.sp_executesql N'SELECT 1'",
+    "EXEC master..sp_executesql N'SELECT 1'",
+    "EXEC [sp_executesql] N'SELECT 1'",
+])
+def test_sp_executesql_前面有限定名稱也算(sql):
+    """lookbehind 排除點與方括號的話,只抓得到最沒有修飾的那一種 ——
+    跟 xp_cmdshell 是同一個坑。"""
+    assert _hits(sql, "R009"), sql
+
+
+@pytest.mark.parametrize("sql", [
+    "DECLARE @p sysname = N'master..xp_' + N'cmdshell'; EXEC @p N'whoami';",
+    "EXECUTE @proc_name",
+])
+def test_不帶括號的EXEC接變數也算動態SQL(sql):
+    """變數裡放的是預存程序名稱時會呼叫那一支,延伸預存程序也可以。名稱用字串拼
+    出來,R007 的文字比對就看不到 xp_cmdshell,呼叫的是哪一支要到執行時才知道。"""
+    assert _hits(sql, "R009"), sql
+
+
+@pytest.mark.parametrize("sql", [
+    "EXEC @rc = dbo.refresh_summary",              # 接回傳值,一般呼叫
+    "EXEC @rc=dbo.refresh_summary",
+    "EXEC dbo.refresh_summary @day = '2026-06-01'",
+])
+def test_接回傳值與一般預存程序呼叫不算(sql):
+    assert not _hits(sql, "R009"), sql
+
+
+# ─────────── 被改到的樣板,原文也要掃(#85 review 第 2 點)───────────
+
+def test_展開成功的樣板原文也掃環境相依的寫法():
+    """`target.schema` 這類編譯期的寫法決定的是「展開出哪一段 SQL」,它們自己不會
+    留在展開結果裡 —— 只掃展開後的話,用它們分環境的 model 一條都看不到。"""
+    src = ("{% if target.schema != 'dbo' %}\nDELETE FROM audit_log;\n{% endif %}\n"
+           "SELECT 1 AS ok")
+    assert _hits(src, "H008"), "原文掃得到 target.schema"
+
+
+def test_合併原文的命中時同一條不重複():
+    from orchestrator.pipeline import _merge_env_hits
+    hit = {"rule": "H008", "message": "m", "severity": "hint"}
+    assert _merge_env_hits([dict(hit)], {"hits": [dict(hit)]}) == [hit]
+
+
+def test_只併環境那一家族():
+    """其餘規則由展開後的結果負責,重複報會指到同一件事兩次。"""
+    from orchestrator.pipeline import _merge_env_hits
+    out = _merge_env_hits([], {"hits": [{"rule": "R002", "message": "select *"},
+                                        {"rule": "H008", "message": "target"}]})
+    assert [h["rule"] for h in out] == ["H008"]
+
+
+ENV_MODEL = ("{{ config(materialized='table') }}\n"
+             "{% if target.schema != 'dbo' %}\nSELECT 1 AS dev\n"
+             "{% else %}\nSELECT 2 AS prod\n{% endif %}\n")
+
+
+def test_prescan對展開成功的樣板也掃原文():
+    """走完整的 prescan:只驗規則層自己的話,把「原文也掃」那一步從 prescan 拿掉
+    也不會紅 —— 而展開成功時 `target.schema` 早就不在展開結果裡了。"""
+    project = dict(DBT.PROJECT)
+    project["models/mrt_big.sql"] = ENV_MODEL
+    mr = DBT._mr([DBT._f("models/mrt_big.sql")])
+    ctx = DBT._ctx(files=project, mr=mr)
+    pre = asyncio.run(prescan(_RealRulesHub(), mr["files"], DBT.CFG, ctx))
+
+    entry = next(e for e in pre if e["path"] == "models/mrt_big.sql")
+    assert "dbt_render_error" not in entry, "這個樣板要展開得成功,情境才成立"
+    assert "H008" in [h["rule"] for h in entry["rules"]], entry["rules"]

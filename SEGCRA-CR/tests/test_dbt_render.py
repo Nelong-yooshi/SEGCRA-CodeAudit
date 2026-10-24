@@ -997,7 +997,8 @@ def _imports_of(path: pathlib.Path) -> set[str]:
 
 
 @pytest.mark.parametrize("module, allowed", [
-    ("dbt_render.py", {"copy", "dataclasses", "difflib", "jinja2", "pathlib", "re",
+    # contextvars:一份審查共用一個 invocation_id(每條執行緒各自一個值),不帶來任何對外能力
+    ("dbt_render.py", {"contextvars", "copy", "dataclasses", "difflib", "jinja2", "pathlib", "re",
                        "secrets", "types", ".isolation"}),
     ("isolation.py", {"multiprocessing", "resource"}),
     ("dbt_relations.py", {"re", "yaml", ".dbt_render"}),

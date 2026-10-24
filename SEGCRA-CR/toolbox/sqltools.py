@@ -303,11 +303,21 @@ _PRIVILEGE_RE = re.compile(
     r"(?i)(?<![\w.@\[])(GRANT|REVOKE|DENY)\s+(?!BY\b)"
     r"|(?<![\w.@\[])EXECUTE\s+AS(?!\w)"
     r"|(?<![\w.@\[])ALTER\s+(SERVER\s+)?ROLE(?!\w)")
-# 動態 SQL:EXEC(…) 或 sp_executesql。**不含**不帶括號的 `EXEC 某個預存程序` ——
-# 那是一般呼叫,不是把字串組出來執行。
+# 動態 SQL:EXEC(…)、sp_executesql,或 EXEC 後面直接接變數。
+#
+# `sp_executesql` 的 lookbehind **不排除點與方括號**:`sys.sp_executesql` 是 Microsoft
+# 文件建議的寫法(系統預存程序建議加 sys.),`master.dbo.sp_executesql`、`[sp_executesql]`
+# 也都是同一支。排除掉的話只抓得到最沒有修飾的那一種(跟 xp_cmdshell 同一個坑)。
+#
+# `EXEC @變數`(不帶括號)也算:變數裡放的是預存程序名稱時會呼叫那一支,延伸預存程序
+# 也可以 —— 名稱用字串拼出來,R007 的文字比對就看不到 xp_cmdshell,呼叫的是哪一支要到
+# 執行時才知道。`EXEC @rc = dbo.某支`(接回傳值)是一般呼叫,不算。
 _DYNAMIC_SQL_RE = re.compile(
     r"(?i)(?<![\w.@\[])(?:EXEC|EXECUTE)" + _GAP + r"\("
-    r"|(?<![\w.@\[])sp_executesql(?!\w)")
+    r"|(?<![\w@])\[?sp_executesql\]?(?!\w)"
+    # `\b` 不可省:沒有它的話 `\w+` 會回溯成 `@r`,負向前瞻就看不到 `@rc = ` 的等號,
+    # 於是「接回傳值」那種一般呼叫也會被當成動態 SQL。
+    r"|(?<![\w.@\[])(?:EXEC|EXECUTE)\s+@\w+\b(?!" + _GAP + r"=)")
 # dbt 編譯期副作用:run_query / {% call statement %} 裡執行 DML。每次 compile 都會跑,
 # 卻不在編譯出來的 SQL 裡,所以沙盒看不到它。
 _DBT_EXEC_RE = re.compile(r"(?i)(?<![\w.])(run_query|statement)" + _GAP + r"\(")
@@ -375,16 +385,17 @@ _JINJA = r"\{\{|\{%"
 _IN_JINJA = r"[^}]{0,200}?"
 # 命中的「寫法」只取關鍵字本身(具名群組 tok):比對需要前面那段 Jinja 當界線,
 # 但把 `{% set target_date = var` 整段印進訊息只會讓人看不懂命中的是什麼。
+# **不含 `var()`**:它是帶參數的一般寫法,實際專案幾乎每個 model 都用;拿它當條件
+# 來分環境很少見,真的那樣寫也會被「原文有寫入語句、展開結果沒有」那道擋到。
 _DBT_ENV_RE = re.compile(
     r"(?i)(?:" + _JINJA + r")" + _IN_JINJA + r"(?<![\w.])(?P<tok>target" + _GAP + r"\." + _GAP
     + r"(?:name|database|schema|type|user))(?!\w)"
-    r"|(?:" + _JINJA + r")" + _IN_JINJA + r"(?<![\w.])(?P<tok2>var)" + _GAP + r"\("
     r"|(?<![\w.])(?P<tok3>env_var)" + _GAP + r"\("
     r"|(?P<tok4>\{%" + _GAP + r"if" + _GAP + r"execute)(?!\w)")
 
 
 def _dbt_env_token(m) -> str:
-    for name in ("tok", "tok2", "tok3", "tok4"):
+    for name in ("tok", "tok3", "tok4"):
         if m.group(name):
             return " ".join(m.group(name).split())
     return m.group(0)
