@@ -23,12 +23,14 @@ from pathlib import Path
 PKG_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PKG_ROOT))
 
-from orchestrator.spec_exec import _shape_check, execute_cases  # noqa: E402
+from orchestrator.spec_exec import (_label_gaps, _shape_check,  # noqa: E402
+                                    _unverified, execute_cases,
+                                    gaps_and_passed)
 
 import testdata_cache  # noqa: E402 - 與本檔同目錄(eval/),執行時已在 sys.path[0]
 
 # 規則碼 → 提供正確 SQL 的正向對照 golden case
-REFERENCE = {"R-140": "mr_406"}
+REFERENCE = {"R-140": "mr_406", "RETAIL_M1_EVAL": "mr_701"}
 
 # 規則碼 → [(寫錯的方式, 正確 SQL 裡的原文, 改成)]。改成空字串 = 整個拿掉這個條件。
 MUTANTS = {
@@ -45,6 +47,102 @@ MUTANTS = {
         ("拿掉時間窗", "  AND t.tx_time >= @start_date AND t.tx_time < @end_date\n", ""),
         ("門檻寫成 > 500000", "HAVING SUM(t.amount) >= 500000", "HAVING SUM(t.amount) > 500000"),
     ],
+    # RETAIL_M1_EVAL 是目前唯一的大規則(23 個條件、46 個「條件×方向」),也是測資
+    # 生成唯一會走到「骨架 + 逐批補缺」那條路的規則(見 orchestrator/spec_exec.py 的
+    # _FILL_BATCH)。沒有這組設定,補缺機制對覆蓋**品質**有沒有幫助就無從量測:
+    # coverage_gaps 只數「每個條件有沒有兩向案例」,數得出數量、數不出有沒有驗到。
+    #
+    # 每一筆對應規格裡的一個條件,所以「抓不到」會直接指名是哪一條形同沒驗。
+    # 門檻類的寫錯多半是**邊界**(含端點 vs 不含、上下界放寬一格),抓不到通常
+    # 代表測資只生了「明顯不符」的案例、沒有踩在門檻上。
+    "RETAIL_M1_EVAL": [
+        # ── 排除資料(規格「排除資料」段的三項) ──
+        ("拿掉空白帳號排除",
+         "WHERE NULLIF(LTRIM(RTRIM(account_id)), '') IS NOT NULL\n    AND ", "WHERE "),
+        ("小額入帳門檻寫成 >= 1000(規格是 > 1000)",
+         "AND amount > 1000", "AND amount >= 1000", "*/2"),
+        ("拿掉小額入帳排除",
+         "        AND amount > 1000\n", "", "*/2"),
+        ("拿掉 EarlyJob 排除",
+         "WHERE NOT EXISTS (\n    SELECT 1\n    FROM retail_m1_earlyjob e\n"
+         "    WHERE e.account_id = f.account_id\n"
+         "    AND e.TABLE_DATE = DATEADD(DAY, -1, @start_date)\n)",
+         "WHERE 1 = 1"),
+        ("EarlyJob 比對日改成同日(規格是前一日)",
+         "DATEADD(DAY, -1, @start_date)", "@start_date"),
+        # ── 時間窗與衍生指標 ──
+        ("拿掉交易日限制",
+         "    AND TABLE_DATE = @start_date\n", ""),
+        ("當日結餘取第一筆而非最後一筆",
+         "ORDER BY posted_date DESC, txn_time DESC", "ORDER BY posted_date ASC, txn_time ASC"),
+        ("io_ratio 分母為 0 時給 NULL(規格是 0)",
+         "WHEN inbound_amt = 0 THEN 0", "WHEN inbound_amt = 0 THEN NULL"),
+        ("io_ratio 不四捨五入到小數 2 位",
+         "ROUND(CAST(outbound_amt AS FLOAT) / CAST(inbound_amt AS FLOAT), 2)",
+         "CAST(outbound_amt AS FLOAT) / CAST(inbound_amt AS FLOAT)"),
+        # ── 分類:op_code 與 direction_flag ──
+        ("指定入帳少一個 op_code",
+         "op_code IN ('OP01','OP02','OP03')", "op_code IN ('OP01','OP02')", "*/2"),
+        ("自助設備出帳少一個 op_code",
+         "op_code IN ('OP11','OP12')", "op_code IN ('OP11')", "*/2"),
+        ("指定出帳少一個 op_code",
+         "op_code IN ('OP21','OP22','OP23')", "op_code IN ('OP21','OP22')"),
+        ("入帳/出帳方向寫反",
+         "direction_flag = '0'", "direction_flag = '1'", "*/2"),
+        # ── 條件 1(A):七項各一個 ──
+        ("A 1-1 kiosk_outbound_cnt 上界放寬成 4",
+         "kiosk_outbound_cnt BETWEEN 2 AND 3", "kiosk_outbound_cnt BETWEEN 2 AND 4"),
+        ("A 1-2 kiosk_outbound_amt 下界寫成不含端點",
+         "kiosk_outbound_amt BETWEEN 50000 AND 100000",
+         "kiosk_outbound_amt > 50000 AND kiosk_outbound_amt <= 100000", "1/2"),
+        ("A 1-3 outbound_amt 上界放寬成 120000",
+         "outbound_amt BETWEEN 90000 AND 110000",
+         "outbound_amt BETWEEN 90000 AND 120000", "1/2"),
+        ("A 1-4 inbound_amt 下界寫成不含端點",
+         "inbound_amt BETWEEN 80000 AND 100000",
+         "inbound_amt > 80000 AND inbound_amt <= 100000", "1/2"),
+        ("A 1-5 inbound_cnt 寫成 >= 2(規格是等於 2)",
+         "inbound_cnt = 2", "inbound_cnt >= 2"),
+        ("A 1-6 io_ratio 下界放寬成 0.50",
+         "io_ratio BETWEEN 0.60 AND 1.20", "io_ratio BETWEEN 0.50 AND 1.20", "1/2"),
+        ("A 1-7 eod_balance 寫成 < 1000(規格是 <= 1000)",
+         "eod_balance <= 1000", "eod_balance < 1000", "1/3"),
+        # ── 條件 2(B) ──
+        ("B 2-1 kiosk_outbound_cnt 下界放寬成 2",
+         "kiosk_outbound_cnt BETWEEN 3 AND 4", "kiosk_outbound_cnt BETWEEN 2 AND 4"),
+        ("B 2-2 kiosk_outbound_amt 上界放寬成 120000",
+         "kiosk_outbound_amt BETWEEN 50000 AND 100000",
+         "kiosk_outbound_amt BETWEEN 50000 AND 120000", "2/2"),
+        ("B 2-3 outbound_amt 下界寫成不含端點",
+         "outbound_amt BETWEEN 90000 AND 110000",
+         "outbound_amt > 90000 AND outbound_amt <= 110000", "2/2"),
+        ("B 2-4 inbound_amt 上界縮成 100000",
+         "inbound_amt BETWEEN 80000 AND 120000", "inbound_amt BETWEEN 80000 AND 100000"),
+        ("B 2-5 inbound_cnt 上界放寬成 9",
+         "inbound_cnt BETWEEN 3 AND 8", "inbound_cnt BETWEEN 3 AND 9"),
+        ("B 2-6 io_ratio 上界放寬成 1.30",
+         "io_ratio BETWEEN 0.60 AND 1.20", "io_ratio BETWEEN 0.60 AND 1.30", "2/2"),
+        ("B 2-7 eod_balance 寫成 < 1000",
+         "eod_balance <= 1000", "eod_balance < 1000", "2/3"),
+        # ── 條件 3(C) ──
+        ("C 3-1 kiosk_outbound_cnt 下界放寬成 3",
+         "kiosk_outbound_cnt BETWEEN 4 AND 10", "kiosk_outbound_cnt BETWEEN 3 AND 10"),
+        ("C 3-2 kiosk_outbound_amt 下界放寬成 50000",
+         "kiosk_outbound_amt BETWEEN 90000 AND 100000",
+         "kiosk_outbound_amt BETWEEN 50000 AND 100000"),
+        ("C 3-3 inbound_amt 上界放寬成 120000",
+         "inbound_amt BETWEEN 80000 AND 100000",
+         "inbound_amt BETWEEN 80000 AND 120000", "2/2"),
+        ("C 3-4 inbound_cnt 上界放寬成 4",
+         "inbound_cnt BETWEEN 2 AND 3", "inbound_cnt BETWEEN 2 AND 4"),
+        ("C 3-5 io_ratio 下界放寬成 0.90",
+         "io_ratio BETWEEN 1.00 AND 1.50", "io_ratio BETWEEN 0.90 AND 1.50"),
+        ("C 3-6 eod_balance 寫成 < 1000",
+         "eod_balance <= 1000", "eod_balance < 1000", "3/3"),
+        # 條件之間是 OR、條件內是 AND(規格「補充」段明寫)——寫成 AND 會漏掉大量帳戶
+        ("三個條件之間寫成 AND(規格是 OR)",
+         "        )\n        OR\n        -- Condition B", "        )\n        AND\n        -- Condition B"),
+    ],
 }
 
 
@@ -54,10 +152,29 @@ def reference_sql(spec_code: str) -> str:
     return case["files"][0]["full_content"]
 
 
-def mutate(sql: str, old: str, new: str) -> str:
-    if sql.count(old) != 1:
-        raise ValueError(f"寫錯的版本對不上正確 SQL(原文出現 {sql.count(old)} 次):{old!r}")
-    return sql.replace(old, new)
+def mutate(sql: str, old: str, new: str, where: str = "1/1") -> str:
+    """把正確 SQL 的某一處改錯。
+
+    `where` 是 "第幾處/共幾處":同一段門檻在條件 A/B/C 裡會重複出現
+    (例如 `eod_balance <= 1000` 三個區塊都有),要能指名只改其中一處,
+    才看得出「是哪一個條件沒被驗到」。`"*/2"` = 兩處都改(例如入帳的
+    CASE 在 cnt 與 amt 各出現一次,只改一邊會變成兩個指標互相矛盾,
+    那是測不到規格條件的假訊號)。
+
+    「共幾處」要寫明是為了**偵測漂移**:正確 SQL 改版後出現次數變了,
+    這裡會直接報錯,而不是悄悄改到別的地方(或什麼都沒改)。
+    """
+    nth, _, total = where.partition("/")
+    got = sql.count(old)
+    if got != int(total):
+        raise ValueError(f"寫錯的版本對不上正確 SQL(原文出現 {got} 次,"
+                         f"設定寫 {total} 次):{old!r}")
+    if nth == "*":
+        return sql.replace(old, new)
+    i = -1
+    for _ in range(int(nth)):
+        i = sql.index(old, i + 1)
+    return sql[:i] + new + sql[i + len(old):]
 
 
 def main() -> int:
@@ -87,13 +204,36 @@ def main() -> int:
         for m in ok["mismatches"]:
             print(f"  - {m.get('case_id')}:預期 {m.get('expect_flagged')},實際 {m.get('actual_flagged')}")
         return 1
-    print(f"正確的 SQL:{len(ok['case_results'])} 個案例全部符合預期\n")
+    # 預期值符不符只是一半:標籤檢查(每個案例的資料有沒有真的測到它宣稱的那一條)
+    # 與最後的 passed 也要印,不然「10/10 符合預期」可以跟一堆標籤缺口同時成立,
+    # 而凍結檔能不能用看的是後者。
+    #
+    # 缺口與 passed 由 spec_exec 的共用函式算:這裡自己算一份的話,正式流程多一種
+    # 缺口時腳本不會跟著變,印出來的結論就跟真的不一樣。
+    label_gaps = _label_gaps(ok["case_results"])
+    unverified = _unverified(ok["case_results"])
+    all_gaps, passed = gaps_and_passed(plan, ok, gaps, ok["mismatches"])
+    print(f"正確的 SQL:{len(ok['case_results'])} 個案例全部符合預期")
+    print(f"標籤檢查:{len(label_gaps)} 個案例的資料與標籤不符、"
+          f"{len(unverified)} 個案例的標籤未經驗證")
+    for g in label_gaps:
+        print(f"  - {g}")
+    for u in unverified:
+        print(f"  - {u['case_id']}:{u['reason']}")
+    print(f"執行驗證的結論:passed={passed}(缺口 {len(all_gaps)} 個)"
+          f"{'' if passed else ' → 不得自動放行,凍結檔還不能用'}")
+    for g in all_gaps:
+        if g not in label_gaps:              # 標籤那幾條上面已經逐條印過
+            print(f"  - {g}")
+    print()
 
+    if not passed:
+        print("‼ 凍結檔本身還不能用:上面的缺口要先處理(抓不抓得到寫錯的版本另外看)\n")
     survived = []
     print("| SQL 寫錯成 | 凍結檔抓得到嗎 | 抓到的案例 |")
     print("|---|---|---|")
-    for name, old, new in MUTANTS[code]:
-        ex = execute_cases(mutate(sql, old, new), plan)
+    for name, old, new, *rest in MUTANTS[code]:
+        ex = execute_cases(mutate(sql, old, new, *rest), plan)
         err = ex["sandbox_error"] or ex["sql_error"] or ex["testdata_error"]
         if err:
             print(f"| {name} | 無法判斷(執行失敗) | {err[:80]} |")
