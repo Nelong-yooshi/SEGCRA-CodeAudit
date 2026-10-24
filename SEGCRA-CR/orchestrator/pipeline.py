@@ -20,7 +20,8 @@ from .dbt_affected import (
     AffectedCheck, SpecForModels, check_affected_models, impact_finding, specs_by_priority,
 )
 from .change_view import build_full_text_section
-from .cold_read import ColdRead, cold_read as _cold_read, record as _cold_read_record
+from .cold_read import (UNREAD_NEAR_LIMIT, UNREAD_NO_USAGE, UNREAD_TOO_FEW, ColdRead,
+                        cold_read as _cold_read, record as _cold_read_record)
 from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_render import is_dbt_template, render_model_isolated
 from .dbt_config_change import HIGH_RISK_NEW, config_changes, default_relative, is_dbt_yaml
@@ -159,21 +160,43 @@ INCOMPLETE_TITLE_PREFIX = "審查未完整"
 # 但整段沒有,大規格的測資生成可以久到讓一次審查永遠不回來,所以整段也要有上限。
 # 逾時不是當成通過,而是交人工(`stage_seconds` 記下各階段耗時,之後調上限有根據)。
 SPEC_EXEC_TIMEOUT_SECONDS = env_seconds("SPEC_EXEC_TIMEOUT_SECONDS", 1200)
-# 冷讀跟主審查平行跑;主審查結束後最多再等它這麼久。不從開始算:端點一次只處理一個請求時,
-# 冷讀可能排在主審查的某一輪後面,那段等待不是冷讀自己的時間。
+# 冷讀的時間上限(主審查之後依序跑,從冷讀開始算;見 _run_cold_read)
 COLD_READ_TIMEOUT_SECONDS = env_seconds("COLD_READ_TIMEOUT_SECONDS", 600)
+# 主審查(模型呼叫)的時間上限。單次請求的逾時(LLM_TIMEOUT,預設 3600 秒)比整份審查的上限
+# (webhook 的 REVIEW_TIMEOUT_SECONDS,預設 2400 秒)還長:端點收了連線卻一直不回時,外層會先把
+# 整份審查取消,確定性的結果跟著消失。所以主審查有自己的上限,而且比整份短,留時間給後面的步驟
+# 把確定性的結果寫出去(預設留 600 秒;整份的上限很短時留一半)。
+MAIN_REVIEW_RESERVE_SECONDS = 600
+
+
+def _main_review_timeout() -> int:
+    total = env_seconds("REVIEW_TIMEOUT_SECONDS", 2400)
+    cap = max(total // 2, total - MAIN_REVIEW_RESERVE_SECONDS)
+    limit = env_seconds("MAIN_REVIEW_TIMEOUT_SECONDS", cap)
+    if limit > cap:
+        print(f"[pipeline] MAIN_REVIEW_TIMEOUT_SECONDS={limit} 不比整份審查的上限 {total} 秒短得夠多,"
+              f"改用 {cap} 秒(要留時間把確定性的結果寫出去)", flush=True)
+        return cap
+    return limit
+
+
+MAIN_REVIEW_TIMEOUT_SECONDS = _main_review_timeout()
 
 
 def _incomplete_finding(stage: str, exc: BaseException | None = None,
-                        timeout: int | None = None) -> dict:
+                        timeout: int | None = None, reason: str | None = None) -> dict:
     """「這個環節沒完成」的 finding。不回顯例外訊息,只寫類型。
 
     `stage` 另外存成一個欄位:判斷「有沒有環節沒完成」要看欄位,不是比對標題開頭
     (標題是給人看的,會改寫;決策與測試靠它判斷就會跟著壞)。
+    `reason` 是沒有執行的原因(程式的固定文字),給「刻意不跑」的情況用。
     """
     if timeout is not None:
         detail = f"{stage} 超過時間上限 {timeout} 秒,已中止。這一環節的結果不在本報告內。"
         title = f"[{stage}] {INCOMPLETE_TITLE_PREFIX}(逾時)"
+    elif reason is not None:
+        detail = f"{stage} 沒有執行:{reason}。這一環節的結果不在本報告內。"
+        title = f"[{stage}] {INCOMPLETE_TITLE_PREFIX}(沒有執行)"
     else:
         detail = (f"{stage} 執行時發生 {type(exc).__name__},已跳過。"
                   f"這一環節的結果不在本報告內。")
@@ -182,6 +205,10 @@ def _incomplete_finding(stage: str, exc: BaseException | None = None,
             "detail": detail, "stage": stage,
             "suggestion": "請人工確認這一環節原本要檢查的內容;其餘環節的結果仍然有效。",
             "citations": []}
+
+
+class _SpecExecSkipped(Exception):
+    """執行驗證刻意不跑(端點無法使用);不是失敗。"""
 
 
 # 哪些環節包過隔離:{函式名: 環節名稱}。由 @_isolated_stage 自己登記,不是人工維護的
@@ -884,7 +911,7 @@ async def _cold_read_stage(cfg: Config, mr: dict, dbt_ctx: DbtContext | None
     """冷讀(見 cold_read)。回傳 (結果, 未完整的 finding)。
 
     任何失敗都記成環節未完整(交人工),不往外丟:冷讀是資安防線,失敗時「沒命中」跟「沒看」
-    分不出來,不能維持原本的流程。只有被取消會往外丟。時間上限在 _await_cold_read。"""
+    分不出來,不能維持原本的流程。只有被取消會往外丟。時間上限見 _run_cold_read。"""
     try:
         texts = _cold_read_texts(mr.get("files", []), dbt_ctx)
         return await _cold_read(cfg, mr, texts), None
@@ -892,13 +919,47 @@ async def _cold_read_stage(cfg: Config, mr: dict, dbt_ctx: DbtContext | None
         return None, _incomplete_finding("冷讀", e)
 
 
-async def _await_cold_read(task: "asyncio.Task") -> tuple[ColdRead | None, dict | None]:
-    """主審查結束後,最多再等冷讀 COLD_READ_TIMEOUT_SECONDS 秒;還沒好就取消,記成逾時。"""
-    done, _ = await asyncio.wait({task}, timeout=COLD_READ_TIMEOUT_SECONDS)
-    if task in done:
-        return task.result()
-    task.cancel()
-    return None, _incomplete_finding("冷讀", timeout=COLD_READ_TIMEOUT_SECONDS)
+async def _run_main_review(cfg: Config, profile, system: str, user: str, hub, trace,
+                           meta: dict, mr_id: str) -> str | None:
+    """主審查的模型呼叫,有自己的時間上限(MAIN_REVIEW_TIMEOUT_SECONDS)。
+
+    模型呼叫失敗(連不上、逾時、端點錯誤…)時回 None,問題類型記進 meta["failed"]:確定性的結果
+    不跟著消失,用空報告走完後處理,由 enforce_truncation 補 major。只記問題類型,不記例外訊息
+    (含主機位址等)。不重試:理由同截斷,重試不保證會好,只會讓整份審查更久。
+    被取消(webhook 的總時間上限、新 commit 取消舊審查)照樣往外傳;asyncio.wait_for 被取消時
+    會一起取消模型呼叫,不留下沒人收尾的請求。"""
+    try:
+        return await asyncio.wait_for(
+            run_agent(cfg, profile, system, user, hub, trace=trace, meta=meta),
+            MAIN_REVIEW_TIMEOUT_SECONDS)
+    except Exception as e:
+        meta["failed"] = _model_failure_kind(e)
+        print(f"[pipeline] MR !{mr_id} 主審查模型呼叫失敗({meta['failed']})", flush=True)
+        return None
+
+
+# 主審查判定端點無法使用的問題類型:之後的模型呼叫(冷讀、執行驗證的測資生成)不再嘗試,
+# 不然各自再等到自己的上限,加起來會超過整份審查的上限
+_ENDPOINT_DOWN_KINDS = ("timeout", "connection")
+_ENDPOINT_DOWN_REASON = "主審查判定審查模型的端點無法使用(連不上或逾時),不再呼叫模型"
+
+
+def _endpoint_unavailable(meta: dict) -> bool:
+    return _failure_kind(meta) in _ENDPOINT_DOWN_KINDS
+
+
+async def _run_cold_read(cfg: Config, mr: dict, dbt_ctx: DbtContext | None
+                         ) -> tuple[ColdRead | None, dict | None]:
+    """主審查之後依序跑冷讀,最多 COLD_READ_TIMEOUT_SECONDS 秒(從冷讀開始算),逾時記成未完整。
+
+    用 asyncio.wait_for:它被取消時會一起取消冷讀(asyncio.wait 不會),外層的總時間上限、
+    新 commit 取消舊審查都會傳進來,不會留下沒人收尾、還在打模型的請求。
+    依序而不是跟主審查平行:開發與黑盒用的端點一次只處理一個請求,平行省不到時間;正式環境量過
+    省得到時間再改回平行。"""
+    try:
+        return await asyncio.wait_for(_cold_read_stage(cfg, mr, dbt_ctx), COLD_READ_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        return None, _incomplete_finding("冷讀", timeout=COLD_READ_TIMEOUT_SECONDS)
 
 
 def _cold_read_texts(files, dbt_ctx: DbtContext | None) -> dict:
@@ -1473,22 +1534,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
 
         trace = [] if capture is not None else None
         output_meta: dict = {}
-        # 冷讀跟主審查平行跑;主審查被取消時一起取消,不留下沒人等的工作
-        cold_task = asyncio.create_task(_cold_read_stage(cfg, mr, dbt_ctx))
-        try:
-            raw = await run_agent(cfg, profile, system, user, hub, trace=trace,
-                                  meta=output_meta)
-        except Exception as e:
-            # 模型呼叫失敗(連不上、逾時、端點錯誤…):確定性的結果不跟著消失。用空報告走完後處理,
-            # 由 enforce_truncation 補 major;冷讀照常等。只記問題類型,不記例外訊息(含主機位址等)
-            raw = None
-            output_meta["failed"] = _model_failure_kind(e)
-            print(f"[pipeline] MR !{mr_id} 主審查模型呼叫失敗({output_meta['failed']})", flush=True)
-        except BaseException:
-            # 取消(webhook 的總時間上限、新 commit 取消舊審查)照樣往外傳
-            cold_task.cancel()
-            raise
-        cold, cold_incomplete = await _await_cold_read(cold_task)
+        raw = await _run_main_review(cfg, profile, system, user, hub, trace, output_meta, mr_id)
+        # 冷讀(只看 MR 文字)在主審查之後依序跑,見 _run_cold_read。主審查判定端點無法使用時
+        # 不再呼叫模型,直接記成未完整(交人工)
+        if _endpoint_unavailable(output_meta):
+            cold, cold_incomplete = None, _incomplete_finding("冷讀", reason=_ENDPOINT_DOWN_REASON)
+        else:
+            cold, cold_incomplete = await _run_cold_read(cfg, mr, dbt_ctx)
         if cold_incomplete is not None:
             report_stub["findings"].append(cold_incomplete)
         if capture is not None:
@@ -1555,6 +1607,10 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         progress: dict = {}
         deadline = time.monotonic() + SPEC_EXEC_TIMEOUT_SECONDS
         try:
+            # 端點無法使用時整段不跑:測資生成要呼叫模型。找不到規格等不用模型的結果這次不會出現,
+            # 但它們本來就是交人工,決策不受影響;端點恢復後重新審查就看得到
+            if _endpoint_unavailable(output_meta):
+                raise _SpecExecSkipped
             # 交給執行驗證的 MR 與規格也在 try 裡:組不出來同樣記成執行驗證未完成
             exec_mr = _mr_for_spec_exec(mr, dbt_ctx)
             exec_code, exec_text = _spec_for_exec(spec_code, spec_text, affected_specs, exec_mr)
@@ -1562,6 +1618,10 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                 run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text,
                               progress=progress, deadline=deadline),
                 timeout=SPEC_EXEC_TIMEOUT_SECONDS)
+        except _SpecExecSkipped:
+            report.setdefault("findings", []).append(
+                _incomplete_finding("執行驗證", reason=_ENDPOINT_DOWN_REASON))
+            spec_result = None
         except asyncio.TimeoutError:
             report.setdefault("findings", []).append(_incomplete_finding(
                 _spec_exec_stage(progress), timeout=SPEC_EXEC_TIMEOUT_SECONDS))
@@ -2365,9 +2425,10 @@ def enforce_injection(report: dict, hits: list[dict]) -> dict:
 
 
 _COLD_READ_TITLE = "冷讀判定有文字在對審查者或審查工具說話"
-_COLD_READ_TRUNCATED_TITLE = "冷讀沒有看完(輸入超過上限)"
+_COLD_READ_TRUNCATED_TITLE = "冷讀沒有看完(輸入超過上限,或被端點截掉)"
 # 報告最多列幾個位置 / 沒看完的段落
 MAX_COLD_READ_LISTED = 20
+_COLD_READ_UNREAD = (UNREAD_NO_USAGE, UNREAD_NEAR_LIMIT, UNREAD_TOO_FEW)
 
 
 def _cold_read_place(kind: str, path) -> str:
@@ -2386,9 +2447,10 @@ def enforce_cold_read(report: dict, cold: ColdRead | None) -> dict:
     報告只寫位置(標題、說明、哪個檔案、哪個檔名),**不寫模型挑出的原文**:那是 MR 作者寫的
     文字,貼回留言等於把它再送一次。片段只留在內部紀錄 `_cold_read`(不貼回 MR)。
     標題只能由程式產生(見 _put_program_finding)。"""
+    # 一律由程式寫:冷讀失敗時是 None,模型自己輸出的同名欄位會被蓋掉
+    report["_cold_read"] = _cold_read_record(cold) if cold is not None else None
     if cold is None:
         return report
-    report["_cold_read"] = _cold_read_record(cold)
     if cold.flagged:
         places = [_cold_read_place(k, p) for k, p in cold.locations[:MAX_COLD_READ_LISTED]]
         flagged = {
@@ -2400,13 +2462,19 @@ def enforce_cold_read(report: dict, cold: ColdRead | None) -> dict:
             "suggestion": "移除對審查者或審查工具說話的文字;變更說明只描述改了什麼、為什麼改。"}
         _put_program_finding(report, flagged)
     if cold.truncated:
-        listed = "、".join(_code_span(o) for o in cold.omitted[:MAX_COLD_READ_LISTED])
-        more = (f" 等 {len(cold.omitted)} 段" if len(cold.omitted) > MAX_COLD_READ_LISTED else "")
+        reasons = []
+        if cold.omitted:
+            listed = "、".join(_code_span(o) for o in cold.omitted[:MAX_COLD_READ_LISTED])
+            more = (f" 等 {len(cold.omitted)} 段" if len(cold.omitted) > MAX_COLD_READ_LISTED else "")
+            reasons.append(f"冷讀的輸入超過上限(models.yaml 的 budget.cold_read,且不超過模型的上下文),"
+                           f"以下段落沒有完整送出:{listed}{more}。")
+        if cold.unread in _COLD_READ_UNREAD:        # 固定文字;不認得的不寫
+            reasons.append(f"{cold.unread}。")
         truncated = {
             "file": "(MR 內容)", "line": 0, "severity": "major", "citations": [],
             "title": _COLD_READ_TRUNCATED_TITLE,
-            "detail": (f"冷讀的輸入超過上限(models.yaml 的 budget.cold_read),以下段落沒有完整送出:"
-                       f"{listed}{more}。沒看到的部分不知道有沒有對審查者說話的文字,需人工確認。"),
+            "detail": ("".join(reasons) or "冷讀沒有看完全部的輸入。")
+                      + "沒看到的部分不知道有沒有對審查者說話的文字,需人工確認。",
             "suggestion": "MR 拆小;或確認上述段落沒有對審查者或審查工具說話的文字。"}
         _put_program_finding(report, truncated)
     return report

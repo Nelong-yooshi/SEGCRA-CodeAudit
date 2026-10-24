@@ -2,7 +2,8 @@
 
     .venv/bin/python tools/cold_read.py fixtures/mr_003.json [更多檔案 ...]
 
-輸出不含模型挑出的原文片段(只有 flagged、位置、有沒有截斷),給評測只跑冷讀這支用。
+輸出不含模型挑出的原文片段(只有 flagged、位置、有沒有看完、沒送的段落、端點回報的讀入量顯示沒看完的原因),
+給單獨測冷讀用。
 要連模型端點(config/models.yaml 的 endpoint 與 cold_read profile)。任何一份失敗時結束碼是 1,
 那一份輸出 `{"file": ..., "error": 例外類型}`,不帶例外內容。
 """

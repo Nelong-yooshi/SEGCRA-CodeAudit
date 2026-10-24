@@ -172,3 +172,183 @@ def test_模型自己輸出同標題的info會被取代():
     report = pipeline.enforce_truncation({"findings": [fake]}, {"failed": "connection"}, 8192)
     [f] = _failed(report)
     assert f["severity"] == "major" and f["detail"] != "沒事"
+
+
+# ─────────────────── 主審查的時間上限、端點無法使用時後面不再呼叫模型 ───────────────────
+
+@pytest.fixture
+def staged(monkeypatch, tmp_path):
+    """review_mr 跑一次,記下冷讀與執行驗證有沒有被呼叫。main:主審查的模型呼叫(async 函式)。"""
+    fixtures, output = tmp_path / "fixtures", tmp_path / "out"
+    fixtures.mkdir()
+    output.mkdir()
+    monkeypatch.setattr(gitlab, "FIXTURES_DIR", fixtures)
+    monkeypatch.setattr(gitlab, "OUTPUT_DIR", output)
+    monkeypatch.setenv("REVIEW_OUTPUT", str(output))
+    calls = []
+
+    async def cold(cfg, mr, head_texts=None):
+        calls.append("cold")
+        from orchestrator.cold_read import ColdRead
+        return ColdRead(flagged=False)
+
+    async def spec_exec(cfg, hub, mr, *a, **kw):
+        calls.append("spec_exec")
+        return {"passed": True, "findings": []}
+
+    monkeypatch.setattr(pipeline, "_cold_read", cold)
+    monkeypatch.setattr(pipeline, "run_spec_exec", spec_exec)
+
+    def _run(main, sql="SELECT id FROM t WHERE id = 1", outer=30):
+        (fixtures / "mr_963.json").write_text(json.dumps({
+            "title": "調整", "description": "例行維護", "sha": "e1b1" + "0" * 36,
+            "files": [{"path": "sql/x.sql", "diff": "@@ -1 +1 @@\n+" + sql, "full_content": sql}],
+        }, ensure_ascii=False), encoding="utf-8")
+
+        async def run_agent(cfg, profile, system, user, hub, meta=None, **kw):
+            calls.append("main")
+            return await main()
+
+        monkeypatch.setattr(pipeline, "run_agent", run_agent)
+        report = asyncio.run(asyncio.wait_for(pipeline.review_mr(load_config(), "963"), outer))
+        return report, calls
+    return _run
+
+
+def _stages(report):
+    return {f.get("stage"): f for f in report["findings"] if f.get("stage")}
+
+
+def test_端點不回應時_整份審查在上限內結束_確定性結果照常_後面不再呼叫模型(staged, monkeypatch):
+    """端點收了連線卻一直不回:主審查到自己的上限就停,冷讀與測資生成不再呼叫模型,
+    整份審查遠在外層的上限之前結束,確定性的結果照常報出,決策交人工。"""
+    import time
+    monkeypatch.setattr(pipeline, "MAIN_REVIEW_TIMEOUT_SECONDS", 0.3)
+
+    async def hang():
+        await asyncio.Event().wait()
+
+    t0 = time.monotonic()
+    report, calls = staged(hang, sql="DELETE FROM t", outer=20)
+    assert time.monotonic() - t0 < 15
+    assert calls == ["main"]                               # 冷讀、執行驗證都沒有呼叫
+    assert any(f["title"].startswith("[R001]") for f in report["findings"])   # 確定性的結果
+    [f] = _failed(report)
+    assert pipeline._MODEL_FAILURE_TEXT["timeout"] in f["detail"]
+    stages = _stages(report)
+    for stage in ("冷讀", "執行驗證"):
+        assert pipeline._ENDPOINT_DOWN_REASON in stages[stage]["detail"]
+        assert stages[stage]["severity"] == "major"
+    assert report["decision"] != "auto_approved"
+
+
+def test_端點不回應而且沒有確定性命中時_決策交人工(staged, monkeypatch):
+    monkeypatch.setattr(pipeline, "MAIN_REVIEW_TIMEOUT_SECONDS", 0.3)
+
+    async def hang():
+        await asyncio.Event().wait()
+
+    report, calls = staged(hang)
+    assert calls == ["main"] and report["decision"] == "needs_human"
+
+
+def test_連不上時後面也不再呼叫模型(staged):
+    async def refuse():
+        raise openai.APIConnectionError(message=SECRET, request=_REQ)
+
+    report, calls = staged(refuse)
+    assert calls == ["main"]
+    assert {"冷讀", "執行驗證"} <= set(_stages(report))
+
+
+@pytest.mark.parametrize("error", [
+    _status(openai.InternalServerError, 500), _status(openai.BadRequestError, 400),
+    _status(openai.RateLimitError, 429), RuntimeError(SECRET),
+])
+def test_端點還在時_冷讀與執行驗證照常跑(staged, error):
+    """端點錯誤、拒絕(例如主審查的輸入超過上限)、忙碌:不代表端點不能用,後面的呼叫照常試。"""
+    async def fail():
+        raise error
+
+    report, calls = staged(fail)
+    assert calls == ["main", "cold", "spec_exec"]
+    assert "冷讀" not in _stages(report) and "執行驗證" not in _stages(report)
+
+
+def test_主審查沒有失敗時_照常跑完(staged):
+    async def ok():
+        return json.dumps({"summary": "沒問題", "score": 100, "findings": []}, ensure_ascii=False)
+
+    report, calls = staged(ok)
+    assert calls == ["main", "cold", "spec_exec"] and _failed(report) == []
+
+
+def test_主審查用自己的時間上限():
+    seen = {}
+
+    async def run(cfg, profile, system, user, hub, meta=None, **kw):
+        await asyncio.sleep(5)
+
+    async def go():
+        import unittest.mock as m
+        with m.patch.object(pipeline, "run_agent", run), \
+                m.patch.object(pipeline, "MAIN_REVIEW_TIMEOUT_SECONDS", 0.05):
+            return await pipeline._run_main_review(None, None, "", "", None, None, seen, "1")
+
+    assert asyncio.run(go()) is None and seen["failed"] == "timeout"
+
+
+def test_等主審查時外層被取消_模型呼叫一起取消():
+    """webhook 的總時間上限、新 commit 取消舊審查:取消要傳進模型呼叫,不留下沒人收尾的請求。"""
+    cancelled = []
+
+    async def run(cfg, profile, system, user, hub, meta=None, **kw):
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    async def go():
+        import unittest.mock as m
+        with m.patch.object(pipeline, "run_agent", run):
+            task = asyncio.ensure_future(
+                pipeline._run_main_review(None, None, "", "", None, None, {}, "1"))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(go())
+    assert cancelled == [True]
+
+
+@pytest.mark.parametrize("env,expected,warned", [
+    ({}, 1800, False),                                                  # 預設:整份 2400 留 600
+    ({"MAIN_REVIEW_TIMEOUT_SECONDS": "900"}, 900, False),
+    ({"MAIN_REVIEW_TIMEOUT_SECONDS": "2300"}, 1800, True),              # 太長:改回上限並警告
+    ({"REVIEW_TIMEOUT_SECONDS": "3600"}, 3000, False),
+    ({"REVIEW_TIMEOUT_SECONDS": "600"}, 300, False),                    # 整份很短:留一半
+    ({"REVIEW_TIMEOUT_SECONDS": "600", "MAIN_REVIEW_TIMEOUT_SECONDS": "500"}, 300, True),
+    ({"MAIN_REVIEW_TIMEOUT_SECONDS": "壞掉"}, 1800, False),             # 讀不懂:退回預設
+])
+def test_主審查的時間上限比整份短(monkeypatch, capsys, env, expected, warned):
+    monkeypatch.delenv("REVIEW_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("MAIN_REVIEW_TIMEOUT_SECONDS", raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    assert pipeline._main_review_timeout() == expected
+    assert ("不比整份審查的上限" in capsys.readouterr().out) is warned
+
+
+def test_沒有執行的環節_寫出原因():
+    f = pipeline._incomplete_finding("冷讀", reason="端點不能用")
+    assert f["stage"] == "冷讀" and f["severity"] == "major"
+    assert "冷讀 沒有執行:端點不能用" in f["detail"] and "沒有執行" in f["title"]
+
+
+def test_只有連不上與逾時算端點無法使用():
+    assert pipeline._endpoint_unavailable({"failed": "timeout"})
+    assert pipeline._endpoint_unavailable({"failed": "connection"})
+    for kind in ("rate_limited", "rejected", "server_error", "other", None):
+        assert not pipeline._endpoint_unavailable({"failed": kind})
