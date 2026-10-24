@@ -10,8 +10,14 @@ import os
 import re
 import time
 from collections import Counter
+from typing import NamedTuple
 
 from pathlib import Path
+
+import sqlglot
+from sqlglot import exp
+from sqlglot.errors import SqlglotError
+from sqlglot.tokens import TokenType
 
 from .agent import MAX_ITERATIONS, extract_json, output_truncated, run_agent
 from .config import (DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, env_seconds,
@@ -29,6 +35,7 @@ from .skills_loader import always_skills, load_skills, skills_index
 from .spec_exec import find_spec, run_spec_exec
 from .tool_hub import ToolHub
 from toolbox.sqltools import LINT_INCOMPLETE_CODE, LINT_MAX_CHARS, LINT_TIMEOUT_SECONDS
+from toolbox.sqltools import DIALECT, _parse
 
 SYSTEM_TEMPLATE = """你是資深資料庫工程主管,負責審查 SQL merge request。\
 你的審查將直接決定 MR 能否合入,必須精準、可回溯、給得出修改建議。
@@ -454,8 +461,43 @@ _DBT_DATABASE_MISMATCH = (
     "不展開此檔(請檢查環境變數 SEGCRA_DBT_DATABASE)")
 
 
+def _is_full_text(f: dict, sql: str, dbt_ctx: DbtContext | None) -> bool:
+    """拿去展開的是不是這個檔案變更後的完整內容(fixture 的 full_content,或取回的 dbt 專案內容)。
+    只有 diff 片段時,對應表的行號是片段裡的行號,不是檔案的行號。"""
+    if not (isinstance(sql, str) and sql):
+        return False
+    if sql == f.get("full_content"):
+        return True
+    return dbt_ctx is not None and sql == dbt_ctx.head_text(f.get("path"))
+
+
+def _keep_line_maps(line_maps: dict, path, source: str, expanded: "_Expanded") -> None:
+    """{(路徑, 分支): (展開後的 sql, 對應表, 原始內容)}。分支是 None(一般)或 "incremental"。
+    對應表不是逐行精確的(不是哨兵法)就不記:那一份的命中不寫行號。"""
+    if expanded.line_map:
+        line_maps[(path, None)] = (expanded.sql, expanded.line_map, source)
+    if expanded.incremental_sql is not None and expanded.incremental_line_map:
+        line_maps[(path, _INCREMENTAL_BRANCH)] = (expanded.incremental_sql,
+                                                   expanded.incremental_line_map, source)
+
+
+class _Expanded(NamedTuple):
+    """_dbt_expand_for_prescan 的結果。"""
+    sql: str                            # 交給規則層的 sql(展開失敗時是原文)
+    error: str | None                   # 展開失敗的原因
+    notice: str | None                  # ref()/source() 精確度提醒
+    incremental_sql: str | None = None  # 增量分支展開後的 sql
+    # 展開後的行 → 原始檔的行。只有哨兵法(逐行精確)才給;近似對齊(difflib)與對不上時是 None
+    line_map: dict | None = None
+    incremental_line_map: dict | None = None
+
+
+def _sentinel_map(rendered) -> dict | None:
+    return rendered.line_map if rendered.map_method == "sentinel" and rendered.line_map else None
+
+
 def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict, dbt_ctx: DbtContext | None = None
-                            ) -> tuple[str, str | None, str | None, str | None]:
+                            ) -> _Expanded:
     """dbt 樣板先展開成純 SQL 再交給規則層。
     回傳 (交給規則層的 sql, 展開失敗原因或 None, ref()/source() 精確度提醒或 None,
     增量分支展開後的 sql 或 None)。
@@ -484,7 +526,7 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict, dbt_ctx: DbtCont
     if dbt_cfg.get("database") != DBT_DATABASE_PLACEHOLDER:
         # 設定載入時已擋過,這裡再擋一次:dbt_cfg 也可能不經 load_config() 直接傳入。
         # 不符就不展開(fail closed),由 enforce_dbt_render_failure 補 major 交人工。
-        return sql, _DBT_DATABASE_MISMATCH, None, None
+        return _Expanded(sql, _DBT_DATABASE_MISMATCH, None)
     project = {}
     if dbt_ctx is not None and dbt_ctx.project is not None:
         project = {"macro_files": dbt_ctx.macro_files, "macro_dirs": dbt_ctx.project.macro_paths,
@@ -492,18 +534,20 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict, dbt_ctx: DbtCont
     rendered = render_model_isolated(path or "model.sql", source=sql,
                                      database=dbt_cfg["database"], **project)
     if rendered.ok and rendered.macro_conflicts:
-        return sql, (f"dbt 專案裡有 {len(rendered.macro_conflicts)} 組同名的 macro"
-                     "(dbt 會編譯失敗),無法確定展開結果"), None, None
+        return _Expanded(sql, (f"dbt 專案裡有 {len(rendered.macro_conflicts)} 組同名的 macro"
+                               "(dbt 會編譯失敗),無法確定展開結果"), None)
     if not rendered.ok:
-        return sql, rendered.error, None, None
+        return _Expanded(sql, rendered.error, None)
     if not rendered.incremental_checked:
-        return rendered.sql, None, rendered.relation_notice, None
+        return _Expanded(rendered.sql, None, rendered.relation_notice,
+                         line_map=_sentinel_map(rendered))
     incremental = render_model_isolated(path or "model.sql", source=sql, incremental=True,
                                         database=dbt_cfg["database"], **project)
     if not incremental.ok:
-        return sql, f"增量分支(is_incremental() 為 True)展開失敗:{incremental.error}", None, None
-    return (rendered.sql, None, rendered.relation_notice or incremental.relation_notice,
-            incremental.sql)
+        return _Expanded(sql, f"增量分支(is_incremental() 為 True)展開失敗:{incremental.error}",
+                         None)
+    return _Expanded(rendered.sql, None, rendered.relation_notice or incremental.relation_notice,
+                     incremental.sql, _sentinel_map(rendered), _sentinel_map(incremental))
 
 
 _INCREMENTAL_BRANCH = "incremental"
@@ -710,7 +754,8 @@ async def _non_sql_entry(hub: ToolHub, text: str, kind: str, path: str) -> dict:
 
 
 async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
-                  dbt_ctx: DbtContext | None = None, rendered: list | None = None) -> list[dict]:
+                  dbt_ctx: DbtContext | None = None, rendered: list | None = None,
+                  line_maps: dict | None = None) -> list[dict]:
     """對每個變更檔跑 rule-base + lint(不經 LLM)。
 
     dbt_cfg 給定且 enabled 時,含 dbt 樣板標記的檔案先展開成純 SQL 再交給規則層
@@ -723,6 +768,9 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
 
     rendered 給定時,展開成功的檔案以 {path, full_content: 展開後的 SQL} 加進去,給注入掃描用
     (見 _mr_with_head_text)。
+
+    line_maps 給定時,記下展開後的行對回原始檔的對應表(見 _keep_line_maps),給程式補的
+    finding 寫行號用(_attach_statement_lines)。不放進預掃結果:預掃結果整份會進 prompt。
     """
     dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True
     results = []
@@ -753,8 +801,11 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
         elif dbt_error is not None:
             entry["dbt_render_error"] = dbt_error
         elif dbt_enabled and sql and is_dbt_template(sql):
-            rule_sql, dbt_error, dbt_notice, incremental_sql = _dbt_expand_for_prescan(
+            expanded = _dbt_expand_for_prescan(
                 f.get("path", ""), sql, dbt_cfg, dbt_ctx if in_project else None)
+            rule_sql, dbt_error, dbt_notice, incremental_sql = expanded[:4]
+            if dbt_error is None and line_maps is not None and _is_full_text(f, sql, dbt_ctx):
+                _keep_line_maps(line_maps, f.get("path"), sql, expanded)
             if dbt_error is not None:
                 entry["dbt_render_error"] = dbt_error
             elif rendered is not None:
@@ -780,13 +831,9 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
             if isinstance(more, dict) and more.get("error") and "parse_error" not in entry:
                 # 增量分支解析不了:語法樹規則在那一段沒有執行,不能當成沒有命中
                 entry["parse_error"] = f"增量分支(is_incremental() 為 True):{more['error']}"
-        # lint 刻意用**原始**文字,不用展開後的 rule_sql:sqlfluff 的違規結果帶行號
-        # (start_line_no),而 LLM 看到的 diff(build_diff_section)是原始行號——
-        # 兩者混在同一份 prescan JSON 裡若行號基準不同,LLM 很可能把展開後的行號
-        # 誤植進 finding,指向原始檔案中錯誤的位置。展開後 SQL 的行號要能可靠地
-        # 對回原始檔,需要哨兵行對應機制(#7 第 4 點),目前尚未接上;在那之前,
-        # 寧可讓 lint 對 Jinja 文字跑出較少或較不準的結果,也不要送出「看起來
-        # 對、實際上指錯行」的資訊——這正是本專案一貫的原則。
+        # lint 用**原始**文字,不用展開後的 rule_sql:lint 管的是開發者寫的程式長什麼樣子,
+        # 展開後的 SQL 不是他們寫、也不會看到的東西,本來就不該對它做 lint。行號也因此跟
+        # LLM 看到的 diff(原始行號)一致。
         lint = await hub.call_json("sqltools__lint", {"sql": sql})
         entry["lint"] = lint[:15] if isinstance(lint, list) else []
         results.append(entry)
@@ -1315,10 +1362,11 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                         DbtContext(prefix="", error="取回 dbt 專案時發生非預期錯誤"),
                         mr, cfg.dbt)
         rendered: list[dict] = []          # 展開後的 SQL,給注入掃描用
+        line_maps: dict = {}               # 展開後的行對回原始檔,給程式補的 finding 寫行號用
         # 預掃失敗不該讓整份審查消失:規則層與 dbt 展開都在裡面,壞了就記一條、
         # 用空的預掃往下走(模型仍然看得到 diff 與規格)。
         pre = await _astep(report_stub, "預掃(規則層/dbt 展開)",
-                           prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered), [])
+                           prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered, line_maps), [])
         if capture is not None:
             capture["mr"] = mr
             capture["prescan_raw"] = copy.deepcopy(pre)
@@ -1427,7 +1475,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             prescan=json.dumps(pre, ensure_ascii=False),
             spec_section=spec_section + spec_changes,
         )
-        _attach_statement_lines(pre, mr["files"])   # 給程式補的 finding 用;prompt 已組好,不受影響
+        # 給程式補的 finding 寫行號;prompt 已組好,不受影響。出錯時記一條未完整、行號維持 0
+        _step(report_stub, "命中行號", _attach_statement_lines, None, pre, mr["files"], line_maps)
 
         trace = [] if capture is not None else None
         output_meta: dict = {}
@@ -2052,56 +2101,24 @@ def _coverage(findings: list[dict], path: str, keywords: list[str],
 MAX_LINE_SOURCE_CHARS = 200_000
 
 
-def _statement_starts(sql: str) -> dict | None:
-    """{語句文字(與預掃命中的 statement 同一個寫法): [(起始行, 完整語句), ...]}。
-
-    用預掃同一個 sqlglot 方言把檔案切成語句:token 帶行號,分號是邊界;語句文字由同一個函式產生,
-    所以能和命中的 statement 逐字比對,不必在原文裡猜(sqlglot 產生的文字跟原文的大小寫、空白、
-    寫法都不同)。只有註解的「語句」(檔尾分號之後的註解)不算。切出來的數量對不上就回 None。
-    """
-    import sqlglot
-    from sqlglot import exp
-    from sqlglot.tokens import TokenType
-    from toolbox.sqltools import DIALECT, _parse
-
-    try:
-        tokens = sqlglot.tokenize(sql, read=DIALECT)
-        statements = [st for st in _parse(sql)
-                      if st is not None and not isinstance(st, exp.Semicolon)]
-    except Exception:                        # noqa: BLE001 — 切不出來就不寫行號
-        return None
-    starts, start = [], None
-    for tok in tokens:
-        if tok.token_type == TokenType.SEMICOLON:
-            if start is not None:
-                starts.append(start)
-            start = None
-        elif start is None:
-            start = tok.line
-    if start is not None:
-        starts.append(start)
-    if len(starts) != len(statements):
-        return None
-    by_text: dict[str, list] = {}
-    for first, st in zip(starts, statements):
-        full = st.sql(dialect=DIALECT)
-        by_text.setdefault(full[:200], []).append((first, full))
-    return by_text
-
-
-def _attach_statement_lines(pre: list[dict], files: list[dict]) -> None:
+def _attach_statement_lines(pre: list[dict], files: list[dict], line_maps: dict | None = None) -> None:
     """在預掃命中上加 line(那句在檔案裡的起始行),給程式補的 finding 寫行號用
-    (#28 review:只有數字,沒有回顯的風險)。
+    (只有數字,沒有回顯的風險)。
 
     要在組好 prompt 之後才呼叫:預掃結果整份放進 prompt,先加行號 prompt 就變了。
-    只處理「規則跑的就是這份檔案原文」的檔案:有完整內容、不是 dbt 樣板(展開後的行號對不回
-    原始檔,#35)、不是規格檔。相同文字的語句出現多次時,第 k 個命中對第 k 句;前 200 字相同、
+    規則跑的是檔案原文時(有完整內容、不是 dbt 樣板、不是規格檔),在原文裡找那句的起始行。
+    dbt 樣板展開後才跑規則的,用 line_maps(prescan 記下的展開結果與對應表)找,見
+    _attach_rendered_lines。相同文字的語句出現多次時,第 k 個命中對第 k 句;前 200 字相同、
     後面不同的語句分不出來,不寫。任何一步對不上就不寫(維持 0),不猜。
     """
     for f, entry in zip(files, pre):
         if (not isinstance(f, dict) or entry.get("path") != f.get("path")
-                or any(entry.get(k) for k in ("spec_file", "dbt_macro", "dbt_render_error",
-                                              "dbt_render_notice"))):
+                or any(entry.get(k) for k in ("spec_file", "dbt_macro", "dbt_render_error"))):
+            continue
+        if line_maps and any(key[0] == f.get("path") for key in line_maps):
+            _attach_rendered_lines(entry, line_maps)
+            continue
+        if entry.get("dbt_render_notice"):
             continue
         text = f.get("full_content")
         if (not isinstance(text, str) or not text or len(text) > MAX_LINE_SOURCE_CHARS
@@ -2110,18 +2127,130 @@ def _attach_statement_lines(pre: list[dict], files: list[dict]) -> None:
         hits = [h for h in entry.get("rules", []) if isinstance(h, dict) and h.get("statement")]
         if not hits:
             continue
-        starts = _statement_starts(text)
+        starts = _rendered_starts(text)
         if starts is None:
             continue
-        used: Counter = Counter()
-        for h in hits:
-            found = starts.get(h["statement"])
-            if not found or len({full for _, full in found}) > 1:
-                continue
-            key = (h.get("rule"), h["statement"])
-            if used[key] < len(found):
-                h["line"] = found[used[key]][0]
-            used[key] += 1
+        for h, (line, *_) in _matched_statements(hits, starts):
+            h["line"] = line
+
+
+def _matched_statements(hits: list[dict], starts: dict):
+    """為每個命中找對應的語句(_rendered_starts 的一項),產生 (命中, 語句)。純 SQL 與展開後的 SQL 共用。
+
+    相同文字的語句出現多次時,第 k 個命中對第 k 句;前 200 字相同、後面不同的語句分不出來,跳過。"""
+    used: Counter = Counter()
+    for h in hits:
+        found = starts.get(h["statement"])
+        if not found or len({full for _, full, _, _ in found}) > 1:
+            continue
+        key = (h.get("rule"), h["statement"])
+        if used[key] < len(found):
+            yield h, found[used[key]]
+        used[key] += 1
+
+
+def _rendered_starts(sql: str) -> dict | None:
+    """SQL 切成語句:{語句文字: [(起始行, 完整語句, 是不是該行的第一段內容, 第幾句), ...]}。
+    純 SQL 檔與 dbt 樣板展開後的 SQL 共用這一個切法。
+
+    用預掃同一個 sqlglot 方言切:token 帶行號,分號是邊界;語句文字由同一個函式產生,所以能和命中的
+    statement 逐字比對,不必在原文裡猜(sqlglot 產生的文字跟原文的大小寫、空白、寫法都不同)。只有
+    註解的「語句」(檔尾分號之後的註解)不算。切出來的數量對不上就回 None。
+
+    另外記兩件事(給展開後的 SQL 用,純 SQL 檔用不到):語句的第一個 token 前面在同一行是不是只有
+    空白(空白控制 `{%- -%}` 會把幾個原始行接成同一個展開後的行,第二句的起始行對不回它真正的那一行),
+    以及它是第幾句(對不回行號時寫在說明裡,分得出是哪一句)。
+
+    只有「切不出語句」(解析錯誤、tokenizer 錯誤、巢狀太深)回 None、不寫行號;其他例外是程式的錯,
+    往外丟,由呼叫端的環節隔離記成未完整,不默默變成 0。"""
+    try:
+        tokens = sqlglot.tokenize(sql, read=DIALECT)
+        statements = [st for st in _parse(sql) if st is not None
+                      and not isinstance(st, exp.Semicolon)]
+    except (SqlglotError, RecursionError):   # 切不出來就不寫行號
+        return None
+    firsts, first = [], None
+    for tok in tokens:
+        if tok.token_type == TokenType.SEMICOLON:
+            if first is not None:
+                firsts.append(first)
+            first = None
+        elif first is None:
+            first = tok
+    if first is not None:
+        firsts.append(first)
+    if len(firsts) != len(statements):
+        return None
+    by_text: dict[str, list] = {}
+    for n, (tok, st) in enumerate(zip(firsts, statements), 1):
+        line_start = sql.rfind("\n", 0, tok.start) + 1
+        alone = not sql[line_start:tok.start].strip()
+        full = st.sql(dialect=DIALECT)
+        by_text.setdefault(full[:200], []).append((tok.line, full, alone, n))
+    return by_text
+
+
+_TAG_OPENERS = ("{{", "{%", "{#")
+
+
+def _literal_prefix(line: str) -> str:
+    """原始行在第一個 Jinja 標記之前的固定文字(去掉前後空白;空白控制的 `-` 會吃掉標記前的空白)。"""
+    cut = min((i for i in (line.find(t) for t in _TAG_OPENERS) if i >= 0), default=len(line))
+    return line[:cut].strip()
+
+
+def _source_line(rendered_line: int, alone: bool, line_map: dict, rendered_lines: list,
+                 source_lines: list) -> int:
+    """展開後第 rendered_line 行起始的語句,在原始檔的行號;對不回時回 0(不猜)。
+
+    四個條件都要成立:是那一行的第一段內容(alone);對應表有這一行;原始那一行在第一個 Jinja
+    標記之前有固定文字;展開後那一行(去掉縮排)以這段固定文字開頭——語句的開頭是 model 檔裡逐字
+    寫出來的,不是 macro 或表達式產生的(那些在原始檔沒有對應的行)。"""
+    if not alone:
+        return 0
+    src = line_map.get(rendered_line, 0)
+    if not (isinstance(src, int) and 1 <= src <= len(source_lines)
+            and 1 <= rendered_line <= len(rendered_lines)):
+        return 0
+    prefix = _literal_prefix(source_lines[src - 1])
+    if not prefix or not rendered_lines[rendered_line - 1].lstrip().startswith(prefix):
+        return 0
+    return src
+
+
+def _attach_rendered_lines(entry: dict, line_maps: dict) -> None:
+    """dbt 樣板展開後的命中:在展開後的 SQL 找那句的起始行,經對應表換回原始檔的行號(line),
+    並記下它是展開後的第幾句(statement_index)。增量分支的命中(branch)用增量那次的展開結果。"""
+    path = entry.get("path")
+    groups: dict = {}
+    for h in entry.get("rules", []):
+        if isinstance(h, dict) and h.get("statement"):
+            branch = _INCREMENTAL_BRANCH if h.get("branch") == _INCREMENTAL_BRANCH else None
+            groups.setdefault(branch, []).append(h)
+    for branch, hits in groups.items():
+        kept = line_maps.get((path, branch))
+        if kept is None:
+            continue
+        rendered_sql, line_map, source = kept
+        if len(rendered_sql) > MAX_LINE_SOURCE_CHARS:
+            continue
+        starts = _rendered_starts(rendered_sql)
+        if starts is None:
+            continue
+        rendered_lines, source_lines = rendered_sql.split("\n"), source.split("\n")
+        for h, (line, _, alone, n) in _matched_statements(hits, starts):
+            h["statement_index"] = n
+            src = _source_line(line, alone, line_map, rendered_lines, source_lines)
+            if src:
+                h["line"] = src
+
+
+def _statement_note(hit: dict, exact: bool) -> str:
+    """寫不出行號、但知道是展開後第幾句時,附在說明後面(一個檔案同一條規則命中好幾次時分得出來)。"""
+    n = hit.get("statement_index")
+    if not exact or _hit_line(hit, exact) or not isinstance(n, int) or isinstance(n, bool):
+        return ""
+    return f"(dbt 樣板展開後的第 {n} 句)"
 
 
 @_isolated_stage("規則命中補報")
@@ -2155,7 +2284,7 @@ def enforce_rules(report: dict, pre: list[dict]) -> dict:
             for n, h in enumerate(missing, 1):
                 detail = h.get("message", "") + (
                     "(這個命中在 is_incremental() 為 True 的增量分支裡)"
-                    if h.get("branch") == _INCREMENTAL_BRANCH else "")
+                    if h.get("branch") == _INCREMENTAL_BRANCH else "") + _statement_note(h, exact)
                 report.setdefault("findings", []).append({
                     "file": entry["path"], "line": _hit_line(h, exact),
                     "severity": h.get("severity", "major"),
