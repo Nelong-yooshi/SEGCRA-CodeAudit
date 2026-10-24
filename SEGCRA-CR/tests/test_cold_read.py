@@ -611,20 +611,36 @@ def test_review_mr_冷讀輸出壞掉_記成未完整並交人工(monkeypatch, t
     assert report["decision"] != "auto_approved"
 
 
-def test_review_mr_主審查丟例外時_冷讀不會開始(monkeypatch, tmp_path, real_cold_read):
-    """依序跑,沒有背景工作:主審查丟例外時冷讀根本還沒開始,不會留下沒人收尾的請求。"""
-    async def main_fails():
+def test_review_mr_主審查被取消時_冷讀不會開始(monkeypatch, tmp_path, real_cold_read):
+    """依序跑,沒有背景工作:主審查被取消(webhook 的總時間上限、新 commit 取消舊審查)時取消照樣往外傳,
+    冷讀根本還沒開始,不會留下沒人收尾的請求。"""
+    async def main_cancelled():
         await asyncio.sleep(0)
-        raise RuntimeError("主審查失敗")
+        raise asyncio.CancelledError()
 
     async def runner(review):
-        with pytest.raises(RuntimeError, match="主審查失敗"):
+        with pytest.raises(asyncio.CancelledError):
             await review
         return len(asyncio.all_tasks())          # 只剩 runner 自己
 
-    left, order, _ = _review(monkeypatch, tmp_path, {}, mr_id="956", main=main_fails,
+    left, order, _ = _review(monkeypatch, tmp_path, {}, mr_id="956", main=main_cancelled,
                              runner=runner)
     assert order == ["main"] and left == 1
+
+
+def test_review_mr_主審查的模型呼叫失敗時_冷讀照常跑_結果照常算進來(monkeypatch, tmp_path,
+                                                         real_cold_read):
+    """主審查失敗不再讓整份審查消失(確定性結果照常報出);冷讀是另一道防線,端點還能用時照常跑。"""
+    async def main_fails():
+        await asyncio.sleep(0)
+        raise RuntimeError("端點壞了")
+
+    report, order, _ = _review(monkeypatch, tmp_path, {"flagged": True, "quotes": [INSTRUCTION]},
+                               mr_id="957", main=main_fails)
+    assert order == ["main", "cold"]
+    titles = [f["title"] for f in report["findings"]]
+    assert _COLD_READ_TITLE in titles and pipeline._FAILED_TITLE in titles
+    assert report["decision"] != "auto_approved"
 
 
 def test_單獨入口(monkeypatch, tmp_path, capsys, real_cold_read):

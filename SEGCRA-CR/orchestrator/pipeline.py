@@ -162,18 +162,41 @@ INCOMPLETE_TITLE_PREFIX = "審查未完整"
 SPEC_EXEC_TIMEOUT_SECONDS = env_seconds("SPEC_EXEC_TIMEOUT_SECONDS", 1200)
 # 冷讀的時間上限(主審查之後依序跑,從冷讀開始算;見 _run_cold_read)
 COLD_READ_TIMEOUT_SECONDS = env_seconds("COLD_READ_TIMEOUT_SECONDS", 600)
+# 主審查(模型呼叫)的時間上限。單次請求的逾時(LLM_TIMEOUT,預設 3600 秒)比整份審查的上限
+# (webhook 的 REVIEW_TIMEOUT_SECONDS,預設 2400 秒)還長:端點收了連線卻一直不回時,外層會先把
+# 整份審查取消,確定性的結果跟著消失。所以主審查有自己的上限,而且比整份短,留時間給後面的步驟
+# 把確定性的結果寫出去(預設留 600 秒;整份的上限很短時留一半)。
+MAIN_REVIEW_RESERVE_SECONDS = 600
+
+
+def _main_review_timeout() -> int:
+    total = env_seconds("REVIEW_TIMEOUT_SECONDS", 2400)
+    cap = max(total // 2, total - MAIN_REVIEW_RESERVE_SECONDS)
+    limit = env_seconds("MAIN_REVIEW_TIMEOUT_SECONDS", cap)
+    if limit > cap:
+        print(f"[pipeline] MAIN_REVIEW_TIMEOUT_SECONDS={limit} 不比整份審查的上限 {total} 秒短得夠多,"
+              f"改用 {cap} 秒(要留時間把確定性的結果寫出去)", flush=True)
+        return cap
+    return limit
+
+
+MAIN_REVIEW_TIMEOUT_SECONDS = _main_review_timeout()
 
 
 def _incomplete_finding(stage: str, exc: BaseException | None = None,
-                        timeout: int | None = None) -> dict:
+                        timeout: int | None = None, reason: str | None = None) -> dict:
     """「這個環節沒完成」的 finding。不回顯例外訊息,只寫類型。
 
     `stage` 另外存成一個欄位:判斷「有沒有環節沒完成」要看欄位,不是比對標題開頭
     (標題是給人看的,會改寫;決策與測試靠它判斷就會跟著壞)。
+    `reason` 是沒有執行的原因(程式的固定文字),給「刻意不跑」的情況用。
     """
     if timeout is not None:
         detail = f"{stage} 超過時間上限 {timeout} 秒,已中止。這一環節的結果不在本報告內。"
         title = f"[{stage}] {INCOMPLETE_TITLE_PREFIX}(逾時)"
+    elif reason is not None:
+        detail = f"{stage} 沒有執行:{reason}。這一環節的結果不在本報告內。"
+        title = f"[{stage}] {INCOMPLETE_TITLE_PREFIX}(沒有執行)"
     else:
         detail = (f"{stage} 執行時發生 {type(exc).__name__},已跳過。"
                   f"這一環節的結果不在本報告內。")
@@ -182,6 +205,10 @@ def _incomplete_finding(stage: str, exc: BaseException | None = None,
             "detail": detail, "stage": stage,
             "suggestion": "請人工確認這一環節原本要檢查的內容;其餘環節的結果仍然有效。",
             "citations": []}
+
+
+class _SpecExecSkipped(Exception):
+    """執行驗證刻意不跑(端點無法使用);不是失敗。"""
 
 
 # 哪些環節包過隔離:{函式名: 環節名稱}。由 @_isolated_stage 自己登記,不是人工維護的
@@ -892,6 +919,35 @@ async def _cold_read_stage(cfg: Config, mr: dict, dbt_ctx: DbtContext | None
         return None, _incomplete_finding("冷讀", e)
 
 
+async def _run_main_review(cfg: Config, profile, system: str, user: str, hub, trace,
+                           meta: dict, mr_id: str) -> str | None:
+    """主審查的模型呼叫,有自己的時間上限(MAIN_REVIEW_TIMEOUT_SECONDS)。
+
+    模型呼叫失敗(連不上、逾時、端點錯誤…)時回 None,問題類型記進 meta["failed"]:確定性的結果
+    不跟著消失,用空報告走完後處理,由 enforce_truncation 補 major。只記問題類型,不記例外訊息
+    (含主機位址等)。不重試:理由同截斷,重試不保證會好,只會讓整份審查更久。
+    被取消(webhook 的總時間上限、新 commit 取消舊審查)照樣往外傳;asyncio.wait_for 被取消時
+    會一起取消模型呼叫,不留下沒人收尾的請求。"""
+    try:
+        return await asyncio.wait_for(
+            run_agent(cfg, profile, system, user, hub, trace=trace, meta=meta),
+            MAIN_REVIEW_TIMEOUT_SECONDS)
+    except Exception as e:
+        meta["failed"] = _model_failure_kind(e)
+        print(f"[pipeline] MR !{mr_id} 主審查模型呼叫失敗({meta['failed']})", flush=True)
+        return None
+
+
+# 主審查判定端點無法使用的問題類型:之後的模型呼叫(冷讀、執行驗證的測資生成)不再嘗試,
+# 不然各自再等到自己的上限,加起來會超過整份審查的上限
+_ENDPOINT_DOWN_KINDS = ("timeout", "connection")
+_ENDPOINT_DOWN_REASON = "主審查判定審查模型的端點無法使用(連不上或逾時),不再呼叫模型"
+
+
+def _endpoint_unavailable(meta: dict) -> bool:
+    return _failure_kind(meta) in _ENDPOINT_DOWN_KINDS
+
+
 async def _run_cold_read(cfg: Config, mr: dict, dbt_ctx: DbtContext | None
                          ) -> tuple[ColdRead | None, dict | None]:
     """主審查之後依序跑冷讀,最多 COLD_READ_TIMEOUT_SECONDS 秒(從冷讀開始算),逾時記成未完整。
@@ -1478,10 +1534,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
 
         trace = [] if capture is not None else None
         output_meta: dict = {}
-        raw = await run_agent(cfg, profile, system, user, hub, trace=trace,
-                              meta=output_meta)
-        # 冷讀(只看 MR 文字)在主審查之後依序跑,見 _run_cold_read
-        cold, cold_incomplete = await _run_cold_read(cfg, mr, dbt_ctx)
+        raw = await _run_main_review(cfg, profile, system, user, hub, trace, output_meta, mr_id)
+        # 冷讀(只看 MR 文字)在主審查之後依序跑,見 _run_cold_read。主審查判定端點無法使用時
+        # 不再呼叫模型,直接記成未完整(交人工)
+        if _endpoint_unavailable(output_meta):
+            cold, cold_incomplete = None, _incomplete_finding("冷讀", reason=_ENDPOINT_DOWN_REASON)
+        else:
+            cold, cold_incomplete = await _run_cold_read(cfg, mr, dbt_ctx)
         if cold_incomplete is not None:
             report_stub["findings"].append(cold_incomplete)
         if capture is not None:
@@ -1493,8 +1552,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         import os as _os
         _raw_dir = Path(_os.environ.get("REVIEW_OUTPUT", PKG_ROOT / "review_output"))
         try:
-            _raw_dir.mkdir(parents=True, exist_ok=True)
-            (_raw_dir / f"mr_{mr_id}_raw.txt").write_text(raw, encoding="utf-8")
+            if raw is not None:             # 模型呼叫失敗時沒有輸出,不寫
+                _raw_dir.mkdir(parents=True, exist_ok=True)
+                (_raw_dir / f"mr_{mr_id}_raw.txt").write_text(raw, encoding="utf-8")
         except Exception:
             pass
         report = _parse_model_output(raw, output_meta, profile.max_output_tokens)
@@ -1547,6 +1607,10 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         progress: dict = {}
         deadline = time.monotonic() + SPEC_EXEC_TIMEOUT_SECONDS
         try:
+            # 端點無法使用時整段不跑:測資生成要呼叫模型。找不到規格等不用模型的結果這次不會出現,
+            # 但它們本來就是交人工,決策不受影響;端點恢復後重新審查就看得到
+            if _endpoint_unavailable(output_meta):
+                raise _SpecExecSkipped
             # 交給執行驗證的 MR 與規格也在 try 裡:組不出來同樣記成執行驗證未完成
             exec_mr = _mr_for_spec_exec(mr, dbt_ctx)
             exec_code, exec_text = _spec_for_exec(spec_code, spec_text, affected_specs, exec_mr)
@@ -1554,6 +1618,10 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                 run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text,
                               progress=progress, deadline=deadline),
                 timeout=SPEC_EXEC_TIMEOUT_SECONDS)
+        except _SpecExecSkipped:
+            report.setdefault("findings", []).append(
+                _incomplete_finding("執行驗證", reason=_ENDPOINT_DOWN_REASON))
+            spec_result = None
         except asyncio.TimeoutError:
             report.setdefault("findings", []).append(_incomplete_finding(
                 _spec_exec_stage(progress), timeout=SPEC_EXEC_TIMEOUT_SECONDS))
@@ -2493,6 +2561,35 @@ _TRUNCATED_TITLE = "審查模型的輸出被截斷,審查結果可能不完整"
 _TRUNCATED_SUMMARY = "審查模型的輸出被截斷、無法解析;以下只有程式確定性檢查的結果。"
 _EXHAUSTED_TITLE = "審查模型用完工具呼叫回合,沒有產出審查結果"
 _EXHAUSTED_SUMMARY = "審查模型用完工具呼叫回合、沒有產出審查結果;以下只有程式確定性檢查的結果。"
+_FAILED_TITLE = "審查模型沒有完成,這次只有程式確定性檢查的結果"
+_FAILED_SUMMARY = "呼叫審查模型失敗、沒有產出審查結果;以下只有程式確定性檢查的結果。"
+# 模型呼叫失敗的問題類型 → 給人看的說明。只有這幾種固定文字,不放例外訊息(含主機位址、端點回應)
+_MODEL_FAILURE_TEXT = {
+    "timeout": "等待審查模型的回應逾時",
+    "connection": "連不上審查模型的端點",
+    "rate_limited": "審查模型的端點忙碌中(請求過多)",
+    "rejected": "審查模型的端點拒絕了這次請求(例如輸入超過模型的上限,或權限、設定不符)",
+    "server_error": "審查模型的端點發生錯誤",
+    "other": "呼叫審查模型時發生非預期的錯誤",
+}
+
+
+def _model_failure_kind(error: BaseException) -> str:
+    """模型呼叫失敗的問題類型(_MODEL_FAILURE_TEXT 的鍵)。由細到粗判斷:逾時是連線錯誤的子類別,
+    請求過多是狀態錯誤的子類別。"""
+    import openai
+    if isinstance(error, (openai.APITimeoutError, asyncio.TimeoutError, TimeoutError)):
+        return "timeout"
+    if isinstance(error, openai.APIConnectionError):
+        return "connection"
+    if isinstance(error, openai.RateLimitError):
+        return "rate_limited"
+    if isinstance(error, openai.APIStatusError):
+        status = getattr(error, "status_code", None)
+        if isinstance(status, int) and status >= 500:
+            return "server_error"
+        return "rejected"
+    return "other"
 
 
 # 稽核紀錄裡結束原因的長度上限(端點回的字串原樣記,只截長度)
@@ -2531,14 +2628,25 @@ def _output_meta_record(meta: dict, max_output_tokens: int) -> dict:
         "prompt_tokens_total": meta.get("prompt_tokens_total"),
         "completion_tokens_total": meta.get("completion_tokens_total"),
         "max_output_tokens": max_output_tokens,
-        "truncated": output_truncated(meta, max_output_tokens),
+        # 模型呼叫失敗時沒有最終輸出:meta 裡的用量是前幾輪的,不算截斷
+        "truncated": _failure_kind(meta) is None and output_truncated(meta, max_output_tokens),
         "exhausted": bool(meta.get("exhausted")),
+        # 模型呼叫失敗時的問題類型(見 _MODEL_FAILURE_TEXT);沒有失敗是 None
+        "failed": _failure_kind(meta),
     }
 
 
-def _parse_model_output(raw: str, meta: dict, max_output_tokens: int) -> dict | None:
+def _failure_kind(meta: dict) -> str | None:
+    failed = meta.get("failed")
+    if failed is None:
+        return None
+    return failed if failed in _MODEL_FAILURE_TEXT else "other"
+
+
+def _parse_model_output(raw: str | None, meta: dict, max_output_tokens: int) -> dict | None:
     """解析主審查模型的輸出。沒有產出完整的結果時回一份空報告,讓審查繼續走完。
 
+    - 模型呼叫失敗(`meta["failed"]`):沒有輸出可以解析。
     - 用完工具呼叫回合(`meta["exhausted"]`):raw 不是模型的報告,一律不解析。最後拿到的是工具
       的回傳(例如 MR 裡的檔案原文,內容由 MR 決定),裡面的 JSON 不能當成審查結果。
     - 被截斷又解析不出來:截斷的位置在第一個 `}` 之前時,extract_json 沒有東西可以修補。
@@ -2548,6 +2656,8 @@ def _parse_model_output(raw: str, meta: dict, max_output_tokens: int) -> dict | 
 
     沒有截斷卻解析不出來時回 None,由呼叫端丟例外。
     """
+    if _failure_kind(meta) is not None:
+        return {"summary": _FAILED_SUMMARY, "findings": []}
     if meta.get("exhausted"):
         return {"summary": _EXHAUSTED_SUMMARY, "findings": []}
     report = extract_json(raw)
@@ -2558,8 +2668,8 @@ def _parse_model_output(raw: str, meta: dict, max_output_tokens: int) -> dict | 
 
 @_isolated_stage("截斷揭露")
 def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict:
-    """主審查沒有產出完整的結果 → 補 major(確定性,不得自動放行):輸出被截斷、或用完工具呼叫
-    回合(後者的輸出已由 _parse_model_output 換成空報告)。
+    """主審查沒有產出完整的結果 → 補 major(確定性,不得自動放行):輸出被截斷、用完工具呼叫
+    回合,或模型呼叫失敗(後兩者的輸出已由 _parse_model_output 換成空報告)。
 
     extract_json 的修補退路會把被切斷的 JSON 補成合法物件:後半的 finding 不見了,報告
     看起來卻一切正常,只是比較短;不見的可能正是該擋下 MR 的那一條。已解析出來的 finding
@@ -2573,6 +2683,17 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
     同名欄位會被蓋掉)。
     """
     report["_output_meta"] = _output_meta_record(meta, max_output_tokens)
+    failed = _failure_kind(meta)
+    if failed is not None:
+        model_failed = {
+            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _FAILED_TITLE,
+            "detail": f"{_MODEL_FAILURE_TEXT[failed]},審查模型沒有產出結果。程式的確定性檢查照常報出;"
+                      "審查模型負責的部分沒有結果,需人工確認。這是審查環境的問題,不是這個 MR 的問題。",
+            "suggestion": "請通知維運確認審查模型的端點狀態,恢復後重新觸發審查。",
+            "citations": []}
+        _put_program_finding(report, model_failed)
+        # 沒有最終輸出:meta 裡的結束原因與用量是前幾輪的,不能拿來判斷截斷或用完回合
+        return report
     if meta.get("exhausted"):
         exhausted = {
             "file": "(MR 內容)", "line": 0, "severity": "major", "title": _EXHAUSTED_TITLE,
