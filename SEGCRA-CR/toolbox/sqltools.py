@@ -34,22 +34,63 @@ def parse_statements(sql: str):
 _parse = parse_statements
 
 
+def _semicolon_cuts(sql: str) -> list[int]:
+    """分號的位置(切在分號**後面**)。字串、識別字、註解裡的分號不算。
+
+    **自己掃而不是用 sqlglot 的 tokenizer**:斷詞對沒收尾的引號或區塊註解會整個
+    失敗,而那正是這道要擋的手法 —— 在檔尾加一個 `'` 或 `/*`,整份就退回一次解析,
+    前面那句 `DELETE FROM t;` 的 blocker 又不見了,比巢狀運算式更容易做出來。
+
+    沒收尾的就吃到檔尾:那一段變成最後一「句」,解析失敗記成錯誤,**前面的句子照樣
+    逐句解析**。切錯的代價也只是那一段解析不了,不會吃掉別句。
+    """
+    cuts, i, n = [], 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == ";":
+            cuts.append(i + 1)
+            i += 1
+        elif ch == "'":                      # 字串('' 是跳脫,不是結束)
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+        elif ch in '"[':                     # 以引號或方括號包起來的識別字
+            j = sql.find('"' if ch == '"' else "]", i + 1)
+            i = n if j < 0 else j + 1
+        elif sql.startswith("--", i):        # 行註解
+            j = sql.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif sql.startswith("/*", i):        # 區塊註解(T-SQL 可以巢狀)
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if sql.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif sql.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        else:
+            i += 1
+    return cuts
+
+
 def _statement_chunks(sql: str) -> list[tuple[str, int]]:
     """依分號切成一句一句,回傳 [(這一句的原文, 它在檔案裡的起始行 - 1)]。
 
-    **用 tokenizer 不用 sql.split(";")**:字串常值與註解裡的分號會切錯,切錯的
-    「一句」本來能解析也會變成解析失敗 —— 那正是這件事要修的病,反而自己製造一次。
-
-    斷詞本身失敗(例如引號沒收)時回空清單,呼叫端照舊把整份當成一句處理。
+    切句用自己的掃描器(見 `_semicolon_cuts`):字串常值與註解裡的分號不算,
+    沒收尾的引號或註解也不會讓整份退回一次解析。
     """
-    try:
-        from sqlglot.tokens import Tokenizer, TokenType
-        tokens = Tokenizer(dialect=DIALECT).tokenize(sql)
-    except Exception:        # noqa: BLE001 — 斷詞失敗就退回舊行為,不是這裡的事
+    cuts = _semicolon_cuts(sql)
+    if not cuts:
         return []
-    cuts = [t.end + 1 for t in tokens if t.token_type == TokenType.SEMICOLON]
     out, start = [], 0
-    for cut in cuts + ([len(sql)] if cuts and cuts[-1] < len(sql) else []):
+    for cut in cuts + ([len(sql)] if cuts[-1] < len(sql) else []):
         chunk = sql[start:cut]
         if chunk.strip(" \t\r\n;"):
             out.append((chunk, sql.count("\n", 0, start)))

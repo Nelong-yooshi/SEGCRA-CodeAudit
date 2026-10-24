@@ -102,3 +102,53 @@ def test_解析進入點有公開的名字():
     from toolbox import sqltools
     assert sqltools.parse_statements("SELECT 1")
     assert sqltools._parse is sqltools.parse_statements
+
+
+# ─────────── 斷詞失敗不可以讓整份退回一次解析(#99 review 第 1 點)───────────
+#
+# 原本斷詞失敗就回空清單、整份當一句。但那正是這道要擋的事:在檔尾加一個沒收的
+# `'` 或 `/*`,整份退回一次解析,前面那句 `DELETE FROM t;` 的 blocker 又不見了 ——
+# 比巢狀運算式更容易做出來。
+
+@pytest.mark.parametrize("tail,label", [
+    ("SELECT 'x", "沒收的引號"),
+    ("/* x", "沒收的區塊註解"),
+    ('SELECT "x', "沒收的雙引號識別字"),
+    ("SELECT [x", "沒收的方括號識別字"),
+])
+def test_檔尾沒收尾時前面的句子照樣跑規則(tail, label):
+    _, hits = _out(PURGE + "\n" + DEEP + "\n" + tail)
+    assert "R001" in [h["rule"] for h in hits], f"{label}:R001 不見了"
+
+
+@pytest.mark.parametrize("sql,count", [
+    ("DELETE FROM t;\nSELECT 'x", 2),             # 沒收的引號吃到檔尾,自成一句
+    ("DELETE FROM t;\nSELECT 1; /* x", 3),
+    ("SELECT [a;b] FROM t; DELETE FROM u", 2),    # 方括號識別字裡的分號不算
+    ("SELECT 'a;b' AS x; DELETE FROM u", 2),      # 字串裡的分號不算
+    ("SELECT 'it''s; here' AS x; DELETE FROM u", 2),   # '' 是跳脫,不是字串結束
+    ("SELECT 1 /* a /* 巢狀 */ still */; DELETE FROM t", 2),   # T-SQL 的巢狀註解
+    # 分號夾在內層 `*/` 與外層 `*/` 之間:只認最內層的話,這個分號會被當成切點
+    ("SELECT 1 /* a /* x */ ; y */ FROM t; DELETE FROM u", 2),
+])
+def test_切句認得字串與註解(sql, count):
+    assert len(_statement_chunks(sql)) == count
+
+
+def test_特製內容不會讓切句變慢():
+    """切句是單趟掃描:沒收尾的就吃到檔尾,不會每個位置都重掃一次。"""
+    import time
+    t = time.perf_counter()
+    run_rules("/*" * 8000)
+    assert time.perf_counter() - t < 3
+
+
+def test_切句不需要在函式裡匯入():
+    """`sqlglot.tokens` 的 import 原本寫在函式裡(#99 review 第 2 點)。
+    現在切句不靠 tokenizer,那段 import 整個不需要了。"""
+    import inspect
+
+    from toolbox import sqltools
+    src = inspect.getsource(sqltools._statement_chunks) + inspect.getsource(
+        sqltools._semicolon_cuts)
+    assert "import" not in src
