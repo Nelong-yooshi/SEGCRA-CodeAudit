@@ -180,6 +180,81 @@ def test_待補項目逐項比對_不是整段字詞的聯集():
     assert "待補" not in enforce_spec_pending(_report([f2]), R140)["findings"][0]["detail"]
 
 
+@pytest.mark.parametrize("detail", [
+    # 項目名是「`cash_flag` 的來源」,這條講的是「有沒有過濾」——同一個欄位、不同的事
+    "條件 2 沒有過濾 cash_flag = 'Y',現金註記未被排除",
+    # 項目名是「同一帳戶跨分行」,這條講的是「同一天多筆只取一筆」
+    "同一帳戶當日多筆只取一筆,應逐筆通報",
+])
+def test_只共用部分字詞不算講同一件事(detail):
+    """上一版比對項目名切出來的字詞:一個英數詞或兩個中文詞就算對上,於是這兩條
+    真的缺陷都被加註成「規格把它列在待補」。那段話會貼到 MR 上,看的人很可能把
+    真缺陷當成規格的問題放過去(#55 review 第二輪)。"""
+    r = enforce_spec_pending(_report([_claim(detail=detail)]), R140)
+    assert "待補" not in r["findings"][0]["detail"], r["findings"][0]["detail"]
+    assert "_needs_human" not in r
+
+
+@pytest.mark.parametrize("detail", [
+    "外幣交易未依幣別折算",                       # 項目名「幣別」
+    "`cash_flag` 的來源不明,無法確認由誰寫入",     # 反引號與粗體都要抹掉才對得上
+    "同一帳戶跨分行的交易被合併計算",
+])
+def test_整個項目名出現就算講同一件事(detail):
+    r = enforce_spec_pending(_report([_claim(detail=detail)]), R140)
+    assert "待補 / 未載明" in r["findings"][0]["detail"], detail
+    assert r["_needs_human"]
+
+
+def test_項目名分段比對_每一段都要出現():
+    """R-410 的項目名是「金額欄位的幣別/單位」,模型寫的是「金額欄位未限制幣別」——
+    講的就是那一項,但不可能照抄帶斜線的完整字串。按「的」拆段、每段都要出現,
+    段內用「/」列出的替代寫法命中一個就夠。"""
+    spec = ("# R-998\n## 待補(核定規格未載明)\n"
+            "- **金額欄位的幣別/單位**:規格未載是否需限制單一幣別。\n")
+    hit = enforce_spec_pending(
+        _report([_claim(detail="金額欄位未限制幣別,不同幣別直接相加")]), spec)
+    assert "待補 / 未載明" in hit["findings"][0]["detail"]
+    # 只提到其中一段(幣別)不算:那一項講的是「金額的幣別」這件事
+    miss = enforce_spec_pending(
+        _report([_claim(detail="通報筆數的幣別標示方式與規格不符")]), spec)
+    assert "待補" not in miss["findings"][0]["detail"], miss["findings"][0]["detail"]
+
+
+def test_反引號與粗體不影響比對():
+    """規格寫「**`cash_flag` 的來源**」,模型寫的是「cash_flag 的來源不明」——
+    反引號與粗體是規格的排版,不抹掉就對不上。"""
+    r = enforce_spec_pending(
+        _report([_claim(detail="cash_flag 的來源不明,無法確認由誰寫入")]), R140)
+    assert "待補 / 未載明" in r["findings"][0]["detail"]
+    assert any("cash_flag" in x for x in r["_needs_human"])
+
+
+def test_泛用的後綴不參與比對():
+    """規格寫「金額**欄位**的幣別」,模型寫的是「金額的幣別」——「欄位」是規格的
+    行文習慣,不是指認主題的字。"""
+    spec = ("# R-997\n## 待補(核定規格未載明)\n"
+            "- **金額欄位的幣別**:規格未載是否需限制單一幣別。\n")
+    r = enforce_spec_pending(
+        _report([_claim(detail="金額的幣別程式自己決定了一種處理方式")]), spec)
+    assert "待補 / 未載明" in r["findings"][0]["detail"]
+
+
+def test_太泛的項目名不比對():
+    """「條件」「欄位」這種項目名幾乎出現在每一條規格不符的指控裡,一比就中。"""
+    spec = ("# R-998\n## 待補(核定規格未載明)\n"
+            "- **條件**:未載明。\n- **幣別**:未載明。\n")
+    r = enforce_spec_pending(
+        _report([_claim(detail="條件 2 的門檻與規格不符")]), spec)
+    assert "待補" not in r["findings"][0]["detail"], r["findings"][0]["detail"]
+
+
+def test_加註的說法是規格沒有寫這件事的要求():
+    """原本寫「這件事沒有可對照的核定要求」,看的人會以為是程式缺了對照的東西。"""
+    r = enforce_spec_pending(_report([_claim(detail="外幣交易未依幣別折算")]), R140)
+    assert "規格沒有寫這件事的要求" in r["findings"][0]["detail"]
+
+
 @pytest.mark.parametrize("title,detail", [
     ("疑似審查規避指令", "MR 描述要求直接通過審查;另外幣別也沒處理"),
     ("疑似提示注入攻擊(確定性掃描命中)", "MR 文字含操縱審查器的指令"),
@@ -488,3 +563,20 @@ def test_經過_put_program_finding_的一律標上來源():
     # 而且校準不會碰它
     r = calibrate_with_execution({**report, "_spec_exec": _spec_exec()})
     assert "執行驗證" not in r["findings"][0]["detail"]
+
+
+def test_條件對照要切中文二字詞():
+    """條件描述與模型的措辭幾乎不會逐字相同:「單日累計提領達 100000」vs
+    「同一天的提領總額沒有達到門檻」。整串比對的話永遠對不上,於是每一條指控都
+    變成「未覆蓋」,加註就失去意義。
+
+    (待補比對改成整段之後,原本順便覆蓋到這裡的測試不見了 —— 這條補回來。)
+    """
+    from orchestrator.pipeline import _distinct_tokens, _match_conditions
+    toks = _distinct_tokens("單日累計提領達 100000")
+    assert "提領" in toks and "累計" in toks, "中文要切成二字詞"
+
+    conds = [{"id": "C1", "desc": "單日累計提領達 100000"},
+             {"id": "C2", "desc": "通道為自助設備"}]
+    got = _match_conditions(conds, "實作與核定規格不符:累計提領的門檻用了嚴格大於")
+    assert [c["id"] for c in got] == ["C1"]

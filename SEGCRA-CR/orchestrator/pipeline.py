@@ -2456,22 +2456,80 @@ _PENDING_SKIP = {"核定", "定規", "規格", "未載", "載明", "待補", "�
 _SECURITY_CLAIM = re.compile(r"注入|規避|越獄|injection|jailbreak|prompt\s*leak", re.I)
 
 
-def _pending_item(line: str) -> tuple[str, set[str]] | None:
-    """一個待補條列項目 →(項目名, 用來比對的字詞)。
+# 比對前先抹掉的東西:反引號、粗體星號、空白與標點。兩邊用同一套,`**\`cash_flag\`
+# 的來源**` 與 finding 裡的「cash_flag 的來源」才對得上。底線與英數不動——它們是識別字
+# 的一部分(`cash_flag`)。
+_NAME_NOISE = re.compile(r"[\s`*~_\-–—\"'()()\[\]【】「」『』::,,。、;;!!??/\\|]+")
 
-    比對只用**項目名**(條列開頭的粗體標題,例如「**幣別**」「**`cash_flag` 的來源**")
-    ——那就是這一項在講的主題。整行的字詞不能用:R-140 的「規格未載是否限單一幣別;
-    現行資料表無幣別欄位」會切出「料表」「否限」這種噪音,任何提到兩個的 finding 都會
-    命中。沒有粗體標題時退回用整行(那種項目通常就是一句話)。
+
+def _claim_key(text) -> str:
+    """把項目名或 finding 的文字正規化成可以直接比對的字串。"""
+    return _NAME_NOISE.sub("", str(text or "")).lower()
+
+
+# 太泛的項目名不比對:它們幾乎出現在每一條規格不符的指控裡,一比就中。
+_PENDING_GENERIC = {"其他", "備註", "說明", "條件", "範圍", "粒度", "項目", "事項",
+                    "內容", "格式", "欄位", "資料", "規則", "需求", "限制"}
+
+
+# 項目名拆段用的分隔符。「的」是中文的修飾關係(「金額欄位**的**幣別」),拆開之後
+# 每一段都要出現;「/」「、」是同一件事的替代寫法,一段裡命中一個就夠。
+_NAME_SPLIT = re.compile(r"的|·")
+_NAME_ALT = re.compile(r"[/、|]")
+
+
+# 泛用的後綴:規格寫「金額**欄位**的幣別」,模型寫的是「金額的幣別」。去掉這些之後
+# 比對的是真正指認主題的那一段,而不是規格的行文習慣。
+_NAME_SUFFIX = re.compile(r"(欄位|值|資料|設定|方式|內容|條件)$")
+
+
+def _pending_parts(name: str) -> list[list[str]]:
+    """項目名 → [[這一段的替代寫法…], …]。每一段都要出現,段內命中一個就夠。"""
+    parts = []
+    for seg in _NAME_SPLIT.split(str(name or "")):
+        alts = []
+        for a in _NAME_ALT.split(seg):
+            core = _NAME_SUFFIX.sub("", a.strip()) or a.strip()
+            key = _claim_key(core if len(core) >= 2 else a)
+            if len(key) >= 2:
+                alts.append(key)
+        if alts:
+            parts.append(alts)
+    return parts
+
+
+def _pending_item(line: str) -> tuple[str, list[list[str]]] | None:
+    """一個待補條列項目 →(項目名, 比對用的分段)。
+
+    **項目名的每一段都要出現在 finding 裡才算**(#55 review 第二輪)。上一版是比對項目名
+    切出來的字詞,一個英數詞或兩個中文詞就算對上,於是:
+
+      * 項目名「**`cash_flag` 的來源**」切出 `cash_flag`,而「條件 2 沒有過濾
+        `cash_flag = 'Y'`」也有這個詞 → 被加註成「規格把它列在待補」,但那一項講的是
+        **它從哪裡來**,跟有沒有過濾無關;
+      * 項目名「**同一帳戶跨分行**」與「同一帳戶當日多筆只取一筆」共用「同一」「帳戶」
+        兩個中文詞 → 也中。
+
+    兩條都是真的缺陷,而加註會貼到 MR 上,看的人很可能把真缺陷當成規格的問題放過去。
+
+    **為什麼是分段而不是整串**:R-410 的項目名是「金額欄位的幣別/單位」,模型寫的是
+    「金額欄位未限制幣別」—— 講的就是那一項,但不可能照抄帶斜線的完整字串。所以按
+    「的」拆段、每一段都要出現(「金額欄位」與「幣別」都有才算),段內用「/」「、」
+    列出的替代寫法命中一個就夠。上面那兩個誤判在分段之後照樣不命中:「`cash_flag`
+    的來源」缺「來源」,「同一帳戶跨分行」整串都沒出現。
+
+    沒有粗體標題時退回用整行冒號前的那一段(那種項目通常就是一句話)。
     """
     item = _LIST_ITEM.sub("", line).strip()
     bold = re.findall(r"\*\*(.+?)\*\*", item)
     name = bold[0] if bold else item.split(":")[0].split(":")[0][:24]
-    toks = _distinct_tokens(name) - _PENDING_SKIP
-    return (name, toks) if toks else None
+    parts = _pending_parts(name)
+    if not parts or name.strip() in _PENDING_GENERIC:
+        return None
+    return (name, parts)
 
 
-def _pending_items(spec_text: str) -> list[tuple[str, set[str]]]:
+def _pending_items(spec_text: str) -> list[tuple[str, list[list[str]]]]:
     """規格「待補 / 未載明」段落底下的**逐個條列項目**:[(項目名, 它特有的字詞)]。
 
     兩件事跟上一版不同,都是誤判的來源:
@@ -2532,11 +2590,12 @@ def enforce_spec_pending(report: dict, spec_text: str | None) -> dict:
         text = _finding_text(f)
         if _SECURITY_CLAIM.search(text):
             continue
-        low = text.lower()
-        hit = next((name for name, toks in items if _is_match(toks, low)), None)
+        claim = _claim_key(text)
+        hit = next((name for name, parts in items
+                    if all(any(a in claim for a in alts) for alts in parts)), None)
         if not hit:
             continue
-        note = (f"(規格把「{hit}」列在「待補 / 未載明」:這件事沒有可對照的核定要求,"
+        note = (f"(規格把「{hit}」列在「待補 / 未載明」:規格沒有寫這件事的要求,"
                 f"嚴重度不因此調整,但需業務單位確認後才能合入。)")
         if note not in str(f.get("detail") or ""):
             f["detail"] = (str(f.get("detail") or "") + note).strip()
