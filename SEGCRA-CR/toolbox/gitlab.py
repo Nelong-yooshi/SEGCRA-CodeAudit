@@ -429,7 +429,9 @@ UNAVAILABLE_TEXT = {
 
 # 給模型看的訊息(get_file 的回傳)。模型拿到的是文字,不是代碼。
 _PROSE = {
-    "no_read_token": ("(無法讀取檔案:未設定唯讀的 GITLAB_READ_TOKEN。"
+    # 連給模型的文字也不寫環境變數名:模型可能把它抄進 finding,而 finding 會貼回
+    # MR —— 繞一圈還是外流了設定細節。模型需要知道的是「這個檔拿不到」。
+    "no_read_token": ("(無法讀取檔案:取檔用的唯讀憑證沒有設定。"
                       "請依 diff 判斷,或交人工確認。)"),      # nosec B105 — 同上
     "no_review_ref": ("(無法取得審查中的版本:這次審查沒有釘住 commit。"
                       "請依 diff 判斷,或交人工確認。)"),

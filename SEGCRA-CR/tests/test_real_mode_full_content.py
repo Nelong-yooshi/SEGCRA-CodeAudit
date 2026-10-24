@@ -390,7 +390,10 @@ def test_沒有唯讀token時不退回寫入用的那把(real, monkeypatch):
                         types.SimpleNamespace(get=lambda *a, **k: called.append(1)))
     gitlab.pin_review_ref(SHA)
     out = gitlab.get_file("sql/x.sql")
-    assert "GITLAB_READ_TOKEN" in out, out
+    # 訊息不寫環境變數名(#95 review:對外的地方只寫哪一類設定);這裡驗的是
+    # 「沒有唯讀 token 就不去抓」,不是訊息裡有沒有那串字
+    assert "唯讀憑證沒有設定" in out, out
+    assert gitlab.fetch_file("sql/x.sql") == (None, "no_read_token")
     assert not called, "沒有唯讀 token 還是發了請求"
 
 
@@ -583,6 +586,9 @@ def test_兩把token設成同一把等於沒有唯讀隔離(real, monkeypatch):
                         types.SimpleNamespace(get=lambda *a, **k: called.append(1)))
     gitlab.pin_review_ref(SHA)
     out = gitlab.get_file("sql/x.sql")
-    assert "GITLAB_READ_TOKEN" in out, out
+    # 訊息不寫環境變數名(#95 review:對外的地方只寫哪一類設定);這裡驗的是
+    # 「沒有唯讀 token 就不去抓」,不是訊息裡有沒有那串字
+    assert "唯讀憑證沒有設定" in out, out
+    assert gitlab.fetch_file("sql/x.sql") == (None, "no_read_token")
     assert not called, "兩把一樣卻還是用它發了請求"
     assert gitlab._read_token() is None
