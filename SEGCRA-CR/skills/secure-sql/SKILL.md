@@ -35,14 +35,14 @@ trigger: on_demand
     執行作業系統指令,不是查詢。
   - **權限授予或切換**:`GRANT`/`REVOKE`/`DENY`、`EXECUTE AS`、`ALTER (SERVER) ROLE`。
     換身分之後的行為沙盒驗不到。
-  - **動態 SQL**:`EXEC(…)`、`sp_executesql`。實際執行的內容在編譯期看不到,規則層與
+  - **動態 SQL**:`EXEC(…)`、`sp_executesql`(前面接 `sys.`、`master.dbo.` 或方括號都算),以及 `EXEC` 後面直接接變數。實際執行的內容在編譯期看不到,規則層與
     沙盒都驗不到,而且可能藏有讀取環境的寫法(`EXEC('SELECT DB_' + 'NAME()')` 這種
     拆字串的寫法,文字比對看不到)。
   - **dbt 編譯期副作用**:macro 裡用 `run_query` / `{% call statement %}` 執行 DML。
     每次 compile 都會跑,卻不在編譯出來的 SQL 裡,執行驗證看不到它。
 - **環境相依但正常也會用的寫法**(預掃 H006–H009,hint):檢查物件存不存在
   (`OBJECT_ID`/`COL_LENGTH`)、連線的語系與日期設定(`@@LANGUAGE`/`@@DATEFIRST`)、
-  dbt 編譯期的環境資訊(`target.name`、`env_var()`、`var()`、`{% if execute %}`)、
+  dbt 編譯期的環境資訊(`target.name`、`env_var()`、`{% if execute %}`)、
   現在時間與寫死的日期比較。這幾種**不要直接給 major**——開發與正式分流本來就會用到;
   但要回應:說明用途,或指出它會讓沙盒與正式環境走不同分支。
 
