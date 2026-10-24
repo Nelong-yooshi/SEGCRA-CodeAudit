@@ -61,7 +61,8 @@ def _is_sys_path_setup(node: ast.AST) -> bool:
 
 def _is_idempotent_setup(node: ast.AST) -> bool:
     """重跑也無害的設定:`os.environ.setdefault(...)`,以及
-    `if hasattr(sys.stdout, ...):`(把主控台輸出改成 UTF-8 的固定寫法,不能有 else)。"""
+    `if hasattr(sys.stdout, "reconfigure"):`(把主控台輸出改成 UTF-8 的固定寫法;不能有 else,
+    區塊裡只能是 reconfigure 本身,見 _is_reconfigure_block)。"""
     if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
         func = node.value.func
         return (isinstance(func, ast.Attribute) and func.attr == "setdefault"
@@ -69,11 +70,34 @@ def _is_idempotent_setup(node: ast.AST) -> bool:
                 and isinstance(func.value.value, ast.Name) and func.value.value.id == "os")
     if isinstance(node, ast.If) and isinstance(node.test, ast.Call):
         call = node.test
-        return (isinstance(call.func, ast.Name) and call.func.id == "hasattr" and bool(call.args)
-                and isinstance(call.args[0], ast.Attribute) and call.args[0].attr == "stdout"
-                and isinstance(call.args[0].value, ast.Name) and call.args[0].value.id == "sys"
-                and not node.orelse)
+        return (isinstance(call.func, ast.Name) and call.func.id == "hasattr"
+                and len(call.args) == 2 and _is_sys_stdout(call.args[0])
+                and isinstance(call.args[1], ast.Constant) and call.args[1].value == "reconfigure"
+                and not node.orelse and all(_is_reconfigure_block(s) for s in node.body))
     return False
+
+
+def _is_sys_stdout(node: ast.AST) -> bool:
+    return (isinstance(node, ast.Attribute) and node.attr == "stdout"
+            and isinstance(node.value, ast.Name) and node.value.id == "sys")
+
+
+def _is_reconfigure_call(stmt: ast.AST) -> bool:
+    """`sys.stdout.reconfigure(...)` 這一句,別的都不算。"""
+    if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call)):
+        return False
+    func = stmt.value.func
+    return isinstance(func, ast.Attribute) and func.attr == "reconfigure" and _is_sys_stdout(func.value)
+
+
+def _is_reconfigure_block(stmt: ast.AST) -> bool:
+    """`if hasattr(sys.stdout, "reconfigure"):` 底下只能是 `sys.stdout.reconfigure(...)`,或是包著它、
+    例外時只 `pass` 的 `try`。區塊裡多寫任何會執行的東西(例如 `main()`)都不放行。"""
+    if _is_reconfigure_call(stmt):
+        return True
+    return (isinstance(stmt, ast.Try) and not stmt.orelse and not stmt.finalbody
+            and bool(stmt.body) and all(_is_reconfigure_call(s) for s in stmt.body)
+            and all(all(isinstance(s, ast.Pass) for s in h.body) for h in stmt.handlers))
 
 
 def _unguarded_calls(source: str) -> list[int]:
@@ -128,3 +152,37 @@ def test_檢查本身抓得到沒有保護的寫法():
             "if hasattr(sys.stdout, 'x'):\n    pass\nelse:\n    serve()\n"
             "if hasattr(os, 'x'):\n    serve()\n")
     assert _unguarded_calls(idem) == [5, 6, 10]       # 只放行 setdefault 與 stdout 的設定
+
+
+@pytest.mark.parametrize("body", [
+    "    sys.stdout.reconfigure(encoding='utf-8')\n",
+    "    try:\n        sys.stdout.reconfigure(encoding='utf-8')\n    except Exception:\n        pass\n",
+    "    try:\n        sys.stdout.reconfigure(encoding='utf-8')\n    except (OSError, ValueError):\n"
+    "        pass\n    except Exception:\n        pass\n",
+])
+def test_stdout_設定的固定寫法放行(body):
+    assert _unguarded_calls("import sys\nif hasattr(sys.stdout, 'reconfigure'):\n" + body) == []
+
+
+@pytest.mark.parametrize("body", [
+    "    sys.stdout.reconfigure(encoding='utf-8')\n    main()\n",            # 區塊裡多寫一行
+    "    main()\n",
+    "    try:\n        sys.stdout.reconfigure(encoding='utf-8')\n        main()\n"
+    "    except Exception:\n        pass\n",
+    "    try:\n        sys.stdout.reconfigure(encoding='utf-8')\n    except Exception:\n"
+    "        main()\n",
+    "    try:\n        sys.stdout.reconfigure(encoding='utf-8')\n    except Exception:\n"
+    "        pass\n    else:\n        main()\n",
+    "    try:\n        sys.stdout.reconfigure(encoding='utf-8')\n    finally:\n        main()\n",
+    "    sys.stderr.reconfigure(encoding='utf-8')\n",
+    "    other.stdout.reconfigure(encoding='utf-8')\n",
+])
+def test_stdout_設定的區塊裡夾帶別的就不放行(body):
+    assert _unguarded_calls("import sys\nif hasattr(sys.stdout, 'reconfigure'):\n" + body) == [2]
+
+
+@pytest.mark.parametrize("test", ["hasattr(sys.stdout, 'x')", "hasattr(sys.stdout)",
+                                  "hasattr(sys.stderr, 'reconfigure')"])
+def test_stdout_設定的條件要是固定寫法(test):
+    src = f"import sys\nif {test}:\n    sys.stdout.reconfigure(encoding='utf-8')\n"
+    assert _unguarded_calls(src) == [2]

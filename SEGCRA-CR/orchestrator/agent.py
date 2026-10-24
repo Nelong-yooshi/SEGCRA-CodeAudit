@@ -130,6 +130,10 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
     # 請求被退回,比多花一點 token 嚴重得多,所以預設不送而不是預設關閉思考。
     effort_kwargs = ({"reasoning_effort": profile.reasoning_effort}
                      if profile.reasoning_effort else {})
+    if meta is not None:
+        # 一開始就寫 False:呼叫端用 meta.get("exhausted") 時,「沒有這個 key」
+        # (舊版程式)與「跑完沒用光輪次」要分得出來。
+        meta["exhausted"] = False
     for i in range(MAX_ITERATIONS):
         dump_path = _dump(profile.model, messages, i)
         resp = await client.chat.completions.create(
@@ -153,8 +157,21 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
         if meta is not None:
             # 每一輪都覆寫:呼叫端關心的是**最後一次**回應有沒有被截斷,
             # 中間輪次的工具呼叫回合即使碰到上限也會繼續跑下去。
+            completion = getattr(usage, "completion_tokens", None) if usage else None
             meta["finish_reason"] = resp.choices[0].finish_reason
-            meta["completion_tokens"] = getattr(usage, "completion_tokens", None) if usage else None
+            meta["completion_tokens"] = completion
+            meta["prompt_tokens"] = prompt_tokens
+            # 另外**累加**:有工具呼叫時一輪會跑好幾次,每一次都把整串對話重讀一遍,
+            # 所以總量遠大於最後一次。只記最後一次的話,工具用得多的 MR 反而看起來
+            # 很便宜,跟黑盒量到的總量對不起來(#84)。
+            #
+            # 端點沒回 usage 的那一輪不加(不要把 None 當 0 加進去之後還記成有值);
+            # 整份都沒有任何一輪回報時,鍵根本不存在 → 呼叫端讀到 None,
+            # 跟 completion_tokens 沒回報時同一個意思。
+            for key, value in (("prompt_tokens_total", prompt_tokens),
+                               ("completion_tokens_total", completion)):
+                if value is not None:
+                    meta[key] = (meta.get(key) or 0) + value
         _dump_response(dump_path, msg.content or "", resp.choices[0].finish_reason,
                        getattr(usage, "completion_tokens", None) if usage else None,
                        prompt_tokens,
@@ -186,7 +203,18 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
                               "result_preview": (result or "")[:400]})
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
-    return messages[-1].get("content") or "(達到工具呼叫上限,未產出最終結果)"
+    # 工具回合用完了,模型始終沒有產出最終回應。
+    #
+    # **不可以回傳最後一則工具結果**:那則內容是工具回來的、而工具看的是 MR,所以內容
+    # 由 MR 決定。它是 JSON 物件時 extract_json 會把它當成審查報告收下,而最後一次模型
+    # 呼叫的 finish_reason 是 "stop" —— 呼叫端從 meta 完全看不出發生了這件事。
+    #
+    # 兩道一起上:回固定文字(就算呼叫端忘了看 meta,也拿不到工具結果),並標記
+    # exhausted(呼叫端據此比照截斷處理:不解析輸出、補一條 major、不得自動放行)。
+    # 只有 run_agent 知道迴圈是跑完還是被 return 出去的,所以標記只能在這裡做。
+    if meta is not None:
+        meta["exhausted"] = True
+    return "(達到工具呼叫上限,未產出最終結果)"
 
 
 def decode_byte_fallback(text: str) -> str:
