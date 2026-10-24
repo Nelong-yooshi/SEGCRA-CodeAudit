@@ -9,6 +9,7 @@
 3. 取不回來 → 專案裡的 .sql 一律交人工,**不退回「沒有 macro」繼續展開**
 """
 import asyncio
+import re
 import gzip
 import io
 import json
@@ -130,6 +131,18 @@ def _prescan(files, cfg=CFG, ctx=None):
     hub = _Hub()
     pre = asyncio.run(prescan(hub, files, cfg, ctx))
     return pre, hub
+
+
+_MACRO_SRC = re.compile(r"\{%-?\s*macro\s")
+
+
+def _model_rules(hub):
+    """送去規則層的內容,去掉 macro 的原始碼。
+
+    改到的 model 所呼叫的 macro 會另外被掃一次讀取環境的寫法(#41 第 4 點)——
+    那跟「model 用什麼內容展開」是兩件事,混在同一個清單裡比對會互相干擾。
+    """
+    return [r for r in hub.rules if not _MACRO_SRC.search(r or "")]
 
 
 # ─────────────────── 1. 什麼時候不取回(行為與接線前相同) ───────────────────
@@ -301,7 +314,7 @@ def test_diff只有片段_改用head的完整內容展開():
     """改到的那一行沒有任何樣板標記;以前會把這一行當成純 SQL 片段送去跑規則。"""
     fragment = "@@ -3,1 +3,1 @@\n+WHERE t.id > 5"
     pre, hub = _prescan([_f("models/mrt_big.sql", diff=fragment)], ctx=_ctx())
-    assert hub.rules == [EXPECTED]
+    assert _model_rules(hub) == [EXPECTED]
     assert hub.lint == [MODEL]                # lint 用原始內容(行號與 diff 一致)
     assert "dbt_render_error" not in pre[0]
 
@@ -309,9 +322,9 @@ def test_diff只有片段_改用head的完整內容展開():
 def test_沒有專案時_呼叫專案macro的model展開失敗_有專案才展得開():
     files = [_f("models/mrt_big.sql", full_content=MODEL)]
     pre, hub = _prescan(files, ctx=None)
-    assert "is_big" in pre[0]["dbt_render_error"] and hub.rules == [MODEL]
+    assert "is_big" in pre[0]["dbt_render_error"] and _model_rules(hub) == [MODEL]
     pre, hub = _prescan(files, ctx=_ctx())
-    assert "dbt_render_error" not in pre[0] and hub.rules == [EXPECTED]
+    assert "dbt_render_error" not in pre[0] and _model_rules(hub) == [EXPECTED]
 
 
 def test_ref依專案資訊驗證_結果與直接呼叫展開器相同():
@@ -325,14 +338,14 @@ def test_ref依專案資訊驗證_結果與直接呼叫展開器相同():
     pre, hub = _prescan([_f("models/x.sql", full_content=src)], ctx=ctx)
     assert pre[0].get("dbt_render_error") == (None if direct.ok else direct.error)
     assert pre[0].get("dbt_render_notice") == direct.relation_notice
-    assert hub.rules == [direct.sql if direct.ok else src]
+    assert _model_rules(hub) == [direct.sql if direct.ok else src]
 
 
 def test_head不是樣板的檔案_維持原本的來源():
     """已編譯的純 SQL:不改成整個檔案(那是另一項工作的範圍),也不展開。"""
     fragment = "@@ -3,1 +3,1 @@\n+WHERE id > 5"
     pre, hub = _prescan([_f("models/plain.sql", diff=fragment)], ctx=_ctx())
-    assert hub.rules == ["WHERE id > 5"] and hub.lint == ["WHERE id > 5"]
+    assert _model_rules(hub) == ["WHERE id > 5"] and hub.lint == ["WHERE id > 5"]
     assert "dbt_render_error" not in pre[0]
 
 
@@ -340,7 +353,7 @@ def test_專案內但沒被收進來的sql_仍用專案的macro展開():
     """例如 analyses/、tests/ 底下的檔案:打包只收 model / macro / seed / snapshot 目錄。"""
     src = "SELECT 1 WHERE {{ is_big('x') }}"
     pre, hub = _prescan([_f("analyses/check.sql", full_content=src)], ctx=_ctx())
-    assert hub.rules == ["SELECT 1 WHERE x >= 100000"]
+    assert _model_rules(hub) == ["SELECT 1 WHERE x >= 100000"]
 
 
 def test_專案外的檔案_沒有專案的macro可用():
@@ -358,7 +371,7 @@ def test_同名的macro_算展開失敗():
     files = {**PROJECT, "macros/dup.sql": "{% macro is_big(col) %}{{ col }} > 0{% endmacro %}"}
     pre, hub = _prescan([_f("models/mrt_big.sql")], ctx=_ctx(files))
     assert "同名的 macro" in pre[0]["dbt_render_error"] and "1 組" in pre[0]["dbt_render_error"]
-    assert hub.rules == [MODEL]               # 不把擇一展開的結果交給規則層
+    assert _model_rules(hub) == [MODEL]               # 不把擇一展開的結果交給規則層
 
 
 # ─────────────────── 5. 預掃:取不回來一律交人工 ───────────────────
@@ -376,7 +389,7 @@ def test_取回失敗_專案裡的sql全部記成展開失敗_而且不嘗試展
     pre, hub = _prescan(files, ctx=_failed_ctx())
     for entry in pre:
         assert entry["dbt_render_error"] == _DBT_FETCH_FAILED + "GitLab 回應 HTTP 403"
-    assert hub.rules == [MODEL, "WHERE id > 5"]       # 規則照舊對原文跑,不吞掉
+    assert _model_rules(hub) == [MODEL, "WHERE id > 5"]       # 規則照舊對原文跑,不吞掉
 
 
 def test_取回失敗_專案外與不是sql的檔案不受影響():
@@ -403,7 +416,7 @@ def test_沒開dbt時_不看dbt_ctx():
     for ctx in (None, _failed_ctx(), _ctx()):
         for cfg in (None, {}, {"enabled": False, "database": DB}):
             pre, hub = _prescan(files, cfg=cfg, ctx=ctx)
-            assert hub.rules == [MODEL] and hub.lint == [MODEL]
+            assert _model_rules(hub) == [MODEL] and hub.lint == [MODEL]
             assert pre == [{"path": "models/mrt_big.sql", "rules": [], "lint": []}]
 
 
@@ -411,7 +424,7 @@ def test_沒有dbt_ctx時_開了dbt的行為與接線前相同():
     """mock 模式、或沒改到專案裡的 .sql:沒有專案可用,照舊不帶 macro 展開。"""
     src = "SELECT {{ 1 + 1 }}"
     pre, hub = _prescan([_f("models/a.sql", full_content=src)], ctx=None)
-    assert hub.rules == ["SELECT 2"] and pre == [{"path": "models/a.sql", "rules": [], "lint": []}]
+    assert _model_rules(hub) == ["SELECT 2"] and pre == [{"path": "models/a.sql", "rules": [], "lint": []}]
 
 
 # ─────────────────── 6. 注入掃描也掃取回的完整內容 ───────────────────
@@ -588,7 +601,7 @@ def test_macro目錄互相包含_不會被當成同名macro():
     files = {**PROJECT, "dbt_project.yml": "name: sample\nmacro-paths: ['macros', 'macros/shared']\n",
              "macros/shared/more.sql": "{% macro more() %}1{% endmacro %}"}
     pre, hub = _prescan([_f("models/mrt_big.sql")], ctx=_ctx(files))
-    assert "dbt_render_error" not in pre[0] and hub.rules == [EXPECTED]
+    assert "dbt_render_error" not in pre[0] and _model_rules(hub) == [EXPECTED]
 
 
 def test_規則掃得到只出現在macro展開結果裡的問題(dry_run):

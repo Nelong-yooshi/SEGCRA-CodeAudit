@@ -157,8 +157,21 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
         if meta is not None:
             # 每一輪都覆寫:呼叫端關心的是**最後一次**回應有沒有被截斷,
             # 中間輪次的工具呼叫回合即使碰到上限也會繼續跑下去。
+            completion = getattr(usage, "completion_tokens", None) if usage else None
             meta["finish_reason"] = resp.choices[0].finish_reason
-            meta["completion_tokens"] = getattr(usage, "completion_tokens", None) if usage else None
+            meta["completion_tokens"] = completion
+            meta["prompt_tokens"] = prompt_tokens
+            # 另外**累加**:有工具呼叫時一輪會跑好幾次,每一次都把整串對話重讀一遍,
+            # 所以總量遠大於最後一次。只記最後一次的話,工具用得多的 MR 反而看起來
+            # 很便宜,跟黑盒量到的總量對不起來(#84)。
+            #
+            # 端點沒回 usage 的那一輪不加(不要把 None 當 0 加進去之後還記成有值);
+            # 整份都沒有任何一輪回報時,鍵根本不存在 → 呼叫端讀到 None,
+            # 跟 completion_tokens 沒回報時同一個意思。
+            for key, value in (("prompt_tokens_total", prompt_tokens),
+                               ("completion_tokens_total", completion)):
+                if value is not None:
+                    meta[key] = (meta.get(key) or 0) + value
         _dump_response(dump_path, msg.content or "", resp.choices[0].finish_reason,
                        getattr(usage, "completion_tokens", None) if usage else None,
                        prompt_tokens,
