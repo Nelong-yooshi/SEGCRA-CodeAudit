@@ -77,10 +77,12 @@ def _clip(text) -> str:
 
 
 def collect_sections(mr: dict, head_texts: dict | None = None) -> list[Section]:
-    """標題、說明,再依變更清單的順序放每個檔案的**改動**(diff),最後才放各檔變更後的**全文**
+    """標題、說明,再放每個檔案的**改動**(diff),最後才放各檔變更後的**全文**
     (檔案的 full_content 優先,其次 head_texts——取回的 dbt 專案內容)。
 
-    改動放在前面:超過預算時,沒送到的會先是沒改動的部分(仍記成沒看完)。不限副檔名:yml、規格、
+    改動放在前面:超過預算時,沒送到的會先是沒改動的部分(仍記成沒看完)。改動與全文各自
+    由小到大放(一樣大時照變更清單的順序):一個大檔不會先佔掉預算,讓後面的小檔整份放不進去,
+    同樣的預算能完整看到最多的檔。不限副檔名:yml、規格、
     文件裡的文字主審查一樣讀得到。被刪掉的檔案只放檔名:刪掉的內容不會進到正式環境。
     二進位檔(含 NUL)內容不送。沒有 diff 的檔案(只有全文)也列出檔名,內容在全文段。"""
     head_texts = head_texts or {}
@@ -106,7 +108,12 @@ def collect_sections(mr: dict, head_texts: dict | None = None) -> list[Section]:
         diffs.append(Section("檔案", path, diff, PART_DIFF))
         if full and full != diff:
             fulls.append(Section("檔案", path, full, PART_FULL))
-    return sections + diffs + fulls
+    return sections + _smallest_first(diffs) + _smallest_first(fulls)
+
+
+def _smallest_first(sections: list[Section]) -> list[Section]:
+    """依送出時的偏高估計由小到大排;sorted 是穩定排序,一樣大的維持原本順序。"""
+    return sorted(sections, key=lambda s: estimate_tokens_upper(_head(s) + s.text))
 
 
 # 跟 pipeline 判斷「整個檔案被刪掉」用同一個寫法:diff 只有一段、變更後是 0 行

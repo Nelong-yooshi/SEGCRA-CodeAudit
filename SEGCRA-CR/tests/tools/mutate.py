@@ -682,6 +682,15 @@ def copy_project(src: pathlib.Path, dst: pathlib.Path) -> None:
 
 # ---- 冷讀:另一支只看 MR 文字的模型呼叫(只能加擋)
 MUTANTS.update({
+ "冷讀:改動與全文不排序": ("cold_read.py",
+     "    return sections + _smallest_first(diffs) + _smallest_first(fulls)",
+     "    return sections + diffs + fulls"),
+ "冷讀:全文由大到小": ("cold_read.py",
+     "    return sorted(sections, key=lambda s: estimate_tokens_upper(_head(s) + s.text))",
+     "    return sorted(sections, key=lambda s: -estimate_tokens_upper(_head(s) + s.text))"),
+ "冷讀:排序用字元數而不是送出時的估計": ("cold_read.py",
+     "    return sorted(sections, key=lambda s: estimate_tokens_upper(_head(s) + s.text))",
+     "    return sorted(sections, key=lambda s: len(_head(s) + s.text))"),
  "冷讀:分隔標記固定不變": ("cold_read.py",
      "    token = secrets.token_hex(8)", '    token = "0" * 16'),
  "冷讀:預算不生效": ("cold_read.py",
@@ -699,7 +708,8 @@ MUTANTS.update({
  "冷讀:不用取回的專案內容": ("cold_read.py",
      "            full = head_texts.get(path)", "            full = None"),
  "冷讀:全文排在改動前面(超過預算時改動沒送到)": ("cold_read.py",
-     "    return sections + diffs + fulls", "    return sections + fulls + diffs"),
+     "    return sections + _smallest_first(diffs) + _smallest_first(fulls)",
+     "    return sections + _smallest_first(fulls) + _smallest_first(diffs)"),
  "冷讀:全文跟改動一樣也送兩份": ("cold_read.py",
      "        if full and full != diff:", "        if full:"),
  "冷讀:預算用 len/3(中文低估)": ("cold_read.py",
