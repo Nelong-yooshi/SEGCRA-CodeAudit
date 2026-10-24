@@ -485,6 +485,12 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
     """在 MR 的特定檔案行號留下審查意見。"""
     if REAL_MODE:
         text = f"**[{severity}]** {body}"
+        if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
+            # 沒有對應的行號(檔案層的 finding):直接貼一般留言,不拿第 0 行去開行內討論、
+            # 再靠 API 失敗分流;開頭不寫 `檔名:0`(看起來像第 0 行)
+            _api("POST", f"/merge_requests/{mr_id}/notes",
+                 json={"body": f"`{file}`(無對應行號)\n\n{text}"})
+            return json.dumps({"ok": True}, ensure_ascii=False)
         try:
             mr = _api("GET", f"/merge_requests/{mr_id}")
             pos = {"position_type": "text", "new_path": file, "new_line": line,
