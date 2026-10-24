@@ -1,8 +1,9 @@
-"""會變成 Dagster 資產名稱的 dbt 名稱,不符合 Dagster 的命名規則時補 blocker。
+"""會變成 Dagster 名稱的 dbt 名稱與設定,不符合 Dagster 的命名規則時補 blocker。
 
-部署端用 Dagster(1.13)與 dagster-dbt 載入 dbt 專案。資產名稱要符合 `^[A-Za-z0-9_]+$`,
-`-` 與 `.` 會先被 dagster-dbt 換成底線;不符合時 Dagster 整個載入失敗。下面的情境照
-Dagster 1.13 實測的結果:會擋的、不會擋的各一條。
+部署端用 Dagster(1.13)與 dagster-dbt(0.29)載入 dbt 專案,不符合時 Dagster 整個載入失敗。
+規則分三種(資產名稱、group、資料檢查的名稱),設定可以寫在 config()、屬性檔、dbt_project.yml
+(見 orchestrator/dbt_asset_names.py)。下面的情境照 Dagster 1.13 實測的結果:每一種位置都有
+會擋的與不會擋的。
 """
 import asyncio
 import json
@@ -10,7 +11,8 @@ import json
 import pytest
 
 from orchestrator import pipeline
-from orchestrator.dbt_asset_names import Layout, check_file, valid_asset_name
+from orchestrator.dbt_asset_names import (Layout, check_file, valid_asset_name, valid_name,
+                                          versioned_models)
 from orchestrator.dbt_context import DbtContext
 from orchestrator.dbt_project import DbtLayout, DbtProject
 from orchestrator.pipeline import (_DBT_ASSET_NAME_TITLE, _DBT_ASSET_NAME_UNKNOWN_TITLE,
@@ -87,7 +89,7 @@ def test_屬性檔的_snapshots_名稱也查():
     _added("snapshots/分行快照.sql",                              # snapshot 檔名
            "{% snapshot snap_branch %}\nselect 1\n{% endsnapshot %}"),
     _added("macros/中文.sql", "{% macro 計算() %}1{% endmacro %}"),  # macro 檔名與名稱
-    _added("models/mrt_daily.sql", "{{ config(alias='每日') }}\nselect 1 as 金額"),  # alias、欄位
+    _added("models/mrt_daily.sql", "select 1 as 金額"),            # 欄位
     _added("models/props.yml", "version: 2\nmodels:\n  - name: mrt_daily\n"
                                "    description: 每日交易\n    columns:\n      - name: 金額\n"
                                "        tests: [not_null]\n"),     # 欄位、測試、說明
@@ -195,7 +197,8 @@ def test_列出名稱與種類_用_code_格式():
     f = _added("models/src.yml", SOURCES.format(source="交易來源", table="明細"))
     detail = _run(f)[0]["detail"]
     assert "source `交易來源`" in detail and "source 的表 `明細`" in detail
-    assert "^[A-Za-z0-9_]+$" in detail
+    assert "資產名稱只能用英數字、底線、`-`、`.`" in detail
+    assert "group 只能用" not in detail                    # 只寫這個檔用到的規則
 
 
 def test_名稱去掉不可列印字元並截長度():
@@ -300,3 +303,256 @@ def test_review_mr_接上了(monkeypatch, tmp_path):
     assert any(f["title"] == _DBT_ASSET_NAME_TITLE and f["severity"] == "blocker"
                for f in report["findings"]), report["findings"]
     assert report["decision"] == "blocked", report["decision"]
+
+
+# ─────────────────── 三種規則與三個來源(Dagster 1.13 + dagster-dbt 0.29 實測的對照) ───────────────────
+
+def _proj_ctx(files=None, root=None, versioned_yml=None):
+    """專案在 repo 根目錄、預設目錄。versioned_yml:放進 models/ 的屬性檔(宣告帶版本的 model)。"""
+    files = dict(files or {})
+    if versioned_yml is not None:
+        files["models/versions.yml"] = versioned_yml
+    project = DbtProject(ok=True, files=files, model_paths=("models",), macro_paths=("macros",),
+                         seed_paths=("seeds",), snapshot_paths=("snapshots",),
+                         test_paths=("tests",),
+                         root_files={"dbt_project.yml": "name: p\n", **(root or {})})
+    return DbtContext(prefix="", project=project,
+                      layout=DbtLayout(("models", "macros", "seeds", "snapshots", "tests")))
+
+
+NO_VERSIONS = "version: 2\nmodels:\n  - name: other\n"
+VERSIONED = "version: 2\nmodels:\n  - name: dim\n    versions:\n      - v: 1\n      - v: 2\n"
+
+
+def _sev(*files, ctx=None):
+    return [(f["file"], f["severity"]) for f in _run(*files, ctx=ctx)]
+
+
+@pytest.mark.parametrize("rule,name,ok", [
+    ("asset", "每日", False), ("asset", "a-b", True), ("asset", "a.b", True),
+    ("asset", "a/b", False), ("asset", "a b", False),
+    ("group", "財務", False), ("group", "fin-ops", False), ("group", "fin.ops", False),
+    ("group", "fin/ops", True), ("group", "fin/ops/x_1", True), ("group", "fin/", False),
+    ("group", "/fin", False), ("group", "fin//ops", False),
+    ("check", "唯一", False), ("check", "uniq-1", False), ("check", "uniq.1", True),
+    ("check", "uniq_1", True), ("check", "a/b", False),
+])
+def test_三種規則各自的字元限制(rule, name, ok):
+    assert valid_name(rule, name) is ok
+
+
+# 資產名稱:schema 設定(三個來源)、meta.dagster.asset_key
+@pytest.mark.parametrize("f", [
+    _added("models/m.sql", "{{ config(schema='報表') }}\nselect 1"),
+    _added("models/m.sql", "{{ config(materialized='table', schema=\"報表\") }}\nselect 1"),
+    _added("models/m.sql", "{{ config({'schema': '報表'}) }}\nselect 1"),
+    _added("models/m.py", "def model(dbt, session):\n    dbt.config(schema='報表')\n    return 1\n"),
+    _added("models/props.yml", "models:\n  - name: m\n    config:\n      schema: 報表\n"),
+    _added("seeds/props.yml", "seeds:\n  - name: s\n    config:\n      schema: 報表\n"),
+    _added("snapshots/s.sql", "{% snapshot snap %}\n{{ config(schema='報表') }}\nselect 1\n"
+                               "{% endsnapshot %}"),
+    _added("models/m.sql", "{{ config(meta={'dagster': {'asset_key': ['報表', 'm']}}) }}\nselect 1"),
+    _added("models/props.yml", "models:\n  - name: m\n    meta:\n      dagster:\n"
+                               "        asset_key: [報表, m]\n"),
+    _added("models/props.yml", "models:\n  - name: m\n    config:\n      meta:\n        dagster:\n"
+                               "          asset_key: [報表]\n"),
+    _added("models/src.yml", "sources:\n  - name: core\n    tables:\n      - name: t\n"
+                             "        meta:\n          dagster:\n            asset_key: [來源, t]\n"),
+], ids=lambda f: f["path"] + ":" + f["full_content"][:30])
+def test_資產名稱的設定不符合_補blocker(f):
+    assert _sev(f) == [(f["path"], "blocker")]
+
+
+@pytest.mark.parametrize("yml", [
+    "models:\n  my_proj:\n    +schema: 報表\n",
+    "models:\n  my_proj:\n    marts:\n      +schema: 報表\n",          # 設在子資料夾
+    "models:\n  my_proj:\n    schema: 報表\n",                          # 沒加 +
+    "seeds:\n  my_proj:\n    +schema: 報表\n",
+    "snapshots:\n  my_proj:\n    +schema: 報表\n",
+    "models:\n  my_proj:\n    +group: 財務\n",
+    "models:\n  my_proj:\n    +meta:\n      dagster:\n        group: fin-ops\n",
+    "models:\n  my_proj:\n    +meta:\n      dagster:\n        asset_key: [中文]\n",
+])
+def test_dbt_project_yml_改到時也查(yml):
+    f = _added("dbt_project.yml", "name: my_proj\n" + yml)
+    assert _sev(f) == [("dbt_project.yml", "blocker")]
+    # 取回專案時,以專案根目錄的設定檔為準
+    g = {"path": "dbt_project.yml", "diff": "@@ -1 +1 @@\n-x\n+y\n"}
+    assert _sev(g, ctx=_proj_ctx(root={"dbt_project.yml": "name: my_proj\n" + yml})) == [
+        ("dbt_project.yml", "blocker")]
+
+
+@pytest.mark.parametrize("yml", [
+    "name: p\nmodels:\n  my_proj:\n    +schema: mart-daily\n    +materialized: table\n",
+    "name: p\nmodels:\n  my_proj:\n    +group: fin/ops\n    +tags: [每日]\n",
+    "name: p\nmodels:\n  my_proj:\n    schema:\n      +schema: ok_schema\n",   # 名叫 schema 的資料夾
+    "name: p\nvars:\n  分行: 1\n",
+    "name: p\n",
+])
+def test_dbt_project_yml_沒有問題不報(yml):
+    assert _run(_added("dbt_project.yml", yml)) == []
+    ctx = _proj_ctx(root={"dbt_project.yml": yml}, versioned_yml=NO_VERSIONS)
+    assert _run({"path": "dbt_project.yml", "diff": "@@ -1 +1 @@\n-x\n+y\n"}, ctx=ctx) == []
+
+
+# group
+@pytest.mark.parametrize("f", [
+    _added("models/groups.yml", "groups:\n  - name: 財務\n    owner:\n      name: 王小明\n"),
+    _added("models/groups.yml", "groups:\n  - name: fin-ops\n    owner:\n      email: a@b.c\n"),
+    _added("models/groups.yml", "groups:\n  - name: fin.ops\n"),
+    _added("models/m.sql", "{{ config(group='財務') }}\nselect 1"),
+    _added("models/props.yml", "models:\n  - name: m\n    config:\n      group: fin-ops\n"),
+    _added("models/props.yml", "models:\n  - name: m\n    group: 財務\n"),
+    _added("models/props.yml", "models:\n  - name: m\n    meta:\n      dagster:\n        group: a.b\n"),
+], ids=lambda f: f["full_content"][:40])
+def test_group_不符合_補blocker(f):
+    found = _run(f)
+    assert [(x["file"], x["severity"]) for x in found] == [(f["path"], "blocker")]
+    assert "group 只能用英數字與底線" in found[0]["detail"]
+
+
+# 資料檢查
+@pytest.mark.parametrize("f", [
+    _added("models/props.yml", "models:\n  - name: m\n    data_tests:\n"
+                               "      - unique:\n          name: 唯一\n"),
+    _added("models/props.yml", "models:\n  - name: m\n    columns:\n      - name: 金額\n"
+                               "        data_tests:\n          - not_null:\n              name: amt-nn\n"),
+    _added("models/props.yml", "models:\n  - name: m\n    columns:\n      - name: id\n"
+                               "        tests:\n          - name: 編號唯一\n            test_name: unique\n"),
+    _added("models/src.yml", "sources:\n  - name: core\n    tables:\n      - name: t\n"
+                             "        data_tests:\n          - unique:\n              name: 唯一\n"),
+    _added("models/props.yml", "models:\n  - name: m\n    data_tests:\n      - unique:\n"
+                               "          config:\n            name: u-1\n"),
+    _added("tests/檢查餘額.sql", "select 1 where 1 = 0"),
+    _added("tests/check-balance.sql", "select 1 where 1 = 0"),
+], ids=lambda f: f["path"] + ":" + f["full_content"][-25:])
+def test_資料檢查的名稱不符合_補blocker(f):
+    found = _run(f)
+    assert [(x["file"], x["severity"]) for x in found] == [(f["path"], "blocker")]
+    assert "資料檢查的名稱只能用英數字、底線、`.`" in found[0]["detail"]
+
+
+# 帶版本的 model
+@pytest.mark.parametrize("yml", [
+    "models:\n  - name: dim\n    versions:\n      - v: 版本二\n",                  # 版本號
+    "models:\n  - name: dim\n    versions:\n      - v: 2\n        config:\n          alias: 維度\n",
+    "models:\n  - name: dim\n    config:\n      alias: 維度\n    versions:\n      - v: 2\n",
+    "models:\n  - name: dim\n    versions:\n      - v: 2\n        config:\n          schema: 報表\n",
+])
+def test_帶版本的_model_名稱不符合_補blocker(yml):
+    assert _sev(_added("models/versions.yml", yml)) == [("models/versions.yml", "blocker")]
+
+
+def test_帶版本的_model_預設名稱與點號都可以():
+    yml = "models:\n  - name: dim\n    versions:\n      - v: 2\n      - v: 2.5\n"
+    assert _run(_added("models/versions.yml", yml)) == []
+
+
+def test_沒有版本的_alias_不影響():
+    yml = "models:\n  - name: m\n    config:\n      alias: 每日\n"
+    assert _run(_added("models/props.yml", yml)) == []
+    f = _added("models/m.sql", "{{ config(alias='每日') }}\nselect 1")
+    assert _run(f, ctx=_proj_ctx(versioned_yml=NO_VERSIONS)) == []
+    project = "name: p\nmodels:\n  p:\n    +alias: 每日\n"
+    g = {"path": "dbt_project.yml", "diff": "@@ -1 +1 @@\n-x\n+y\n"}
+    assert _run(g, ctx=_proj_ctx(root={"dbt_project.yml": project}, versioned_yml=NO_VERSIONS)) == []
+    # 專案有帶版本的 model、或不知道時:整個資料夾的 +alias 可能套到帶版本的 model
+    assert _sev(g, ctx=_proj_ctx(root={"dbt_project.yml": project}, versioned_yml=VERSIONED)) == [
+        ("dbt_project.yml", "major")]
+    assert _sev(_added("dbt_project.yml", project)) == [("dbt_project.yml", "major")]
+
+
+def test_SQL_的_alias_要看_model_有沒有版本():
+    f = _added("models/dim_v2.sql", "{{ config(alias='維度') }}\nselect 1")
+    assert _sev(f, ctx=_proj_ctx(versioned_yml=VERSIONED)) == [("models/dim_v2.sql", "blocker")]
+    # 專案有帶版本的 model、但檔名對不上(可能用 defined_in 指定):不知道
+    g = _added("models/other.sql", "{{ config(alias='維度') }}\nselect 1")
+    assert _sev(g, ctx=_proj_ctx(versioned_yml=VERSIONED)) == [("models/other.sql", "major")]
+    # 沒有取回專案:不知道有沒有版本
+    assert _sev(f) == [("models/dim_v2.sql", "major")]
+    # alias 本身符合規則時,有沒有版本都沒差
+    ok = _added("models/other.sql", "{{ config(alias='dim-2') }}\nselect 1")
+    assert _run(ok) == []
+
+
+def test_versioned_models():
+    layout = Layout()
+    assert versioned_models({"models/v.yml": VERSIONED, "models/n.yml": NO_VERSIONS}, layout) == {"dim"}
+    assert versioned_models({"models/n.yml": NO_VERSIONS}, layout) == frozenset()
+    assert versioned_models({"models/v.yml": "models: [\n  versions"}, layout) is None
+    assert versioned_models({"seeds/v.yml": VERSIONED}, layout) == frozenset()
+
+
+# 值是樣板、寫法看不懂:major
+@pytest.mark.parametrize("f", [
+    _added("models/m.sql", "{{ config(schema=env_var('S', '報表')) }}\nselect 1"),
+    _added("models/m.sql", "{{ config(schema=var('s')) }}\nselect 1"),
+    _added("models/m.sql", "{{ config(schema='a' ~ 'b') }}\nselect 1"),
+    _added("models/m.sql", "{{ config(**cfg) }}\nselect 1"),
+    _added("models/m.sql", "{% do config.set('schema', '報表') %}\nselect 1"),
+    _added("models/m.sql", "{{ config(schema='報表'\nselect 1"),
+    _added("models/props.yml", "models:\n  - name: m\n    config:\n      schema: \"{{ env_var('S') }}\"\n"),
+    _added("dbt_project.yml", "name: p\nmodels:\n  p:\n    +schema: \"{{ env_var('S') }}\"\n"),
+    _added("models/props.yml", "models:\n  - name: m\n    meta: 文字\n"),
+    _added("models/props.yml", "models:\n  - name: m\n    config:\n      group: [a]\n"),
+    _added("models/props.yml", "models:\n  - name: m\n    data_tests: unique\n"),
+    _added("snapshots/s.sql", "{% snapshot snap %}\n{{ config(target_schema='報表') }}\nselect 1\n"
+                               "{% endsnapshot %}"),
+], ids=lambda f: f["full_content"][:45])
+def test_值是樣板或看不懂時補major(f):
+    assert _sev(f) == [(f["path"], "major")]
+
+
+def test_config_的參數是樣板時寫出是哪個參數():
+    f = _added("models/m.sql", "{{ config(group=env_var('G')) }}\nselect 1")
+    assert "config() 的 group 是樣板或運算式" in _run(f)[0]["detail"]
+
+
+def test_檔名不合規而內容看不懂時_兩條都補():
+    f = _added("models/每日.sql", "{{ config(schema=var('s')) }}\nselect 1")
+    assert sorted(_sev(f)) == [("models/每日.sql", "blocker"), ("models/每日.sql", "major")]
+
+
+# 不受影響的
+@pytest.mark.parametrize("f", [
+    _added("models/m.sql", "{{ config(materialized='table', tags=['每日'], schema='mart-daily') }}\n"
+                           "select 1 as 金額"),
+    _added("models/m.sql", "{{ config(meta={'owner': '王小明', 'dagster': {'group': 'fin/ops'}}) }}"),
+    _added("models/m.sql", "-- config( 註解裡的括號\nselect 1"),
+    _added("models/props.yml", "models:\n  - name: m\n    columns:\n      - name: 狀態\n"
+                               "        data_tests:\n          - accepted_values:\n"
+                               "              values: ['正常', '停用']\n          - not_null\n"),
+    _added("models/exposures.yml", "exposures:\n  - name: 每日報表\n    type: dashboard\n"
+                                   "    owner:\n      name: 王小明\n"),
+    _added("models/props.yml", "models:\n  - name: m\n    config:\n      tags: [每日]\n"
+                               "      meta:\n        負責人: 王小明\n"),
+    _added("tests/generic/中文.sql", "{% test 中文(model) %}select 1{% endtest %}"),
+    _added("tests/每日檢查_generic.sql", "{% test my_check(model) %}select 1{% endtest %}"),
+    _added("tests/check.balance.sql", "select 1"),
+    _added("models/m.py", "def model(dbt, session):\n    dbt.config(materialized='table')\n    return 1\n"),
+], ids=lambda f: f["path"] + ":" + f["full_content"][:25])
+def test_不影響_Dagster_名稱的設定不報(f):
+    assert _run(f) == []
+
+
+def test_設定值是布林時補major():
+    f = _added("models/props.yml", "models:\n  - name: m\n    config:\n      schema: true\n")
+    assert _sev(f) == [("models/props.yml", "major")]
+
+
+def test_跟名稱無關的參數寫成樣板不影響():
+    f = _added("models/m.sql", "{{ config(materialized=var('m'), tags=[var('t')], schema='ok_s') }}"
+                               "\nselect 1")
+    assert _run(f) == []
+
+
+def test_Jinja_的_true_false_none_算常值():
+    f = _added("models/m.sql", "{{ config(meta={'x': true, 'y': none, 'dagster': {'group': 'a-b'}}) }}"
+                               "\nselect 1")
+    assert _sev(f) == [("models/m.sql", "blocker")]
+
+
+def test_dbt_project_yml_資料夾太深時不解析():
+    yml = "name: p\nmodels:\n" + "".join("  " * (i + 1) + f"d{i}:\n" for i in range(80)) \
+        + "  " * 81 + "+schema: ok\n"
+    assert _sev(_added("dbt_project.yml", yml)) == [("dbt_project.yml", "major")]
