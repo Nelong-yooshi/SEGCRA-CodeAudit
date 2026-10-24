@@ -185,19 +185,19 @@ def test_規格讀的是正在審的那一版(monkeypatch):
 
     calls = []
 
-    class _Hub:
-        async def call(self, name, params, truncate=False):
-            calls.append(params)
-            return "(找不到)"
+    def fake_fetch(path, ref="", mr_id=""):
+        calls.append({"path": path, "ref": ref})
+        return None, None            # 這個檔不存在
 
     monkeypatch.setattr(spec_exec, "SPECS_DIR", __import__("pathlib").Path("/nonexistent"))
+    monkeypatch.setattr(spec_exec, "fetch_file", fake_fetch)
     mr = {"title": "R-999 調整", "description": "", "files": [{"path": "sql/x.sql"}]}
-    asyncio.run(spec_exec.find_spec(_Hub(), mr))
+    asyncio.run(spec_exec.find_spec(object(), mr))
 
     assert calls, "find_spec 沒有去抓規格"
     for p in calls:
-        assert "ref" not in p, (
-            f"規格讀取指定了 ref={p.get('ref')!r}——應該吃 get_file 的預設"
+        assert not p["ref"], (
+            f"規格讀取指定了 ref={p['ref']!r}——應該吃取檔函式的預設"
             "(正在審的那一版),否則規格跟程式一起修的 MR 會被拿舊規格驗")
 
 
@@ -268,6 +268,15 @@ def _review_real(monkeypatch, tmp_path, *, serve_full: bool):
             return "# R-201 單日 ATM 現金提領累計達 100000(含)通報\n\n規格內容。\n"
         return _BIG_SQL if serve_full else f"(repo 內無 {path})"
     monkeypatch.setattr(gitlab, "get_file", fake_get_file)
+
+    # 規格那條路走的是 fetch_file(回「內容 + 拿不到的原因」,不讓呼叫端比對文字,
+    # 見 #95 review 第 4 點),所以替身也要換它;spec_exec 是 from-import 進去的。
+    def fake_fetch_file(path, ref="", mr_id=""):
+        text = fake_get_file(path, ref, mr_id)
+        return (None, None) if text.startswith("(repo 內無") else (text, None)
+    monkeypatch.setattr(gitlab, "fetch_file", fake_fetch_file)
+    from orchestrator import spec_exec as _spec_exec
+    monkeypatch.setattr(_spec_exec, "fetch_file", fake_fetch_file)
     # tool_hub 在**模組載入時**就把函式物件放進 TOOL_GROUPS,所以只換 gitlab.get_file
     # 不會影響模型(與 find_spec)實際呼叫到的那個。兩邊都要換。
     from orchestrator import tool_hub

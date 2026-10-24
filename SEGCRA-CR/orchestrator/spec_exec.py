@@ -32,7 +32,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
-from toolbox.gitlab import unavailable_reason as gitlab_unavailable_reason
+from toolbox.gitlab import UNAVAILABLE_TEXT, fetch_file
 from .agent import extract_json, output_truncated, run_agent
 from .config import Config, PKG_ROOT
 
@@ -61,14 +61,14 @@ def _real_mode() -> bool:
     return bool(gitlab.REAL_MODE)
 
 
-# 「拿不到規格」的代碼 → 給人看的說法。訊息只說**哪一種設定**出了問題,不帶原始
-# 錯誤、主機位址或內部類別名稱:它會貼回 MR(#89 第 3 點的對照表之後會併進來)。
-_SPEC_UNAVAILABLE = {
-    "no_read_token": "規格檔取不回來:未設定唯讀的 GITLAB_READ_TOKEN。",
-    "no_review_ref": "規格檔取不回來:這次審查沒有釘住 commit。",
-    "too_large": "規格檔取不回來:超過單檔大小上限。",
-    "fetch_failed": "規格檔取不回來:向 GitLab 取檔失敗。",
-}
+# BOM(Windows 的編輯器常加)不是內容的一部分,但 lstrip() 不會去掉它,
+# 於是一份存在的規格會被判成「不是規格」。
+_BOM = "\ufeff"
+
+
+def _is_spec_text(text) -> bool:
+    """看起來是不是規格檔(Markdown,第一個非空白字元是 #)。"""
+    return bool(text) and str(text).lstrip().lstrip(_BOM).lstrip().startswith("#")
 
 
 class SpecLookup(tuple):
@@ -91,6 +91,12 @@ class SpecLookup(tuple):
         obj = super().__new__(cls, (code, text))
         obj.unavailable = unavailable
         return obj
+
+    def __getnewargs__(self):
+        """複製與 pickle 都靠它。沒有的話 tuple 子類別會把 (code, text) 整個當成
+        第一個參數傳回 __new__,三種都丟 TypeError —— 管線有 deepcopy(capture),
+        隔離子行程用 pickle 傳結果,踩到只是時間問題。"""
+        return (self[0], self[1], self.unavailable)
 
 
 async def find_spec(hub, mr: dict, *, by_path: bool = False) -> SpecLookup:
@@ -118,24 +124,24 @@ async def find_spec(hub, mr: dict, *, by_path: bool = False) -> SpecLookup:
     unavailable = None          # 第一個遇到的「拿不到」,照實帶出去
     if hub is not None:
         for code in codes:
-            try:
-                # 不指定 ref → 讀「正在審的那一版」。規格與程式是我們自己整理的,
-                # 會在同一個 MR 裡一起修正;鎖在目標分支的話,「規格寫錯、跟程式
-                # 一起修」的 MR 會被拿舊規格生測資,把正確的修正判成不符。
-                #
-                # 代價是一個 MR 可以同時改規格與程式、讓執行驗證拿改過的規格驗
-                # 自己。這一點改由**讓審查的人看見規格被改了**來處理(#38 第 3 點),
-                # 不是靠鎖版本——鎖版本會讓正常的修正無法通過。
-                txt = await hub.call("gitlab__get_file",
-                                     {"path": f"specs/{code}.md"}, truncate=False)
-            except Exception:
-                # 取檔本身失敗(連線、HTTP 錯誤)。**不要當成沒有規格**:那會叫
-                # 開發者去補一份可能已經存在的規格。原始錯誤不帶出去。
-                unavailable = unavailable or "fetch_failed"
+            # 不指定 ref → 讀「正在審的那一版」。規格與程式是我們自己整理的,會在
+            # 同一個 MR 裡一起修正;鎖在目標分支的話,「規格寫錯、跟程式一起修」的
+            # MR 會被拿舊規格生測資,把正確的修正判成不符。
+            #
+            # 代價是一個 MR 可以同時改規格與程式、讓執行驗證拿改過的規格驗自己。
+            # 這一點改由**讓審查的人看見規格被改了**來處理(#38 第 3 點),不是靠
+            # 鎖版本——鎖版本會讓正常的修正無法通過。
+            txt, reason = fetch_file(f"specs/{code}.md")
+            if reason:
+                unavailable = unavailable or reason
                 continue
-            if txt and txt.lstrip().startswith("#"):
+            if txt is None:
+                continue                      # 這個編號的規格確實不存在
+            if _is_spec_text(txt):
                 return SpecLookup(code, txt)
-            unavailable = unavailable or gitlab_unavailable_reason(txt)
+            # 拿到了,但不是規格的格式。**不可以當成不存在**:那會叫開發者去補一份
+            # 已經在 repo 裡的檔案,而真正的問題是這個檔被改壞了或放錯了。
+            unavailable = unavailable or "not_a_spec"
     if by_path and not codes:
         found, by_path_unavailable = await _find_spec_by_path(hub, mr)
         if found is not None:
@@ -179,16 +185,15 @@ async def _find_spec_by_path(hub, mr: dict) -> tuple[tuple[str, str] | None, str
     unavailable = None
     for path in paths:
         for candidate in resolve_spec(path, ()).candidates:   # 只要候選路徑,不比對存在與否
-            try:
-                # 同上:不指定 ref,讀正在審的那一版
-                txt = await hub.call("gitlab__get_file",
-                                     {"path": candidate}, truncate=False)
-            except Exception:
-                unavailable = unavailable or "fetch_failed"
+            txt, reason = fetch_file(candidate)               # 同上:不指定 ref
+            if reason:
+                unavailable = unavailable or reason
                 continue
-            if txt and txt.lstrip().startswith("#"):
+            if txt is None:
+                continue
+            if _is_spec_text(txt):
                 return (candidate.rsplit("/", 1)[-1][:-len(".md")], txt), None
-            unavailable = unavailable or gitlab_unavailable_reason(txt)
+            unavailable = unavailable or "not_a_spec"
     return None, unavailable
 
 
@@ -1908,11 +1913,12 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                 "coverage_gaps": [], "case_results": [], "dropped_cases": [],
                 "spec_unavailable": unavailable,
                 "findings": [_finding(path, "major", "執行驗證沒有完成:取不到規格",
-                                      f"{_SPEC_UNAVAILABLE[unavailable]}"
-                                      "這是驗證環境的問題,不是這個 MR 的問題:"
-                                      "不需要補規格。處理之後重新觸發審查;"
-                                      "在那之前本 MR 不得自動放行。",
-                                      "通知維運確認上述設定後重新觸發審查。")]}
+                                      f"{UNAVAILABLE_TEXT[unavailable]}"
+                                      f"這是驗證環境的問題,不是這個 MR 的問題:"
+                                      f"不需要補規格。處理之後重新觸發審查;在那之前"
+                                      f"本 MR 不得自動放行。(代碼:{unavailable})",
+                                      "通知維運依代碼查設定(見 docs/10),"
+                                      "處理後重新觸發審查。")]}
 
     if not spec_text:
         detail = (f"MR 涉及規則 {spec_code},但找不到對應的規格檔 specs/{spec_code}.md。"

@@ -641,8 +641,8 @@ MUTANTS.update({
      "    if len(r.content) > MAX_FILE_BYTES:" + NL + "        return None",
      "    if False:" + NL + "        return None"),
  "完整檔:沒釘住版本時退回目標分支(= #22 的原始 bug)": ("../toolbox/gitlab.py",
-     '        ref = ref or review_ref() or ""',
-     '        ref = ref or review_ref() or "main"'),
+     '    ref = ref or review_ref() or ""',
+     '    ref = ref or review_ref() or "main"'),
  "完整檔:取不到完整內容不交人工": ("pipeline.py",
      '    no_full = [f["path"] for f in mr.get("files", [])' + NL
      + '               if f.get("full_content_unavailable") and not f.get("unreviewable")]',
@@ -3772,40 +3772,50 @@ MUTANTS.update({
 G = "../toolbox/gitlab.py"
 MUTANTS.update({
  "規格:取檔失敗當成沒有規格": (S,
-     "                # 開發者去補一份可能已經存在的規格。原始錯誤不帶出去。" + NL
-     + '                unavailable = unavailable or "fetch_failed"',
-     "                # 開發者去補一份可能已經存在的規格。原始錯誤不帶出去。" + NL
-     + "                pass"),
- "規格:get_file 的訊息不分類(一律當成拿得到)": (S,
-     "            unavailable = unavailable or gitlab_unavailable_reason(txt)" + NL
+     "            if reason:" + NL + "                unavailable = unavailable or reason" + NL
+     + "                continue" + NL + "            if txt is None:" + NL
+     + "                continue                      # 這個編號的規格確實不存在",
+     "            if txt is None:" + NL
+     + "                continue                      # 這個編號的規格確實不存在"),
+ "規格:拿到的內容不是規格時當成不存在": (S,
+     '            unavailable = unavailable or "not_a_spec"' + NL
      + "    if by_path and not codes:",
      "    if by_path and not codes:"),
- # R 編號那條的 except 底下隔著註解,所以「except 緊接著賦值」只有依檔名這條
+ "規格:判斷規格格式前不去掉 BOM": (S,
+     '    return bool(text) and str(text).lstrip().lstrip(_BOM).lstrip().startswith("#")',
+     '    return bool(text) and str(text).lstrip().startswith("#")'),
  "規格:依檔名找規格時取檔失敗當成沒有規格": (S,
-     "            except Exception:" + NL
-     + '                unavailable = unavailable or "fetch_failed"',
-     "            except Exception:" + NL
-     + '                unavailable = None'),
- "規格:依檔名找規格時不分類 get_file 的訊息": (S,
-     "            unavailable = unavailable or gitlab_unavailable_reason(txt)" + NL
-     + "    return None, unavailable",
-     "    return None, unavailable"),
- "規格:依檔名那條路拿不到的記號不往上帶": (S,
-     "        unavailable = unavailable or by_path_unavailable",
-     "        pass"),
+     "            txt, reason = fetch_file(candidate)               # 同上:不指定 ref" + NL
+     + "            if reason:",
+     "            txt, reason = fetch_file(candidate)               # 同上:不指定 ref" + NL
+     + "            if False:"),
+ "規格:依檔名找規格時內容不是規格也收下": (S,
+     "            if _is_spec_text(txt):" + NL
+     + '                return (candidate.rsplit("/", 1)[-1][:-len(".md")], txt), None',
+     "            if txt:" + NL
+     + '                return (candidate.rsplit("/", 1)[-1][:-len(".md")], txt), None'),
+ # 少回一個值不算回歸:pickle 會另外還原物件屬性。真正的回歸是整個忘了寫。
+ "規格:沒有 __getnewargs__(複製與 pickle 會丟 TypeError)": (S,
+     "        return (self[0], self[1], self.unavailable)",
+     "        return ()"),
+ "規格:404 一律當成檔案不存在(專案/commit 找不到也算)": (G,
+     '            return (None, None) if _FILE_NOT_FOUND in body else (None, "not_found")',
+     "            return None, None"),
+ "規格:404 一律當成拿不到(檔案不存在也算)": (G,
+     '            return (None, None) if _FILE_NOT_FOUND in body else (None, "not_found")',
+     '            return None, "not_found"'),
  "規格:拿不到時照樣叫人補規格": (S,
      "    if not spec_text and unavailable:",
      "    if False:"),
- "規格:檔案不存在也算拿不到": (G,
-     '    if text.startswith("(") and _TOO_LARGE_MARK in text:' + NL
-     + '        return "too_large"' + NL
-     + "    return None",
-     '    if text.startswith("(") and _TOO_LARGE_MARK in text:' + NL
-     + '        return "too_large"' + NL
-     + '    return "fetch_failed" if text.startswith("(") else None'),
- "規格:沒 token 與沒釘 commit 分不出來": (G,
-     '    if text == _NO_REVIEW_REF:' + NL + '        return "no_review_ref"',
-     '    if text == _NO_REVIEW_REF:' + NL + '        return "no_read_token"'),
+ "規格:404 一律當成檔案不存在(專案/commit 找不到也算)": (G,
+     '            return (None, None) if _FILE_NOT_FOUND in body else (None, "not_found")',
+     "            return None, None"),
+ "規格:404 一律當成拿不到(檔案不存在也算)": (G,
+     '            return (None, None) if _FILE_NOT_FOUND in body else (None, "not_found")',
+     '            return None, "not_found"'),
+ "規格:拿不到時照樣叫人補規格": (S,
+     "    if not spec_text and unavailable:",
+     "    if False:"),
 })
 
 # ---- 評測用的 token 用量(#84)。數字錯了不會有人發現,只會得到錯的結論。
