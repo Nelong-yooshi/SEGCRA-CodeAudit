@@ -578,8 +578,8 @@ def test_ref_without_database_fails_loudly():
 
 
 def test_this_is_not_silently_stubbed():
-    """`{{ this }}` 未支援時必須失敗,不可輸出一個假的表名混進 SQL。"""
-    r = _render(source="SELECT * FROM {{ this }}")
+    """沒給 database 時 `{{ this }}` 必須失敗,不可輸出一個假的表名混進 SQL。"""
+    r = _render(source="SELECT * FROM {{ this }}", database=None)
     assert not r.ok
     assert r.sql == ""
 
@@ -997,7 +997,8 @@ def _imports_of(path: pathlib.Path) -> set[str]:
 
 
 @pytest.mark.parametrize("module, allowed", [
-    ("dbt_render.py", {"copy", "dataclasses", "difflib", "jinja2", "pathlib", "re",
+    # contextvars:一份審查共用一個 invocation_id(每條執行緒各自一個值),不帶來任何對外能力
+    ("dbt_render.py", {"contextvars", "copy", "dataclasses", "difflib", "jinja2", "pathlib", "re",
                        "secrets", "types", ".isolation"}),
     ("isolation.py", {"multiprocessing", "resource"}),
     ("dbt_relations.py", {"re", "yaml", ".dbt_render"}),

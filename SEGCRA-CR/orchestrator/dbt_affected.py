@@ -32,10 +32,13 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 
+from sqlglot.errors import SqlglotError
+
 from .config import DBT_DATABASE_PLACEHOLDER
 from .dbt_context import DbtContext
 from .dbt_impact import ImpactReport
 from .dbt_render import DEFAULT_ISOLATED_TIMEOUT_S, render_model_isolated
+from toolbox.sqltools import DIALECT, _parse
 
 MAX_CHECKED_MODELS = 50
 MAX_SPEC_LOOKUPS = 20          # 規格逐一向 GitLab 探測,數量另外設限
@@ -245,32 +248,56 @@ async def _compare(hub, rel: str, dbt_cfg: dict, ctx: DbtContext, render, deadli
 
     比較的單位是「每一句的規則命中數」:兩邊切出來的語句數量相同時,依語句的順序逐句比;否則
     (macro 讓語句多了或少了一句、切不出語句)退回比較整個 model 同一條規則的命中數。兩種都只有
-    「變多」才算新增。文字層的規則與對不到語句的命中沒有位置,只比個數。"""
+    「變多」才算新增。文字層的規則與對不到語句的命中沒有位置,只比個數。
+
+    變更後的樣板有呼叫 `is_incremental()` 時,兩邊再以增量模式各展開一次、照同樣的方式比較
+    (變更後沒有呼叫的話,增量模式的結果跟一般模式相同,不會多出命中)。增量那次的 SQL 本來就包含非增量的部分,所以只補「增量那次多出來的」命中,以規則為
+    單位、不寫第幾句(那是另一份展開結果的句序)。變更後的增量展開失敗算這個 model 的錯誤;
+    變更前的失敗則跟沒有變更前的版本一樣,無法比較。"""
     head_text = ctx.project.files.get(rel)
     if head_text is None:
         return (), False, "變更後的專案裡找不到這個 model 的內容"
-    head, head_error = await _hits(hub, rel, head_text, dbt_cfg, ctx.macro_files,
-                                   ctx.project.macro_paths, ctx.info, render, deadline, clock)
+    base_text = None if ctx.base_project is None else ctx.base_project.files.get(rel)
+
+    async def both(incremental: bool):
+        head, head_error = await _hits(hub, rel, head_text, dbt_cfg, ctx.macro_files,
+                                       ctx.project.macro_paths, ctx.info, render, deadline, clock,
+                                       incremental)
+        if head_error is not None:
+            return None, None, head_error, None
+        base, base_error = None, "沒有變更前的專案"
+        if ctx.base_project is not None:
+            if base_text is None:
+                base_error = "變更前沒有這個 model"
+            else:
+                base, base_error = await _hits(hub, rel, base_text, dbt_cfg, ctx.base_macro_files,
+                                               ctx.base_project.macro_paths, ctx.base_info, render,
+                                               deadline, clock, incremental)
+        return head, base, None, base_error
+
+    head, base, head_error, base_error = await both(False)
     if head_error is not None:
         return (), False, head_error
-    base, base_error = None, "沒有變更前的專案"
-    if ctx.base_project is not None:
-        base_text = ctx.base_project.files.get(rel)
-        if base_text is None:
-            base_error = "變更前沒有這個 model"
-        else:
-            base, base_error = await _hits(hub, rel, base_text, dbt_cfg, ctx.base_macro_files,
-                                           ctx.base_project.macro_paths, ctx.base_info, render,
-                                           deadline, clock)
-    if base_error is not None:
-        new = head.counts
-    elif head.statements is not None and head.statements == base.statements:
-        new = head.counts - base.counts
-    else:
-        new = _by_rule(head.counts) - _by_rule(base.counts)
+    new = _new_hits(head, base, base_error)
+    blind = base_error is not None
+    if head.incremental_checked:
+        head_inc, base_inc, inc_error, inc_base_error = await both(True)
+        if inc_error is not None:
+            return (), False, f"增量分支(is_incremental() 為 True):{inc_error}"
+        new = new + (_by_rule(_new_hits(head_inc, base_inc, inc_base_error)) - _by_rule(new))
+        blind = blind or inc_base_error is not None
     found = sorted(new.elements(), key=lambda h: (h[0], h[1], -1 if h[2] is None else h[2]))
     return (tuple((rule, sev, None if pos is None else pos + 1) for rule, sev, pos in found),
-            base_error is not None, None)
+            blind, None)
+
+
+def _new_hits(head: "_Hits", base: "_Hits | None", base_error: str | None) -> Counter:
+    """變更後比變更前多出來的命中;沒有變更前的版本可以比時,是變更後的全部命中。"""
+    if base_error is not None:
+        return head.counts
+    if head.statements is not None and head.statements == base.statements:
+        return head.counts - base.counts
+    return _by_rule(head.counts) - _by_rule(base.counts)
 
 
 def _by_rule(counts: Counter) -> Counter:
@@ -285,10 +312,13 @@ def _by_rule(counts: Counter) -> Counter:
 class _Hits:
     counts: Counter                 # {(規則, 嚴重度, 第幾句(從 0 起算)或 None): 次數}
     statements: int | None          # 切出來幾句;切不出來時是 None(只能整個 model 合計比較)
+    incremental_checked: bool = False   # 樣板有沒有呼叫 is_incremental()
 
 
-async def _hits(hub, rel, text, dbt_cfg, macro_files, macro_dirs, info, render, deadline, clock):
-    """展開一個 model 並跑規則。回傳 (_Hits, None) 或 (None, 錯誤原因);時間用完丟 _OutOfTime。"""
+async def _hits(hub, rel, text, dbt_cfg, macro_files, macro_dirs, info, render, deadline, clock,
+                incremental: bool = False):
+    """展開一個 model 並跑規則。回傳 (_Hits, None) 或 (None, 錯誤原因);時間用完丟 _OutOfTime。
+    incremental 為 True 時以增量模式展開(is_incremental() 為 True)。"""
     if dbt_cfg.get("database") != DBT_DATABASE_PLACEHOLDER:
         return None, "dbt 的資料庫名稱設定不符,無法展開"
     seconds = deadline - clock()
@@ -296,7 +326,8 @@ async def _hits(hub, rel, text, dbt_cfg, macro_files, macro_dirs, info, render, 
         raise _OutOfTime
     rendered = render(rel, source=text, database=dbt_cfg["database"], macro_files=macro_files,
                       macro_dirs=macro_dirs, project=info,
-                      timeout_s=min(DEFAULT_ISOLATED_TIMEOUT_S, seconds))
+                      timeout_s=min(DEFAULT_ISOLATED_TIMEOUT_S, seconds),
+                      **({"incremental": True} if incremental else {}))
     if not rendered.ok:
         if clock() >= deadline:
             raise _OutOfTime                # 展開被剩下的時間截斷,不是 model 本身的問題
@@ -328,16 +359,16 @@ async def _hits(hub, rel, text, dbt_cfg, macro_files, macro_dirs, info, render, 
                 pos = where
                 taken.add((hit["rule"], where))
         counts[(hit["rule"], hit["severity"], where)] += 1
-    return _Hits(counts, None if keys is None else len(keys)), None
+    return _Hits(counts, None if keys is None else len(keys),
+                 bool(getattr(rendered, "incremental_checked", False))), None
 
 
 def _statement_keys(sql: str) -> list[str] | None:
     """展開後 SQL 的每一句,文字寫法與規則命中的 statement 相同(規則層同一個函式產生)。
-    切不出來回 None。"""
-    from toolbox.sqltools import DIALECT, _parse
+    切不出來(解析錯誤、巢狀太深)回 None;其他例外是程式的錯,往外丟。"""
     try:
         return [st.sql(dialect=DIALECT)[:200] for st in _parse(sql) if st is not None]
-    except Exception:                        # noqa: BLE001 — 切不出來就只能整個 model 合計比較
+    except (SqlglotError, RecursionError):   # 切不出來就只能整個 model 合計比較
         return None
 
 

@@ -44,10 +44,15 @@
    - `ref()` / `source()` 展開成 `"<資料庫>"."<綱要>"."<表>"`(資料庫名由呼叫端傳入,不猜);
      沒有專案資訊時綱要固定為 `dbo`,有專案資訊時見下方「`ref()` / `source()` 的精確度」
    - `config()` 回傳空字串、`var()` 取呼叫端給的值、`execute` 為 True、
-     `is_incremental()` 為 False(比照 compile 期)
-   - `this`、`env_var` **刻意不定義**:給錯值會靜靜產出錯的 SQL,或把審查機的環境變數
-     寫進 SQL;未定義則由 `StrictUndefined` 大聲失敗。`target.database` 在未提供
-     database 時同理
+     `is_incremental()` 預設為 False(比照 compile 期)。以 `incremental=True` 展開時回 True;
+     `RenderResult.incremental_checked` 說明樣板(含它呼叫的 macro)有沒有呼叫 `is_incremental()`
+   - `this`:跟 dbt 一樣兩種模式都提供(這個 model 自己的表,規則與 `ref()` 相同),所以
+     `{% if this is defined %}` 裡的 SQL 一般模式就展開得出來,非增量的 model 直接寫 `{{ this }}`
+     (例如自我 join)也不會展開失敗。沒有 database、或 model 名稱不能當表名(例如有連字號、點、數字開頭,dbt 都接受)時給不出值:仍然算有定義(`this is defined` 為 True,跟 dbt 一樣,否則寫在裡面的語句會被藏起來),但任何使用都失敗,錯誤訊息不帶檔名;沒用到的 model 照常展開。
+     用到時帶表名提醒:增量模式一律算;一般模式看 model 本身有沒有寫到 `this`(只看語法樹,寫在
+     沒進去的分支裡也算),或呼叫了定義裡寫到 `this` 的 macro(macro 檔最外層的程式碼不算)
+   - `env_var` **刻意不定義**:會把審查機的環境變數寫進 SQL;未定義則由 `StrictUndefined` 大聲失敗。
+     `target.database` 在未提供 database 時同理
    - **所有 macro 檔共用同一個命名空間**:dbt 解析 macro 與檔案順序無關,逐檔各自展開
      會讓「呼叫排在後面檔案的 macro」找不到名稱(跨檔互相呼叫在真實專案很常見)
    - **`adapter.dispatch('x')`**:比照 dbt,先找 `<轉接器>__x`,再退回 `default__x`;
@@ -186,7 +191,8 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 | 識別字注入 | 原始碼看似無害的 `ref('...')`,展開後藏了另一段 SQL | 表名只接受英數與底線 |
 | 指向錯誤的關聯 | `ref('t', version=2)` 在 dbt 是另一張表,我們忽略參數 | 拒絕展開(沒有 manifest 可解析版本) |
 | 偽造行號標記 | MR 放入仿冒標記,行號對應降級 | 標記使用每次隨機產生的權杖 |
-| 資訊洩漏 | 錯誤訊息帶出審查機完整路徑;`{{ ref }}` 輸出記憶體位址 | 錯誤訊息不含路徑、不含控制字元、有長度上限;不輸出函式物件 |
+| 資訊洩漏 | 錯誤訊息帶出審查機完整路徑;`{{ ref }}` 輸出記憶體位址 | 錯誤訊息不含路徑、不含控制字元、有長度上限;不輸出函式物件;給不出值的 `this` 連 `repr`(`pprint`)都失敗 |
+| 樣板辨認自己在展開器裡,把語句藏起來 | `{% if invocation_id != '固定值' %}`、`{% if this is not string %}`、`{% if this.keys is defined %}` 裡的 DELETE 審查時不出現、執行時照跑 | `invocation_id` 每份審查不同(格式同 dbt 的 uuid4);同一份審查裡的展開(預掃的一般與增量、受影響 model 的前後)共用一個值,跟 dbt 一次執行一個一樣,兩種模式的同一句才不會被算成兩句。`this` / `ref()` / `source()` 回傳表名物件(`_Relation`):對它們做 `defined` / `undefined` 以外的 `is` 判斷(含放在判斷的參數、清單、dict 裡),或取 `database`、`schema`、`identifier`、`name`、`table` 以外的屬性與索引(含 `attr`、`map(attribute=…)`),一律展開失敗、交人工——dbt 的 Relation 物件跟字串的型別判斷結果、有哪些屬性都不同,逐個模擬模擬不完。`string` 濾器把表名物件轉成一般字串,跟 dbt 一樣 |
 | 樣板改到呼叫端資料 | `{% do var('x').append(...) %}` 改到呼叫端的 list | 變數每次取用都給複本;`target` 唯讀 |
 | ReDoS | 內部正規表達式是平方時間,40 萬字元約 40 分鐘 | 改為線性時間掃描 |
 | 資源耗盡 | `((9**256)**256)**256`、超大字串、無窮迴圈 | 原始碼 / macro / 輸出 / 整數運算上限;子行程隔離 |
@@ -227,7 +233,7 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 
 | 項目 | 狀態 | 行為 |
 |---|---|---|
-| 預掃前展開 | 已接上 | 含樣板的檔案先以 `render_model_isolated()` 展開再交給規則層;展開失敗則原樣退回,由 `enforce_dbt_render_failure()` 一律補 major(見下方)。lint 刻意仍吃原始文字(帶行號,基準要與 diff 一致) |
+| 預掃前展開 | 已接上 | 含樣板的檔案先以 `render_model_isolated()` 展開再交給規則層;展開失敗則原樣退回,由 `enforce_dbt_render_failure()` 一律補 major(見下方)。lint 跑原始文字:lint 管的是開發者寫的程式,展開後的 SQL 不是他們寫、也不會看到的 |
 | 依檔名對應規格 | 已接上 | 完全沒有 R 編號時,先查本機 `specs/`、再逐一探測 GitLab 的候選路徑 |
 | `ref()`/`source()` 精確度提醒 | 已接上 | 預掃結果帶 `dbt_render_notice`,後處理由 `enforce_dbt_notice()` 確定性補成 info finding(正式路徑與 dry-run 皆同) |
 | 執行驗證(沙盒) | **不支援** | SQL 是樣板時不送進沙盒,回報「尚未支援」major、交人工——原樣執行只會得到語法錯誤,會錯誤地指控程式有誤。改到 dbt 而執行驗證卻通過時,`enforce_dbt_unexecuted()` 補 major |
@@ -397,6 +403,11 @@ review_mr
 專案裡被改到的 `.sql`(與其他確定是樣板的檔案)一律記成展開失敗 → major;macro 反查當成
 「全部 model 可能受影響」→ major。不退回「沒有 macro」繼續展開。
 
+**增量 model**:樣板(含它呼叫的 macro)有呼叫 `is_incremental()` 時,預掃再以增量模式(`is_incremental()` 為 True)
+展開一次,兩次的規則命中合併:同一條規則在同一句只算一次,只在增量那次出現的命中標
+`branch: "incremental"`,補報的說明會寫明它在增量分支裡。增量那次展開失敗照展開失敗處理(major);解析不了記成
+「無法解析」(major)。兩份展開結果都進注入掃描。
+
 **展開用的內容。** 真實 GitLab 模式的 diff 只有新增的行。專案裡的檔案只要 head 的完整內容是樣板,
 就用完整內容展開(改到的那幾行沒有樣板標記,不代表整個檔案沒有)。不是樣板的 SQL 檔維持原本的
 來源(完整內容屬於 #22 的範圍)。專案裡有同名的 macro 時算展開失敗:dbt 會編譯失敗,擇一展開的
@@ -416,6 +427,9 @@ alias 寫在 seed 目錄的屬性檔裡,都沒有讀,所以一律標成無法確
   的命中不能因為文字變了就當成新的。兩邊切出來的語句數量不同時,退回比較整個 model 同一條規則的
   命中數;文字層的規則與對不到語句的命中只比個數。原本就有的命中不重報(否則每個改到 macro 的 MR 都會被既有的寫法擋下)。
   命中寫出在展開後的第幾句
+- **增量分支**:變更後的樣板有呼叫 `is_incremental()` 時,兩邊再以增量模式各展開一次、照同樣的
+  方式比較。增量那次的 SQL 本來就包含非增量的部分,只補「增量那次多出來的」命中(以規則為單位、不寫第幾句)。
+  變更後的增量展開失敗算這個 model 的錯誤(major);變更前的失敗算無法比較
 - 整理成一條 finding(`enforce_dbt_impact`),嚴重度:
 
   | 嚴重度 | 條件 |
@@ -466,7 +480,7 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 |---|---|
 | `relation_notice` 改成確定性揭露 | 完成(#14):`enforce_dbt_notice` |
 | macro 目錄的取檔方式決定並實作 | 完成:依 commit 打包下載(#20),接進管線(本節) |
-| 進入點有 `if __name__ == "__main__":` 保護 | `demo.py` 與 `scripts/webhook_server.py` 都有,由 `tests/test_entrypoint_guard.py` 鎖住。展開、macro 反查、專案資訊都開子行程(spawn);進入點少了保護時,子行程會把整支程式從頭重跑一次。實際踩到時的結果是專案資訊整理失敗 → 當成取不回專案 → 交人工 |
+| 進入點有 `if __name__ == "__main__":` 保護 | `demo.py`、`scripts/webhook_server.py`、`tools/prescan.py`、`eval/run_eval.py` 都有;`tests/test_entrypoint_guard.py` 另外自動找出 `scripts/`、`tools/`、`eval/` 底下用到管線的腳本,檢查最外層不直接執行。展開、macro 反查、專案資訊與 lint 都開子行程(spawn);進入點少了保護時,子行程會把整支程式從頭重跑一次。實際踩到時的結果是專案資訊整理失敗 → 當成取不回專案 → 交人工 |
 | 資料庫假名確定並寫進文件,設錯要擋下 | 完成(#16):固定為 `DBT_PLACEHOLDER`,載入設定與展開前各檢查一次 |
 
 開啟與回復的步驟、以及不接 GitLab 就能跑的範例,見 README「開啟 dbt 接線」與 `examples/dbt_wiring/`。
@@ -527,16 +541,33 @@ major。加上非 SQL 檔的處理之後,改由非 SQL 檔的分類與設定比�
 - 每個要展開的檔案開一次子行程;受影響的 model 每個開兩次
 - 改到 seed / snapshot / analysis / test 目錄裡的檔案(含 seed 的 `.csv` 資料檔)時,反查不分析它們的影響,一律標不確定(major,交人工)。seed 的資料會被 model 以 `ref()` 讀到,不能說沒有影響;analysis / test 不影響 model,但沿用反查原本對這些目錄的保守處理,沒有放寬
 
+### 命中的行號
+
+規則層掃的是展開後的 SQL,程式補的 finding(`enforce_rules`、`enforce_hints`)要寫原始檔的行號,行內留言才落得到正確的位置。做法(`pipeline._attach_rendered_lines`):
+
+1. 預掃展開時,把展開後的 SQL 與對應表記在 `line_maps`(`{(路徑, 分支): (展開後的 SQL, 對應表, 原始內容)}`)。**不放進預掃結果**:預掃結果整份會進 prompt。增量分支(`branch: "incremental"`)的命中用增量那次的展開結果。
+2. 組好 prompt 之後,用預掃同一個 sqlglot 方言把展開後的 SQL 切成語句,找到命中那句的起始行。
+3. 用對應表換回原始檔的行。以下全部成立才寫,否則維持 0、不猜:
+
+| 條件 | 擋掉的情況 |
+|---|---|
+| 對應表是哨兵法(逐行精確) | 近似對齊(difflib)的非對齊區段是猜的位置 |
+| 拿去展開的是檔案的完整內容(fixture 的 `full_content`,或取回的專案內容) | 只有 diff 片段時,行號是片段裡的行號 |
+| 語句的第一個 token 前面在同一行只有空白 | 空白控制(`{%- -%}`)把兩個原始行接成一個展開後的行,第二句會指到第一句那一行;語句前面同一行有註解也不寫 |
+| 原始那一行在第一個 Jinja 標記之前有固定文字,而且展開後那一行(去掉縮排)以它開頭 | macro 或表達式產生的語句(例如 `{{ purge() }}` 展開成 DELETE):原始檔沒有那句 |
+| 展開後的 SQL 不超過 `MAX_LINE_SOURCE_CHARS`(20 萬字元) | 太大不切 |
+
+對不回行號時,補的 finding 在說明裡寫「dbt 樣板展開後的第 n 句」:同一條規則在一個檔案命中好幾次時分得出是哪一句。只寫數字,不回顯語句。模型的 finding 只靠數量對應、不知道剩下的是哪幾句時,行號與第幾句都不寫。
+
+這一步出錯時記一條「審查未完整」(交人工),行號維持 0,審查照常產出。lint 跑的是原始文字(lint 管的是開發者寫的程式,本來就不對展開後的 SQL 做),行號本來就是原始檔的,不需要對回。
+
 ## 後續
 
 - **展開結果尚未在 MS SQL 沙盒實際執行過**(目前只驗證了展開字串與 `dbt compile`
   逐字一致)。要支援樣板的執行驗證,需把 `ref()`/`source()` 對應到沙盒每次建立的
   資料庫,且 model 引用的上游表與規格建立的測資表名稱不同,需要處理
-- `{% if is_incremental() %}` 內的 SQL 不會被掃到(比照 compile 固定為 False),需另以 True
-  再展開一次
 - 真實 GitLab 模式下,dbt 專案以外的 SQL 檔(與專案裡不是樣板的 SQL 檔)仍只有 diff 新增的行,
   完整內容由 #22 以 Files API 依 head sha 取得
 - 不分析第三方套件內的 macro;目錄由呼叫端指定
-- `invocation_id` 為固定值,樣板若輸出它,結果會與 dbt compile 不同
 - 待確認:規格檔名慣例(目前只去除 `mrt_` 前綴);earlyjob model 應歸屬主規則的規格,
   確認前會交人工

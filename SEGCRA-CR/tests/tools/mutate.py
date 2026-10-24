@@ -151,8 +151,8 @@ MUTANTS = {
         "        if default is _MISSING:\n            raise DbtRenderError(",
         "        if default is _MISSING:\n            return None\n            raise DbtRenderError("),
     "this 靜靜給假值": (
-        '    env.globals["invocation_id"] = "segcra00"',
-        '    env.globals["invocation_id"] = "segcra00"\n'
+        '    env.globals["invocation_id"] = _checked_invocation_id(invocation_id)',
+        '    env.globals["invocation_id"] = _checked_invocation_id(invocation_id)\n'
         '    env.globals["this"] = "THIS_RELATION"'),
     "target.database 未設定時給 None": (
         '        "database": database if database is not None else StrictUndefined(name="target.database"),',
@@ -161,8 +161,8 @@ MUTANTS = {
         "        if kwargs:\n            # dbt 的 ref('model', version=2)",
         "        if False:\n            # dbt 的 ref('model', version=2)"),
     "macro 檔逐一展開(跨檔呼叫會失敗)": (
-        "        module = env.from_string(text).make_module(vars=shared, shared=True)",
-        "        module = env.from_string(text).module"),
+        "        module = env.from_string(tree).make_module(vars=shared, shared=True)",
+        "        module = env.from_string(tree).module"),
     "dispatch 不先找轉接器實作": (
         '        for candidate in (f"{self._adapter}__{macro_name}", f"default__{macro_name}"):',
         '        for candidate in (f"default__{macro_name}", f"{self._adapter}__{macro_name}"):'),
@@ -180,15 +180,15 @@ MUTANTS = {
         '                or any(part in ("", ".", "..") for part in posix.split("/"))):',
         "                or False):"),
     "macro 未進共用命名空間(跨檔呼叫找不到)": (
-        "            shared[name] = env.globals[name] = _wrap(obj)",
-        "            env.globals[name] = _wrap(obj)"),
+        "            shared[name] = env.globals[name] = _wrap(obj, on_call=",
+        "            env.globals[name] = _wrap(obj, on_call="),
     "隔離:啟動失敗不收斂": ("isolation.py",
         '        return on_failure(f"IsolationError: 無法啟動子行程({type(e).__name__})")',
         "        raise"),
     "ref 改回裸表名": (
-        "        return f'\"{database}\".\"{_check_ident(\"綱要\", rel_schema)}\"."
+        "        text = f'\"{database}\".\"{_check_ident(\"綱要\", rel_schema)}\"."
         "\"{_check_ident(\"表\", name)}\"'",
-        "        return name"),
+        "        text = name"),
     # ---- dbt 一致性
     "不去原始檔頭尾空白": (
         "        body = source.strip()",
@@ -501,8 +501,8 @@ MUTANTS.update({
      "    findings = []"),
  "隔離:dry-run 不帶未完整過去": ("pipeline.py",
      "                                         affected, dbt_ctx, cfg.dbt," + NL
-     + '                                         incomplete=report_stub["findings"])',
-     "                                         affected, dbt_ctx, cfg.dbt)"),
+     + '                                         incomplete=report_stub["findings"],',
+     "                                         affected, dbt_ctx, cfg.dbt,"),
  "隔離:注入掃描失敗時當成沒有注入(不記未完整)": ("pipeline.py",
      '        injection_hits = _step(report_stub, "注入掃描", scan_mr, [], scan_target)',
      "        injection_hits = scan_mr(scan_target)"),
@@ -565,6 +565,52 @@ MUTANTS.update({
  "隔離:各階段秒數不記進結果": ("spec_exec.py",
      '        stage_seconds[stage] = round(time.monotonic() - t0, 1)',
      "        pass"),
+ # lint 的時間上限:在子行程跑、沒跑完要看得見
+ "lint 上限:不在子行程跑(同步卡住就整份審查卡住)": ("../toolbox/sqltools.py",
+     "    return run_isolated(_lint_in_child, (sql,), timeout_s=LINT_TIMEOUT_SECONDS," + NL
+     + "                        max_memory_mb=LINT_MAX_MEMORY_MB," + NL
+     + "                        on_failure=lambda _message: _LINT_INCOMPLETE)",
+     "    return _lint_in_child(sql)"),
+ "lint 上限:沒跑完回空清單(看起來像沒有違規)": ("../toolbox/sqltools.py",
+     "on_failure=lambda _message: _LINT_INCOMPLETE)",
+     'on_failure=lambda _message: "[]")'),
+ "lint 上限:時間上限寫死、不讀設定": ("../toolbox/sqltools.py",
+     "timeout_s=LINT_TIMEOUT_SECONDS,",
+     "timeout_s=600,"),
+ "lint 上限:sqlfluff 丟例外時回錯誤訊息(預掃當成沒有結果、還帶例外內容)": ("../toolbox/sqltools.py",
+     "    except Exception:" + NL + "        # sqlfluff 對內容本身的問題會回報成違規",
+     '    except Exception as e:' + NL + '        return json.dumps({"error": f"lint failed: {e}"}, ensure_ascii=False)'
+     + NL + "        # sqlfluff 對內容本身的問題會回報成違規"),
+ "lint 上限:字數上限不生效": ("../toolbox/sqltools.py",
+     "    if isinstance(sql, str) and len(sql) > LINT_MAX_CHARS:",
+     "    if False:"),
+ "lint 上限:剛好在字數上限的也不跑": ("../toolbox/sqltools.py",
+     "    if isinstance(sql, str) and len(sql) > LINT_MAX_CHARS:",
+     "    if isinstance(sql, str) and len(sql) >= LINT_MAX_CHARS:"),
+ "lint 未完成:認不出沒跑完的那一筆": ("pipeline.py",
+     '                isinstance(v, dict) and v.get("code") == LINT_INCOMPLETE_CODE for v in lint)):',
+     '                isinstance(v, dict) and v.get("code") == "LT00" for v in lint)):'),
+ "lint 未完成:只看第一筆": ("pipeline.py",
+     "LINT_INCOMPLETE_CODE for v in lint)):",
+     "LINT_INCOMPLETE_CODE for v in lint[:1])):"),
+ "lint 未完成:不標環節(決策不交人工)": ("pipeline.py",
+     '            "stage": "lint",',
+     '            "lint_stage": "lint",'),
+ "lint 未完成:記成 info": ("pipeline.py",
+     '            "file": entry["path"], "line": 0, "severity": "major",' + NL
+     + '            "title": f"[lint] {INCOMPLETE_TITLE_PREFIX}",',
+     '            "file": entry["path"], "line": 0, "severity": "info",' + NL
+     + '            "title": f"[lint] {INCOMPLETE_TITLE_PREFIX}",'),
+ "lint 未完成:管線沒接上": ("pipeline.py",
+     "        report = enforce_lint_incomplete(report, pre)  # lint 逾時或沒跑:同樣要看得見",
+     "        pass"),
+ "lint 未完成:dry-run 沒接上": ("pipeline.py",
+     "    report = enforce_non_sql(report, pre)      # 與正式路徑一致" + NL
+     + "    report = enforce_lint_incomplete(report, pre)",
+     "    report = enforce_non_sql(report, pre)      # 與正式路徑一致"),
+ "lint 未完成:沒包進環節隔離": ("pipeline.py",
+     '@_isolated_stage("lint 未完成揭露")' + NL + "def enforce_lint_incomplete(",
+     "def enforce_lint_incomplete("),
  # 第 3 點:舊審查不得把結論貼上去
  "回寫:不確認是不是最新的那次審查": ("pipeline.py",
      '        if await _superseded(hub, mr_id, mr.get("head_sha") or mr.get("sha")):',
@@ -670,11 +716,126 @@ MUTANTS.update({
      "                        key=lambda item: item[0].split(\"/\"))",
      "                        key=lambda item: 0)"),
  "字典來源:render_model 沒把字典傳下去": (
-     "macro_dirs, adapter, project, macro_files)", "macro_dirs, adapter, project)"),
+     "macro_dirs, adapter, project, macro_files,", "macro_dirs, adapter, project, None,"),
  "字典來源:給了字典仍讀 model 旁邊的 macros": (
      "    elif source is None and macro_files is None:", "    elif source is None:"),
  "字典來源:目錄互相包含時同一個檔載入兩次(與自己同名)": (
      "    files = list(dict(files).items())\n", ""),
+})
+
+# ---- 以增量模式展開(is_incremental() 為 True、提供 this)
+MUTANTS.update({
+    "增量:is_incremental 一律回 False": ("dbt_render.py",
+        "        env.segcra_incremental[\"called\"] = True" + NL + "        return incremental",
+        "        env.segcra_incremental[\"called\"] = True" + NL + "        return False"),
+    "增量:不記有沒有呼叫 is_incremental": ("dbt_render.py",
+        "        env.segcra_incremental[\"called\"] = True" + NL + "        return incremental",
+        "        return incremental"),
+    "增量:macro 檔最外層呼叫的也算": ("dbt_render.py",
+        "    env.segcra_incremental[\"called\"] = False" + NL + "    env.segcra_macro_phase = False",
+        "    env.segcra_macro_phase = False"),
+    "增量:不提供 this": ("dbt_render.py",
+        "        env.globals[\"this\"] = this(model_name)",
+        "        pass"),
+    "增量:沒有 database 時 this 給空字串": ("dbt_render.py",
+        "            return _UnavailableRelation(\"未設定 database,無法提供 {{ this }}\")",
+        "            return \"\""),
+    "增量:this 的字串內容不是表名": ("dbt_render.py",
+        "        obj = super().__new__(cls, text)",
+        "        obj = super().__new__(cls, name)"),
+    "增量:不記用到表名": ("dbt_render.py",
+        "            _mark_this_used(env.segcra_relation_usage, project, model_path.stem)",
+        "            pass"),
+    "增量:表名會改變的設定不記無法確定": ("dbt_render.py",
+        "    if project is not None and (project.global_uncertain or name in project.uncertain_models):" + NL
+        + "        usage[\"uncertain\"] = True",
+        "    if False:" + NL + "        usage[\"uncertain\"] = True"),
+    "增量:結果不帶有沒有呼叫": ("dbt_render.py",
+        "        incremental_checked=incremental_checked,",
+        "        incremental_checked=False,"),
+    "this:只在增量模式提供": ("dbt_render.py",
+        "    if model_name is not None:" + NL + "        env.globals[\"this\"] = this(model_name)",
+        "    if incremental:" + NL + "        env.globals[\"this\"] = this(model_name)"),
+    "this:model 名稱不合法時整份展開失敗": ("dbt_render.py",
+        "        if not isinstance(name, str) or not _IDENT.fullmatch(name):" + NL
+        + "            return _UnavailableRelation(",
+        "        if not isinstance(name, str) or not _IDENT.fullmatch(name):" + NL
+        + "            _check_ident(\"表\", name)" + NL + "            return _UnavailableRelation("),
+    "this:給不出值時當成未定義(is defined 為 False,語句藏得住)": ("dbt_render.py",
+        "class _UnavailableRelation:", "class _UnavailableRelation(StrictUndefined):"),
+    # 只拿掉 __str__ 是等價突變:str() 沒有 __str__ 時改呼叫 __repr__,一樣失敗。兩個都拿掉才會輸出記憶體位址
+    "this:給不出值時串接與轉字串不失敗(輸出記憶體位址)": ("dbt_render.py",
+        "    __str__ = __repr__ = __bool__", "    __bool__"),
+    "this:給不出值時 repr 不失敗(pprint 輸出記憶體位址)": ("dbt_render.py",
+        "    __str__ = __repr__ = __bool__", "    __str__ = __bool__"),
+    "this:給不出值時比較不失敗": ("dbt_render.py",
+        "    __eq__ = __ne__ = __lt__", "    __ne__ = __lt__"),
+    # 展開器跟 dbt 分得出來的地方:表名物件的型別判斷、invocation_id
+    "型別判斷:不擋": ("dbt_render.py",
+        "    _guard_relation_tests(env)", "    pass"),
+    "型別判斷:defined 也擋(is defined 的語句藏得住)": ("dbt_render.py",
+        '_RELATION_TESTS_ALLOWED = frozenset({"defined", "undefined"})',
+        "_RELATION_TESTS_ALLOWED = frozenset()"),
+    "型別判斷:只看判斷對象、不看參數": ("dbt_render.py",
+        "        if _holds_relation((*args, *kwargs.values())):", "        if _holds_relation(args[:1]):"),
+    "型別判斷:清單裡的表名物件不往下找": ("dbt_render.py",
+        "        elif isinstance(value, (list, tuple, set, frozenset)):" + NL + "            stack.extend(value)",
+        "        elif isinstance(value, (list, tuple, set, frozenset)):" + NL + "            pass"),
+    "型別判斷:dict 裡的表名物件不往下找": ("dbt_render.py",
+        "            stack.extend(value.keys())" + NL + "            stack.extend(value.values())",
+        "            pass"),
+    "型別判斷:容器太大看不完時當成沒有": ("dbt_render.py",
+        "        if seen > _RELATION_SCAN_LIMIT:" + NL + "            return True",
+        "        if seen > _RELATION_SCAN_LIMIT:" + NL + "            return False"),
+    "型別判斷:jinja 的標記沒保留(is filter / is test 壞掉)": ("dbt_render.py",
+        '    guarded.__dict__.update(getattr(test, "__dict__", {}))', "    pass"),
+    "型別判斷:ref() 回傳一般字串(is string 擋不到)": ("dbt_render.py",
+        "        return _Relation(text, database, rel_schema, name)", "        return text"),
+    "invocation_id:固定值": ("dbt_render.py",
+        '    env.globals["invocation_id"] = _checked_invocation_id(invocation_id)',
+        '    env.globals["invocation_id"] = "segcra00"'),
+    "invocation_id:一份審查裡不共用(兩種模式的同一句算兩次)": ("dbt_render.py",
+        '        kwargs.setdefault("invocation_id", review_id)', "        pass"),
+    "invocation_id:開始審查時沒記下值": ("dbt_render.py",
+        "    _REVIEW_INVOCATION_ID.set(value)", "    pass"),
+    "invocation_id:review_mr 沒開始一份審查": ("pipeline.py",
+        "    # 這份審查的 dbt 展開(預掃的一般與增量、受影響 model 的前後)共用一個 invocation_id" + NL
+        + "    start_review_invocation()",
+        "    pass"),
+    "invocation_id:指定的值不檢查格式": ("dbt_render.py",
+        "    if not isinstance(value, str) or not _INVOCATION_ID_RE.fullmatch(value):",
+        "    if False:"),
+    "取屬性:不擋": ("dbt_render.py",
+        "        _guard_relation_access(obj, attribute)", "        pass"),
+    "取屬性:取索引不擋(this['x']、map(attribute=))": ("dbt_render.py",
+        "        _guard_relation_access(obj, argument)", "        pass"),
+    "取屬性:attr 濾器不擋": ("dbt_render.py",
+        "    _guard_relation_access(obj, name)" + NL + "    return do_attr(environment, obj, name)",
+        "    return do_attr(environment, obj, name)"),
+    "取屬性:沒換掉 attr 濾器": ("dbt_render.py",
+        '    env.filters["attr"] = _attr_filter', "    pass"),
+    "取屬性:放行沒有照實模擬的屬性": ("dbt_render.py",
+        '_RELATION_ATTRS_ALLOWED = frozenset({"database", "schema", "identifier", "name", "table"})',
+        '_RELATION_ATTRS_ALLOWED = frozenset({"database", "schema", "identifier", "name", "table", "keys"})'),
+    "取屬性:照實模擬的屬性也擋": ("dbt_render.py",
+        '_RELATION_ATTRS_ALLOWED = frozenset({"database", "schema", "identifier", "name", "table"})',
+        '_RELATION_ATTRS_ALLOWED = frozenset({"database", "schema", "name", "table"})'),
+    "string 濾器:表名物件不轉成一般字串": ("dbt_render.py",
+        "            return str.__str__(value)", "            return value"),
+    "string 濾器:沒換掉": ("dbt_render.py",
+        '    env.filters["string"] = _string_filter(env.filters["string"])', "    pass"),
+    "this:輸出時的錯誤訊息不說原因": ("dbt_render.py",
+        "    if isinstance(value, _UnavailableRelation):" + NL + "        value._fail()",
+        "    if False:" + NL + "        value._fail()"),
+    "this:一般模式寫到 this 不記表名": ("dbt_render.py",
+        "        if database is not None and (incremental or _uses_this(tree)",
+        "        if database is not None and (incremental"),
+    "this:呼叫寫到 this 的 macro 不記": ("dbt_render.py",
+        "                env.segcra_this_called) if name in uses_this else None)",
+        "                env.segcra_this_called) if False else None)"),
+    "this:macro 檔最外層呼叫的也算": ("dbt_render.py",
+        "    env.segcra_this_called[\"called\"] = False" + NL + "    env.segcra_incremental",
+        "    env.segcra_incremental"),
 })
 
 # ---- 取回 MR 那個 commit 的 dbt 專案並接進預掃(dbt_context)
@@ -744,8 +905,8 @@ MUTANTS.update({
      + "                        mr, cfg.dbt)",
      "        dbt_ctx = None"),
  '專案接線:review_mr 沒把專案交給預掃': ('pipeline.py',
-     '                           prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered), [])',
-     '                           prescan(hub, mr["files"], cfg.dbt, None, rendered), [])'),
+     '                           prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered, line_maps), [])',
+     '                           prescan(hub, mr["files"], cfg.dbt, None, rendered, line_maps), [])'),
  '專案接線:注入掃描不掃取回的完整內容': ('pipeline.py',
      '                            _mr_with_head_text, dict(mr), mr, dbt_ctx, rendered)',
      '                            _mr_with_head_text, dict(mr), mr, None, rendered)'),
@@ -822,13 +983,13 @@ MUTANTS.update({
  "受影響:規格沒有內容也算對到": ("dbt_affected.py",
      "    if not code or not text:", "    if not code:"),
  '受影響:只數規則個數、不比語句': ('dbt_affected.py',
-     '    elif head.statements is not None and head.statements == base.statements:',
-     '    elif False:'),
+     '    if head.statements is not None and head.statements == base.statements:',
+     '    if False:'),
  '受影響:不與變更前比較(原本就有的也重報)': ('dbt_affected.py',
-     '    if base_error is not None:\n        new = head.counts',
-     '    if True:\n        new = head.counts'),
+     '    if base_error is not None:\n        return head.counts',
+     '    if True:\n        return head.counts'),
  '受影響:無法比較當成比較過(可能誤擋)': ('dbt_affected.py',
-     '            base_error is not None, None)',
+     '            blind, None)',
      '            False, None)'),
  '受影響:變更後展開失敗當成沒事': ('dbt_affected.py',
      '    if head_error is not None:\n        return (), False, head_error',
@@ -948,6 +1109,46 @@ MUTANTS.update({
  "專案準備:變更前的專案資訊整理失敗仍拿來比較": ("dbt_context.py",
      "    base_summary = summarize(base) if isinstance(base, DbtProject) and base.ok else None",
      "    base_summary = (summarize(base) or (DbtProjectInfo(), {})) if isinstance(base, DbtProject) and base.ok else None"),
+})
+
+# ---- 增量分支也要掃:預掃與受影響 model 的前後比較
+MUTANTS.update({
+    "增量掃描:預掃不展開增量分支": ("pipeline.py",
+        "    if not rendered.incremental_checked:" + NL + "        return _Expanded(rendered.sql, None,",
+        "    if True:" + NL + "        return _Expanded(rendered.sql, None,"),
+    "增量掃描:增量分支展開失敗當成沒事": ("pipeline.py",
+        "    if not incremental.ok:" + NL + "        return _Expanded(sql, f\"增量分支",
+        "    if False:" + NL + "        return _Expanded(sql, f\"增量分支"),
+    "增量掃描:增量分支的命中不跑規則": ("pipeline.py",
+        "        if incremental_sql is not None:" + NL + "            more = await hub.call_json(",
+        "        if False:" + NL + "            more = await hub.call_json("),
+    "增量掃描:兩次都有的命中重複算": ("pipeline.py",
+        "        if seen.get(key, 0) > 0:" + NL + "            seen[key] -= 1" + NL + "            continue",
+        "        if False:" + NL + "            seen[key] -= 1" + NL + "            continue"),
+    "增量掃描:增量分支解析不了當成沒有命中": ("pipeline.py",
+        "            if isinstance(more, dict) and more.get(\"error\") and \"parse_error\" not in entry:",
+        "            if False:"),
+    "增量掃描:增量分支不進注入掃描": ("pipeline.py",
+        "                if incremental_sql is not None:" + NL + "                    rendered.append(",
+        "                if False:" + NL + "                    rendered.append("),
+    "增量掃描:補報不寫在增量分支": ("pipeline.py",
+        "                    if h.get(\"branch\") == _INCREMENTAL_BRANCH else \"\")",
+        "                    if False else \"\")"),
+    "增量比較:受影響 model 不比增量分支": ("dbt_affected.py",
+        "    if head.incremental_checked:" + NL + "        head_inc, base_inc",
+        "    if False:" + NL + "        head_inc, base_inc"),
+    "增量比較:變更後的增量展開失敗當成沒事": ("dbt_affected.py",
+        "        if inc_error is not None:" + NL + "            return (), False, f\"增量分支",
+        "        if False:" + NL + "            return (), False, f\"增量分支"),
+    "增量比較:兩種模式的命中重複算": ("dbt_affected.py",
+        "        new = new + (_by_rule(_new_hits(head_inc, base_inc, inc_base_error)) - _by_rule(new))",
+        "        new = new + _by_rule(_new_hits(head_inc, base_inc, inc_base_error))"),
+    "增量比較:變更前的增量展開失敗不算無法比較": ("dbt_affected.py",
+        "        blind = blind or inc_base_error is not None",
+        "        blind = blind"),
+    "增量比較:展開時不帶增量模式": ("dbt_affected.py",
+        "                      **({\"incremental\": True} if incremental else {}))",
+        "                      )"),
 })
 
 # ---- mock 模式的 dbt 專案來源(fixture 目錄)
@@ -1298,8 +1499,8 @@ MUTANTS.update({
      '    dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True',
      "    dbt_enabled = bool(dbt_cfg)"),
  "接線:展開失敗時送出不完整結果": ("pipeline.py",
-     "    return sql, rendered.error, None",
-     "    return rendered.sql, rendered.error, None"),
+     "        return _Expanded(sql, rendered.error, None)",
+     "        return _Expanded(rendered.sql, rendered.error, None)"),
  "接線:lint 吃展開後的 SQL(行號基準錯位)": ("pipeline.py",
      '        lint = await hub.call_json("sqltools__lint", {"sql": sql})',
      '        lint = await hub.call_json("sqltools__lint", {"sql": rule_sql})'),
@@ -2096,11 +2297,11 @@ MUTANTS.update({
      '            raise_to("major" if m.no_baseline or worst == "blocker" else worst)',
      '            raise_to("major" if m.no_baseline else worst)'),
  '受影響:語句數量不同仍逐句比': ('dbt_affected.py',
-     '    elif head.statements is not None and head.statements == base.statements:',
-     '    elif head.statements is not None:'),
+     '    if head.statements is not None and head.statements == base.statements:',
+     '    if head.statements is not None:'),
  '受影響:展開不傳剩下的時間': ('dbt_affected.py',
-     '                      timeout_s=min(DEFAULT_ISOLATED_TIMEOUT_S, seconds))',
-     '                      timeout_s=DEFAULT_ISOLATED_TIMEOUT_S)'),
+     '                      timeout_s=min(DEFAULT_ISOLATED_TIMEOUT_S, seconds),',
+     '                      timeout_s=DEFAULT_ISOLATED_TIMEOUT_S,'),
  '受影響:時間用完仍開始展開': ('dbt_affected.py',
      '    if seconds <= 0:\n        raise _OutOfTime',
      '    if False:\n        raise _OutOfTime'),
@@ -2219,17 +2420,39 @@ MUTANTS.update({
      '                guessed = guessed or n >= len(quoted)',
      '                guessed = False'),
  "行號:不加行號": ("pipeline.py",
-     '        _attach_statement_lines(pre, mr["files"])   # 給程式補的 finding 用;prompt 已組好,不受影響\n',
+     '        _step(report_stub, "命中行號", _attach_statement_lines, None, pre, mr["files"], line_maps)\n',
      ''),
  "行號:組 prompt 之前就加(prompt 會變)": ("pipeline.py",
      '        user = USER_TEMPLATE.format(\n            title=mr["title"]',
      '        _attach_statement_lines(pre, mr["files"])\n        user = USER_TEMPLATE.format(\n            title=mr["title"]'),
  "行號:前 200 字相同的不同語句也寫": ("pipeline.py",
-     '            if not found or len({full for _, full in found}) > 1:',
-     '            if not found:'),
+     '        if not found or len({full for _, full, _, _ in found}) > 1:',
+     '        if not found:'),
  "行號:同一句出現多次都寫第一句": ("pipeline.py",
-     '                h["line"] = found[used[key]][0]',
-     '                h["line"] = found[0][0]'),
+     '            yield h, found[used[key]]',
+     '            yield h, found[0]'),
+ # 切語句只略過「切不出來」;程式自己的錯往外丟(環節隔離記成未完整)
+ "行號:切語句時程式的錯也吞掉": ("pipeline.py",
+     "    except (SqlglotError, RecursionError):   # 切不出來就不寫行號",
+     "    except Exception:"),
+ "行號:巢狀太深往外丟": ("pipeline.py",
+     "    except (SqlglotError, RecursionError):   # 切不出來就不寫行號",
+     "    except SqlglotError:"),
+ "受影響:切語句時程式的錯也吞掉": ("dbt_affected.py",
+     "    except (SqlglotError, RecursionError):   # 切不出來就只能整個 model 合計比較",
+     "    except Exception:"),
+ "受影響:切語句時巢狀太深往外丟": ("dbt_affected.py",
+     "    except (SqlglotError, RecursionError):   # 切不出來就只能整個 model 合計比較",
+     "    except SqlglotError:"),
+ "留言:沒有行號也開行內討論": ("../toolbox/gitlab.py",
+     "        if isinstance(line, bool) or not isinstance(line, int) or line <= 0:",
+     "        if False:"),
+ "留言:負的行號也開行內討論": ("../toolbox/gitlab.py",
+     "        if isinstance(line, bool) or not isinstance(line, int) or line <= 0:",
+     "        if isinstance(line, bool) or not isinstance(line, int) or line == 0:"),
+ "留言:True 當成第 1 行": ("../toolbox/gitlab.py",
+     "        if isinstance(line, bool) or not isinstance(line, int) or line <= 0:",
+     "        if not isinstance(line, int) or line <= 0:"),
  "行號:dbt 樣板也算": ("pipeline.py",
      '                or is_dbt_template(text)):',
      '                ):'),
@@ -2237,11 +2460,59 @@ MUTANTS.update({
      '        if (not isinstance(text, str) or not text or len(text) > MAX_LINE_SOURCE_CHARS\n',
      '        if (not isinstance(text, str) or not text\n'),
  "行號:切出來的數量對不上也寫": ("pipeline.py",
-     '    if len(starts) != len(statements):\n        return None',
+     '    if len(firsts) != len(statements):\n        return None',
      '    if False:\n        return None'),
+ # dbt 樣板展開後的命中:經對應表對回原始檔
+ "行號對回:近似對齊的對應表也用": ("pipeline.py",
+     '    return rendered.line_map if rendered.map_method == "sentinel" and rendered.line_map else None',
+     "    return rendered.line_map or None"),
+ "行號對回:只有 diff 片段也記對應表": ("pipeline.py",
+     "            if dbt_error is None and line_maps is not None and _is_full_text(f, sql, dbt_ctx):",
+     "            if dbt_error is None and line_maps is not None:"),
+ "行號對回:取回的專案內容不算完整內容": ("pipeline.py",
+     '    return dbt_ctx is not None and sql == dbt_ctx.head_text(f.get("path"))', "    return False"),
+ "行號對回:增量那次的對應表不記": ("pipeline.py",
+     "    if expanded.incremental_sql is not None and expanded.incremental_line_map:",
+     "    if False:"),
+ "行號對回:增量分支的命中用一般那次的對應表": ("pipeline.py",
+     '            branch = _INCREMENTAL_BRANCH if h.get("branch") == _INCREMENTAL_BRANCH else None',
+     "            branch = None"),
+ "行號對回:展開結果不設大小上限": ("pipeline.py",
+     "        if len(rendered_sql) > MAX_LINE_SOURCE_CHARS:", "        if False:"),
+ "行號對回:被空白控制接起來的第二句也寫": ("pipeline.py",
+     "    if not alone:" + NL + "        return 0", "    if False:" + NL + "        return 0"),
+ "行號對回:不看語句前面同一行有沒有別的內容": ("pipeline.py",
+     "        alone = not sql[line_start:tok.start].strip()", "        alone = True"),
+ "行號對回:macro 產生的語句也寫(不比固定文字)": ("pipeline.py",
+     "    if not prefix or not rendered_lines[rendered_line - 1].lstrip().startswith(prefix):",
+     "    if False:"),
+ "行號對回:原始行沒有固定文字也寫": ("pipeline.py",
+     "    if not prefix or not rendered_lines[rendered_line - 1].lstrip().startswith(prefix):",
+     "    if prefix and not rendered_lines[rendered_line - 1].lstrip().startswith(prefix):"),
+ "行號對回:固定文字不切在 Jinja 標記前": ("pipeline.py",
+     "    cut = min((i for i in (line.find(t) for t in _TAG_OPENERS) if i >= 0), default=len(line))",
+     "    cut = len(line)"),
+ "行號對回:不記第幾句": ("pipeline.py",
+     '            h["statement_index"] = n', "            pass"),
+ "行號對回:對應不確定時也寫第幾句": ("pipeline.py",
+     "    if not exact or _hit_line(hit, exact) or not isinstance(n, int) or isinstance(n, bool):",
+     "    if _hit_line(hit, exact) or not isinstance(n, int) or isinstance(n, bool):"),
+ "行號對回:說明不寫第幾句": ("pipeline.py",
+     ' else "") + _statement_note(h, exact)', ' else "")'),
+ "行號對回:樣板的命中不對回": ("pipeline.py",
+     "            _attach_rendered_lines(entry, line_maps)", "            pass"),
+ "行號對回:對回失敗會中斷審查": ("pipeline.py",
+     '        _step(report_stub, "命中行號", _attach_statement_lines, None, pre, mr["files"], line_maps)',
+     '        _attach_statement_lines(pre, mr["files"], line_maps)'),
+ "行號對回:對應表沒傳到對回那一步": ("pipeline.py",
+     '_attach_statement_lines, None, pre, mr["files"], line_maps)',
+     '_attach_statement_lines, None, pre, mr["files"], None)'),
+ "行號對回:預掃沒記對應表": ("pipeline.py",
+     "                           prescan(hub, mr[\"files\"], cfg.dbt, dbt_ctx, rendered, line_maps), [])",
+     "                           prescan(hub, mr[\"files\"], cfg.dbt, dbt_ctx, rendered, None), [])"),
  "行號:只有註解的語句也算": ("pipeline.py",
-     '                      if st is not None and not isinstance(st, exp.Semicolon)]',
-     '                      if st is not None]'),
+     '                      and not isinstance(st, exp.Semicolon)]',
+     '                      ]'),
  "行號:檔案與預掃結果對不上也寫": ("pipeline.py",
      '        if (not isinstance(f, dict) or entry.get("path") != f.get("path")',
      '        if (not isinstance(f, dict)'),
@@ -3190,32 +3461,344 @@ MUTANTS.update({
 })
 
 
+# ---- 工具回合用完時不得把工具結果當成審查報告(#66)
+MUTANTS.update({
+ "回合用完:回傳最後一則工具結果": ("agent.py",
+     '    return "(達到工具呼叫上限,未產出最終結果)"',
+     '    return messages[-1].get("content") or "(達到工具呼叫上限,未產出最終結果)"'),
+ "回合用完:不標記": ("agent.py",
+     "    if meta is not None:" + NL + '        meta["exhausted"] = True',
+     "    if False:" + NL + '        meta["exhausted"] = True'),
+ "回合用完:一開始不寫 False(分不出舊版程式)": ("agent.py",
+     "        # 一開始就寫 False:呼叫端用 meta.get(\"exhausted\") 時,「沒有這個 key」" + NL
+     + "        # (舊版程式)與「跑完沒用光輪次」要分得出來。" + NL
+     + '        meta["exhausted"] = False',
+     "        pass"),
+})
+
+
 # ---- 測資生成的覆蓋度重試(spec_exec)
 # 這道防線的失效是**靜默**的:覆蓋不完整的測資照樣跑得完、報告看起來正常,
 # 只是執行驗證少驗了幾個條件。沒有突變點的話,測試是不是真的守著它無從得知。
 S = "spec_exec.py"
 MUTANTS.update({
     "測資:有缺口也直接收下(回到舊行為)": (S,
-        "                if not gaps and n_conds >= max_conds:",
+        "                if not repaired and not gaps and n_conds >= max_conds:",
         "                if True:"),
     "測資:不留覆蓋最多的一版(只認最後一次)": (S,
-        "                if best is None or _covered(cleaned) > _covered(best[0]):\n"
-        "                    best = (cleaned, gaps, dropped)",
-        "                best = (cleaned, gaps, dropped)"),
+        "                if better:\n"
+        "                    best = (cleaned, gaps, dropped)\n"
+        "                    best_repaired = repaired",
+        "                best = (cleaned, gaps, dropped)\n"
+        "                best_repaired = repaired"),
     # review 第 4 點:缺口是對照模型自己拆的條件算的,拆得少的 0 缺口版本不能
     # 勝過拆得齊、只缺一點的版本;重試 prompt 不帶缺口,固定 seed 下等於白跑。
     "測資:0 缺口就提前結束,不看條件數有沒有變少": (S,
-        "                if not gaps and n_conds >= max_conds:",
-        "                if not gaps:"),
+        "                if not repaired and not gaps and n_conds >= max_conds:",
+        "                if not repaired and not gaps:"),
     "測資:最佳版本改回比缺口數": (S,
-        "                if best is None or _covered(cleaned) > _covered(best[0]):",
-        "                if best is None or len(gaps) < len(best[1]):"),
+        "                          and _covered(cleaned) > _covered(best[0])))",
+        "                          and len(gaps) < len(best[1])))"),
     "測資:重試 prompt 不帶上一次的缺口": (S,
         "        issues.append(\"上一次的測資計畫覆蓋不完整,缺:\\n\" + \"\\n\".join(f\"- {g}\" for g in gaps))",
         "        issues.append(\"上一次的測資計畫覆蓋不完整。\")"),
+    # #23 第 1 點:json-repair 不會失敗,它把壞掉的 JSON 修補成一個**合法但語意
+    # 錯誤**的物件。少了這三道,格式問題會被回報成「模型覆蓋不足」,而兩者的
+    # 修法完全不同(修 prompt / 限制輸出格式 vs 調 max_tokens、分批生成)。
+    "測資:修補過的輸出當成正常結果": (S,
+        "        repaired = bool(parse_meta.get(\"repaired\"))",
+        "        repaired = False"),
+    "測資:修補過的也能提前結束(假的 0 缺口被收下)": (S,
+        "                if not repaired and not gaps and n_conds >= max_conds:",
+        "                if not gaps and n_conds >= max_conds:"),
+    "測資:修補過的結果不在缺口裡說明(看的人會照著缺口去調 prompt)": (S,
+        "            return plan_, [_MALFORMED_GAP, *gaps_], dropped_",
+        "            return plan_, gaps_, dropped_"),
+    # #23 第 2 點:大規則一次生不完,每次整份重來等於每次重付已成功那部分的代價。
+    # 合併的三道防線少任何一道,補進來的案例都可能指向不存在的東西,而失敗會出現
+    # 在沙盒執行階段,離真正的原因很遠。
+    "測資:不走補缺模式(每次整份重來)": (S,
+        "        if filling and plan and best is not None and not repaired:",
+        "        if False:"),
+    "測資:補生成可以發明新條件(用假分母灌覆蓋率)": (S,
+        "        if not _known(c) or key in have:",
+        "        if False:"),
+    "測資:補生成的 schema 蓋掉先前的(已有案例跑不起來)": (S,
+        "    return ({**base, \"cases\": [*base[\"cases\"], *added]}, len(added), dropped)",
+        "    return ({**base, **addition, \"cases\": [*base[\"cases\"], *added]}, len(added), dropped)"),
+    "測資:補缺失敗退回時用合併後的條件數(拆得少的提示永遠不出現)": (S,
+        "                attempted, _, attempted_dropped = _shape_check(plan)",
+        "                attempted, attempted_dropped = cleaned, []"),
+    # 生成的資料要先對過資料表定義(#47 review 第 2 點)。兩份黑盒規格各花 50 分鐘和
+    # 14 分鐘生成,每一列都有欄位值超過宣告長度 → 沙盒灌資料失敗 → 整輪白跑。
+    "測資:資料不對表定義就收下": (S,
+        '            why = _rows_fit_ddl(c.get("rows") or [], cols_by_table)',
+        '            why = ""'),
+    "測資:只檢查第一列": (S,
+        "    for i, row in enumerate(rows, 1):",
+        "    for i, row in enumerate(rows[:1], 1):"),
+    "測資:不檢查欄位數": (S,
+        "        if len(vals) != len(cols):",
+        "        if False:"),
+    "測資:表名不在定義裡也放行": (S,
+        "        if cols is None:" + NL
+        + "            return f\"第 {i} 列的表名 {row[0]} 不在 schema_ddl 裡\"",
+        "        if cols is None:" + NL
+        + "            continue"),
+    "測資:字串長度只看超過一倍的": (S,
+        "        if limit is not None and len(v) > limit:",
+        "        if limit is not None and len(v) > limit * 2:"),
+    "測資:小數位數超過宣告也放行(悄悄四捨五入)": (S,
+        "        if len(frac) > scale:",
+        "        if False:"),
+    "測資:NOT NULL 給 null 也放行": (S,
+        '        return "" if col["nullable"] else f"{name} 宣告 NOT NULL,卻給了 NULL"',
+        '        return ""'),
+    "測資:日期格式不檢查": (S,
+        '        return "" if ok else f"{name} 是 {type_name},{why}"',
+        '        return ""'),
+    "測資:整數欄位給小數也放行": (S,
+        '            return f"{name} 是整數欄位,但值有小數({v})"',
+        '            return ""'),
+    "測資:灌不進去的原因不回饋給模型": (S,
+        "    bad = [str(d.get(\"reason\", \"\")) for d in dropped if _DDL_FAIL_MARK in str(d.get(\"reason\", \"\"))]",
+        "    bad = []"),
+    # #23 第 3 點:覆蓋檢查原本完全相信模型自己貼的條件編號與方向,
+    # 「標籤對、資料卻沒測到」看起來跟正確的案例一模一樣。
+    "測資:判斷式不驗形狀(任意 SQL 進沙盒)": (S,
+        "        if \"check_sql\" in c and not _check_sql_ok(c.get(\"check_sql\")):",
+        "        if False:"),
+    # 對所有條件下判定 = OR 結構的規格 100% 誤報(實測:30 個案例 30 個被判不符,
+    # 含 22 個行為完全正確的)。互斥的條件不可能同時成立,判定本身就是錯的。
+    "測資:標籤對所有條件下判定(OR 結構的規格全盤誤報)": (S,
+        "    return {target: direction == \"true\"}",
+        "    return {c[\"id\"]: (direction == \"true\" or c[\"id\"] != target) for c in conds}"),
+    "測資:不記錄同時不成立的其他條件": (S,
+        "        if cofail:" + NL + "            r[\"label_cofail\"] = cofail",
+        "        if False:" + NL + "            r[\"label_cofail\"] = cofail"),
+    "測資:判斷式算不出來時回部分結果": (S,
+        "        except Exception as e:\n            return None, f\"條件 {c.get('id')} 的判斷式執行失敗:{str(e)[:120]}\"",
+        "        except Exception:\n            continue"),
+    # 基準＋變體(測資正確率的修法)。預期值由構造決定,不由模型判斷——實測
+    # 模型在 46 個案例裡填錯 12 個,其中 10 個是「只滿足一條卻說該命中」。
+    "測資:基準/變體的預期值照抄模型給的": (S,
+        "    out[\"expect_flagged\"] = (c.get(\"kind\") == \"base\")",
+        "    out[\"expect_flagged\"] = bool(c.get(\"expect_flagged\"))"),
+    "測資:非資料層面的條件也要求變體(永遠補不完)": (S,
+        "            if not _data_level(c0):",
+        "            if False:"),
+    # 變體要從基準改一處,所以補缺的 prompt 必須附上基準的資料列。少了它,
+    # 模型只能自己重新發明一組,那正是預期值出錯的來源。
+    "測資:要變體時不附基準的資料列": (S,
+        "                got = _base_rows_for(plan, target)" + NL
+        + "                if got:" + NL
+        + "                    bases_shown[got[0]] = got[1]",
+        "                got = None" + NL
+        + "                if got:" + NL
+        + "                    bases_shown[got[0]] = got[1]"),
+    # 全域條件(branch="*")不是一個分支:要求它有自己的基準 = 要求一份「只讓全域
+    # 條件成立」的資料,而那不會讓規則命中,預期必然錯。實測發生過(GLOBAL 分支)。
+    "測資:全域條件被當成一個需要基準的分支": (S,
+        "    out.discard(GLOBAL_BRANCH)",
+        "    pass"),
+    # 基準的隔離期望少了全域條件 = 沒驗到規則真正的前提。
+    "測資:基準的隔離期望不含全域條件": (S,
+        "                if str(c.get(\"branch\", \"\") or \"\") in (b_id, GLOBAL_BRANCH)}",
+        "                if str(c.get(\"branch\", \"\") or \"\") == b_id}"),
+    # 區間類的條件要兩個變體(下界、上界各一個);只認 condition_id 的話第二個會被
+    # 當成「已經有了」拒收,於是只驗得到一邊的門檻(實測漏掉 9 個突變)。
+    "測資:同一條件只收一個變體(只驗得到一邊門檻)": (S,
+        "            return (\"variant\", c[\"condition_id\"], c[\"case_id\"])",
+        "            return (\"variant\", c[\"condition_id\"])"),
+    # 基準的 condition_id 是我們補的 `__base__<分支>`、不在條件清單裡,所以
+    # 「已經有了/認不認得」的判斷要依形狀而異。一律用 condition_id 判斷的話,
+    # 補缺回來的基準會被整批拒收,補缺模式永遠拿不到基準(實測確認過)。
+    "測資:合併時一律用 condition_id 判斷(補缺拿不到基準)": (S,
+        "        if c.get(\"kind\") == \"base\":" + NL
+        + "            return str(c.get(\"branch\", \"\") or \"\") in branch_ids" + NL
+        + "        return c[\"condition_id\"] in cond_ids",
+        "        return c[\"condition_id\"] in cond_ids"),
+    # 接著上次的缺口補(--resume):給了 seed_plan 卻還是先問整份計畫,等於把
+    # 已經生好的案例丟掉重來——每次呼叫 11-16 分鐘,大規則一輪 151 分鐘。
+    "測資:給了既有計畫仍重新生成整份": (S,
+        "            filling = True" + NL
+        + "            user = _fill_gaps_prompt(spec_code, spec_text, seeded, missing, fill_batch," + NL
+        + "                                     seeded_dropped)",
+        "            filling = False"),
+    "測資:既有計畫已補滿仍再問模型": (S,
+        "            if not missing:" + NL
+        + "                return seeded, seeded_gaps, seeded_dropped   # 已經滿了,不用問模型",
+        "            if False:" + NL
+        + "                return seeded, seeded_gaps, seeded_dropped   # 已經滿了,不用問模型"),
+    # 沒有條件可比時若照樣下標籤結論,label_ok 會是 True——「標籤驗過了」的假訊號。
+    # 工具輪次用光時回傳的是最後一則工具結果(不是報告),而端點回 finish_reason="stop"
+    # ——呼叫端只能靠這個標記知道。少了它,工具結果會被當成審查報告收下(#26 第 1 點)。
+    "執行:沒有條件可比也下標籤結論": (S,
+        "    conds = plan.get(\"conditions\") or []" + NL
+        + "    if not conds:" + NL
+        + "        return",
+        "    conds = plan.get(\"conditions\") or []" + NL
+        + "    if False:" + NL
+        + "        return"),
+    # 標籤檢查沒跑成時,整個案例的標籤就靜靜地沒被驗,報告上跟「驗過沒問題」一樣
+    # (#47 review 的建議)。判斷式多包一層子查詢之後,帶 ORDER BY 或回多欄的會從
+    # 「能算」變成「算不出來」,那種退化不該默默發生。
+    "執行:標籤沒驗到不留痕跡": (S,
+        '                r["label_unverified"] = label_skip',
+        "                pass"),
+    "執行:放棄的原因不帶出來": (S,
+        '            return None, f"條件 {c.get(\'id\')} 沒有判斷式(check_sql)"',
+        '            return None, ""'),
+    "執行:通過的 finding 不提標籤沒驗到": (S,
+        '                                 + _unverified_note(ex["case_results"])))',
+        "                                 ))"),
+    "測資:標籤不符不列入覆蓋缺口": (S,
+        "        if r.get(\"label_ok\") is not False:" + NL + "            continue",
+        "        if True:" + NL + "            continue"),
+    # 凍結檔要記下「生出來花了多少」:這些數字決定上限怎麼訂,不該每次要用就
+    # 重跑一輪(大規格 70 分鐘)。少了它們,凍結檔看起來一樣、但判斷依據就沒了。
+    "凍結:不記錄生成成本": ("../eval/testdata_cache.py",
+        '        "cost": cost or {},',
+        '        "cost": {},'),
+    # 「其他分支整個成立」原本只寫在 prompt 裡靠模型遵守,實測造成 5 個預期錯誤
+    # (變體往上跨一格落進相鄰分支的區間)。改成用 check_sql 直接算。
+    "測資:不驗其他分支有沒有整個成立": (S,
+        "        if case.get(\"kind\") in (\"base\", \"variant\"):" + NL
+        + "            others = _other_branch_satisfied(",
+        "        if False:" + NL
+        + "            others = _other_branch_satisfied("),
+    # 全域條件不成立時任何一支都不會命中(#47 review 第 1 點)。漏了這個判斷,
+    # 全域條件的變體會被判成「別支整個成立」→ 有全域條件的規格永遠通不過。
+    "測資:別支判定不看全域條件有沒有成立": (S,
+        "    if not all(actual.get(i) is True for i in glob):" + NL
+        + "        return []",
+        "    if False:" + NL
+        + "        return []"),
+    "測資:算不出來的全域條件當成立": (S,
+        '    glob = [c["id"] for c in conds' + NL
+        + '            if str(c.get("branch", "") or "") == GLOBAL_BRANCH]' + NL
+        + "    if not all(actual.get(i) is True for i in glob):",
+        '    glob = [c["id"] for c in conds' + NL
+        + '            if str(c.get("branch", "") or "") == GLOBAL_BRANCH]' + NL
+        + "    if not all(actual.get(i) is not False for i in glob):"),
+    # 變體的標籤判準改成「跟基準比 + 差異歸因得到目標條件」。沙盒實測:舊判準把凍結
+    # R-140 的 5 個變體(測資設計正確、10/10 抓得到寫錯的 SQL)全判成資料與標籤不符
+    # → 轉成覆蓋缺口 → 「篩選+門檻」型的規則永遠通不過。三道判準各一個突變點。
+    "測資:變體回到固定的真假向量(不跟基準比)": (S,
+        '        if case.get("kind") == "variant":' + NL
+        + "            why = _variant_label_check(conds, cols_by_table, bases, case, actual)",
+        "        if False:" + NL
+        + "            why = _variant_label_check(conds, cols_by_table, bases, case, actual)"),
+    "測資:不收基準的真假向量(變體永遠沒有基準可比)": (S,
+        '        if case.get("kind") == "base" and vec is not None:',
+        "        if False:"),
+    "測資:變體不必真的弄壞東西": (S,
+        "    if not became_false:",
+        "    if False:"),
+    "測資:不是下游的條件也算歸因得到": (S,
+        "        stray = [i for i in became_false if i != target and i not in down]",
+        "        stray = []"),
+    "測資:下游不看述詞(每個條件都算下游)": (S,
+        '    return {c["id"] for c in conds' + NL
+        + '            if c.get("id") != target_id and pred in _norm_sql(c.get("check_sql"))}',
+        '    return {c["id"] for c in conds' + NL
+        + '            if c.get("id") != target_id}'),
+    "測資:述詞太短也算下游": (S,
+        "    if len(pred) < 8:",
+        "    if False:"),
+    "測資:不檢查改的欄位跟目標條件有不有關": (S,
+        "            stray_cols = sorted(c for c in changed if c not in in_target)",
+        "            stray_cols = []"),
+    "測資:資料與基準完全相同也算驗過": (S,
+        "        if not changed:" + NL
+        + '            why.append("變體的資料與基準完全相同,沒有改動任何東西")',
+        "        if False:" + NL
+        + '            why.append("變體的資料與基準完全相同,沒有改動任何東西")'),
+    "測資:條件從不成立變成成立也放行": (S,
+        "    if became_true:",
+        "    if False:"),
+    "測資:沒有基準可比時直接放行": (S,
+        '        return [] if actual.get(target) is False else [' + NL
+        + '            f"沒有分支 {b_id} 的基準可以比對,而 {target} 仍然成立"]',
+        "        return []"),
+    # #47 review 第二輪:每一欄都要在目標的判斷式裡(any 會放過混著改的變體)、
+ # SQL Server 收得下的日期寫法不可以擋掉(擋了就是假的覆蓋缺口)
+ "測資:改的欄位有一個對上就算驗到(混著改的變體會漏過)": (S,
+     "            stray_cols = sorted(c for c in changed if c not in in_target)",
+     "            stray_cols = ([] if any(c in in_target for c in changed)" + NL
+     + "                          else sorted(changed))"),
+ # 欄名比對退回子字串:amount 會被當成出現在 fee_amount 裡,這一道自己就判錯了
+ "測資:欄名用子字串比對(amount 對上 fee_amount)": (S,
+     '            in_target = _sql_columns(tcond["check_sql"])',
+     '            in_target = _norm_sql(tcond["check_sql"])'),
+ "測資:yyyymmdd 的日期當成不合法": (S,
+     '_DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",' + NL
+     + '                 "%Y%m%d %H:%M:%S", "%Y%m%d %H:%M", "%Y%m%d")',
+     '_DATE_FORMATS = ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d")'),
+ # 缺口與 passed 只有一份:腳本自己再算一份的時候,正式流程多一種缺口,
+ # 腳本印出來的「執行驗證的結論」就會跟真的不一樣
+ "共用:算 passed 時不看缺口": (S,
+     "    return gaps, bool(effective) and not faults and not gaps",
+     "    return gaps, bool(effective) and not faults"),
+ "共用:一個有效案例都沒有也算通過": (S,
+     "    return gaps, bool(effective) and not faults and not gaps",
+     "    return gaps, not faults and not gaps"),
+ "共用:逾時不算缺口": (S,
+     '    if ex.get("timed_out"):' + NL
+     + "        # 沒跑到的案例本身也是缺口,但不說「逾時」的話,看報告的人會以為是測資或",
+     "    if False:" + NL
+     + "        # 沒跑到的案例本身也是缺口,但不說「逾時」的話,看報告的人會以為是測資或"),
+ "共用:標籤缺口不併進去": (S,
+     '    gaps = list(base_gaps) + _label_gaps(ex["case_results"])',
+     "    gaps = list(base_gaps)"),
+ "測資:小數秒只認 6 位(DATETIME2 預設是 7 位)": (S,
+     '    digits = _FRAC_DIGITS.get(type_name or "", _FRAC_DIGITS_DEFAULT)',
+     "    digits = 6"),
+ # DATETIME/SMALLDATETIME 只收 3 位:放過去的值會通過形狀檢查、灌資料才失敗,
+ # 而灌資料失敗會停掉整輪執行驗證,不是只丟掉那一個案例
+ "測資:小數秒的上限不看型別(一律放到 7 位)": (S,
+     '_FRAC_DIGITS = {"DATETIME": 3, "SMALLDATETIME": 3}',
+     "_FRAC_DIGITS = {}"),
+ "測資:日期檢查不帶欄位型別進去": (S,
+     "        ok, why = _datetime_ok(v, type_name)",
+     "        ok, why = _datetime_ok(v)"),
+ "測資:只給時間也放行(日期會變成 1900-01-01)": (S,
+     "    if _TIME_ONLY.match(text):",
+     "    if False:"),
+ "測資:其他分支整個成立時不算有效驗證": (S,
+        "                r[\"label_ok\"] = False" + NL
+        + "                r.setdefault(\"label_mismatch\", []).extend(",
+        "                r[\"label_ok\"] = True" + NL
+        + "                r.setdefault(\"label_mismatch\", []).extend("),
+    # 算不出來的條件(沒有 check_sql → None)不可以當成「成立」:那會把沒驗到的
+    # 說成驗過了。原本另外寫了一道 None 的守衛,但 `is True` 本來就排除 None,
+    # 守衛是死碼(突變它屬於等價突變、抓不到),所以拿掉守衛、改突變這個判斷。
+    "測資:算不出來的條件當成成立": (S,
+        "        if ids and all(actual.get(i) is True for i in ids):",
+        "        if ids and all(actual.get(i) is not False for i in ids):"),
+    # #23 第 2 點的實際可用性:沒有這三道,補缺模式對大規則完全不會啟動——
+    # 第一次就截斷 → 沒有計畫 → 永遠進不去補缺。實測 RETAIL_M1_EVAL 在正式設定下
+    # 就是 3/3 次截斷、0 個案例。
+    "測資:截斷後不要骨架(大規則永遠裝不下)": (S,
+        "            user = _skeleton_prompt(spec_code, spec_text)" + NL
+        + "            continue",
+        "            user = _retry_prompt(spec_code, spec_text, [], 0, max_conds)" + NL
+        + "            continue"),
+    # 補缺被截斷時退回「整份重來」= 把已經拿到的骨架與案例丟掉,再走一次已知裝不下
+    # 的路。重放模擬:這樣改最後拿到 0/46 個案例(真實端點量到的就是 0 個、3/3 截斷),
+    # 減半重試則補滿 46/46。
+    "測資:補缺被截斷就退回整份重來(丟掉骨架)": (S,
+        "            if filling and best is not None:",
+        "            if False:"),
+    "測資:骨架不收(補缺永遠不啟動)": (S,
+        "            if not cleaned[\"cases\"] and cleaned[\"conditions\"] and cleaned[\"schema_ddl\"]:",
+        "            if False:"),
+    "測資:補缺佔用整份生成的預算(補一輪少一次機會)": (S,
+        "    for attempt in range(max_attempts + _FILL_ROUNDS):",
+        "    for attempt in range(max_attempts):"),
     "測資:重試用完就判失敗(丟掉已抽到的最佳版)": (S,
-        "    if best is not None:\n        return best",
-        "    if False:\n        return best"),
+        "    if best is not None:\n        if best_repaired:",
+        "    if False:\n        if best_repaired:"),
     # 執行中止後,沒跑到的案例必須列入覆蓋缺口。少了它,報告會顯示「跑了 N 個
     # 案例、零缺口」,讀起來像全覆蓋,實際上多數案例根本沒執行——而 coverage_gaps
     # 正是人用來判斷「這次到底驗了多少」的欄位。兩個早退點各一個突變點。
@@ -3300,9 +3883,92 @@ MUTANTS.update({
     "截斷:稽核紀錄的結束原因不截長度": (P,
         '"finish_reason": None if reason is None else str(reason)[:_FINISH_REASON_MAX],',
         '"finish_reason": reason,'),
-    "截斷:capture 不記 finish_reason": (P,
-        '            capture["output_meta"] = dict(output_meta)' + NL,
+    "用完回合:工具結果照樣當成報告解析": (P,
+        "    if meta.get(\"exhausted\"):" + NL + "        return {\"summary\": _EXHAUSTED_SUMMARY",
+        "    if False:" + NL + "        return {\"summary\": _EXHAUSTED_SUMMARY"),
+    "用完回合:不補 major": (P,
+        "        _put_program_finding(report, exhausted)" + NL,
         ""),
+    "用完回合:補成 info(擋不住自動放行)": (P,
+        '"severity": "major", "title": _EXHAUSTED_TITLE,',
+        '"severity": "info", "title": _EXHAUSTED_TITLE,'),
+    # 評測量測用的稽核欄位:讀入與生成量、對到哪份規格
+    "量測:最後一次讀入量不帶進報告": (P,
+        '        "prompt_tokens": meta.get("prompt_tokens"),', '        "prompt_tokens": None,'),
+    "量測:讀入總量不帶進報告": (P,
+        '        "prompt_tokens_total": meta.get("prompt_tokens_total"),',
+        '        "prompt_tokens_total": None,'),
+    "量測:生成總量不帶進報告": (P,
+        '        "completion_tokens_total": meta.get("completion_tokens_total"),',
+        '        "completion_tokens_total": None,'),
+    "量測:對到的規格不記進報告": (P,
+        '        report["_spec_lookup"] = _spec_lookup(spec_code, affected_specs)', "        pass"),
+    "量測:不記受影響 model 的規格": (P,
+        "    for spec in affected_specs or ():", "    for spec in ():"),
+    "量測:規格代號重複也列": (P,
+        "        if isinstance(code, str) and code and code not in codes:",
+        "        if isinstance(code, str) and code:"),
+    "量測:dry-run 不記對到的規格": (P,
+        '              "_spec_lookup": _spec_lookup(spec_code, affected_specs),' + NL, ""),
+    "量測:dry-run 拿不到受影響 model 的規格": (P,
+        "                                         affected_specs=affected_specs)",
+        "                                         affected_specs=())"),
+    "用完回合:稽核紀錄不記": (P,
+        '        "exhausted": bool(meta.get("exhausted")),' + NL,
+        ""),
+})
+
+
+# ---- 設定參數一覽與程式要對得上(#58)。掃漏一種讀法,一致性檢查就變成永遠綠的。
+E = "env_registry.py"
+MUTANTS.update({
+ "設定表:掃描漏掉 helper 讀的(env_seconds 那幾個)": (E,
+     "                or _helper_name(func) in ENV_HELPERS):",
+     "                or False):"),
+ "設定表:比對寫死 os. 開頭(換個 import 寫法就掃不到)": (E,
+     '        if (tail == "environ.get" or func.split(".")[-1] == "getenv" or setter',
+     '        if (tail == "os.environ.get" or func == "os.getenv" or setter'),
+ "設定表:下標寫法比對寫死 os.environ": (E,
+     '                and ast.unparse(node.value).split(".")[-1] == "environ"',
+     '                and ast.unparse(node.value) == "os.environ"'),
+ "設定表:掃描只認 environ.get,漏掉 getenv": (E,
+     '        if (tail == "environ.get" or func.split(".")[-1] == "getenv" or setter',
+     '        if (tail == "environ.get" or setter'),
+ "設定表:掃描漏掉 os.environ[\"X\"] 的下標寫法": (E,
+     '        if (isinstance(node, ast.Subscript)',
+     "        if (False and isinstance(node, ast.Subscript)"),
+ "設定表:setdefault 設的值當成程式的預設值": (E,
+     "        return None if self.is_setter else const_value(self.default)",
+     "        return const_value(self.default)"),
+ "設定表:算不出 str(1024 * 1024) 這種預設值": (E,
+     '                and node.func.id in ("str", "int", "float") and len(node.args) == 1):',
+     "                and False):"),
+ "設定表:掃描範圍少一個目錄": (E,
+     'SCAN_DIRS = ("orchestrator", "toolbox", "scripts", "eval")',
+     'SCAN_DIRS = ("orchestrator", "toolbox", "eval")'),
+})
+
+
+# ---- 評測用的 token 用量(#84)。數字錯了不會有人發現,只會得到錯的結論。
+A = "agent.py"
+MUTANTS.update({
+ "用量:只記最後一次、不累加": (A,
+     "            for key, value in ((\"prompt_tokens_total\", prompt_tokens)," + NL
+     + "                               (\"completion_tokens_total\", completion)):" + NL
+     + "                if value is not None:" + NL
+     + "                    meta[key] = (meta.get(key) or 0) + value",
+     "            meta[\"prompt_tokens_total\"] = prompt_tokens" + NL
+     + "            meta[\"completion_tokens_total\"] = completion"),
+ "用量:沒回報的那一輪當成 0 加進去(總量變成有值)": (A,
+     "                if value is not None:" + NL
+     + "                    meta[key] = (meta.get(key) or 0) + value",
+     "                meta[key] = (meta.get(key) or 0) + (value or 0)"),
+ "用量:讀入的量不記": (A,
+     "            meta[\"prompt_tokens\"] = prompt_tokens",
+     "            meta[\"prompt_tokens\"] = None"),
+ "用量:生成的總量跟著最後一次走": (A,
+     "                               (\"completion_tokens_total\", completion)):",
+     "                               (\"completion_tokens_total\", None)):"),
 })
 
 
