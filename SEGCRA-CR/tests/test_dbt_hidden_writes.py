@@ -132,6 +132,53 @@ def test_大小寫轉換的區塊也認得記號():
     assert _check(src) == {}
 
 
+@pytest.mark.parametrize("show,unreached", [
+    ("{{ w[:-22] }}", True),                          # 只印出記號
+    ("{{ w | replace(w[-22:], '') }}", True),         # 把語句換掉
+    ("{{ w[:30] }}", False),                          # 記號加上一部分:去掉記號後跟第一次不同
+])
+def test_只印出記號_沒有印出那句時算沒有展開到(show, unreached):
+    """先把寫入語句收進變數,再只印出前面的記號:記號出現了,語句卻沒有。"""
+    src = ("{% set w %}DELETE FROM audit_log;{% endset %}\n"
+           "{% if var('run_hidden', false) %}{{ w }}{% else %}" + show + "{% endif %}\n"
+           "select 1 as x")
+    found = _check(src)
+    if unreached:
+        assert found == {hw.UNREACHED: [{"line": 1, "keyword": "DELETE"}]}
+    else:
+        assert set(found) == {hw.UNVERIFIED}
+
+
+def test_偵測到記號才印出完整語句時_記成無法確認():
+    """反過來:只在插了記號那次印出完整語句,去掉記號後跟第一次不同,由另一道擋下。"""
+    src = ("{% set w %}DELETE FROM audit_log;{% endset %}\n"
+           "{% if '__' in w %}{{ w }}{% endif %}\nselect 1 as x")
+    assert hw.UNVERIFIED in _check(src)
+
+
+def test_記號後面接的是整段固定文字_不只是關鍵字():
+    src = ("{% set w %}DELETE FROM audit_log WHERE 1 = 1;{% endset %}\n"
+           "{% if var('run_hidden', false) %}{{ w }}{% else %}{{ w | replace('audit_log WHERE 1 = 1', 'x') }}"
+           "{% endif %}\nselect 1 as x")
+    assert _check(src) == {hw.UNREACHED: [{"line": 1, "keyword": "DELETE"}]}
+
+
+def test_一段裡有好幾個關鍵字_各自都要接著自己那段():
+    src = "SELECT 1 AS a; DELETE FROM t WHERE x = 1; INSERT INTO t2 SELECT 1;"
+    assert _check(src) == {}
+
+
+def test_標記前面的空白被修掉也算展開到():
+    src = "{% if true %}DELETE FROM t WHERE x = 1   {%- endif %}\nSELECT 1 AS a"
+    assert _check(src) == {}
+
+
+def test_tails():
+    src = "SELECT 1; DELETE FROM t  {{ x }}\nUPDATE t SET a = 1"
+    literal, _ = hw.occurrences(src)
+    assert hw._tails(src, literal) == ["DELETE FROM t", "UPDATE t SET a = 1"]
+
+
 # ─────────────────── 寫在 Jinja 標記的字串裡 ───────────────────
 
 @pytest.mark.parametrize("src,kw", [
@@ -141,6 +188,60 @@ def test_大小寫轉換的區塊也認得記號():
 ])
 def test_寫在標記字串裡的寫入語句一律報(src, kw):
     assert _check(src) == {hw.IN_TAGS: [{"line": 1, "keyword": kw}]}
+
+
+@pytest.mark.parametrize("src,kws", [
+    # 會被執行的位置:不像一句完整的語句也報
+    ("{{ config(post_hook='delete stale rows') }}\nSELECT 1 AS a", ["DELETE"]),
+    ("{{ config(post_hook=['select 1', 'exec cleanup']) }}\nSELECT 1 AS a", ["EXEC"]),
+    ("{{ config({'post-hook': 'merge things'}) }}\nSELECT 1 AS a", ["MERGE"]),
+    ("{{ config(post_hook=['update t set a = 1', 'merge more']) }}\nSELECT 1 AS a", ["UPDATE", "MERGE"]),
+    ("{{ config(sql_header='truncate later') }}\nSELECT 1 AS a", ["TRUNCATE"]),
+    ("{% do run_query('drop it') %}\nSELECT 1 AS a", ["DROP"]),
+    ("{% do run_query(fmt('%s', 'create x')) %}\nSELECT 1 AS a", ["CREATE"]),
+    ("{{ config(post_hook=\"update t set a = 1\", materialized='table') }}\nSELECT 1 AS a",
+     ["UPDATE"]),
+    # 其他位置:像一句寫入語句才報
+    ("{% set q = 'INSERT INTO t VALUES (1)' %}\nSELECT 1 AS a", ["INSERT"]),
+    ("{% set q = 'update dbo.t set a = 1' %}\nSELECT 1 AS a", ["UPDATE"]),
+    ("{% set q = 'MERGE INTO t USING s ON 1 = 1' %}\nSELECT 1 AS a", ["MERGE"]),
+    ("{% set q = 'merge t using s on 1 = 1' %}\nSELECT 1 AS a", ["MERGE"]),
+    ("{% set q = 'delete t where 1 = 1' %}\nSELECT 1 AS a", ["DELETE"]),
+    ("{% set q = 'create or alter view v as select 1' %}\nSELECT 1 AS a", ["CREATE", "ALTER"]),
+    ("{% set q = 'exec dbo.p' %}\nSELECT 1 AS a", ["EXEC"]),
+    ("{% set q = 'exec p' %}\nSELECT 1 AS a", ["EXEC"]),             # 整個字串就是一句 exec
+    ("{% set q = '  EXECUTE [dbo].[p];' %}\nSELECT 1 AS a", ["EXECUTE"]),
+    ("{% set q = 'revoke select on t from r' %}\nSELECT 1 AS a", ["REVOKE"]),
+    ("{% set q = 'grant select, insert on t to r' %}\nSELECT 1 AS a", ["GRANT"]),   # insert on 不是一句
+    ("{% set q = 'truncate table t' %}\nSELECT 1 AS a", ["TRUNCATE"]),
+    ("{% set q = 'alter table t add c int' %}\nSELECT 1 AS a", ["ALTER"]),
+    ("{% set q = 'drop view v' %}\nSELECT 1 AS a", ["DROP"]),
+    ("{% set q = 'insert t select 1' %}\nSELECT 1 AS a", ["INSERT"]),
+    ("{% set q = 'exec(@sql)' %}\nSELECT 1 AS a", ["EXEC"]),
+])
+def test_會被執行的位置一律報_其他位置像寫入語句才報(src, kws):
+    """直接看分類(run_query、log 在展開器裡沒有定義,整條展開會失敗)。"""
+    assert [kw for _, kw in hw.occurrences(src)[1]] == kws
+
+
+@pytest.mark.parametrize("src", [
+    "{{ config(materialized='incremental', incremental_strategy='merge', unique_key='id') }}\nSELECT 1 AS a",
+    "{{ config(materialized='incremental', incremental_strategy='delete+insert', unique_key='id') }}"
+    "\nSELECT 1 AS a",
+    "{{ log('will create the summary table', info=True) }}\nSELECT 1 AS a",
+    "{{ config(materialized='table', post_hook='select 1') }}\nSELECT 1 AS a",
+    "{% set msg = 'delete old rows, then exec finished' %}\nSELECT 1 AS a",
+    "{% set msg = 'exec finished ok' %}\nSELECT 1 AS a",
+    "{% set k = {'mode': 'drop'} %}\nSELECT 1 AS a",
+    "{{ config(alias='update_log') }}\nSELECT 1 AS a",
+    "{{ config(post_hook=['select 1'], tags=['delete']) }}\nSELECT 1 AS a",   # hook 之後的別的設定
+    "{{ run_query('select 1') ~ 'delete stuff' }}\nSELECT 1 AS a",            # run_query 已經閉合
+    "{% set msg = 'update later' %}\nSELECT 1 AS a",
+    "{% set msg = 'truncate later; grant access; alter ego' %}\nSELECT 1 AS a",
+    "{% set msg = 'insert coin' %}\nSELECT 1 AS a",
+])
+def test_不會被執行_也不像寫入語句的字串不報(src):
+    assert hw.occurrences(src)[1] == []
 
 
 @pytest.mark.parametrize("src", [

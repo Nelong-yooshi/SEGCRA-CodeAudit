@@ -5,14 +5,21 @@
 所以這裡不靠「展開器跟 dbt 一樣」,改看樣板原文:
 
 * **固定文字裡的寫入關鍵字**:每一個前面插一個隨機記號,用同一支展開器再展開一次(一般模式;
-  樣板有呼叫 `is_incremental()` 時增量模式也一次)。哪一次的輸出都沒有那個記號 → 那一句這次審查
-  沒有展開到,不論用什麼條件藏。macro 產生的語句不帶記號,拿來掩護也沒用。
+  樣板有呼叫 `is_incremental()` 時增量模式也一次)。**記號後面要緊接著那段固定文字**(從關鍵字到
+  下一個 Jinja 標記為止;不分大小寫,`{% filter upper %}` 會改大小寫;結尾的空白不算,`-%}` 會
+  修掉)才算展開到。只看記號有沒有出現不夠:樣板可以先把語句收進變數,再只印出前面的記號
+  (`{{ w[:-22] }}`、`{{ w | replace(...) }}`)。哪一次都沒有展開到 → 那一句這次審查沒有展開到,
+  不論用什麼條件藏。macro 產生的語句不帶記號,拿來掩護也沒用。
 * **插記號的那次展開,去掉記號後必須跟第一次的展開結果相同**:不同代表樣板會因為記號改變輸出
-  (例如檢查自己的內容),「記號出現了」就不代表規則層看到了同一句,這時無法確認,一律報。
+  (例如檢查自己的內容、偵測到記號才印出完整語句),這時無法確認,一律報。
   比對前遮掉 uuid 格式的字串(`invocation_id` 每次展開都不同),只差在那裡的兩份輸出結構相同。
-* **Jinja 標記裡的字串含寫入關鍵字**(例如 `post_hook="DELETE ..."`、`{% set q = 'DELETE ...' %}`):
-  展開結果裡看不到,規則層沒有檢查到,一律報。標記裡的名稱不算(`{% if execute %}` 的 execute
-  是 dbt 的變數)。
+* **Jinja 標記裡的字串**(展開結果裡看不到,規則層沒有檢查到):
+  * dbt 會拿去當 SQL 執行的位置——`pre_hook` / `post_hook`(含 `pre-hook` / `post-hook`)、
+    `sql_header` 的值,`run_query(...)` 的參數——字串裡有寫入關鍵字就報;
+  * 其他位置的字串要**像一句寫入語句**才報(`DELETE FROM`、`INSERT INTO`、`UPDATE x SET`、
+    `MERGE INTO`、`DROP TABLE`…,見 _STATEMENT):`{% set q = 'DELETE FROM t' %}` 之後可能交給
+    `run_query(q)`。`incremental_strategy='merge'`、`materialized` 的值、`log()` 的訊息不報。
+  標記裡的名稱不算(`{% if execute %}` 的 execute 是 dbt 的變數)。
 * Jinja 註解不算:dbt 執行時也不會輸出。
 * 關鍵字拆開寫(`DEL{{ '' }}ETE`)也找得到:固定文字接起來再找一次。
 
@@ -32,6 +39,29 @@ WRITE_KEYWORDS = ("INSERT", "UPDATE", "DELETE", "MERGE", "DROP", "TRUNCATE", "AL
 # 前後不能接識別字的字元:`updated_at`、`@delete`、`#drop_tmp` 都不是關鍵字
 _KEYWORD_RE = re.compile(r"(?<![A-Za-z0-9_@#$])(" + "|".join(WRITE_KEYWORDS) + r")(?![A-Za-z0-9_@#$])",
                          re.IGNORECASE)
+# 標記字串裡「像一句寫入語句」:關鍵字後面接著該有的下一個字。每一條都從關鍵字的位置 match,
+# 量詞之間有固定的分隔,沒有巢狀的重複(不會回溯爆炸)
+_OBJECTS = (r"(?:TABLE|VIEW|SCHEMA|DATABASE|INDEX|PROCEDURE|PROC|FUNCTION|TRIGGER|SYNONYM|"
+            r"SEQUENCE|TYPE|USER|LOGIN|ROLE)\b")
+_TOP = r"(?:TOP\s*\([^)]*\)\s*)?"
+_STATEMENT = re.compile(
+    r"DELETE\s+" + _TOP + r"(?:FROM\b|\S+\s+(?:WHERE|FROM|OUTPUT)\b)"
+    r"|INSERT\s+" + _TOP + r"(?:INTO\b|\S+\s*(?:\(|VALUES\b|SELECT\b|EXEC))"
+    r"|UPDATE\s+" + _TOP + r"\S+\s+SET\b"
+    r"|MERGE\s+(?:INTO\b|\S+\s+(?:(?:AS\s+)?\w+\s+)?USING\b)"
+    r"|(?:DROP|ALTER)\s+" + _OBJECTS +
+    r"|TRUNCATE\s+TABLE\b"
+    r"|CREATE\s+(?:(?:OR\s+ALTER|UNIQUE|CLUSTERED|NONCLUSTERED)\s+)*" + _OBJECTS +
+    r"|EXEC(?:UTE)?\s*(?:\(|@|\[|(?:sp|xp)_|\w+\.\w)"
+    r"|(?:GRANT|REVOKE)\s+\w+(?:\s*,\s*\w+)*\s+(?:ON|TO|FROM)\b",
+    re.IGNORECASE)
+# dbt 會拿去當 SQL 執行的設定
+# 整個字串就是一句 `EXEC 名稱`(字串裡其他地方出現 exec 加一個字太常見,例如 log 訊息)
+_WHOLE_EXEC = re.compile(r"EXEC(?:UTE)?\s+[\w.\[\]]+\s*;?", re.IGNORECASE)
+_EXEC_KEYS = frozenset({"pre_hook", "post_hook", "pre-hook", "post-hook", "sql_header"})
+_KEY_RE = re.compile(r"([A-Za-z_][\w-]*)\s*[=:]")
+_STRING_KEY_RE = re.compile(r"\s*:")
+_RUN_QUERY_RE = re.compile(r"\brun_query\s*\(")
 _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 _TAG_PAIRS = {"{{": "}}", "{%": "%}", "{#": "#}"}
 
@@ -102,10 +132,43 @@ def occurrences(text: str) -> tuple[list[tuple[int, str]], list[tuple[int, str]]
         found.setdefault(pieces[k][0] + m.start() - starts[k], m.group(1).upper())
     for kind, s, e in segments:
         if kind == "tag":
-            for a, b in _strings(text, s, e):
-                in_tags.extend((m.start(), m.group(1).upper())
-                               for m in _KEYWORD_RE.finditer(text, a, b))
+            in_tags.extend(_tag_writes(text, s, e))
     return sorted(found.items()), in_tags
+
+
+def _tag_writes(text: str, start: int, end: int):
+    """一個標記裡、字串常值中的寫入關鍵字:會被執行的位置全部算,其他位置只算像一句寫入語句的。
+
+    位置看字串前面最近的「名稱 =」或「名稱 :」(名稱寫成字串、後面接 `:` 的也算,例如
+    `{'post-hook': ...}`);找名稱時不看字串內容(字串裡的 `a = 1` 不是設定)。串列裡後面的
+    字串沿用同一個名稱(`post_hook=['…', '…']`)。`run_query(` 還沒閉合時也算會被執行。"""
+    pos, key, masked = start + 2, None, []
+    for a, b in _strings(text, start, end):
+        gap = text[pos:a - 1]
+        masked.append(gap)
+        for km in _KEY_RE.finditer(gap):
+            key = km.group(1).lower()
+        pos = b + 1
+        if _STRING_KEY_RE.match(text, pos, end):           # 字串本身是名稱
+            key = text[a:b].lower()
+            masked.append("''")
+            continue
+        executed = key in _EXEC_KEYS or _inside_run_query("".join(masked))
+        masked.append("''")
+        for m in _KEYWORD_RE.finditer(text, a, b):
+            if executed or _STATEMENT.match(text, m.start(), b) or \
+                    _WHOLE_EXEC.fullmatch(text[a:b].strip()):
+                yield m.start(), m.group(1).upper()
+
+
+def _inside_run_query(masked: str) -> bool:
+    last = None
+    for last in _RUN_QUERY_RE.finditer(masked):
+        pass
+    if last is None:
+        return False
+    rest = masked[last.end():]
+    return rest.count("(") >= rest.count(")")
 
 
 def _marker(token: str, n: int) -> str:
@@ -126,6 +189,19 @@ def mark(text: str, found: list[tuple[int, str]], token: str) -> str:
         prev = pos
     out.append(text[prev:])
     return "".join(out)
+
+
+def _tails(text: str, found: list[tuple[int, str]]) -> list[str]:
+    """每個關鍵字從它的位置到所在那段固定文字的結尾(下一個 Jinja 標記之前),去掉結尾的空白
+    (`{%-` 會修掉前面的空白)。拆開寫的關鍵字(`DEL{{ '' }}ETE`)只有第一段。"""
+    ends = sorted(e for kind, _, e in _segments(text) if kind == "literal")
+    return [text[pos:ends[bisect.bisect_right(ends, pos)]].rstrip() for pos, _ in found]
+
+
+def _inside(found: list[tuple[int, str]], n: int, tail: str) -> int:
+    """第 n 個關鍵字那段裡,後面還夾著幾個關鍵字(各自前面會插記號)。"""
+    pos = found[n][0]
+    return sum(1 for p, _ in found[n + 1:] if p < pos + len(tail))
 
 
 def _lines(text: str, found: list[tuple[int, str]]) -> list[dict]:
@@ -158,16 +234,25 @@ def find_hidden_writes(source: str, clean: dict, render, *, token: str | None = 
     token = token or secrets.token_hex(8)
     pattern = _marker_re(token)
     marked = mark(source, literal, token)
+    tails = _tails(source, literal)
+    # 記號後面那段可能夾著後面關鍵字的記號:比對的範圍要放寬這麼多,去掉記號後再比
+    room = [len(tails[n]) + len(_marker(token, len(literal))) * _inside(literal, n, tails[n])
+            for n in range(len(literal))]
     reached: set[int] = set()
     for incremental, clean_sql in clean.items():
         result = render(marked, incremental)
         if not getattr(result, "ok", False) or not isinstance(getattr(result, "sql", None), str):
             out[UNVERIFIED] = "加了檢查記號後展開失敗,無法確認寫入語句有沒有展開到"
             return out
-        if _UUID_RE.sub("", pattern.sub("", result.sql)) != _UUID_RE.sub("", clean_sql):
+        sql = result.sql
+        if _UUID_RE.sub("", pattern.sub("", sql)) != _UUID_RE.sub("", clean_sql):
             out[UNVERIFIED] = "加了檢查記號後展開結果不同,樣板會因為內容改變輸出,無法確認"
             return out
-        reached.update(int(m.group(1)) for m in pattern.finditer(result.sql))
+        for m in pattern.finditer(sql):
+            n = int(m.group(1))
+            if n < len(literal) and pattern.sub("", sql[m.end():m.end() + room[n]]).lower() \
+                    .startswith(tails[n].lower()):
+                reached.add(n)
     unreached = [occ for n, occ in enumerate(literal) if n not in reached]
     if unreached:
         out[UNREACHED] = _lines(source, unreached)
