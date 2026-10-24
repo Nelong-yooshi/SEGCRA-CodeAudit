@@ -139,6 +139,26 @@ _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # 與 dbt-core 的 Jinja 環境相同的擴充
 _JINJA_EXTENSIONS = ["jinja2.ext.do", "jinja2.ext.loopcontrols"]
 
+
+def _is_list(value) -> bool:
+    return isinstance(value, list)
+
+
+def _as_is(value):
+    return value
+
+
+# dbt 加的濾器,照 dbt_common 的 TEXT_FILTERS(compile 展開 SQL 時用的那一組):
+# as_text / as_bool / as_native / as_number 原樣回傳,is_list 判斷是不是 list。
+# 少了它們,用到的 macro 與 model 會被當成展開器不支援,正常的寫法每次都要人看。
+_DBT_TEXT_FILTERS = {
+    "as_text": _as_is,
+    "as_bool": _as_is,
+    "as_native": _as_is,
+    "as_number": _as_is,
+    "is_list": _is_list,
+}
+
 # 正式環境所有表都在單一資料庫的 dbo 底下
 DEFAULT_SCHEMA = "dbo"
 # 正式環境的 dbt 轉接器;決定 adapter.dispatch 先找哪個前綴的實作
@@ -727,6 +747,7 @@ def build_env(code_root=None, variables: dict | None = None,
         extensions=[*_JINJA_EXTENSIONS, _DbtBlocks],
         finalize=_finalize,
     )
+    env.filters.update(_DBT_TEXT_FILTERS)
 
     # 是否用到 ref()/source() 記在這裡,render_model() 展開成功後讀出來決定
     # relation_notice 要不要帶上。掛在 env 上是既有作法(見 segcra_macro_phase),
@@ -1128,40 +1149,27 @@ def _relation_notice(usage: dict, project: DbtProjectInfo | None) -> str | None:
 
 
 # ------------------------------------------------------------------ macro 檔檢查
-# macro 檔載入失敗的種類。只有 SYNTAX 是「dbt 一樣解析不了、整個專案編譯失敗」;其餘可能是展開器
-# 的限制(dbt 有、我們沒有的標籤、濾器、內建函式),dbt 不一定有問題。
-MACRO_SYNTAX = "syntax"              # Jinja 語法錯誤(未閉合的區塊、寫錯的運算式…)
-MACRO_UNSUPPORTED = "unsupported"    # 不認得的標籤、濾器、判斷(dbt 可能有)
+# macro 檔載入失敗的種類。只有 SYNTAX 是「dbt 一樣解析不了、整個專案編譯失敗」;其餘是 dbt 解析
+# 得過、用到時才可能失敗,或展開器的限制,dbt 不一定有問題。
+MACRO_SYNTAX = "syntax"              # Jinja 語法錯誤(未閉合的區塊、寫錯的運算式、不認得的標籤…)
+MACRO_UNSUPPORTED = "unsupported"    # 不認得的濾器、重複定義的 block(dbt 解析得過,用到時才失敗)
 MACRO_TOO_DEEP = "too_deep"          # 巢狀太深(Python 的遞迴上限不一定跟 dbt 相同)
 MACRO_LOAD_FAILED = "load_failed"    # 解析得過,載入時失敗(模組層用到展開器沒提供的東西、讀檔失敗)
-
-
-_UNKNOWN_TAG_RE = re.compile(r"Encountered unknown tag '([^']*)'")
-
-
-def _is_nesting_tag(tag: str) -> bool:
-    """結束標籤或 elif / else:Jinja 認得的區塊寫錯巢狀時才會被說成「不認得」。"""
-    return tag.startswith("end") or tag in ("elif", "else")
 
 
 def macro_issue(rel: str, error: BaseException) -> dict:
     """macro 檔載入失敗的分類:{path, kind, line}。只有種類與行號,不帶錯誤訊息(含樣板內容)。
 
-    「不認得的標籤」與 TemplateAssertionError(不認得的濾器 `as_bool`、重複定義的 block…)都是
-    Jinja 語法錯誤的子類別,但 dbt 自己加了標籤與濾器,展開器沒有的不代表 dbt 也沒有,所以分開。
-    例外:Jinja 對巢狀寫錯(`{% if %}` 沒閉合就遇到 `{% endmacro %}`)也說「不認得的標籤」,
-    那個標籤是結束標籤或 elif / else——這是真的語法錯誤。"""
+    **不認得的標籤算語法錯誤**:dbt 的 Jinja 環境(dbt_common 的 get_environment)只多了 `do`、
+    `loopcontrols` 兩個 Jinja 內建擴充與 `materialization`、`docs`、`test` 三個標籤,展開器全都有
+    (另外還認得 `snapshot`)。所以展開器不認得的標籤 dbt 也不認得,整個專案解析失敗。
+    TemplateAssertionError(不認得的濾器、重複定義的 block)也是語法錯誤的子類別,但 dbt 解析得過、
+    呼叫到那個 macro 時才失敗,所以分開給 major。dbt 自己加的濾器展開器都有(見 _DBT_TEXT_FILTERS)。"""
     line = 0
     if isinstance(error, jinja2.TemplateSyntaxError):
         lineno = getattr(error, "lineno", None)
         line = lineno if isinstance(lineno, int) and not isinstance(lineno, bool) and lineno > 0 else 0
-        if isinstance(error, jinja2.TemplateAssertionError):
-            kind = MACRO_UNSUPPORTED
-        else:
-            found = _UNKNOWN_TAG_RE.match(str(getattr(error, "message", "") or ""))
-            kind = MACRO_SYNTAX
-            if found is not None and not _is_nesting_tag(found.group(1)):
-                kind = MACRO_UNSUPPORTED
+        kind = MACRO_UNSUPPORTED if isinstance(error, jinja2.TemplateAssertionError) else MACRO_SYNTAX
     elif isinstance(error, RecursionError):
         kind = MACRO_TOO_DEEP
     else:

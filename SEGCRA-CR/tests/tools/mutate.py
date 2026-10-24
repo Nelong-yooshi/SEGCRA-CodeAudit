@@ -253,18 +253,19 @@ MUTANTS = {
         + "        total += len(text)",
         "            continue" + NL + "        total += len(text)"),
     "macro 檢查:不認得的濾器當成語法錯誤": (
-        "        if isinstance(error, jinja2.TemplateAssertionError):" + NL
-        + "            kind = MACRO_UNSUPPORTED",
-        "        if False:" + NL + "            kind = MACRO_UNSUPPORTED"),
-    "macro 檢查:不認得的標籤當成語法錯誤": (
-        "            if found is not None and not _is_nesting_tag(found.group(1)):",
-        "            if False:"),
-    "macro 檢查:巢狀寫錯當成不認得的標籤(結束標籤)": (
-        '    return tag.startswith("end") or tag in ("elif", "else")',
-        '    return tag in ("elif", "else")'),
-    "macro 檢查:巢狀寫錯當成不認得的標籤(else)": (
-        '    return tag.startswith("end") or tag in ("elif", "else")',
-        '    return tag.startswith("end")'),
+        "        kind = MACRO_UNSUPPORTED if isinstance(error, jinja2.TemplateAssertionError) else MACRO_SYNTAX",
+        "        kind = MACRO_SYNTAX"),
+    "macro 檢查:不認得的標籤當成展開器的限制": (
+        "        kind = MACRO_UNSUPPORTED if isinstance(error, jinja2.TemplateAssertionError) else MACRO_SYNTAX",
+        "        kind = MACRO_UNSUPPORTED"),
+    "macro 檢查:沒有 dbt 加的濾器": (
+        "    env.filters.update(_DBT_TEXT_FILTERS)", "    pass"),
+    "macro 檢查:少了 dbt 的 as_native 濾器": (
+        '    "as_native": _as_is,' + NL, ""),
+    "macro 檢查:is_list 不分型別": (
+        "    return isinstance(value, list)", "    return isinstance(value, (list, tuple, dict))"),
+    "macro 檢查:as_ 濾器不是原樣回傳": (
+        "def _as_is(value):" + NL + "    return value", "def _as_is(value):" + NL + "    return str(value) + ' '"),
     "macro 檢查:巢狀太深不另外分類": (
         "    elif isinstance(error, RecursionError):", "    elif False:"),
     "macro 檢查:不記行號": (

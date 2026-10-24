@@ -1,8 +1,8 @@
 """MR 改到的 macro 檔載入失敗時補 finding。
 
-只有 Jinja 語法錯誤(區塊沒閉合、運算式寫錯…)是 dbt 一樣解析不了、整個專案編譯失敗,補 blocker。
-不認得的標籤 / 濾器、巢狀太深、載入時失敗可能是展開器的限制(dbt 自己加了標籤與濾器),補 major
-「無法確認」,不報 blocker,免得誤擋正常的 MR。
+Jinja 語法錯誤(區塊沒閉合、運算式寫錯、不認得的標籤…)dbt 一樣解析不了、整個專案編譯失敗,補 blocker。
+不認得的濾器、重複定義的 block(dbt 解析得過、用到時才失敗)、巢狀太深、載入時失敗,補 major「無法確認」。
+dbt 加的濾器展開器都有,用到的 macro 不報。
 """
 import asyncio
 import json
@@ -42,19 +42,38 @@ def _issues(files: dict, **kw):
     ("{% macro m() %}\n{% else %}\n{% endmacro %}", 2),                  # 多出來的 else
     ("{% macro m() %}\nselect 1\n", 1),                                   # macro 沒閉合
     ("{% macro m() %}{% for x in y %}{% endif %}{% endmacro %}", 1),     # 結束標籤對錯
+    ("{% macro m() %}\n{% weird %}\n{% endmacro %}", 2),                 # 不認得的標籤
+    ("{% macro m() %}\n{% if x %}\n{% iff y %}{% endif %}{% endmacro %}", 3),   # 打錯字,在區塊裡
+    ("{% macro m() %}\n{% data_test t %}{% enddata_test %}{% endmacro %}", 2),   # dbt 也不認得
 ])
 def test_Jinja語法錯誤是_syntax_並記下行號(text, line):
     assert _issues({"macros/a.sql": text}) == {"macros/a.sql": (MACRO_SYNTAX, line)}
 
 
 @pytest.mark.parametrize("text", [
-    "{% macro m() %}{% weird %}{% endmacro %}",                          # 不認得的標籤
-    "{% macro m() %}{% if x %}{% weird %}{% endif %}{% endmacro %}",     # 在區塊裡也一樣
-    "{% macro m() %}{{ x | as_bool }}{% endmacro %}",                    # dbt 有的濾器
-    "{% block a %}{% endblock %}{% block a %}{% endblock %}",            # TemplateAssertionError
+    "{% macro m() %}{{ x | no_such_filter }}{% endmacro %}",             # 不認得的濾器
+    "{% block a %}{% endblock %}{% block a %}{% endblock %}",            # 重複定義的 block
 ])
-def test_展開器不認得的寫法是_unsupported_不當成語法錯誤(text):
+def test_dbt解析得過_用到才失敗的寫法是_unsupported(text):
     assert _issues({"macros/a.sql": text})["macros/a.sql"][0] == MACRO_UNSUPPORTED
+
+
+@pytest.mark.parametrize("name", ["as_text", "as_bool", "as_native", "as_number", "is_list"])
+def test_dbt加的濾器展開器都有_用到的macro不報(name):
+    text = "{% macro m(x) %}{{ x | " + name + " }}{% endmacro %}"
+    assert _issues({"macros/a.sql": text}) == {}
+
+
+@pytest.mark.parametrize("expr,out", [
+    ("'a' | as_text", "a"), ("1 | as_number", "1"), ("true | as_bool", "True"),
+    ("'x' | as_native", "x"), ("[1] | is_list", "True"), ("'a' | is_list", "False"),
+    ("(1,) | is_list", "False"), ("{} | is_list", "False"),
+])
+def test_dbt加的濾器照dbt的行為展開(expr, out):
+    """dbt_common 的 TEXT_FILTERS:as_text / as_bool / as_native / as_number 原樣回傳,
+    is_list 只有 list 是 True。"""
+    r = dbt_render.render_model("models/m.sql", source="select {{ " + expr + " }}", database=DB)
+    assert r.ok and r.sql == f"select {out}"
 
 
 def test_巢狀太深是_too_deep():

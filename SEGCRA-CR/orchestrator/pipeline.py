@@ -1919,7 +1919,7 @@ _MACRO_SYNTAX_TITLE = "macro 檔有 Jinja 語法錯誤,dbt 整個專案會編譯
 _MACRO_UNCERTAIN_TITLE = "展開器載入不了這個 macro 檔,無法確認 dbt 能不能編譯"
 _MACRO_CHECK_FAILED = "check_failed"      # 檢查本身沒做完(逾時、資源上限、設定不符)
 _MACRO_UNCERTAIN_REASONS = {
-    MACRO_UNSUPPORTED: "用到展開器不認得的標籤、濾器或判斷(dbt 自己加了一些,這裡沒有的不代表 dbt 也沒有)",
+    MACRO_UNSUPPORTED: "用到不認得的濾器,或重複定義了同名的 block(dbt 解析得過,呼叫到這個 macro 時才會失敗)",
     MACRO_TOO_DEEP: "巢狀太深,展開器解析不完",
     MACRO_LOAD_FAILED: "解析得過,但載入時失敗(檔案開頭用到展開器沒有提供的東西,或讀不到內容)",
     _MACRO_CHECK_FAILED: "檢查沒有做完(逾時、超過資源上限,或 dbt 的設定與預期不符)",

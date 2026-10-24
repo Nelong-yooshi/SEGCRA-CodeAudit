@@ -420,12 +420,14 @@ alias 寫在 seed 目錄的屬性檔裡,都沒有讀,所以一律標成無法確
 **改到的 macro 檔本身。** MR 改到 macro 檔時,照展開時的方式(同樣的資料庫名、macro 目錄、專案資訊)把整包
 macro 載入一次(隔離子行程),看改到的檔載入得了嗎:
 
-- **Jinja 語法錯誤**(區塊沒閉合、運算式寫錯、多出來的 `else`):dbt 一樣解析不了,整個專案編譯失敗、部署端
-  整個載入失敗 → **blocker**,寫出行號
-- 不認得的標籤、濾器、判斷(dbt 自己加了一些,例如 `as_bool`,展開器沒有的不代表 dbt 也沒有)、巢狀太深、
-  解析得過但載入時失敗、檢查沒做完 → **major**「無法確認」,不報 blocker,免得誤擋正常的 MR
-- Jinja 對巢狀寫錯(`{% if %}` 沒閉合就遇到 `{% endmacro %}`)也說「不認得的標籤」;那個標籤是結束標籤或
-  `elif` / `else` 時算語法錯誤
+- **Jinja 語法錯誤**(區塊沒閉合、運算式寫錯、多出來的 `else`、**不認得的標籤**):dbt 一樣解析不了,整個專案
+  編譯失敗、部署端整個載入失敗 → **blocker**,寫出行號。dbt 的 Jinja 環境(dbt_common 的 `get_environment`)
+  只多了 `do`、`loopcontrols` 與 `materialization`、`docs`、`test` 三個標籤,展開器全都有(另外認得 `snapshot`),
+  所以展開器不認得的標籤 dbt 也不認得(例如打錯字的 `{% iff %}`、`{% data_test %}`)
+- 不認得的濾器、重複定義的 block(dbt 解析得過,呼叫到那個 macro 時才失敗)、巢狀太深、解析得過但載入時失敗、
+  檢查沒做完 → **major**「無法確認」
+- dbt 加的五個濾器(`as_text`、`as_bool`、`as_native`、`as_number`、`is_list`,dbt_common 的 `TEXT_FILTERS`)
+  展開器照 dbt 的行為提供:前四個原樣回傳,`is_list` 判斷是不是 list。用到它們的 macro 與 model 照常展開
 - 只看改到的檔:專案裡本來就壞的檔不是這個 MR 造成的,用到它的 model 展開失敗時已經會報
 - 只寫種類與行號,不帶 Jinja 的錯誤訊息(裡面有樣板內容)
 
