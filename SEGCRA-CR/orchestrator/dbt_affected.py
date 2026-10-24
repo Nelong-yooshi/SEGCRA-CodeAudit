@@ -32,10 +32,13 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 
+from sqlglot.errors import SqlglotError
+
 from .config import DBT_DATABASE_PLACEHOLDER
 from .dbt_context import DbtContext
 from .dbt_impact import ImpactReport
 from .dbt_render import DEFAULT_ISOLATED_TIMEOUT_S, render_model_isolated
+from toolbox.sqltools import DIALECT, _parse
 
 MAX_CHECKED_MODELS = 50
 MAX_SPEC_LOOKUPS = 20          # 規格逐一向 GitLab 探測,數量另外設限
@@ -384,11 +387,10 @@ async def _hits(hub, rel, text, dbt_cfg, macro_files, macro_dirs, info, render, 
 
 def _statement_keys(sql: str) -> list[str] | None:
     """展開後 SQL 的每一句,文字寫法與規則命中的 statement 相同(規則層同一個函式產生)。
-    切不出來回 None。"""
-    from toolbox.sqltools import DIALECT, _parse
+    切不出來(解析錯誤、巢狀太深)回 None;其他例外是程式的錯,往外丟。"""
     try:
         return [st.sql(dialect=DIALECT)[:200] for st in _parse(sql) if st is not None]
-    except Exception:                        # noqa: BLE001 — 切不出來就只能整個 model 合計比較
+    except (SqlglotError, RecursionError):   # 切不出來就只能整個 model 合計比較
         return None
 
 
