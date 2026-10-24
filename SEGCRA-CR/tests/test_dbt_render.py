@@ -1346,7 +1346,11 @@ def test_unrendered_template_is_blind_spot():
     out = json.loads(sqltools.run_rules(REFERENCE_SOURCES["mrt_RETAIL_M1"]))
     assert isinstance(out, dict), "預期原始樣板應解析失敗並回 {'error':...}"
     assert "parse failed" in out["error"]
-    assert out["hits"] == [], "未展開時不應命中任何規則(這正是盲區)"
+    # 語法樹規則(R001 DML 無 WHERE、R002 SELECT * …)整組沒跑,這正是盲區。
+    # 文字層的提醒(H008:編譯期讀 target / var)不需要語法樹,原始樣板上就看得到 ——
+    # 它量的是「編譯期決定了展開出哪一段 SQL」,跟展不展開無關。
+    assert [h["rule"] for h in out["hits"] if h["rule"].startswith("R")] == [], \
+        "未展開時不應命中任何語法樹規則(這正是盲區)"
 
 
 # ------------------------------------------------------------ relation_notice

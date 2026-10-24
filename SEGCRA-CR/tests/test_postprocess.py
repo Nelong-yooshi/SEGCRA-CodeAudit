@@ -178,10 +178,10 @@ def test_自己補的_finding_不能讓其他檔案的同一條命中被跳過()
 
 
 def test_不認得的規則嚴重度只有_blocker_才算報過():
-    pre = _pre([{"rule": "R009", "severity": "critical", "message": "R009 新規則"}])
-    major = {"severity": "major", "file": FILE, "title": "R009 已處理"}
+    pre = _pre([{"rule": "R999", "severity": "critical", "message": "R999 新規則"}])
+    major = {"severity": "major", "file": FILE, "title": "R999 已處理"}
     assert len(enforce_rules({"findings": [dict(major)]}, pre)["findings"]) == 2
-    blocker = {"severity": "blocker", "file": FILE, "title": "R009 已處理"}
+    blocker = {"severity": "blocker", "file": FILE, "title": "R999 已處理"}
     assert len(enforce_rules({"findings": [dict(blocker)]}, pre)["findings"]) == 1
 
 

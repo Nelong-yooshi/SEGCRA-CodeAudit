@@ -146,6 +146,26 @@ _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # 與 dbt-core 的 Jinja 環境相同的擴充
 _JINJA_EXTENSIONS = ["jinja2.ext.do", "jinja2.ext.loopcontrols"]
 
+
+def _is_list(value) -> bool:
+    return isinstance(value, list)
+
+
+def _as_is(value):
+    return value
+
+
+# dbt 加的濾器,照 dbt_common 的 TEXT_FILTERS(compile 展開 SQL 時用的那一組):
+# as_text / as_bool / as_native / as_number 原樣回傳,is_list 判斷是不是 list。
+# 少了它們,用到的 macro 與 model 會被當成展開器不支援,正常的寫法每次都要人看。
+_DBT_TEXT_FILTERS = {
+    "as_text": _as_is,
+    "as_bool": _as_is,
+    "as_native": _as_is,
+    "as_number": _as_is,
+    "is_list": _is_list,
+}
+
 # 正式環境所有表都在單一資料庫的 dbo 底下
 DEFAULT_SCHEMA = "dbo"
 # 正式環境的 dbt 轉接器;決定 adapter.dispatch 先找哪個前綴的實作
@@ -866,6 +886,7 @@ def build_env(code_root=None, variables: dict | None = None,
     _guard_relation_tests(env)
     env.filters["attr"] = _attr_filter
     env.filters["string"] = _string_filter(env.filters["string"])
+    env.filters.update(_DBT_TEXT_FILTERS)
 
     # 是否用到 ref()/source() 記在這裡,render_model() 展開成功後讀出來決定
     # relation_notice 要不要帶上。掛在 env 上是既有作法(見 segcra_macro_phase),
@@ -913,6 +934,8 @@ def build_env(code_root=None, variables: dict | None = None,
     macros: list[str] = []
     conflicts: list[str] = []
     problems: list[str] = []
+    # 同樣的失敗,另外分類記下(見 macro_issue):給 check_macro_files 用
+    env.segcra_macro_issues = []
     if code_root is None and macro_files is None:
         return env, macros, conflicts, problems
     if code_root is not None and macro_files is not None:
@@ -952,6 +975,7 @@ def build_env(code_root=None, variables: dict | None = None,
             text = origin if isinstance(origin, str) else origin.read_bytes().decode("utf-8")
         except UnicodeDecodeError as e:
             problems.append(f"{rel}:{_safe_error(e)}")
+            env.segcra_macro_issues.append(macro_issue(rel, e))
             continue
         total += len(text)
         if total > MAX_MACRO_CHARS:
@@ -969,6 +993,7 @@ def build_env(code_root=None, variables: dict | None = None,
             # 略過它並記錄。真的需要它的 model 仍會因為名稱未定義而大聲失敗,
             # 不會靜靜產出少了那段邏輯的 SQL。
             problems.append(f"{rel}:{_safe_error(e)}")
+            env.segcra_macro_issues.append(macro_issue(rel, e))
             continue
         for name in dir(module):
             if name.startswith("_"):
@@ -1263,6 +1288,69 @@ def _relation_notice(usage: dict, project: DbtProjectInfo | None) -> str | None:
     if project is None:
         return _RELATION_NOTICE if usage["used"] else None
     return _RELATION_UNCERTAIN_NOTICE if usage["uncertain"] else None
+
+
+# ------------------------------------------------------------------ macro 檔檢查
+# macro 檔載入失敗的種類。只有 SYNTAX 是「dbt 一樣解析不了、整個專案編譯失敗」;其餘是 dbt 解析
+# 得過、用到時才可能失敗,或展開器的限制,dbt 不一定有問題。
+MACRO_SYNTAX = "syntax"              # Jinja 語法錯誤(未閉合的區塊、寫錯的運算式、不認得的標籤…)
+MACRO_UNSUPPORTED = "unsupported"    # 不認得的濾器、重複定義的 block(dbt 解析得過,用到時才失敗)
+MACRO_TOO_DEEP = "too_deep"          # 巢狀太深(Python 的遞迴上限不一定跟 dbt 相同)
+MACRO_LOAD_FAILED = "load_failed"    # 解析得過,載入時失敗(模組層用到展開器沒提供的東西、讀檔失敗)
+
+
+def macro_issue(rel: str, error: BaseException) -> dict:
+    """macro 檔載入失敗的分類:{path, kind, line}。只有種類與行號,不帶錯誤訊息(含樣板內容)。
+
+    **不認得的標籤算語法錯誤**:dbt 的 Jinja 環境(dbt_common 的 get_environment)只多了 `do`、
+    `loopcontrols` 兩個 Jinja 內建擴充與 `materialization`、`docs`、`test` 三個標籤,展開器全都有
+    (另外還認得 `snapshot`)。所以展開器不認得的標籤 dbt 也不認得,整個專案解析失敗。
+    TemplateAssertionError(不認得的濾器、重複定義的 block)也是語法錯誤的子類別,但 dbt 解析得過、
+    呼叫到那個 macro 時才失敗,所以分開給 major。dbt 自己加的濾器展開器都有(見 _DBT_TEXT_FILTERS)。"""
+    line = 0
+    if isinstance(error, jinja2.TemplateSyntaxError):
+        lineno = getattr(error, "lineno", None)
+        line = lineno if isinstance(lineno, int) and not isinstance(lineno, bool) and lineno > 0 else 0
+        kind = MACRO_UNSUPPORTED if isinstance(error, jinja2.TemplateAssertionError) else MACRO_SYNTAX
+    elif isinstance(error, RecursionError):
+        kind = MACRO_TOO_DEEP
+    else:
+        kind = MACRO_LOAD_FAILED
+    return {"path": rel, "kind": kind, "line": line}
+
+
+@dataclass(frozen=True)
+class MacroCheck:
+    """check_macro_files 的結果。ok=False:檢查本身沒做完(逾時、資源上限、子行程失敗),
+    不能當成沒問題。"""
+    ok: bool
+    issues: tuple = ()               # (macro_issue 的結果, ...)
+
+
+def check_macro_files(*, macro_files: dict, database: str | None = None,
+                      macro_dirs=DEFAULT_MACRO_DIRS, adapter: str = DEFAULT_ADAPTER,
+                      project: DbtProjectInfo | None = None) -> MacroCheck:
+    """照展開時的方式載入專案的 macro 檔(參數同 render_model),回傳每個載入失敗的檔與原因。
+    **待審的 MR 內容請改用 check_macro_files_isolated()。**"""
+    try:
+        env, _, _, _ = build_env(database=database, macro_dirs=macro_dirs, adapter=adapter,
+                                 project=project, macro_files=macro_files)
+    except Exception:                  # noqa: BLE001 — 資源上限、與內建同名等:檢查沒做完
+        return MacroCheck(ok=False)
+    return MacroCheck(ok=True, issues=tuple(env.segcra_macro_issues))
+
+
+def _macro_check_failure(message: str) -> MacroCheck:
+    return MacroCheck(ok=False)
+
+
+def check_macro_files_isolated(*, timeout_s: float = DEFAULT_ISOLATED_TIMEOUT_S,
+                               max_memory_mb: int = DEFAULT_ISOLATED_MEMORY_MB,
+                               **kwargs) -> MacroCheck:
+    """在獨立子行程中做 check_macro_files(理由同 render_model_isolated)。不丟例外。"""
+    result = run_isolated(check_macro_files, (), kwargs, timeout_s=timeout_s,
+                          max_memory_mb=max_memory_mb, on_failure=_macro_check_failure)
+    return result if isinstance(result, MacroCheck) else MacroCheck(ok=False)
 
 
 # ------------------------------------------------------------------ 隔離展開
