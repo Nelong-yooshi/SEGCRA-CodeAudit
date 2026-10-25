@@ -168,6 +168,20 @@ def test_真的命中待補項目_加註並交人工():
     assert r["_calibration"]["annotated"][0]["by"] == "spec-pending"
 
 
+def test_加註寫成有條件的():
+    """比對是用字猜的:真的缺陷剛好提到那幾個字也會被加註(例如「門檻寫成 > 而不是
+    >=,幣別換算之前就先比了」)。加註因此不能寫成已經判定是同一件事,否則看的人會
+    把真缺陷當成規格待補放過去。要讓讀的人自己判斷,也不能提「業務單位」——規格與
+    程式是同一個部門負責,沒有那一關。"""
+    f = _claim(title="門檻比較寫錯",
+               detail="門檻寫成 > 而不是 >=,而且在幣別換算之前就先比了")
+    out = enforce_spec_pending(_report([f]), R140)["findings"][0]["detail"]
+    assert "如果講的就是這件事" in out, out
+    assert "如果講的是別的問題" in out, out
+    assert "需確認規格後再合入" in out, out
+    assert "業務單位" not in out, out
+
+
 def test_待補項目逐項比對_不是整段字詞的聯集():
     """R-140 的待補段三項加起來有幾十個字詞,聯集比對的話任何提到其中兩個的 finding
     都會命中。逐項比對才能說「這條指控講的就是那一項待補的事」。"""
@@ -249,10 +263,11 @@ def test_太泛的項目名不比對():
     assert "待補" not in r["findings"][0]["detail"], r["findings"][0]["detail"]
 
 
-def test_加註的說法是規格沒有寫這件事的要求():
-    """原本寫「這件事沒有可對照的核定要求」,看的人會以為是程式缺了對照的東西。"""
+def test_加註的說法是規格沒有寫這項要求():
+    """寫「這件事沒有可對照的核定要求」的話,看的人會以為是程式缺了對照的東西;
+    要寫成缺的是規格那一側。"""
     r = enforce_spec_pending(_report([_claim(detail="外幣交易未依幣別折算")]), R140)
-    assert "規格沒有寫這件事的要求" in r["findings"][0]["detail"]
+    assert "規格沒有寫這項要求" in r["findings"][0]["detail"]
 
 
 @pytest.mark.parametrize("title,detail", [
