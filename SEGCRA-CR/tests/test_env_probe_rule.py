@@ -175,13 +175,30 @@ def test_雙引號識別字照樣命中R005(sql):
     "EXEC sys.sp_executesql N'SELECT 1'",
     "EXEC [sys].[sp_executesql] N'SELECT 1'",
     'EXEC "sys"."sp_executesql" N\'SELECT 1\'',
-    "EXEC sys.sp_who",
-    "EXEC sys.sp_addsrvrolemember 'app', 'sysadmin'",
 ])
-def test_sys的預存程序不算讀取執行環境(sql):
-    """`sys.sp_` 是預存程序,不是系統目錄。動態 SQL 由 R009 報、權限變更由 R008 報,
-    R005 再報一次只會讓同一句出現兩條說法不同的 finding。"""
+def test_sp_executesql不重複報(sql):
+    """這一支已經由 R009(動態 SQL)報。同一句出現兩條說法不同的 finding,看的人會
+    以為是兩件事。"""
     assert _r005(sql) == []
+
+
+@pytest.mark.parametrize("sql", [
+    # 回傳執行環境的系統預存程序:跟 HOST_NAME()、@@SERVERNAME 是同一類資訊
+    "EXEC sys.sp_who",
+    "EXEC sys.sp_helpserver",
+    "EXEC sys.sp_server_info",
+    "EXEC sys.sp_helpdb",
+    # 把帳號加進 sysadmin / db_owner:R008 只認 GRANT/REVOKE/DENY 這些新式寫法
+    "EXEC sys.sp_addsrvrolemember 'app', 'sysadmin'",
+    "EXEC sys.sp_addrolemember 'db_owner', 'app'",
+    'EXEC "sys"."sp_addsrvrolemember" \'app\', \'sysadmin\'',
+])
+def test_sp_executesql以外的系統預存程序照樣命中(sql):
+    """只排除別條已經報的那一支,不是整個 `sys.sp_` 都排除:其餘的沒有別的規則接手,
+    排掉就變成一條都不報。類別不完全貼切,但報得出來比漏掉好。"""
+    hits = _r005(sql)
+    assert len(hits) == 1, f"沒抓到:{sql}"
+    assert hits[0]["severity"] == "major"
 
 
 @pytest.mark.parametrize("sql", [

@@ -310,6 +310,22 @@ _MASKED_KEY_RE = re.compile(
 # 一路掃到檔尾才宣告失敗,整體是平方時間(實測 8 萬字元要 14 秒)。而這些內容由 MR
 # 決定。函式名與括號之間的空白或註解本來就很短,給得很寬也只是常數。
 _GAP = r"(?:\s|/\*(?:[^*]|\*(?!/)){0,500}\*/|--[^\n]*\n){0,30}"
+# 識別字的三種寫法:不加引號、方括號、雙引號(SQL Server 預設 `QUOTED_IDENTIFIER ON`,
+# `"sys"."databases"` 是可用的寫法)。**共用一份**:原本每條規則各寫各的,結果補的時候
+# 補得到一條、漏掉另一條 —— 換一種引號就繞過去的洞,要一次補完所有用到識別字的規則。
+_IDENT = r'(?:\[[^\]]+\]|"[^"]+"|[A-Za-z_]\w*)'   # 任意識別字:每一段都要像名字
+# 前後不能再接名字的一部分(含引號):避免切到更長的限定名稱中間
+_IDENT_BEFORE = r'(?<![\w.\["])'
+_IDENT_AFTER = r'(?![\w."])'
+
+
+def _named(name: str) -> str:
+    """寫死名稱的識別字(`sys` / `[sys]` / `"sys"`)。
+
+    引號**不要求成對**(`[sys` 也算):這些規則是找線索、不是解析,寫壞的引號照樣報,
+    代價只是多一次人工確認;要求成對反而讓「故意寫壞」變成繞過的辦法。
+    """
+    return r'[\["]?' + name + r'[\]"]?' 
 # 需要括號的環境函式。分三類只是為了讀起來分得清,比對時三條都跑。
 _ENV_FUNC_RE = re.compile(
     r"(?i)(?<![\w.@\[])("
@@ -338,13 +354,16 @@ _ENV_VAR_RE = re.compile(r"(?i)@@(SERVERNAME|SERVICENAME|VERSION|SPID)\b"
 # 就繞過去了。只容許「可能有引號」而不要求成對(`[sys` 也算),是因為這一條是找線索、
 # 不是解析:寫壞的引號照樣報,代價只是多一次人工確認。
 #
-# **`sys.sp_` 開頭不算**:那是預存程序(`sys.sp_executesql`、`sys.sp_who`),不是在讀
-# 執行環境。動態 SQL 由 R009 報、權限變更由 R008 報,這裡再報一次只會讓同一句出現
-# 兩條說法不同的 finding。
-_SYS = r'[\["]?sys[\]"]?'
-_OBJ = r'[\["]?\w+[\]"]?'
+# **只排除 `sys.sp_executesql`**:那一支已經由 R009(動態 SQL)報,同一句出現兩條說法
+# 不同的 finding 只會讓人以為是兩件事。其餘的 `sys.sp_*` 照樣算 —— `sp_who` 回傳每個
+# 連線的主機、登入帳號與資料庫,`sp_helpserver` 回傳伺服器名稱,跟 `HOST_NAME()`、
+# `@@SERVERNAME` 是同一類資訊;`sp_addsrvrolemember`、`sp_addrolemember` 是把帳號加進
+# sysadmin / db_owner,而 R008 只認 GRANT/REVOKE/DENY 這些新式寫法,不認它們。類別雖然
+# 不完全貼切,但報得出來比一條都不報好。
+_SYS = _named("sys")
+_OBJ = _named(r"\w+")
 _ENV_CATALOG_RE = re.compile(
-    r"(?i)(?<!\w)" + _SYS + _GAP + r"\." + _GAP + r'(?![\["]?sp_)' + _OBJ
+    r"(?i)(?<!\w)" + _SYS + _GAP + r"\." + _GAP + r'(?![\["]?sp_executesql\b)' + _OBJ
     # 舊式的系統表名(master..sysdatabases、master.dbo.sysobjects),沒有 sys. 前綴
     + r"|(?<!\w)[\[\"]?sys(databases|objects|columns|users|logins|processes|servers|indexes)[\]\"]?(?!\w)"
     r"|(?<!\w)[\[\"]?INFORMATION_SCHEMA[\]\"]?" + _GAP + r"\.")
@@ -377,13 +396,12 @@ _EXTERNAL_SRC_RE = re.compile(
 # 中間兩段可以是空的(server.db..table),最前與最後一定要有名字。
 # 每一段都要像識別字(字母或底線開頭,或是方括號包起來)—— 只寫 \w+ 的話
 # IP 位址 10.0.0.9 也是「四段」,寫死主機的連線字串會被報成 linked server。
-_IDENT_PART = r"(?:\[[^\]]+\]|[A-Za-z_]\w*)"
 _FOUR_PART_RE = re.compile(
-    r"(?<![\w.\[])" + _IDENT_PART + r"\." + _IDENT_PART + r"?\."
-    + _IDENT_PART + r"?\." + _IDENT_PART + r"(?![\w.])")
+    _IDENT_BEFORE + _IDENT + r"\." + _IDENT + r"?\."
+    + _IDENT + r"?\." + _IDENT + _IDENT_AFTER)
 # 作業系統命令。lookbehind **不排除點**:`master..xp_cmdshell` 正是最常見的寫法,
 # 排除點就等於只抓得到沒有限定名稱的那一種。
-_OS_CMD_RE = re.compile(r"(?i)(?<![\w@\[])\[?xp_cmdshell\]?(?!\w)")
+_OS_CMD_RE = re.compile(r'(?i)(?<![\w@\["])' + _named("xp_cmdshell") + r"(?!\w)")
 # 權限授予或切換。關鍵字後面要接空白,`grant_amount` 這種欄位名才不會命中。
 _PRIVILEGE_RE = re.compile(
     r"(?i)(?<![\w.@\[])(GRANT|REVOKE|DENY)\s+(?!BY\b)"
@@ -494,7 +512,8 @@ _TIME_BOMB_RE = re.compile(
     + r"|" + _DATE_LITERAL + _GAP + r"(?:[<>=]=?|<>|!=)" + _GAP + _NOW_FUNC)
 # 定義不在這次 MR 裡的自訂函式或 view:讀取環境的程式可能藏在那裡面。
 # 只認 schema 限定的呼叫(dbo.fn_x(...)),不然每個內建函式都會命中。
-_USER_FUNC_RE = re.compile(r"(?i)(?<![\w.@\[])\[?dbo\]?\s*\.\s*\[?(\w+)\]?" + _GAP + r"\(")
+_USER_FUNC_RE = re.compile(r'(?i)(?<![\w.@\["])' + _named("dbo") + r"\s*\.\s*"
+                           + r'[\["]?(\w+)[\]"]?' + _GAP + r"\(")
 
 
 def _env_hints(sql: str) -> list[tuple[str, str, str]]:
