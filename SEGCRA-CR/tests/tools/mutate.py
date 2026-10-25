@@ -720,8 +720,8 @@ MUTANTS.update({
      "    if len(r.content) > MAX_FILE_BYTES:" + NL + "        return None",
      "    if False:" + NL + "        return None"),
  "完整檔:沒釘住版本時退回目標分支(= #22 的原始 bug)": ("../toolbox/gitlab.py",
-     '        ref = ref or review_ref() or ""',
-     '        ref = ref or review_ref() or "main"'),
+     '    ref = ref or review_ref() or ""',
+     '    ref = ref or review_ref() or "main"'),
  "完整檔:取不到完整內容不交人工": ("pipeline.py",
      '    no_full = [f["path"] for f in mr.get("files", [])' + NL
      + '               if f.get("full_content_unavailable") and not f.get("unreviewable")]',
@@ -4110,6 +4110,27 @@ MUTANTS.update({
 })
 
 
+# ---- 背景執行緒的收尾(#53 的 _in_thread)
+MUTANTS.update({
+ "收尾:例外不先綁到自己的變數(lambda 跑的時候 e 已經被刪掉 → 永遠掛著)": (S,
+     "            exc = e" + NL
+     + "            settle(lambda: fut.cancelled() or fut.set_exception(exc))",
+     "            settle(lambda: fut.cancelled() or fut.set_exception(e))"),
+ "收尾:迴圈關掉之後照樣硬丟回去": (S,
+     "        try:" + NL
+     + "            loop.call_soon_threadsafe(apply)" + NL
+     + "        except RuntimeError:                  # 迴圈已經關了" + NL
+     + "            pass",
+     "        loop.call_soon_threadsafe(apply)"),
+ # 原本這條是「連正常的結果也安靜丟掉」(把 settle 換成 pass)。那個改法會讓**每一個**
+ # 碰到沙盒的測試都掛住(20 個檔、900 多條),整個套件撐到工具的逾時 —— 偵測得到,
+ # 但不是乾淨的失敗,而逐條加上限不可行。換成同樣有意義、但會立刻失敗的形狀:
+ # 結果交回去了,內容卻是空的。
+ "收尾:正常的結果換成 None(呼叫端拿到空的)": (S,
+     "        settle(lambda: fut.cancelled() or fut.set_result(out))",
+     "        settle(lambda: fut.cancelled() or fut.set_result(None))"),
+})
+
 # ---- 危險 SQL 原語(#41 第 1 點)。每一條問的都是同一件事:放寬之後有沒有測試會紅。
 T = "../toolbox/sqltools.py"
 MUTANTS.update({
@@ -4297,6 +4318,48 @@ MUTANTS.update({
  "逐句:錯誤訊息不設則數上限": (TOOLS,
      "    shown = list(dict.fromkeys(errors))[:_MAX_PARSE_ERRORS]",
      "    shown = list(dict.fromkeys(errors))"),
+})
+
+# ---- 取不到規格 ≠ 沒有規格(#90 第 2 點)。混在一起的話,報告會叫開發者去補一份
+# 其實已經存在的規格,而維運看不出是 token 設錯了。
+G = "../toolbox/gitlab.py"
+MUTANTS.update({
+ "規格:取檔失敗當成沒有規格": (S,
+     "            if reason:" + NL + "                unavailable = unavailable or reason" + NL
+     + "                continue" + NL + "            if txt is None:" + NL
+     + "                continue                      # 這個編號的規格確實不存在",
+     "            if txt is None:" + NL
+     + "                continue                      # 這個編號的規格確實不存在"),
+ "規格:拿到的內容不是規格時當成不存在": (S,
+     '            unavailable = unavailable or "not_a_spec"' + NL
+     + "    if by_path and not codes:",
+     "    if by_path and not codes:"),
+ "規格:判斷規格格式前不去掉 BOM": (S,
+     '    return bool(text) and str(text).lstrip().lstrip(_BOM).lstrip().startswith("#")',
+     '    return bool(text) and str(text).lstrip().startswith("#")'),
+ "規格:依檔名找規格時取檔失敗當成沒有規格": (S,
+     "            txt, reason = fetch_file(candidate)               # 同上:不指定 ref" + NL
+     + "            if reason:",
+     "            txt, reason = fetch_file(candidate)               # 同上:不指定 ref" + NL
+     + "            if False:"),
+ "規格:依檔名找規格時內容不是規格也收下": (S,
+     "            if _is_spec_text(txt):" + NL
+     + '                return (candidate.rsplit("/", 1)[-1][:-len(".md")], txt), None',
+     "            if txt:" + NL
+     + '                return (candidate.rsplit("/", 1)[-1][:-len(".md")], txt), None'),
+ # 少回一個值不算回歸:pickle 會另外還原物件屬性。真正的回歸是整個忘了寫。
+ "規格:沒有 __getnewargs__(複製與 pickle 會丟 TypeError)": (S,
+     "        return (self[0], self[1], self.unavailable)",
+     "        return ()"),
+ "規格:404 一律當成檔案不存在(專案/commit 找不到也算)": (G,
+     '            return (None, None) if _FILE_NOT_FOUND in body else (None, "not_found")',
+     "            return None, None"),
+ "規格:404 一律當成拿不到(檔案不存在也算)": (G,
+     '            return (None, None) if _FILE_NOT_FOUND in body else (None, "not_found")',
+     '            return None, "not_found"'),
+ "規格:拿不到時照樣叫人補規格": (S,
+     "    if not spec_text and unavailable:",
+     "    if False:"),
 })
 
 # ---- 評測用的 token 用量(#84)。數字錯了不會有人發現,只會得到錯的結論。
