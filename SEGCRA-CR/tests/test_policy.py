@@ -149,6 +149,23 @@ def test_閘門_未回應的檢核點():
     assert r["decision"] == "auto_approved"
 
 
+def test_閘門_必須有人看的理由():
+    """判斷校準記下的「要人看」理由(無規格可對照、規格未載明)是獨立的閘門。
+
+    這些情況下的 finding 刻意是 info——規格沒寫,指控不成立,嚴重度不該撐著。
+    但「無法確認意圖」本身就不能自動放行,所以不靠嚴重度表達,改用 _needs_human;
+    嚴重度白名單那條擋不住它(info 是允許的),這一條才擋得住。
+    """
+    r = apply_policy(_report(_needs_human=["無規格可對照,無法確認實作意圖"]), _mr(), POLICY)
+    assert r["decision"] == "needs_human"
+    assert r["_policy_signals"]["needs_human"] == ["無規格可對照,無法確認實作意圖"]
+
+    # 空清單不算理由,照樣放行(證明是「有理由」在擋,不是這個欄位存在就擋)
+    r = apply_policy(_report(_needs_human=[]), _mr(), POLICY)
+    assert r["decision"] == "auto_approved"
+    assert r["_policy_signals"]["needs_human"] == []
+
+
 # ─────────────────── blocker 與 fail-safe ───────────────────
 
 def test_blocker_優先且不寫_policy_signals():

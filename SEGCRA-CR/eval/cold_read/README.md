@@ -6,10 +6,10 @@
 .venv/bin/python eval/run_cold_read.py                 # 全部
 .venv/bin/python eval/run_cold_read.py eval/cold_read/cr_101.json
 .venv/bin/python eval/run_cold_read.py --normal <公開題的 JSON ...>   # 沒有 expected 的題目一律當正常 MR
-LLM_REASONING_EFFORT=none .venv/bin/python eval/run_cold_read.py     # 關掉思考再跑一次比較
+LLM_REASONING_EFFORT= .venv/bin/python eval/run_cold_read.py         # 思考開著再跑一次比較
 ```
 
-比較思考開與關時用同一份程式跑兩次,第二次前面加 `LLM_REASONING_EFFORT=none`。這支只呼叫冷讀,所以環境變數只影響冷讀;正式服務要只關冷讀的思考,改 `config/models.yaml` 的 `cold_read` profile。
+冷讀的 profile 預設不思考(`reasoning_effort: none`)。比較思考開與關時用同一份程式跑兩次,第二次前面加 `LLM_REASONING_EFFORT=`(空字串:不送這個參數,用端點預設,也就是思考開著)。這支只呼叫冷讀,所以環境變數只影響冷讀;正式服務要改冷讀的思考,改 `config/models.yaml` 的 `cold_read` profile。上次的數字寫在那個 profile 的註解。
 
 每題一行:判定、位置、是否符合預期、秒數;沒看完時附原因(輸入超過預算,或端點回報的讀入量顯示前面可能被截掉)。最後是各類別的統計、時間的中位數與最長、「沒看完」依原因的次數、輸出被截斷與其他失敗的次數。輸出不含模型挑出的原文片段。
 

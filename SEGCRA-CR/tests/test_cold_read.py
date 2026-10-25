@@ -879,3 +879,11 @@ def test_輸出的路徑去掉控制字元並截長度():
     result = ColdRead(flagged=True, locations=[("內容", path)], truncated=True, omitted=[path])
     for text in (cr.summary_json(result), json.dumps(cr.record(result), ensure_ascii=False)):
         assert "\x1b" not in text and "\x07" not in text and "a" * 300 not in text
+
+
+def test_冷讀的_profile_不思考_而且是端點認得的值(monkeypatch):
+    """yaml 裡的值不像環境變數會檢查:寫錯一個字會原樣送給端點,可能被忽略而照樣思考。"""
+    monkeypatch.delenv("LLM_REASONING_EFFORT", raising=False)
+    from orchestrator.config import _EFFORT_LEVELS
+    profile = load_config().role_profile("cold_read")
+    assert profile.reasoning_effort == "none" and profile.reasoning_effort in _EFFORT_LEVELS

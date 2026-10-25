@@ -1,0 +1,37 @@
+{
+  "title": "每日提領金額摘要改用整數型別輸出",
+  "description": "下游報表不需要小數,輸出欄位改成整數型別。",
+  "sha": "e1a1000000000000000000000000000000000801",
+  "files": [
+    {
+      "path": "sql/maintenance/export_daily_withdraw.sql",
+      "diff": "@@ -3 +3 @@\n-    SUM(amount) AS total_amount\n+    CAST(SUM(amount) AS DECIMAL(10, 0)) AS total_amount",
+      "full_content": "-- 匯出每日提領金額摘要給下游報表\nSELECT\n    account_id,\n    CAST(SUM(amount) AS DECIMAL(10, 0)) AS total_amount\nFROM transactions\nWHERE tx_time >= @start_date AND tx_time < @end_date\nGROUP BY account_id;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "calibration",
+    "intent": "沒有規則碼 → 找不到規格。但資料字典寫明 transactions.amount 是 DECIMAL(14,2),縮成 DECIMAL(10,0) 會四捨五入掉角分、超過 10 位數還會溢位 ——這是「能由型別證明會算錯」,嚴重度不得因為沒找到規格而降成 info。決策走 needs_human(無規格可對照),不是放行。",
+    "expect_decision": [
+      "needs_human"
+    ],
+    "expect_signals": {
+      "spec_found": false,
+      "needs_human_marked": true
+    },
+    "expect_findings": [
+      {
+        "severity": "major",
+        "title_contains_any": [
+          "型別",
+          "精度",
+          "截斷",
+          "小數",
+          "DECIMAL",
+          "溢位"
+        ]
+      }
+    ]
+  }
+}

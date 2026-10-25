@@ -21,15 +21,88 @@ logging.disable(logging.INFO)  # sqlfluff 的 INFO 輸出會灌爆 stderr
 DIALECT = os.environ.get("SQL_DIALECT", "tsql")
 
 
-def _parse(sql: str):
+def parse_statements(sql: str):
+    """把一份 SQL 解析成語句清單。解析失敗會丟例外,呼叫端自己決定怎麼處理。
+
+    公開的名字:`pipeline` 與 `dbt_affected` 都在用它(#82 review)。
+    """
     return sqlglot.parse(sql, dialect=DIALECT)
+
+
+# 舊名字:等 pipeline 與 dbt_affected 的呼叫端換過去之後移除。先留著是因為那兩個
+# 檔案現在有在途的改動,一起改會撞在一起。
+_parse = parse_statements
+
+
+def _semicolon_cuts(sql: str) -> list[int]:
+    """分號的位置(切在分號**後面**)。字串、識別字、註解裡的分號不算。
+
+    **自己掃而不是用 sqlglot 的 tokenizer**:斷詞對沒收尾的引號或區塊註解會整個
+    失敗,而那正是這道要擋的手法 —— 在檔尾加一個 `'` 或 `/*`,整份就退回一次解析,
+    前面那句 `DELETE FROM t;` 的 blocker 又不見了,比巢狀運算式更容易做出來。
+
+    沒收尾的就吃到檔尾:那一段變成最後一「句」,解析失敗記成錯誤,**前面的句子照樣
+    逐句解析**。切錯的代價也只是那一段解析不了,不會吃掉別句。
+    """
+    cuts, i, n = [], 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == ";":
+            cuts.append(i + 1)
+            i += 1
+        elif ch == "'":                      # 字串('' 是跳脫,不是結束)
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+        elif ch in '"[':                     # 以引號或方括號包起來的識別字
+            j = sql.find('"' if ch == '"' else "]", i + 1)
+            i = n if j < 0 else j + 1
+        elif sql.startswith("--", i):        # 行註解
+            j = sql.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif sql.startswith("/*", i):        # 區塊註解(T-SQL 可以巢狀)
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if sql.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif sql.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        else:
+            i += 1
+    return cuts
+
+
+def _statement_chunks(sql: str) -> list[tuple[str, int]]:
+    """依分號切成一句一句,回傳 [(這一句的原文, 它在檔案裡的起始行 - 1)]。
+
+    切句用自己的掃描器(見 `_semicolon_cuts`):字串常值與註解裡的分號不算,
+    沒收尾的引號或註解也不會讓整份退回一次解析。
+    """
+    cuts = _semicolon_cuts(sql)
+    if not cuts:
+        return []
+    out, start = [], 0
+    for cut in cuts + ([len(sql)] if cuts[-1] < len(sql) else []):
+        chunk = sql[start:cut]
+        if chunk.strip(" \t\r\n;"):
+            out.append((chunk, sql.count("\n", 0, start)))
+        start = cut
+    return out
 
 
 def parse_ast(sql: str) -> str:
     """解析 SQL,回傳結構摘要:語句類型、涉及的表/欄位/JOIN、是否有 WHERE。"""
     out = []
     try:
-        statements = _parse(sql)
+        statements = parse_statements(sql)
     except Exception as e:
         # 這條只回給模型,而模型本來就看得到整份 SQL,所以不必像預掃那樣只留位置
         return json.dumps({"error": f"parse failed: {e}"}, ensure_ascii=False)
@@ -188,7 +261,7 @@ _SECRET_KINDS = {
 }
 
 
-def parse_error_text(e: Exception) -> str:
+def parse_error_text(e: Exception, line_offset: int = 0) -> str:
     """解析失敗的說明:**只留位置,不帶任何原文**。
 
     為什麼不是「把疑似憑證的部分遮掉」:要防的是「解析錯誤把原文帶出去」,跟那段原文
@@ -203,7 +276,9 @@ def parse_error_text(e: Exception) -> str:
     spots = []
     for d in getattr(e, "errors", None) or []:
         if isinstance(d, dict) and d.get("line") is not None:
-            spots.append(f"第 {d['line']} 行第 {d.get('col', '?')} 欄")
+            # 逐句解析時,行號是**那一句之內**的;加上這一句在檔案裡的起始行,
+            # 看留言的人才對得回原檔(#90 第 1 點)
+            spots.append(f"第 {d['line'] + line_offset} 行第 {d.get('col', '?')} 欄")
     where = "、".join(dict.fromkeys(spots))[:120] if spots else type(e).__name__
     return f"parse failed: 語法無法解析({where})"
 
@@ -231,7 +306,10 @@ _MASKED_KEY_RE = re.compile(
 # 會連真正會執行的呼叫一起被當成註解去掉);寫在註解裡的誤報只是多一次人工確認。
 # 函式名與括號之間可以夾空白**或註解**:`DB_NAME/**/()` 在 T-SQL 是合法的,
 # 只容許空白就漏掉了(#27 review)。`--` 到行尾的註解同理。
-_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/))*\*/|--[^\n]*\n)*"
+# 長度有上限:沒有上限的話,`DB_NAME /*` 這種**不閉合**的註解開頭,每一個出現位置都會
+# 一路掃到檔尾才宣告失敗,整體是平方時間(實測 8 萬字元要 14 秒)。而這些內容由 MR
+# 決定。函式名與括號之間的空白或註解本來就很短,給得很寬也只是常數。
+_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/)){0,500}\*/|--[^\n]*\n){0,30}"
 # 需要括號的環境函式。分三類只是為了讀起來分得清,比對時三條都跑。
 _ENV_FUNC_RE = re.compile(
     r"(?i)(?<![\w.@\[])("
@@ -272,6 +350,170 @@ def _env_probes(sql: str) -> list[str]:
     return found
 
 
+# ── 危險 SQL 原語(R006–R010)──
+#
+# 這些是封閉的關鍵字與結構集合,跟自然語言注入相反:用文字比對就能做得精準,不需要
+# 靠模型。原本這幾種會被報成「語法錯誤」「效能問題」「缺暫存表」—— 類別錯了,看留言
+# 的人就不會知道這是資料外送或權限變更,所以每一條的理由固定寫明是哪一類。
+#
+# 一律走文字層(不靠語法樹):這些寫法常常伴隨解析失敗(dbt 樣板、非 T-SQL 語法),
+# 而解析失敗正是最該報的情況之一。
+_EXTERNAL_SRC_RE = re.compile(
+    r"(?i)(?<![\w.@\[])(OPENROWSET|OPENDATASOURCE|OPENQUERY|OPENXML)" + _GAP + r"\("
+    r"|(?<![\w.@\[])BULK" + _GAP + r"INSERT(?!\w)")
+# 四段式名稱(伺服器.資料庫.schema.物件):跨 linked server 讀寫。三段式(資料庫.schema.
+# 物件)是正常寫法,所以要剛好三個點,前後都不能再接點 —— 否則 a.b.c.d.e 也會命中。
+# 中間兩段可以是空的(server.db..table),最前與最後一定要有名字。
+# 每一段都要像識別字(字母或底線開頭,或是方括號包起來)—— 只寫 \w+ 的話
+# IP 位址 10.0.0.9 也是「四段」,寫死主機的連線字串會被報成 linked server。
+_IDENT_PART = r"(?:\[[^\]]+\]|[A-Za-z_]\w*)"
+_FOUR_PART_RE = re.compile(
+    r"(?<![\w.\[])" + _IDENT_PART + r"\." + _IDENT_PART + r"?\."
+    + _IDENT_PART + r"?\." + _IDENT_PART + r"(?![\w.])")
+# 作業系統命令。lookbehind **不排除點**:`master..xp_cmdshell` 正是最常見的寫法,
+# 排除點就等於只抓得到沒有限定名稱的那一種。
+_OS_CMD_RE = re.compile(r"(?i)(?<![\w@\[])\[?xp_cmdshell\]?(?!\w)")
+# 權限授予或切換。關鍵字後面要接空白,`grant_amount` 這種欄位名才不會命中。
+_PRIVILEGE_RE = re.compile(
+    r"(?i)(?<![\w.@\[])(GRANT|REVOKE|DENY)\s+(?!BY\b)"
+    r"|(?<![\w.@\[])EXECUTE\s+AS(?!\w)"
+    r"|(?<![\w.@\[])ALTER\s+(SERVER\s+)?ROLE(?!\w)")
+# 動態 SQL:EXEC(…)、sp_executesql,或 EXEC 後面直接接變數。
+#
+# `sp_executesql` 的 lookbehind **不排除點與方括號**:`sys.sp_executesql` 是 Microsoft
+# 文件建議的寫法(系統預存程序建議加 sys.),`master.dbo.sp_executesql`、`[sp_executesql]`
+# 也都是同一支。排除掉的話只抓得到最沒有修飾的那一種(跟 xp_cmdshell 同一個坑)。
+#
+# `EXEC @變數`(不帶括號)也算:變數裡放的是預存程序名稱時會呼叫那一支,延伸預存程序
+# 也可以 —— 名稱用字串拼出來,R007 的文字比對就看不到 xp_cmdshell,呼叫的是哪一支要到
+# 執行時才知道。`EXEC @rc = dbo.某支`(接回傳值)是一般呼叫,不算。
+_DYNAMIC_SQL_RE = re.compile(
+    r"(?i)(?<![\w.@\[])(?:EXEC|EXECUTE)" + _GAP + r"\("
+    r"|(?<![\w@])\[?sp_executesql\]?(?!\w)"
+    # `\b` 不可省:沒有它的話 `\w+` 會回溯成 `@r`,負向前瞻就看不到 `@rc = ` 的等號,
+    # 於是「接回傳值」那種一般呼叫也會被當成動態 SQL。
+    r"|(?<![\w.@\[])(?:EXEC|EXECUTE)\s+@\w+\b(?!" + _GAP + r"=)")
+# dbt 編譯期副作用:run_query / {% call statement %} 裡執行 DML。每次 compile 都會跑,
+# 卻不在編譯出來的 SQL 裡,所以沙盒看不到它。
+_DBT_EXEC_RE = re.compile(r"(?i)(?<![\w.])(run_query|statement)" + _GAP + r"\(")
+_DML_RE = re.compile(
+    r"(?i)(?<![\w.@\[])(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|ALTER|CREATE)\s")
+
+
+def _dangerous_primitives(sql: str) -> list[tuple[str, str, str]]:
+    """危險 SQL 原語。回傳 [(規則碼, severity, 訊息)]。"""
+    hits = []
+    external = [" ".join(m.group(0).split()).rstrip("(").strip()
+                for m in _EXTERNAL_SRC_RE.finditer(sql)]
+    external += [m.group(0) for m in _FOUR_PART_RE.finditer(sql)]
+    if external:
+        hits.append(("R006", "blocker",
+                     f"外部資料源讀寫:{'、'.join(dict.fromkeys(external))[:200]}——"
+                     "規則 SQL 只該讀寫本資料庫裡的表。讀寫外部來源等於把資料送出去、"
+                     "或把外部輸入帶進來,沙盒驗不到對方那一端。請改用既有的資料表,"
+                     "或說明這條路徑的正當用途與授權"))
+    if _OS_CMD_RE.search(sql):
+        hits.append(("R007", "blocker",
+                     "作業系統命令:規則 SQL 呼叫 xp_cmdshell——這會在資料庫主機上執行"
+                     "作業系統指令,不是查詢。一律禁止"))
+    priv = [" ".join(m.group(0).split()).strip() for m in _PRIVILEGE_RE.finditer(sql)]
+    if priv:
+        hits.append(("R008", "major",
+                     f"權限授予或切換:{'、'.join(dict.fromkeys(priv))[:120]}——規則 SQL 不該"
+                     "變更授權,也不該換一個身分執行(換身分之後的行為沙盒驗不到)。"
+                     "請移除,或說明正當用途"))
+    if _DYNAMIC_SQL_RE.search(sql):
+        hits.append(("R009", "major",
+                     "動態 SQL:把字串組出來再執行(EXEC(…) 或 sp_executesql)——"
+                     "實際執行的內容在編譯期看不到,規則層與沙盒都驗不到,而且可能藏有"
+                     "讀取執行環境的寫法(例如 EXEC('SELECT DB_' + 'NAME()'),文字比對"
+                     "看不到)。請改寫成靜態 SQL,或說明正當用途"))
+    if _DBT_EXEC_RE.search(sql) and _DML_RE.search(sql):
+        hits.append(("R010", "blocker",
+                     "dbt 編譯期副作用:macro 裡用 run_query / statement 執行 DML——"
+                     "每次 compile 都會跑,卻不在編譯出來的 SQL 裡,所以執行驗證看不到它。"
+                     "請改成在 model 裡做,或說明正當用途"))
+    return hits
+
+
+# ── 只適合當提醒的環境相依寫法(H006–H009;#41 第 4 點)──
+#
+# 這些正常程式也會用,所以不給 major —— 但值得請人確認用途:它們都會讓同一段 SQL
+# 在沙盒與正式環境得到不同結果,而執行驗證只跑得到沙盒那一邊。
+# 真正「規則不該知道」的那些(DB_NAME、SUSER_NAME、sys. 目錄…)是 R005,給 major。
+
+# 物件存在性探測。tempdb 的暫存表要排除:`OBJECT_ID('tempdb..#x')` 是建暫存表前的
+# 標準寫法,報它只會製造雜訊。
+_OBJ_PROBE_RE = re.compile(
+    r"(?i)(?<![\w.@\[])(OBJECT_ID|COL_LENGTH|OBJECTPROPERTY|COLUMNPROPERTY)" + _GAP + r"\(")
+_TEMPDB_ARG_RE = re.compile(r"(?i)\(\s*'[^']*tempdb[^']*'")
+# 連線的語系與日期設定:沙盒與正式環境可能不同,同一段 SQL 的結果會跟著不同。
+_LOCALE_RE = re.compile(r"(?i)@@(LANGUAGE|DATEFIRST|LANGID|DATEFORMAT)\b")
+# dbt 編譯期的環境資訊。開發與正式分流本來就會用到,所以只提醒。
+#
+# `target.` 與 `var(` **只在 Jinja 區段裡**才算,否則會誤報兩種很常見的 T-SQL:
+# `MERGE` 的慣用別名就叫 target(`target.id`),而 `VAR()` 是變異數聚合函式。
+# `env_var(` 是 dbt 專有的名字,不受這個限制。
+_JINJA = r"\{\{|\{%"
+# 從 `{{`/`{%` 往後找關鍵字的範圍也要有上限:`{{` 開頭而**沒有閉合**的內容,每一個
+# `{{` 都會掃到檔尾,整體是平方時間(實測 4 萬字元要 35 秒)。Jinja 的表達式很短。
+_IN_JINJA = r"[^}]{0,200}?"
+# 命中的「寫法」只取關鍵字本身(具名群組 tok):比對需要前面那段 Jinja 當界線,
+# 但把 `{% set target_date = var` 整段印進訊息只會讓人看不懂命中的是什麼。
+# **不含 `var()`**:它是帶參數的一般寫法,實際專案幾乎每個 model 都用;拿它當條件
+# 來分環境很少見,真的那樣寫也會被「原文有寫入語句、展開結果沒有」那道擋到。
+_DBT_ENV_RE = re.compile(
+    r"(?i)(?:" + _JINJA + r")" + _IN_JINJA + r"(?<![\w.])(?P<tok>target" + _GAP + r"\." + _GAP
+    + r"(?:name|database|schema|type|user))(?!\w)"
+    r"|(?<![\w.])(?P<tok3>env_var)" + _GAP + r"\("
+    r"|(?P<tok4>\{%" + _GAP + r"if" + _GAP + r"execute)(?!\w)")
+
+
+def _dbt_env_token(m) -> str:
+    for name in ("tok", "tok3", "tok4"):
+        if m.group(name):
+            return " ".join(m.group(name).split())
+    return m.group(0)
+# 現在時間跟寫死的日期比較:上線之後才會改變行為的寫法(定時炸彈)。
+_NOW_FUNC = r"(?:GETDATE|GETUTCDATE|SYSDATETIME|SYSUTCDATETIME|CURRENT_TIMESTAMP)"
+_DATE_LITERAL = r"'\d{4}[-/]?\d{2}[-/]?\d{2}[^']*'"
+_TIME_BOMB_RE = re.compile(
+    r"(?i)" + _NOW_FUNC + r"(?:" + _GAP + r"\(" + _GAP + r"\))?" + _GAP
+    + r"(?:[<>=]=?|<>|!=|BETWEEN\s)" + _GAP + _DATE_LITERAL
+    + r"|" + _DATE_LITERAL + _GAP + r"(?:[<>=]=?|<>|!=)" + _GAP + _NOW_FUNC)
+# 定義不在這次 MR 裡的自訂函式或 view:讀取環境的程式可能藏在那裡面。
+# 只認 schema 限定的呼叫(dbo.fn_x(...)),不然每個內建函式都會命中。
+_USER_FUNC_RE = re.compile(r"(?i)(?<![\w.@\[])\[?dbo\]?\s*\.\s*\[?(\w+)\]?" + _GAP + r"\(")
+
+
+def _env_hints(sql: str) -> list[tuple[str, str, str]]:
+    """環境相依、但正常程式也會用的寫法。一律 hint:請人確認用途,不擋。"""
+    hits = []
+    probes = [m for m in _OBJ_PROBE_RE.finditer(sql)
+              if not _TEMPDB_ARG_RE.match(sql, m.end() - 1)]
+    if probes:
+        names = dict.fromkeys(m.group(1).upper() for m in probes)
+        hits.append(("H006", "hint",
+                     f"檢查物件存不存在:{'、'.join(names)}——這會讓同一段 SQL 在沙盒與"
+                     f"正式環境走不同分支,執行驗證只驗得到沙盒那一邊。請確認用途"))
+    locale = dict.fromkeys(m.group(0).upper() for m in _LOCALE_RE.finditer(sql))
+    if locale:
+        hits.append(("H007", "hint",
+                     f"讀取連線的語系/日期設定:{'、'.join(locale)}——沙盒與正式環境的設定"
+                     f"可能不同,同一段 SQL 的結果會跟著不同。請確認用途"))
+    dbt_env = dict.fromkeys(_dbt_env_token(m) for m in _DBT_ENV_RE.finditer(sql))
+    if dbt_env:
+        hits.append(("H008", "hint",
+                     f"dbt 編譯期的環境資訊:{'、'.join(dbt_env)[:120]}——開發與正式分流"
+                     f"本來就會用到,但它決定了編譯出來的 SQL,而執行驗證驗的是編譯後的"
+                     f"結果。請確認分流的內容"))
+    if _TIME_BOMB_RE.search(sql):
+        hits.append(("H009", "hint",
+                     "現在時間與寫死的日期比較:行為會在某個日期之後改變,審查與執行驗證"
+                     "都是在今天跑的,驗不到那之後的行為。請確認是刻意的"))
+    return hits
+
+
 def _text_rules(sql: str):
     hits = []
     m = _SECRET_RE.search(sql)
@@ -291,6 +533,8 @@ def _text_rules(sql: str):
                      f"規則 SQL 讀取執行環境:{'、'.join(probes[:5])}——規則不需要知道自己跑在"
                      f"哪個資料庫/主機/身分下;讀取環境的寫法可以讓規則在執行驗證的沙盒裡照規格跑、"
                      f"到正式環境才做別的事,執行驗證會因此通過。請移除,或說明正當用途"))
+    hits += _dangerous_primitives(sql)
+    hits += _env_hints(sql)
     if _MASKED_KEY_RE.search(sql):
         hits.append(("H005", "hint",
                      "輸出的 account_id/主鍵疑似被遮罩:若規格要求明碼輸出(供下游部門"
@@ -298,18 +542,46 @@ def _text_rules(sql: str):
     return hits
 
 
+# 解析失敗時最多列幾句的位置。訊息會貼回 MR,不讓一份全壞的檔案洗出一長串。
+_MAX_PARSE_ERRORS = 5
+
+
+def _parse_each_statement(sql: str):
+    """逐句解析,回傳 (解析得出來的語句, 解析失敗的說明或 None)。
+
+    **一句解析不了,不可以吃掉整個檔案的命中**:原本是把整份一次丟給解析器,其中
+    一句壞掉(例如巢狀太深)就整份都不跑規則 —— 同一個檔裡那句 `DELETE FROM t;`
+    的 blocker 跟著不見,只剩一條「預掃無法解析」的 major,決策從擋下變成交人工。
+    而那是可以刻意做出來的(#90 第 1 點)。
+
+    解析失敗時 AST 規則對**那一句**無法執行,但文字層規則(R004 明碼憑證等)不需要
+    AST,由呼叫端對整份照跑 —— 否則一段解析不了的 SQL 會連明碼密碼都一起放過。
+
+    說明只留位置:它會變成 finding 的內文、貼回 MR 留言(見 parse_error_text)。
+    """
+    chunks = _statement_chunks(sql)
+    if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析
+        try:
+            return parse_statements(sql), None
+        except Exception as e:           # noqa: BLE001 — 解析失敗不中斷預掃
+            return [], parse_error_text(e)
+    statements, errors = [], []
+    for chunk, line_offset in chunks:
+        try:
+            statements.extend(parse_statements(chunk))
+        except Exception as e:           # noqa: BLE001
+            errors.append(parse_error_text(e, line_offset))
+    if not errors:
+        return statements, None
+    shown = list(dict.fromkeys(errors))[:_MAX_PARSE_ERRORS]
+    more = f"(還有 {len(errors) - len(shown)} 句)" if len(errors) > len(shown) else ""
+    return statements, ";".join(shown) + more
+
+
 def run_rules(sql: str) -> str:
     """執行 rule-base 檢查(組織既有規則的掛載點),回傳命中清單。"""
     hits = []
-    parse_error = None
-    try:
-        statements = _parse(sql)
-    except Exception as e:
-        # 解析失敗時 AST 規則無法執行,但文字層規則(R004 明碼憑證等)不需要 AST,
-        # 照樣要跑 —— 否則一段解析不了的 SQL 會連明碼密碼都一起放過。
-        # 這條訊息會變成 finding 的內文、貼回 MR 留言,所以**只留位置**
-        # (見 parse_error_text:sqlglot 的訊息夾著出錯位置附近的原文)
-        statements, parse_error = [], parse_error_text(e)
+    statements, parse_error = _parse_each_statement(sql)
     for st in statements:
         if st is None:
             continue
