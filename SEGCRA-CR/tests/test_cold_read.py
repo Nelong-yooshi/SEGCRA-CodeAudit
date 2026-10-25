@@ -5,6 +5,7 @@
 """
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -472,18 +473,24 @@ def _hanging(cancelled):
     return hangs
 
 
+def _far():
+    """離整份審查的截止還很久(只看冷讀自己的上限時用)。"""
+    return time.monotonic() + 3600
+
+
 def test_冷讀超過時間上限就取消並記成逾時(monkeypatch, real_cold_read):
     cancelled = []
     monkeypatch.setattr(pipeline, "_cold_read", _hanging(cancelled))
     monkeypatch.setattr(pipeline, "COLD_READ_TIMEOUT_SECONDS", 0.2)
 
     async def main():
-        out = await pipeline._run_cold_read(load_config(), _mr(), None)
+        out = await pipeline._run_cold_read(load_config(), _mr(), None, _far())
         # 在 asyncio.run 收尾之前看:收尾時它會自己取消還沒完成的工作,在那之後看分不出來
         return out, list(cancelled)
 
     (result, incomplete), seen = asyncio.run(main())
     assert result is None and incomplete["stage"] == "冷讀" and "逾時" in incomplete["title"]
+    assert "截止時間縮短" not in incomplete["detail"]       # 用的是冷讀自己的上限
     assert seen == [True], "逾時後沒有取消冷讀:那個請求會一直佔著端點"
 
 
@@ -493,7 +500,7 @@ def test_等冷讀時外層被取消_冷讀一起取消(monkeypatch, real_cold_r
     monkeypatch.setattr(pipeline, "_cold_read", _hanging(cancelled))
 
     async def main():
-        task = asyncio.create_task(pipeline._run_cold_read(load_config(), _mr(), None))
+        task = asyncio.create_task(pipeline._run_cold_read(load_config(), _mr(), None, _far()))
         await asyncio.sleep(0.05)               # 冷讀已經開始
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -514,7 +521,7 @@ def test_冷讀的時間從冷讀開始算(monkeypatch, real_cold_read):
 
     async def main():
         await asyncio.sleep(0.6)                # 主審查跑得比冷讀的上限還久
-        return await pipeline._run_cold_read(load_config(), _mr(), None)
+        return await pipeline._run_cold_read(load_config(), _mr(), None, _far())
 
     assert asyncio.run(main()) == (ColdRead(flagged=False), None)
 
@@ -523,7 +530,7 @@ def test_冷讀自己丟的逾時例外記成未完整_不當成外層逾時(mon
     async def inner_timeout(cfg, mr, head_texts=None):
         raise asyncio.TimeoutError()
     monkeypatch.setattr(pipeline, "_cold_read", inner_timeout)
-    result, incomplete = asyncio.run(pipeline._run_cold_read(load_config(), _mr(), None))
+    result, incomplete = asyncio.run(pipeline._run_cold_read(load_config(), _mr(), None, _far()))
     assert result is None and incomplete["stage"] == "冷讀" and "逾時" not in incomplete["title"]
 
 
@@ -611,20 +618,36 @@ def test_review_mr_冷讀輸出壞掉_記成未完整並交人工(monkeypatch, t
     assert report["decision"] != "auto_approved"
 
 
-def test_review_mr_主審查丟例外時_冷讀不會開始(monkeypatch, tmp_path, real_cold_read):
-    """依序跑,沒有背景工作:主審查丟例外時冷讀根本還沒開始,不會留下沒人收尾的請求。"""
-    async def main_fails():
+def test_review_mr_主審查被取消時_冷讀不會開始(monkeypatch, tmp_path, real_cold_read):
+    """依序跑,沒有背景工作:主審查被取消(webhook 的總時間上限、新 commit 取消舊審查)時取消照樣往外傳,
+    冷讀根本還沒開始,不會留下沒人收尾的請求。"""
+    async def main_cancelled():
         await asyncio.sleep(0)
-        raise RuntimeError("主審查失敗")
+        raise asyncio.CancelledError()
 
     async def runner(review):
-        with pytest.raises(RuntimeError, match="主審查失敗"):
+        with pytest.raises(asyncio.CancelledError):
             await review
         return len(asyncio.all_tasks())          # 只剩 runner 自己
 
-    left, order, _ = _review(monkeypatch, tmp_path, {}, mr_id="956", main=main_fails,
+    left, order, _ = _review(monkeypatch, tmp_path, {}, mr_id="956", main=main_cancelled,
                              runner=runner)
     assert order == ["main"] and left == 1
+
+
+def test_review_mr_主審查的模型呼叫失敗時_冷讀照常跑_結果照常算進來(monkeypatch, tmp_path,
+                                                         real_cold_read):
+    """主審查失敗不再讓整份審查消失(確定性結果照常報出);冷讀是另一道防線,端點還能用時照常跑。"""
+    async def main_fails():
+        await asyncio.sleep(0)
+        raise RuntimeError("端點壞了")
+
+    report, order, _ = _review(monkeypatch, tmp_path, {"flagged": True, "quotes": [INSTRUCTION]},
+                               mr_id="957", main=main_fails)
+    assert order == ["main", "cold"]
+    titles = [f["title"] for f in report["findings"]]
+    assert _COLD_READ_TITLE in titles and pipeline._FAILED_TITLE in titles
+    assert report["decision"] != "auto_approved"
 
 
 def test_單獨入口(monkeypatch, tmp_path, capsys, real_cold_read):
