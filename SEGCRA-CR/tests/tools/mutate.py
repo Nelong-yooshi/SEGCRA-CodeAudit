@@ -4766,9 +4766,11 @@ MUTANTS.update({
  "原語:sp_executesql 的比對排除限定名稱(sys.sp_executesql 漏掉)": (T,
      r'    r"|(?<![\w@])\[?sp_executesql\]?(?!\w)"',
      r'    r"|(?<![\w.@\[])sp_executesql(?!\w)"'),
+ # 換掉整個分支時要留下合法的正規式:直接砍成 r")") 會少一個括號、import 就炸,
+ # 那是「程式壞掉」被發現,不是測試抓到。接一個空字串才是真的少了這個分支。
  "原語:不帶括號的 EXEC 接變數不算動態 SQL": (T,
      r'    r"|(?<![\w.@\[])(?:EXEC|EXECUTE)\s+@\w+\b(?!" + _GAP + r"=)")',
-     r'    r")")'),
+     r'    r"")'),
  "原語:EXEC 接變數時不排除接回傳值的寫法": (T,
      r'    r"|(?<![\w.@\[])(?:EXEC|EXECUTE)\s+@\w+\b(?!" + _GAP + r"=)")',
      r'    r"|(?<![\w.@\[])(?:EXEC|EXECUTE)\s+@\w+\b")'),
