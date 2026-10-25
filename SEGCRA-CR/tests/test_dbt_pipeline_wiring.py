@@ -38,22 +38,44 @@ def _mr(files, title="", description=""):
 
 
 class _FakeHub:
-    """只實作 find_spec 會用到的 call(),記錄呼叫次數。
+    """假的 GitLab:contents 裡有的就回內容,沒有的就是「這個檔不存在」。
 
-    contents 沒有的路徑,回傳的是 mock 模式的佔位文字(與 toolbox/gitlab.py 的
-    get_file 相同:不丟例外、回一段不以 # 開頭的說明)——管線實際跑的時候 hub
-    一定存在,這才是 find_spec 真正會遇到的情境。
+    `find_spec` 現在直接用 `gitlab.fetch_file` 取檔(#95 review 第 4 點:內容與
+    「拿不到的原因」要分開回,不可以讓呼叫端去比對文字)。所以這個替身不再實作
+    `call()`,改由下面的 `_fetch_from_hub` 把 `fetch_file` 導到這裡 —— 測試本身的
+    寫法不用改。
     """
+
+    current: "None | _FakeHub" = None
 
     def __init__(self, contents: dict | None = None):
         self.contents = contents or {}
         self.calls: list[str] = []
+        self.raises: dict = {}
+        _FakeHub.current = self
 
-    async def call(self, name, params, truncate=False):
-        assert name == "gitlab__get_file"
-        path = params["path"]
+    def fetch(self, path):
         self.calls.append(path)
-        return self.contents.get(path, f"(mock 模式無 {path} 的完整內容,請依 diff 判斷)")
+        if path in self.raises:
+            return None, "fetch_failed"
+        if path in self.contents:
+            return self.contents[path], None
+        return None, None            # 這個檔不存在
+
+
+@pytest.fixture(autouse=True)
+def _fetch_from_hub(monkeypatch):
+    """把 spec_exec 的取檔導到最近建立的 _FakeHub。"""
+    import orchestrator.spec_exec as spec_exec_mod
+
+    def fake(path, ref="", mr_id=""):
+        hub = _FakeHub.current
+        return hub.fetch(path) if hub is not None else (None, None)
+
+    monkeypatch.setattr(spec_exec_mod, "fetch_file", fake)
+    _FakeHub.current = None
+    yield
+    _FakeHub.current = None
 
 
 @pytest.fixture
@@ -152,14 +174,15 @@ def test_gitlab_placeholder_or_non_spec_content_rejected(specs_dir):
 
 
 def test_gitlab_exception_is_swallowed_and_next_candidate_tried(specs_dir):
-    class _Flaky(_FakeHub):
-        async def call(self, name, params, truncate=False):
-            self.calls.append(params["path"])
-            if params["path"] == "specs/mrt_RETAIL_M1.md":
-                raise ConnectionError("暫時性網路錯誤")
-            return "# 第二個候選"
-    hub = _Flaky()
-    assert _run(find_spec(hub, DBT_MR, by_path=True)) == ("RETAIL_M1", "# 第二個候選")
+    """某個候選取檔失敗時,還是要試下一個候選。
+
+    取檔失敗現在回的是代碼 `fetch_failed`(不再是丟例外出來,見 #95 review 第 4 點),
+    但「繼續試下一個」這件事不變;找到之後 `unavailable` 也不留。"""
+    hub = _FakeHub({"specs/RETAIL_M1.md": "# 第二個候選"})
+    hub.raises = {"specs/mrt_RETAIL_M1.md": True}
+    got = _run(find_spec(hub, DBT_MR, by_path=True))
+    assert got == ("RETAIL_M1", "# 第二個候選")
+    assert got.unavailable is None, "找到了就不該留著前一個候選的失敗"
 
 
 # ------------------------------------------------------ R 編號永遠優先
