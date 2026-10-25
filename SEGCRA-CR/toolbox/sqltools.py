@@ -332,11 +332,22 @@ _ENV_VAR_RE = re.compile(r"(?i)@@(SERVERNAME|SERVICENAME|VERSION|SPID)\b"
 # 前面的 lookbehind 只排除 word char(`mysys.objects` 不算),**不排除點**——
 # 原本寫 (?<![\w.]) 把 `master.sys.databases` 這種三段式名稱排除掉了,
 # 而 `[master].[sys].[databases]` 反而抓得到,行為不一致(#27 review 指出的 bug)。
+#
+# 識別字的三種寫法都要認:不加引號、方括號、**雙引號**。SQL Server 預設
+# `QUOTED_IDENTIFIER ON`,`"sys"."databases"` 是可用的寫法,只認方括號的話,換個引號
+# 就繞過去了。只容許「可能有引號」而不要求成對(`[sys` 也算),是因為這一條是找線索、
+# 不是解析:寫壞的引號照樣報,代價只是多一次人工確認。
+#
+# **`sys.sp_` 開頭不算**:那是預存程序(`sys.sp_executesql`、`sys.sp_who`),不是在讀
+# 執行環境。動態 SQL 由 R009 報、權限變更由 R008 報,這裡再報一次只會讓同一句出現
+# 兩條說法不同的 finding。
+_SYS = r'[\["]?sys[\]"]?'
+_OBJ = r'[\["]?\w+[\]"]?'
 _ENV_CATALOG_RE = re.compile(
-    r"(?i)(?<!\w)\[?sys\]?" + _GAP + r"\." + _GAP + r"\[?\w+\]?"
+    r"(?i)(?<!\w)" + _SYS + _GAP + r"\." + _GAP + r'(?![\["]?sp_)' + _OBJ
     # 舊式的系統表名(master..sysdatabases、master.dbo.sysobjects),沒有 sys. 前綴
-    r"|(?<!\w)\[?sys(databases|objects|columns|users|logins|processes|servers|indexes)\]?(?!\w)"
-    r"|(?<!\w)\[?INFORMATION_SCHEMA\]?" + _GAP + r"\.")
+    + r"|(?<!\w)[\[\"]?sys(databases|objects|columns|users|logins|processes|servers|indexes)[\]\"]?(?!\w)"
+    r"|(?<!\w)[\[\"]?INFORMATION_SCHEMA[\]\"]?" + _GAP + r"\.")
 
 
 def _env_probes(sql: str) -> list[str]:

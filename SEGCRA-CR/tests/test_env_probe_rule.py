@@ -156,6 +156,35 @@ def test_review_補齊的寫法都命中R005(probe):
 
 
 @pytest.mark.parametrize("sql", [
+    'SELECT * FROM "sys"."databases"',                       # 雙引號識別字
+    'SELECT * FROM "master"."sys"."objects"',                # 三段式都加雙引號
+    'SELECT * FROM "sys".objects',                           # 只有前半加
+    'SELECT * FROM sys."objects"',                           # 只有後半加
+    'SELECT * FROM "INFORMATION_SCHEMA"."TABLES"',
+    'SELECT * FROM "master"."dbo"."sysdatabases"',           # 舊式系統表名加雙引號
+])
+def test_雙引號識別字照樣命中R005(sql):
+    """SQL Server 預設 QUOTED_IDENTIFIER ON,`"sys"."databases"` 是可用的寫法。
+    只認方括號的話,換一種引號就繞過去了(#27 review 留給規則層那張處理的項目)。"""
+    hits = _r005(sql)
+    assert len(hits) == 1, f"沒抓到:{sql}"
+    assert hits[0]["severity"] == "major"
+
+
+@pytest.mark.parametrize("sql", [
+    "EXEC sys.sp_executesql N'SELECT 1'",
+    "EXEC [sys].[sp_executesql] N'SELECT 1'",
+    'EXEC "sys"."sp_executesql" N\'SELECT 1\'',
+    "EXEC sys.sp_who",
+    "EXEC sys.sp_addsrvrolemember 'app', 'sysadmin'",
+])
+def test_sys的預存程序不算讀取執行環境(sql):
+    """`sys.sp_` 是預存程序,不是系統目錄。動態 SQL 由 R009 報、權限變更由 R008 報,
+    R005 再報一次只會讓同一句出現兩條說法不同的 finding。"""
+    assert _r005(sql) == []
+
+
+@pytest.mark.parametrize("sql", [
     # 延續原本那組:名稱剛好含關鍵字不誤報
     "SELECT current_user_id, session_user_id FROM t",        # 欄位名含 niladic 函式名
     "SELECT t.user_name FROM t",                             # 欄位叫 user_name(沒有括號)
