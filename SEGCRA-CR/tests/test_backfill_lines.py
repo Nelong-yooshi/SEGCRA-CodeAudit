@@ -13,7 +13,7 @@ import pytest
 
 from orchestrator import pipeline, spec_exec
 from orchestrator.config import load_config
-from orchestrator.pipeline import _attach_statement_lines, _statement_starts, enforce_hints, enforce_rules
+from orchestrator.pipeline import _attach_statement_lines, _rendered_starts, enforce_hints, enforce_rules
 from toolbox import gitlab
 from toolbox.sqltools import run_rules
 
@@ -71,15 +71,15 @@ def test_檔尾分號之後只有註解也對得上():
 
 
 def test_切出來的語句與行號():
-    starts = _statement_starts("SELECT 1;\n\n  DELETE FROM a;;\nSELECT\n 2")
-    assert {text: [line for line, _ in found] for text, found in starts.items()} == {
+    starts = _rendered_starts("SELECT 1;\n\n  DELETE FROM a;;\nSELECT\n 2")
+    assert {text: [line for line, *_ in found] for text, found in starts.items()} == {
         "SELECT 1": [1], "DELETE FROM a": [3], "SELECT 2": [4]}
 
 
 @pytest.mark.parametrize("sql", ["SELECT (", "SELECT 'unterminated", ""])
 def test_切不出來時回_None(sql):
     if sql:
-        assert _statement_starts(sql) is None or _statement_starts(sql) == {}
+        assert _rendered_starts(sql) is None or _rendered_starts(sql) == {}
 
 
 def test_前200字相同_後面不同的語句分不出來就不寫():
@@ -235,7 +235,7 @@ def review(monkeypatch, tmp_path):
 
         monkeypatch.setattr(pipeline, "run_agent", fake_run_agent)
         if not attach:
-            monkeypatch.setattr(pipeline, "_attach_statement_lines", lambda pre, files: None)
+            monkeypatch.setattr(pipeline, "_attach_statement_lines", lambda *args: None)
         report = asyncio.run(pipeline.review_mr(load_config(), "900"))
         return report, seen["user"]
 
@@ -272,7 +272,7 @@ def test_樣板標記只在註解裡時也不寫():
                           ("SELECT '{{ x }}';\nDELETE FROM transactions;",        # 語句文字對得上的情況
                            "SELECT 'v';\nDELETE FROM transactions;")):
         pre = _pre(rendered)
-        assert _statement_starts(raw) is not None
+        assert _rendered_starts(raw) is not None
         _attach_statement_lines(pre, _files(raw))
         assert all(h.get("line") is None for h in pre[0]["rules"]), raw
 
@@ -281,11 +281,10 @@ def test_切出來的語句數量與_token_對不上時不寫(monkeypatch):
     """兩邊數量不同時一一對應會錯位;寧可不寫。"""
     import sqlglot
 
-    import toolbox.sqltools as sqltools
-    real = sqltools._parse
-    monkeypatch.setattr(sqltools, "_parse",
+    real = pipeline._parse
+    monkeypatch.setattr(pipeline, "_parse",
                         lambda sql: [sqlglot.parse_one("SELECT 0", dialect="tsql"), *real(sql)])
-    assert _statement_starts(TWO_DELETES) is None
+    assert _rendered_starts(TWO_DELETES) is None
     pre = _pre(TWO_DELETES)
     _attach_statement_lines(pre, _files(TWO_DELETES))
     assert all(h.get("line") is None for h in pre[0]["rules"])

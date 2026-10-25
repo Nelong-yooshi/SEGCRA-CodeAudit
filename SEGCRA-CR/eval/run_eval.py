@@ -140,12 +140,17 @@ def finding_matches(spec: dict, f: dict) -> bool:
     """_golden 的 finding 選擇器:severity / file / 標題關鍵詞皆須符合(有給才比)。
 
     關鍵詞用 `title_contains`(單一)或 `title_contains_any`(任一命中即可)。
+    `source` 分得出這條是誰寫的:`"program"` 只對上管線自己補的(`_source`),
+    `"model"` 只對上模型寫的。要求「不得把某一類問題報成 major」時一定要指定來源:
+    模型照實多報是現在刻意要的行為,斷言不該因為它多報而紅。
     **優先用 any 版**:findings 的文字是模型生成的,同一個問題可能寫「注入」也可能寫
     「規避」,把標準答案綁死在單一措辭會產生假失敗——防線是好的,只是用詞不同。
     """
     if "severity" in spec and f.get("severity") != spec["severity"]:
         return False
     if "file" in spec and f.get("file") != spec["file"]:
+        return False
+    if "source" in spec and (f.get("_source") or "model") != spec["source"]:
         return False
     haystack = f"{f.get('title', '')}\n{f.get('detail', '')}"
     needles = spec.get("title_contains_any")
@@ -159,7 +164,7 @@ def finding_matches(spec: dict, f: dict) -> bool:
 
 def spec_desc(spec: dict) -> str:
     bits = []
-    for k in ("severity", "title_contains", "file"):
+    for k in ("severity", "source", "title_contains", "file"):
         if k in spec:
             bits.append(str(spec[k]))
     if "title_contains_any" in spec:
@@ -209,9 +214,25 @@ def read_signal(report: dict, key: str):
         # 執行驗證默默失效、靜態審查剛好補上時,測試仍是綠的,看不出防線已經退化。
         return any("執行驗證失敗" in f.get("title", "")
                    for f in report.get("findings", []))
+    if key == "needs_human_marked":
+        # 判斷校準記下了「必須有人看」的理由(無規格可對照、規格未載明)。
+        # 這些情況的 finding 刻意是 info,所以光看 severity 分不出來;決策是 needs_human
+        # 的原因有六七種,光看 decision 也分不出是哪一條在擋。
+        return bool(report.get("_needs_human"))
+    if key == "calibration_downgraded":
+        # 校準降過嚴重度嗎。只有「無法執行」類的指控在沙盒實際跑成功之後可以降
+        # (blocker → major,仍交人工),其餘一律不動 —— 這個訊號釘住的是
+        # 「沒有在沒有證據的情況下偷偷降級」。
+        return bool((report.get("_calibration") or {}).get("downgraded"))
+    if key == "calibration_annotated":
+        # 校準加註過嗎(規格把這件事列為待補、執行驗證未重現)。加註是現在唯一的
+        # 常態動作,沒有這個訊號時,「校準根本沒被走到」跟「走到了但沒事可做」
+        # 在報告上看起來一模一樣。
+        return bool((report.get("_calibration") or {}).get("annotated"))
     raise KeyError(f"未知的訊號名稱: {key}(可用: injection_hit / spec_exec_passed / "
                    f"spec_found / citations_removed / pending_hints / "
-                   f"arbiter_dropped / spec_exec_sql_fault)")
+                   f"arbiter_dropped / spec_exec_sql_fault / needs_human_marked / "
+                   f"calibration_downgraded / calibration_annotated)")
 
 
 # ─────────────────────────── 斷言 ───────────────────────────
