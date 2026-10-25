@@ -408,6 +408,11 @@ review_mr
 `branch: "incremental"`,補報的說明會寫明它在增量分支裡。增量那次展開失敗照展開失敗處理(major);解析不了記成
 「無法解析」(major)。兩份展開結果都進注入掃描。
 
+**寫入語句沒有展開到。** 展開器跟 dbt 真正執行時總有可以分辨的差異,樣板可以拿來當條件,把寫入語句藏在
+審查時不會進的分支。預掃對展開成功的樣板另外看原文:固定文字裡的寫入關鍵字插記號、用同一份專案資訊再展開
+(需要時增量模式也一次),記號後面沒有緊接著那段固定文字就是沒展開到;寫在 Jinja 標記字串裡的,會被執行的位置(hook、`sql_header`、`run_query`)一律算,其他位置像一句寫入語句才算。結果記在
+`dbt_hidden_writes`,由 `enforce_dbt_hidden_writes` 補 major(判定細節與已知限制見 04 篇)。
+
 **展開用的內容。** 真實 GitLab 模式的 diff 只有新增的行。專案裡的檔案只要 head 的完整內容是樣板,
 就用完整內容展開(改到的那幾行沒有樣板標記,不代表整個檔案沒有)。不是樣板的 SQL 檔維持原本的
 來源(完整內容屬於 #22 的範圍)。專案裡有同名的 macro 時算展開失敗:dbt 會編譯失敗,擇一展開的
@@ -417,6 +422,20 @@ review_mr
 Python model 只知道存在:snapshot 的 `target_schema` / `alias` 寫在區塊的 config 裡、seed 的
 alias 寫在 seed 目錄的屬性檔裡,都沒有讀,所以一律標成無法確定(帶提醒),不用預設慣例當成確定的
 表名。屬性檔是待審 repo 的內容,解析放在有逾時與記憶體上限的子行程裡。
+
+**改到的 macro 檔本身。** MR 改到 macro 檔時,照展開時的方式(同樣的資料庫名、macro 目錄、專案資訊)把整包
+macro 載入一次(隔離子行程),看改到的檔載入得了嗎:
+
+- **Jinja 語法錯誤**(區塊沒閉合、運算式寫錯、多出來的 `else`、**不認得的標籤**):dbt 一樣解析不了,整個專案
+  編譯失敗、部署端整個載入失敗 → **blocker**,寫出行號。dbt 的 Jinja 環境(dbt_common 的 `get_environment`)
+  只多了 `do`、`loopcontrols` 與 `materialization`、`docs`、`test` 三個標籤,展開器全都有(另外認得 `snapshot`),
+  所以展開器不認得的標籤 dbt 也不認得(例如打錯字的 `{% iff %}`、`{% data_test %}`)
+- 不認得的濾器、重複定義的 block(dbt 解析得過,呼叫到那個 macro 時才失敗)、巢狀太深、解析得過但載入時失敗、
+  檢查沒做完 → **major**「無法確認」
+- dbt 加的五個濾器(`as_text`、`as_bool`、`as_native`、`as_number`、`is_list`,dbt_common 的 `TEXT_FILTERS`)
+  展開器照 dbt 的行為提供:前四個原樣回傳,`is_list` 判斷是不是 list。用到它們的 macro 與 model 照常展開
+- 只看改到的檔:專案裡本來就壞的檔不是這個 MR 造成的,用到它的 model 展開失敗時已經會報
+- 只寫種類與行號,不帶 Jinja 的錯誤訊息(裡面有樣板內容)
 
 **受影響的 model(MR 改到 macro、屬性檔、專案設定檔時)。**
 
@@ -449,7 +468,7 @@ alias 寫在 seed 目錄的屬性檔裡,都沒有讀,所以一律標成無法確
 - 規格:每個受影響的 model 依檔名對應規格並列在 finding 裡。**取不到**規格(唯讀 token 沒設、沒釘住 commit、
   規格檔太大、取檔失敗,或查的過程出錯)不是「沒有對應到規格」:另外列成「取不到規格」,寫出是哪一種設定、
   註明這是驗證環境的問題、不需要補規格,升到 major;給審查模型的規格段也分開寫。原因代碼與
-  `spec_exec.find_spec` 的 `unavailable` 相同(`dbt_affected.SPEC_UNAVAILABLE`)。MR 自己對不到規格(只改了 macro)、
+  `spec_exec.find_spec` 的 `unavailable` 相同,說法引用 `gitlab.UNAVAILABLE_TEXT`(代碼與說法只有那一份,代碼一覽見 10 篇)。MR 自己對不到規格(只改了 macro)、
   而受影響的 model **全部檢查過、全部對到同一份**時,用那一份給模型審查
 - 對到多份規格、或只有部分對到時(`dbt_affected.specs_by_priority`、
   `pipeline._affected_spec_section`):找到的規格**都附上**,每份標明對應哪些 model,並寫明

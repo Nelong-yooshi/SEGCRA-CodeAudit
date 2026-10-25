@@ -32,6 +32,7 @@ import uuid
 from datetime import datetime
 from decimal import Decimal
 
+from toolbox.gitlab import UNAVAILABLE_TEXT, fetch_file
 from .agent import extract_json, output_truncated, run_agent
 from .config import Config, PKG_ROOT
 
@@ -60,10 +61,48 @@ def _real_mode() -> bool:
     return bool(gitlab.REAL_MODE)
 
 
-async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None, str | None]:
-    """回傳 (rule_code, spec_text)。mock 模式讀本地 specs/;real 模式**只**用
-    gitlab get_file 抓 repo 內 specs/<code>.md(讀正在審的那一版)。
-    都找不到 → (code|None, None)。
+# BOM(Windows 的編輯器常加)不是內容的一部分,但 lstrip() 不會去掉它,
+# 於是一份存在的規格會被判成「不是規格」。
+_BOM = "\ufeff"
+
+
+def _is_spec_text(text) -> bool:
+    """看起來是不是規格檔(Markdown,第一個非空白字元是 #)。"""
+    return bool(text) and str(text).lstrip().lstrip(_BOM).lstrip().startswith("#")
+
+
+class SpecLookup(tuple):
+    """`find_spec` 的結果:`(code, text)` 再加一個 `unavailable` 代碼。
+
+    **為什麼不是三欄位的型別**:`code, text = await find_spec(...)` 這個解法在 25 處
+    被用著(含 dbt 反查與大量測試)。改成三欄位會同時動到兩邊在途的改動,衝突成本
+    遠大於這件事本身。所以保持二元組、把第三態掛成屬性;等呼叫端都改用屬性之後,
+    再收斂成一般的具名元組。
+
+    `unavailable` 是 None 代表正常(找到規格,或**確定它不存在**);非 None 時是固定
+    的代碼(`no_read_token` / `no_review_ref` / `too_large` / `fetch_failed`),代表這次
+    **拿不到**——環境的問題,不是 MR 的問題。兩者混在一起的話,報告會叫開發者去補
+    一份其實已經存在的規格,維運也看不出是 token 設錯了(#90 第 2 點)。
+
+    代碼只放固定的英文短字串:它會被轉成給人看的訊息、貼回 MR,不可以帶原始錯誤。
+    """
+
+    def __new__(cls, code, text, unavailable=None):
+        obj = super().__new__(cls, (code, text))
+        obj.unavailable = unavailable
+        return obj
+
+    def __getnewargs__(self):
+        """複製與 pickle 都靠它。沒有的話 tuple 子類別會把 (code, text) 整個當成
+        第一個參數傳回 __new__,三種都丟 TypeError —— 管線有 deepcopy(capture),
+        隔離子行程用 pickle 傳結果,踩到只是時間問題。"""
+        return (self[0], self[1], self.unavailable)
+
+
+async def find_spec(hub, mr: dict, *, by_path: bool = False) -> SpecLookup:
+    """回傳 SpecLookup(rule_code, spec_text, unavailable)。mock 模式讀本地 specs/;
+    real 模式**只**用 gitlab get_file 抓 repo 內 specs/<code>.md(讀正在審的那一版)。
+    都找不到 → (code|None, None);**拿不到**(環境問題)另外記在 `unavailable`。
 
     R 編號的比對邏輯不變(即使多個編號都對到既有規格,一律取第一個找到的)。
     by_path 為 True **且完全沒有** R 編號時,才改依 model 檔名對應規格:
@@ -81,33 +120,42 @@ async def find_spec(hub, mr: dict, *, by_path: bool = False) -> tuple[str | None
         for code in codes:
             local = SPECS_DIR / f"{code}.md"
             if local.exists():
-                return code, local.read_text(encoding="utf-8")
+                return SpecLookup(code, local.read_text(encoding="utf-8"))
+    unavailable = None          # 第一個遇到的「拿不到」,照實帶出去
     if hub is not None:
         for code in codes:
-            try:
-                # 不指定 ref → 讀「正在審的那一版」。規格與程式是我們自己整理的,
-                # 會在同一個 MR 裡一起修正;鎖在目標分支的話,「規格寫錯、跟程式
-                # 一起修」的 MR 會被拿舊規格生測資,把正確的修正判成不符。
-                #
-                # 代價是一個 MR 可以同時改規格與程式、讓執行驗證拿改過的規格驗
-                # 自己。這一點改由**讓審查的人看見規格被改了**來處理(#38 第 3 點),
-                # 不是靠鎖版本——鎖版本會讓正常的修正無法通過。
-                txt = await hub.call("gitlab__get_file",
-                                     {"path": f"specs/{code}.md"}, truncate=False)
-            except Exception:
+            # 不指定 ref → 讀「正在審的那一版」。規格與程式是我們自己整理的,會在
+            # 同一個 MR 裡一起修正;鎖在目標分支的話,「規格寫錯、跟程式一起修」的
+            # MR 會被拿舊規格生測資,把正確的修正判成不符。
+            #
+            # 代價是一個 MR 可以同時改規格與程式、讓執行驗證拿改過的規格驗自己。
+            # 這一點改由**讓審查的人看見規格被改了**來處理(#38 第 3 點),不是靠
+            # 鎖版本——鎖版本會讓正常的修正無法通過。
+            txt, reason = fetch_file(f"specs/{code}.md")
+            if reason:
+                unavailable = unavailable or reason
                 continue
-            if txt and txt.lstrip().startswith("#"):
-                return code, txt
+            if txt is None:
+                continue                      # 這個編號的規格確實不存在
+            if _is_spec_text(txt):
+                return SpecLookup(code, txt)
+            # 拿到了,但不是規格的格式。**不可以當成不存在**:那會叫開發者去補一份
+            # 已經在 repo 裡的檔案,而真正的問題是這個檔被改壞了或放錯了。
+            unavailable = unavailable or "not_a_spec"
     if by_path and not codes:
-        found = await _find_spec_by_path(hub, mr)
+        found, by_path_unavailable = await _find_spec_by_path(hub, mr)
         if found is not None:
-            return found
-    return (codes[0] if codes else None), None
+            return SpecLookup(found[0], found[1])
+        unavailable = unavailable or by_path_unavailable
+    return SpecLookup(codes[0] if codes else None, None, unavailable)
 
 
-async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
+async def _find_spec_by_path(hub, mr: dict) -> tuple[tuple[str, str] | None, str | None]:
     """依 model 檔名對應規格(dbt_impact.resolve_spec)。只由 find_spec() 在完全
-    沒有 R 編號時呼叫,找不到回 None。
+    沒有 R 編號時呼叫。回傳 ((code, text) 或 None, 「拿不到」的代碼或 None)。
+
+    **拿不到也要分出來**:dbt 的 model 沒有 R 編號,走的就是這條路;只回 None 的話,
+    token 沒設一樣會變成「沒有規格」—— 跟 R 編號那條是同一個病(#90 第 2 點)。
 
     查找順序與上面 R 編號那段相同:**先查本機 specs/,再問 GitLab**。管線呼叫時
     hub 一定存在,所以本機這段不能只在 hub 為 None 時才走,否則 mock 模式(demo、
@@ -121,7 +169,7 @@ async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
 
     paths = [f["path"] for f in mr.get("files", []) if f.get("path")]
     if not paths:
-        return None
+        return None, None
 
     available = ([f"specs/{p.name}" for p in SPECS_DIR.glob("*.md") if p.is_file()]
                  if SPECS_DIR.is_dir() else [])
@@ -130,21 +178,23 @@ async def _find_spec_by_path(hub, mr: dict) -> tuple[str, str] | None:
         if match.spec_path:
             local = SPECS_DIR / match.spec_path.rsplit("/", 1)[-1]
             if local.is_file():   # available 就是列這個目錄得來的,理論上必成立
-                return local.stem, local.read_text(encoding="utf-8")
+                return (local.stem, local.read_text(encoding="utf-8")), None
 
     if hub is None:
-        return None
+        return None, None
+    unavailable = None
     for path in paths:
         for candidate in resolve_spec(path, ()).candidates:   # 只要候選路徑,不比對存在與否
-            try:
-                # 同上:不指定 ref,讀正在審的那一版
-                txt = await hub.call("gitlab__get_file",
-                                     {"path": candidate}, truncate=False)
-            except Exception:
+            txt, reason = fetch_file(candidate)               # 同上:不指定 ref
+            if reason:
+                unavailable = unavailable or reason
                 continue
-            if txt and txt.lstrip().startswith("#"):
-                return candidate.rsplit("/", 1)[-1][:-len(".md")], txt
-    return None
+            if txt is None:
+                continue
+            if _is_spec_text(txt):
+                return (candidate.rsplit("/", 1)[-1][:-len(".md")], txt), None
+            unavailable = unavailable or "not_a_spec"
+    return None, unavailable
 
 
 # ------------------------------------------------------------------ 1. 測資生成
@@ -1803,13 +1853,32 @@ async def _in_thread(fn, *args):
     fut: asyncio.Future = loop.create_future()
     ctx = contextvars.copy_context()
 
+    def settle(apply):
+        """把結果交回事件迴圈。迴圈已經關掉就安靜放掉。
+
+        逾時之後外層不等這個執行緒,它可能在迴圈收掉之後才跑完 —— 那時
+        `call_soon_threadsafe` 會丟 `RuntimeError: Event loop is closed`,而這個例外
+        發生在 daemon 執行緒裡,沒有人接:正式環境的 log 每逾時一次就多一段看起來很
+        嚴重的 traceback,排查的人會先去追它;測試套件則是長期掛著警告。
+        逾時的結果本來就不要了,放掉是對的,但要**安靜地**放掉。
+        """
+        try:
+            loop.call_soon_threadsafe(apply)
+        except RuntimeError:                  # 迴圈已經關了
+            pass
+
     def runner():
         try:
             out = ctx.run(fn, *args)
         except BaseException as e:            # noqa: BLE001 — 原樣交回給 await 端
-            loop.call_soon_threadsafe(lambda: fut.cancelled() or fut.set_exception(e))
+            # **要先綁到自己的變數**:`except ... as e` 的 e 在區塊結束時就被刪掉,
+            # 而這個 lambda 是丟給事件迴圈稍後才跑的。直接捕捉 e 的話,跑的時候會丟
+            # NameError,fut 永遠不會有結果,await 就**永遠掛著** —— 沙盒丟例外時
+            # 整個執行驗證卡住,要等外層的時間上限才被砍掉。
+            exc = e
+            settle(lambda: fut.cancelled() or fut.set_exception(exc))
         else:
-            loop.call_soon_threadsafe(lambda: fut.cancelled() or fut.set_result(out))
+            settle(lambda: fut.cancelled() or fut.set_result(out))
 
     threading.Thread(target=runner, name="spec-exec-sandbox", daemon=True).start()
     return await fut
@@ -1848,10 +1917,27 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
     for f in mr.get("files", []):
         sql = f.get("full_content") or _sql_from_diff(f.get("diff", "")) or sql
 
+    unavailable = None
     if spec_text is None:
         # getattr:呼叫端可能傳測試用的替身 cfg(沒有 dbt 欄位),視為未開啟
-        spec_code, spec_text = await find_spec(
+        lookup = await find_spec(
             hub, mr, by_path=(getattr(cfg, "dbt", None) or {}).get("enabled") is True)
+        spec_code, spec_text = lookup
+        unavailable = getattr(lookup, "unavailable", None)
+
+    if not spec_text and unavailable:
+        # **拿不到 ≠ 沒有**:環境出了問題,卻叫開發者去補一份其實可能已經存在的規格,
+        # 而維運也看不出是 token 設錯了——每張 MR 都只說「沒有規格」(#90 第 2 點)。
+        return {"passed": False, "spec_code": spec_code, "conditions": [],
+                "coverage_gaps": [], "case_results": [], "dropped_cases": [],
+                "spec_unavailable": unavailable,
+                "findings": [_finding(path, "major", "執行驗證沒有完成:取不到規格",
+                                      f"{UNAVAILABLE_TEXT[unavailable]}"
+                                      f"這是驗證環境的問題,不是這個 MR 的問題:"
+                                      f"不需要補規格。處理之後重新觸發審查;在那之前"
+                                      f"本 MR 不得自動放行。(代碼:{unavailable})",
+                                      "通知維運依代碼查設定(見 docs/10),"
+                                      "處理後重新觸發審查。")]}
 
     if not spec_text:
         detail = (f"MR 涉及規則 {spec_code},但找不到對應的規格檔 specs/{spec_code}.md。"

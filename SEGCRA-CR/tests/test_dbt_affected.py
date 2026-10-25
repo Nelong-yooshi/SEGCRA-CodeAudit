@@ -16,6 +16,8 @@ import tarfile
 
 import pytest
 
+from orchestrator.spec_exec import SpecLookup
+
 import orchestrator.dbt_affected as dbt_affected
 import orchestrator.pipeline as pipeline
 from orchestrator import dbt_context, dbt_project, spec_exec
@@ -146,7 +148,7 @@ class _Hub:
 
 
 async def _no_spec(hub, mr, *, by_path=False):
-    return None, None
+    return SpecLookup(None, None)
 
 
 def _check(head_body, base_body=None, *, mr=MACRO_MR, hub=None, find_spec=_no_spec, loader=None,
@@ -525,7 +527,7 @@ class _Clock:
             clock.now += clock.spec_s
             calls.append(mr["files"][0]["path"])
             code = mapping.get(mr["files"][0]["path"])
-            return (code, f"# 規格 {code}") if code else (None, None)
+            return SpecLookup(code, f"# 規格 {code}") if code else SpecLookup(None, None)
         return find
 
 
@@ -595,7 +597,7 @@ def _spec_by(mapping: dict, calls: list | None = None):
         if calls is not None:
             calls.append((path, by_path, mr["title"], mr["description"]))
         code = mapping.get(path)
-        return (code, f"# 規格 {code}") if code else (None, None)
+        return SpecLookup(code, f"# 規格 {code}") if code else SpecLookup(None, None)
     return find
 
 
@@ -676,7 +678,7 @@ def test_查規格卡住_只等剩下的時間(monkeypatch):
 
     async def stuck(hub, mr, *, by_path=False):
         real_time.sleep(30)                          # 同步卡住,像是 GitLab 很慢
-        return "A", "# 規格 A"
+        return SpecLookup("A", "# 規格 A")
 
     ctx = prepare_dbt_context(MACRO_MR, CFG, real_mode=True,
                               load=_Loader(_project("SELECT 1 AS id")))
@@ -701,7 +703,7 @@ def test_查規格丟例外_記成取不到_不中斷():
 @pytest.mark.parametrize("result", [("BIG", None), ("BIG", ""), (None, "# x"), ("", "# x")])
 def test_規格代號或內容缺一_不算對到(result):
     async def find(hub, mr, *, by_path=False):
-        return result
+        return SpecLookup(*result)
     check, *_ = _check("SELECT 1 AS id", find_spec=find)
     assert _only(check).spec is None and check.spec is None
 
@@ -1379,7 +1381,7 @@ TWO_MODEL_SPECS = {"models/mrt_a.sql": "R-201", "models/mrt_b.sql": "R-305"}
 def test_只改共用設定_受影響的_model_對到兩份規格_兩份都附上(review, monkeypatch):
     async def find(hub, mr, *, by_path=False):
         code = TWO_MODEL_SPECS.get(mr["files"][0]["path"]) if by_path else None
-        return (code, f"# {code} 規格\n門檻依核定。") if code else (None, None)
+        return SpecLookup(code, f"# {code} 規格\n門檻依核定。") if code else SpecLookup(None, None)
 
     monkeypatch.setattr(pipeline, "find_spec", find)
     diff = "@@ -1 +1 @@\n-{{ return({'R-201': 1000, 'R-305': 5000}) }}\n+{{ return({'R-201': 900, 'R-305': 5000}) }}"
@@ -1403,7 +1405,7 @@ def test_受影響的_model_的規格整理失敗時_審查照出並記下未完
     """當成沒有對到規格(執行驗證照「無規格可驗」處理),並記下這個環節沒完成。"""
     async def find(hub, mr, *, by_path=False):
         code = TWO_MODEL_SPECS.get(mr["files"][0]["path"]) if by_path else None
-        return (code, f"# {code} 規格\n門檻依核定。") if code else (None, None)
+        return SpecLookup(code, f"# {code} 規格\n門檻依核定。") if code else SpecLookup(None, None)
 
     def boom(*a, **kw):
         raise RuntimeError("內部爆掉:這段訊息不可以出現在報告裡")
@@ -1467,7 +1469,7 @@ def test_查規格的背景執行緒_讀得到呼叫端的contextvars():
 
     async def spec(hub, mr, *, by_path=False):
         seen["ref"] = gitlab.review_ref()
-        return "A", "# 規格 A"
+        return SpecLookup("A", "# 規格 A")
 
     async def run():
         gitlab.pin_review_ref("c" * 40)

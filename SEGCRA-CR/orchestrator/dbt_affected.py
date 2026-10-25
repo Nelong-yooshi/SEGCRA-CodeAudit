@@ -38,6 +38,7 @@ from .config import DBT_DATABASE_PLACEHOLDER
 from .dbt_context import DbtContext
 from .dbt_impact import ImpactReport
 from .dbt_render import DEFAULT_ISOLATED_TIMEOUT_S, render_model_isolated
+from toolbox.gitlab import UNAVAILABLE_TEXT
 from toolbox.sqltools import DIALECT, _parse
 
 MAX_CHECKED_MODELS = 50
@@ -56,7 +57,7 @@ class CheckedModel:
     chain: tuple[str, ...] = ()
     spec: str | None = None                # 對應到的規格代號;None = 沒找到或沒查
     spec_looked_up: bool = False
-    # 取不到規格的原因代碼(見 SPEC_UNAVAILABLE);None = 取得到(對到或確定沒有)或沒查
+    # 取不到規格的原因代碼(gitlab.UNAVAILABLE_TEXT 的鍵);None = 取得到(對到或確定沒有)或沒查
     spec_unavailable: str | None = None
     # 變更後多出來的規則命中 [(規則代號, 嚴重度)]
     new_hits: tuple[tuple[str, str], ...] = ()
@@ -194,24 +195,20 @@ async def _check(hub, mr: dict, dbt_cfg: dict, ctx: DbtContext, find_spec, rende
                          spec=(code, specs[code]) if code else None, specs_found=specs)
 
 
-# 取不到規格的原因代碼 → 給人看的說法。代碼與 spec_exec.find_spec 的 `unavailable` 相同;
-# 只寫是哪一種設定,不帶原始錯誤、主機位址。
-SPEC_UNAVAILABLE = {
-    "no_read_token": "未設定唯讀的 GITLAB_READ_TOKEN",
-    "no_review_ref": "這次審查沒有釘住 commit",
-    "too_large": "規格檔超過單檔大小上限",
-    "fetch_failed": "向 GitLab 取檔失敗",
-}
-_FETCH_FAILED_TEXT = SPEC_UNAVAILABLE["fetch_failed"]
+def _unavailable_text(code) -> str:
+    """取不到規格的說法。代碼與說法只有一份,在定義代碼的 gitlab.UNAVAILABLE_TEXT;不認得的代碼
+    (不應該出現)寫成取檔失敗,不把代碼原樣寫出去。"""
+    return UNAVAILABLE_TEXT.get(code, UNAVAILABLE_TEXT["fetch_failed"]).rstrip("。")
 
 
 async def _spec_for(hub, ctx: DbtContext, rel: str, find_spec, specs: dict,
                     seconds: float) -> tuple[str | None, str | None]:
     """查一個 model 的規格,最多等 seconds 秒(逾時丟 _OutOfTime)。回傳 (代號, 取不到的原因):
-    對到 → (代號, None);確定沒有 → (None, None);**取不到** → (None, SPEC_UNAVAILABLE 的代碼)。
+    對到 → (代號, None);確定沒有 → (None, None);**取不到** → (None, gitlab.UNAVAILABLE_TEXT 的代碼)。
 
-    取不到(token 沒設、沒釘住 commit、檔案太大、取檔失敗)不是「沒有規格」:那是環境的問題,
-    報告不能叫開發者去補一份其實存在的規格。find_spec 回傳值的 `unavailable` 屬性帶這個代碼;
+    取不到(token 沒設、沒釘住 commit、專案或 commit 找不到、檔案太大、取檔失敗、取回的內容不是
+    規格)不是「沒有規格」:報告不能叫開發者去補一份其實存在的規格。代碼直接讀 find_spec 回傳的
+    SpecLookup.unavailable,**不給預設值**:介面改了要大聲失敗,不能靜靜退回「確定沒有」。
     查的過程丟例外也算取不到(不知道規格存不存在)。
 
     查規格的工具呼叫是同步的(真實 GitLab 模式會發請求),在這個事件迴圈裡等就沒辦法中途
@@ -228,10 +225,10 @@ async def _spec_for(hub, ctx: DbtContext, rel: str, find_spec, specs: dict,
     if code and text:
         specs.setdefault(code, text)
         return code, None
-    reason = getattr(lookup, "unavailable", None)
+    reason = lookup.unavailable
     if reason is None:
         return None, None
-    return None, reason if reason in SPEC_UNAVAILABLE else "fetch_failed"
+    return None, reason if reason in UNAVAILABLE_TEXT else "fetch_failed"
 
 
 async def _wait_in_thread(make_coroutine, seconds: float):
@@ -518,7 +515,7 @@ def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None
         parts.append("超過查詢數量或時間上限,**沒有查規格**的受影響 model:"
                      + "、".join(not_looked) + "。")
     mapped = [f"{full(m.path)} → {m.spec}" for m in check.models if m.spec]
-    unavailable = [f"{full(m.path)}({SPEC_UNAVAILABLE.get(m.spec_unavailable, _FETCH_FAILED_TEXT)})"
+    unavailable = [f"{full(m.path)}({_unavailable_text(m.spec_unavailable)})"
                    for m in check.models if m.spec_unavailable]
     if unavailable:
         raise_to("major")
