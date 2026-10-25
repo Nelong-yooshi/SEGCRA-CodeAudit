@@ -234,7 +234,10 @@ def test_管線在決策前補這條_並讀的是同一個_hub():
     src = inspect.getsource(pipeline.review_mr)
     call = "report = enforce_tool_refusals(report, hub.refused_calls)"
     assert src.count(call) == 1
-    assert src.index("raw = await run_agent(cfg, profile, system, user, hub") < src.index(call)
+    assert src.index("raw = await _run_main_review(cfg, profile, system, user, hub") < src.index(call)
+    # 主審查的模型呼叫拿到的也是這個 hub
+    assert "run_agent(cfg, profile, system, user, hub, trace=trace, meta=meta)" in inspect.getsource(
+        pipeline._run_main_review)
     assert src.index(call) < src.index("report = apply_policy(report, mr, cfg.policy)")
 
 
