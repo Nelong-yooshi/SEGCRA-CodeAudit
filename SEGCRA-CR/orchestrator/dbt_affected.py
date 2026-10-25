@@ -38,6 +38,7 @@ from .config import DBT_DATABASE_PLACEHOLDER
 from .dbt_context import DbtContext
 from .dbt_impact import ImpactReport
 from .dbt_render import DEFAULT_ISOLATED_TIMEOUT_S, render_model_isolated
+from toolbox.gitlab import UNAVAILABLE_TEXT
 from toolbox.sqltools import DIALECT, _parse
 
 MAX_CHECKED_MODELS = 50
@@ -56,6 +57,8 @@ class CheckedModel:
     chain: tuple[str, ...] = ()
     spec: str | None = None                # 對應到的規格代號;None = 沒找到或沒查
     spec_looked_up: bool = False
+    # 取不到規格的原因代碼(gitlab.UNAVAILABLE_TEXT 的鍵);None = 取得到(對到或確定沒有)或沒查
+    spec_unavailable: str | None = None
     # 變更後多出來的規則命中 [(規則代號, 嚴重度)]
     new_hits: tuple[tuple[str, str], ...] = ()
     # 與 new_hits 一一對應:命中在展開後的第幾句(從 1 起算);None = 文字層規則或對不到語句
@@ -168,17 +171,17 @@ async def _check(hub, mr: dict, dbt_cfg: dict, ctx: DbtContext, find_spec, rende
             continue
         # 查規格在真實 GitLab 模式是逐一發請求,同樣受數量與時間上限約束;沒查到的不算
         # 「沒有對應的規格」,而是沒查(列出來、下面不會採用規格)
-        spec, looked_up = None, False
+        spec, unavailable, looked_up = None, None, False
         if index < MAX_SPEC_LOOKUPS and clock() < deadline:
             try:
-                spec = await _spec_for(hub, ctx, model.path, find_spec, specs,
-                                       deadline - clock())
+                spec, unavailable = await _spec_for(hub, ctx, model.path, find_spec, specs,
+                                                    deadline - clock())
                 looked_up = True
             except _OutOfTime:
                 pass
         checked.append(CheckedModel(
             path=model.path, name=model.name, certain=model.certain, chain=model.chain,
-            spec=spec, spec_looked_up=looked_up,
+            spec=spec, spec_looked_up=looked_up, spec_unavailable=unavailable,
             new_hits=tuple((rule, sev) for rule, sev, _ in new if sev in _COMPARED),
             new_hit_statements=tuple(pos for _, sev, pos in new if sev in _COMPARED),
             new_hints=tuple(rule for rule, sev, _ in new if sev not in _COMPARED),
@@ -192,24 +195,40 @@ async def _check(hub, mr: dict, dbt_cfg: dict, ctx: DbtContext, find_spec, rende
                          spec=(code, specs[code]) if code else None, specs_found=specs)
 
 
+def _unavailable_text(code) -> str:
+    """取不到規格的說法。代碼與說法只有一份,在定義代碼的 gitlab.UNAVAILABLE_TEXT;不認得的代碼
+    (不應該出現)寫成取檔失敗,不把代碼原樣寫出去。"""
+    return UNAVAILABLE_TEXT.get(code, UNAVAILABLE_TEXT["fetch_failed"]).rstrip("。")
+
+
 async def _spec_for(hub, ctx: DbtContext, rel: str, find_spec, specs: dict,
-                    seconds: float) -> str | None:
-    """查一個 model 的規格,最多等 seconds 秒(逾時丟 _OutOfTime)。
+                    seconds: float) -> tuple[str | None, str | None]:
+    """查一個 model 的規格,最多等 seconds 秒(逾時丟 _OutOfTime)。回傳 (代號, 取不到的原因):
+    對到 → (代號, None);確定沒有 → (None, None);**取不到** → (None, gitlab.UNAVAILABLE_TEXT 的代碼)。
+
+    取不到(token 沒設、沒釘住 commit、專案或 commit 找不到、檔案太大、取檔失敗、取回的內容不是
+    規格)不是「沒有規格」:報告不能叫開發者去補一份其實存在的規格。代碼直接讀 find_spec 回傳的
+    SpecLookup.unavailable,**不給預設值**:介面改了要大聲失敗,不能靜靜退回「確定沒有」。
+    查的過程丟例外也算取不到(不知道規格存不存在)。
 
     查規格的工具呼叫是同步的(真實 GitLab 模式會發請求),在這個事件迴圈裡等就沒辦法中途
     停下;放到另一條背景執行緒裡跑,這裡只等剩下的時間(見 _wait_in_thread)。"""
     repo_path = f"{ctx.prefix}/{rel}" if ctx.prefix else rel
     target = {"title": "", "description": "", "files": [{"path": repo_path}]}
     try:
-        code, text = await _wait_in_thread(lambda: find_spec(hub, target, by_path=True), seconds)
+        lookup = await _wait_in_thread(lambda: find_spec(hub, target, by_path=True), seconds)
+        code, text = lookup
     except asyncio.TimeoutError:
         raise _OutOfTime from None
-    except Exception:                        # noqa: BLE001 — 找不到規格不該讓審查中斷
-        return None
-    if not code or not text:
-        return None
-    specs.setdefault(code, text)
-    return code
+    except Exception:                        # noqa: BLE001 — 查規格出錯不該讓審查中斷
+        return None, "fetch_failed"
+    if code and text:
+        specs.setdefault(code, text)
+        return code, None
+    reason = lookup.unavailable
+    if reason is None:
+        return None, None
+    return None, reason if reason in UNAVAILABLE_TEXT else "fetch_failed"
 
 
 async def _wait_in_thread(make_coroutine, seconds: float):
@@ -496,7 +515,14 @@ def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None
         parts.append("超過查詢數量或時間上限,**沒有查規格**的受影響 model:"
                      + "、".join(not_looked) + "。")
     mapped = [f"{full(m.path)} → {m.spec}" for m in check.models if m.spec]
-    unmapped = [full(m.path) for m in check.models if m.spec_looked_up and not m.spec]
+    unavailable = [f"{full(m.path)}({_unavailable_text(m.spec_unavailable)})"
+                   for m in check.models if m.spec_unavailable]
+    if unavailable:
+        raise_to("major")
+        parts.append("**取不到規格**(驗證環境的問題,不是這個 MR 的問題,不需要補規格;處理後重新觸發審查):"
+                     + "、".join(unavailable) + "。")
+    unmapped = [full(m.path) for m in check.models
+                if m.spec_looked_up and not m.spec and not m.spec_unavailable]
     if mapped:
         parts.append("對應的規格:" + _listed(mapped) + "。")
     if unmapped:

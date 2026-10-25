@@ -41,7 +41,7 @@ from .dbt_render import (MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, M
                          check_macro_files_isolated)
 from .security import scan_mr
 from .skills_loader import always_skills, load_skills, skills_index
-from .spec_exec import find_spec, run_spec_exec
+from .spec_exec import SpecLookup, find_spec, run_spec_exec
 from .tool_hub import ToolHub
 from toolbox.sqltools import LINT_INCOMPLETE_CODE, LINT_MAX_CHARS, LINT_TIMEOUT_SECONDS
 from toolbox.sqltools import run_rules
@@ -1150,9 +1150,14 @@ def _affected_spec_section(specs: tuple[SpecForModels, ...], affected: AffectedC
     missing = []
     if omitted:
         missing.append("- 超出預算、沒有附上的規格:" + ";".join(omitted))
-    unmapped = [full(m.path) for m in affected.models if m.spec_looked_up and not m.spec]
+    unmapped = [full(m.path) for m in affected.models
+                if m.spec_looked_up and not m.spec and not m.spec_unavailable]
     if unmapped:
         missing.append("- 沒有對應到規格的 model:" + "、".join(unmapped))
+    unavailable = [full(m.path) for m in affected.models if m.spec_unavailable]
+    if unavailable:
+        missing.append("- 取不到規格的 model(環境問題,規格可能存在,不要當成沒有規格):"
+                       + "、".join(unavailable))
     not_looked = [full(m.path) for m in affected.models if not m.spec_looked_up]
     if not_looked:
         missing.append("- 沒有查規格的 model(超過查詢上限):" + "、".join(not_looked))
@@ -1347,14 +1352,19 @@ def _is_deleted(diff) -> bool:
 
 def _find_spec_in_mr(mr: dict):
     """find_spec 找到的規格,換成這個 MR 的版本(見 _spec_versions_in_mr)。受影響的 model 對規格時
-    也用這一個,同一個 MR 裡兩條路讀到的版本一致。"""
+    也用這一個,同一個 MR 裡兩條路讀到的版本一致。
+
+    回傳跟 find_spec 一樣是 SpecLookup,**`unavailable` 要照樣帶出去**:受影響 model 的檢查靠它
+    分出「取不到」與「確定沒有」,丟掉的話 token 沒設也會被說成沒有規格。用的是 MR 的版本時拿得到,
+    不算取不到。"""
     versions, _ = _spec_versions_in_mr(mr)
 
     async def find(hub, target: dict, **kw):
-        code, text = await find_spec(hub, target, **kw)
+        found = await find_spec(hub, target, **kw)
+        code, text = found
         if code is not None and code in versions:
-            text = versions[code]
-        return code, text
+            return SpecLookup(code, versions[code])
+        return SpecLookup(code, text, found.unavailable)
     return find
 
 

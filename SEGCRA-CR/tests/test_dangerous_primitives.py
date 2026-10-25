@@ -47,6 +47,29 @@ def test_外部資料源讀寫命中R006(sql):
 
 
 @pytest.mark.parametrize("sql", [
+    'SELECT * FROM "srv"."db"."dbo"."t"',
+    'SELECT * FROM srv."db".dbo.t',                        # 只有一段加引號
+    'INSERT INTO "srv"."db"."dbo"."t" SELECT 1',           # 寫到 linked server
+    'SELECT * FROM "report srv"."db"."dbo"."txn_log"',     # 名稱裡有空白
+])
+def test_四段式名稱認雙引號識別字(sql):
+    """SQL Server 預設 QUOTED_IDENTIFIER ON。只認方括號的話,換一種引號就繞過
+    這條 blocker —— 跟 R005 是同一個洞,所以識別字的寫法現在共用一份。"""
+    hits = _hits(sql, "R006")
+    assert hits, sql
+    assert hits[0]["severity"] == "blocker"
+
+
+@pytest.mark.parametrize("sql", [
+    'SELECT * FROM "db"."dbo"."t"',                        # 三段式是正常寫法
+    'SELECT * FROM "a"."b"."c"."d"."e"',                   # 五段不是四段
+    "SELECT x FROM t WHERE conn = 'Server=10.0.0.9'",      # 寫死主機的連線字串
+])
+def test_加了雙引號之後仍然不誤報(sql):
+    assert _hits(sql, "R006") == []
+
+
+@pytest.mark.parametrize("sql", [
     "EXEC xp_cmdshell 'dir'",
     "EXEC master..xp_cmdshell 'dir'",                      # 限定名稱是最常見的寫法
     "EXEC [master].[dbo].[xp_cmdshell] 'dir'",
@@ -367,12 +390,15 @@ def test_沒開dbt時不掃macro():
 import time  # noqa: E402
 
 
+# 這幾個 payload 有十幾萬字元,而 pytest 會把參數原文放進測試名稱、再寫進
+# PYTEST_CURRENT_TEST 這個環境變數。Windows 的環境變數上限是 32767 字元,名稱一長
+# 這幾條就會在 setup 階段直接 ValueError。所以一定要給 ids。
 @pytest.mark.parametrize("payload,label", [
     ("{{" * 50_000, "不閉合的 Jinja 開頭"),
     ("DB_NAME /*" * 20_000, "不閉合的註解開頭"),
     ("EXEC /*" * 20_000, "不閉合的註解接在 EXEC 後面"),
     ("a.b.c." * 20_000, "大量的點分隔名稱"),
-])
+], ids=("jinja-open", "comment-open", "comment-after-exec", "dotted-names"))
 def test_特製內容不會讓規則層卡住(payload, label):
     t = time.perf_counter()
     run_rules(payload)

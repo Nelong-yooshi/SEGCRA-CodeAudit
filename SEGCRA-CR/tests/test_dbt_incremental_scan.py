@@ -7,6 +7,8 @@ import asyncio
 
 import pytest
 
+from orchestrator.spec_exec import SpecLookup
+
 from orchestrator import dbt_context, dbt_project, pipeline
 from orchestrator.config import DBT_DATABASE_PLACEHOLDER
 from orchestrator.dbt_affected import check_affected_models
@@ -150,7 +152,7 @@ def _affected(head_body, base_body, **kw):
 
 
 async def _no_spec(hub, mr, *, by_path=False):
-    return None, None
+    return SpecLookup(None, None)
 
 
 def test_只在增量分支多出的命中_受影響model照樣抓到():

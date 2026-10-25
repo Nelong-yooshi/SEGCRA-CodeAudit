@@ -120,7 +120,7 @@ async def find_spec(hub, mr: dict, *, by_path: bool = False) -> SpecLookup:
         for code in codes:
             local = SPECS_DIR / f"{code}.md"
             if local.exists():
-                return code, local.read_text(encoding="utf-8")
+                return SpecLookup(code, local.read_text(encoding="utf-8"))
     unavailable = None          # 第一個遇到的「拿不到」,照實帶出去
     if hub is not None:
         for code in codes:
