@@ -9,12 +9,8 @@
 """
 import asyncio
 import json
-import sys
-from pathlib import Path
 
 import pytest
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from orchestrator import pipeline
 
@@ -25,23 +21,6 @@ def _report(findings=()):
 
 # ─────────────────── 單一環節丟例外 ───────────────────
 
-STAGES = [
-    ("validate_citations", "引用白名單"),
-    ("sanitize_findings", "輸出清理"),
-    ("enforce_hints", "檢核點補報"),
-    ("enforce_rules", "規則命中補報"),
-    ("enforce_parse", "解析失敗揭露"),
-    ("enforce_style", "風格補報"),
-    ("enforce_dbt_notice", "dbt 表名提醒"),
-    ("enforce_dbt_render_failure", "dbt 展開失敗揭露"),
-    ("enforce_injection", "注入防線"),
-    ("enforce_unreviewable", "未審查內容揭露"),
-    ("enforce_tool_refusals", "工具拒絕揭露"),
-    ("apply_rubric", "評分"),
-    ("apply_policy", "決策閘門"),
-    ("normalize_findings", "輸出形狀整理"),
-    ("enforce_format", "輸出格式檢查"),
-]
 
 
 def test_每個後處理呼叫都有被包到():
@@ -69,9 +48,14 @@ def test_登記簿與實際包裝一致():
         assert getattr(fn, "__wrapped_stage__", None) == stage, name
 
 
-@pytest.mark.parametrize("fname,stage", STAGES)
-def test_環節丟例外時報告照出並記下是哪個環節(fname, stage):
-    """包裝過的環節吃到例外:回傳進來的 report、補一條 major 說明是哪個環節。"""
+def test_環節丟例外時報告照出並記下是哪個環節():
+    """包裝過的環節吃到例外:回傳進來的 report、補一條 major 說明是哪個環節。
+
+    只測一次通用的包裝,不逐一列舉環節:包的是同一個 `_isolated`,列舉等於把同一件事
+    測十幾遍;而「每個環節都有包到」已經由掃原始碼與登記簿那兩條測試保證——人工清單
+    會漏(這份原本就少了後來加的 6 個),那兩條不會。
+    """
+    stage = "某個環節"
     def boom(report, *a, **kw):
         raise RuntimeError("內部爆掉:這段訊息不可以出現在報告裡")
 
@@ -85,10 +69,10 @@ def test_環節丟例外時報告照出並記下是哪個環節(fname, stage):
         "其他環節的 finding 要留著"
 
 
-@pytest.mark.parametrize("fname,stage", STAGES)
-def test_環節失敗的那條是major(fname, stage):
+def test_環節失敗的那條是major():
     """major 會讓 auto_approve 的條件不成立(allowed_severities 只許 info)。"""
-    wrapped = pipeline._isolated(stage, lambda r, *a, **k: (_ for _ in ()).throw(ValueError()))
+    wrapped = pipeline._isolated("某個環節",
+                                 lambda r, *a, **k: (_ for _ in ()).throw(ValueError()))
     out = wrapped(_report())
     # 認的是 stage 欄位,不是標題開頭(標題是給人看的文字,改寫它不該讓判斷失效)
     bad = [f for f in out["findings"] if f.get("stage")]

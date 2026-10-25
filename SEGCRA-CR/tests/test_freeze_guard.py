@@ -8,7 +8,6 @@ golden set 從此一直拿錯的預期去跑,而且不會有人發現。
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "eval"))
 
 import freeze_testdata as fz  # noqa: E402

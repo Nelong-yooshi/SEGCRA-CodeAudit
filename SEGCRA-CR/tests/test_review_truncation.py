@@ -125,8 +125,9 @@ def _others(report):
 
 STOP = {"finish_reason": "stop", "completion_tokens": 500}
 LENGTH = {"finish_reason": "length", "completion_tokens": LIMIT}
-# run_agent 沒有回填讀入量與總量時,這三個欄位是 None
-NO_USAGE = {"prompt_tokens": None, "prompt_tokens_total": None, "completion_tokens_total": None}
+# run_agent 沒有回填讀入量、總量與「沒回報用量的輪數」時,這四個欄位是 None
+NO_USAGE = {"prompt_tokens": None, "prompt_tokens_total": None,
+            "completion_tokens_total": None, "rounds_without_usage": None}
 # 模型呼叫沒有失敗時,failed 是 None
 NOT_FAILED = {"failed": None}
 

@@ -3658,6 +3658,9 @@ def _output_meta_record(meta: dict, max_output_tokens: int) -> dict:
     `prompt_tokens` 是最後一次呼叫讀入的量;`*_total` 是主審查這次 run_agent 每一輪的加總(有工具
     呼叫時每一輪都把整串對話重讀一遍,總量遠大於最後一次)。run_agent 沒有回填的欄位是 None。
 
+    `rounds_without_usage` 是其中沒回報用量的輪數:那幾輪的量沒有加進 `*_total`,所以這個數字
+    不是 0 的時候,總量是低估的。光看總量看不出少了多少輪。
+
     **只含主審查**,不是整份 MR 打到端點的總量:測資生成、仲裁、風格基準各自呼叫 run_agent,
     它們的用量不在這裡。
     """
@@ -3668,6 +3671,7 @@ def _output_meta_record(meta: dict, max_output_tokens: int) -> dict:
         "prompt_tokens": meta.get("prompt_tokens"),
         "prompt_tokens_total": meta.get("prompt_tokens_total"),
         "completion_tokens_total": meta.get("completion_tokens_total"),
+        "rounds_without_usage": meta.get("rounds_without_usage"),
         "max_output_tokens": max_output_tokens,
         # 模型呼叫失敗時沒有最終輸出:meta 裡的用量是前幾輪的,不算截斷
         "truncated": _failure_kind(meta) is None and output_truncated(meta, max_output_tokens),
