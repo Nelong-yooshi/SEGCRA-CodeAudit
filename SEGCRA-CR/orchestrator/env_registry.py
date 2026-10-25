@@ -140,11 +140,15 @@ def _scan_targets(root: pathlib.Path):
 
 
 def scan_repo(root: pathlib.Path | None = None) -> dict[str, list[EnvRead]]:
-    """{環境變數名稱: [讀取的地方…]},照名稱排序。"""
+    """{環境變數名稱: [讀取的地方…]},照名稱排序。
+
+    位置一律用 `/` 分隔(`as_posix()`):`str(Path)` 在 Windows 給的是反斜線,
+    拿位置來比對的地方(動態讀法的放行清單)就會在那裡對不上。
+    """
     root = root or PKG_ROOT
     found: dict[str, list[EnvRead]] = {}
     for f in _scan_targets(root):
-        for read in scan_file(f, str(f.relative_to(root))):
+        for read in scan_file(f, f.relative_to(root).as_posix()):
             found.setdefault(read.name, []).append(read)
     return dict(sorted(found.items()))
 
@@ -158,5 +162,5 @@ def scan_repo_dynamic(root: pathlib.Path | None = None) -> list[EnvRead]:
     root = root or PKG_ROOT
     out = []
     for f in _scan_targets(root):
-        out.extend(_scan(f, str(f.relative_to(root)))[1])
+        out.extend(_scan(f, f.relative_to(root).as_posix())[1])
     return sorted(out, key=lambda r: r.where)

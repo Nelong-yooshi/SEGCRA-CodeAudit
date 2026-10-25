@@ -367,12 +367,15 @@ def test_沒開dbt時不掃macro():
 import time  # noqa: E402
 
 
+# 這幾個 payload 有十幾萬字元,而 pytest 會把參數原文放進測試名稱、再寫進
+# PYTEST_CURRENT_TEST 這個環境變數。Windows 的環境變數上限是 32767 字元,名稱一長
+# 這幾條就會在 setup 階段直接 ValueError。所以一定要給 ids。
 @pytest.mark.parametrize("payload,label", [
     ("{{" * 50_000, "不閉合的 Jinja 開頭"),
     ("DB_NAME /*" * 20_000, "不閉合的註解開頭"),
     ("EXEC /*" * 20_000, "不閉合的註解接在 EXEC 後面"),
     ("a.b.c." * 20_000, "大量的點分隔名稱"),
-])
+], ids=("jinja-open", "comment-open", "comment-after-exec", "dotted-names"))
 def test_特製內容不會讓規則層卡住(payload, label):
     t = time.perf_counter()
     run_rules(payload)
