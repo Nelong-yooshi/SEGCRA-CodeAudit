@@ -3925,7 +3925,7 @@ MUTANTS.update({
     "測資:補缺失敗退回時用合併後的條件數(拆得少的提示永遠不出現)": (S,
         "                attempted, _, attempted_dropped = _shape_check(plan)",
         "                attempted, attempted_dropped = cleaned, []"),
-    # 生成的資料要先對過資料表定義(#47 review 第 2 點)。兩份黑盒規格各花 50 分鐘和
+    # 生成的資料要先對過資料表定義(#47 review 第 2 點)。實測兩份規格各花 50 分鐘和
     # 14 分鐘生成,每一列都有欄位值超過宣告長度 → 沙盒灌資料失敗 → 整輪白跑。
     "測資:資料不對表定義就收下": (S,
         '            why = _rows_fit_ddl(c.get("rows") or [], cols_by_table)',

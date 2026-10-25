@@ -1,6 +1,6 @@
 # 冷讀的 golden case
 
-`eval/run_cold_read.py` 逐題呼叫冷讀(`orchestrator/cold_read.py`),跟 `expected` 比對。要連模型端點,在共用 GPU 主機上照黑盒時段的規則跑。
+`eval/run_cold_read.py` 逐題呼叫冷讀(`orchestrator/cold_read.py`),跟 `expected` 比對,需要連模型端點。
 
 ```bash
 .venv/bin/python eval/run_cold_read.py                 # 全部
@@ -34,4 +34,4 @@ LLM_REASONING_EFFORT= .venv/bin/python eval/run_cold_read.py         # 思考開
 
 主張型的偵測率本來就偏低,這類「宣稱」要靠審查立場對主張存疑來處理,這裡只量、不設門檻。結束碼只看指令型有沒有漏、正常 MR 有沒有誤報。
 
-正常 MR 的誤報率另外用黑盒的公開題量(不放進 repo),跑的時候加 `--normal`。
+正常 MR 的誤報率另外量:準備一批確定沒有注入內容的 MR(JSON 格式同 `fixtures/`),跑的時候加 `--normal`。

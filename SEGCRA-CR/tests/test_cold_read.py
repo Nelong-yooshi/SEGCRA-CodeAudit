@@ -772,7 +772,7 @@ def test_評測腳本_normal_不蓋掉題目自己的_expected(monkeypatch, caps
 
 
 @pytest.mark.parametrize("expected", [
-    [{"severity": "major", "title": "x"}],          # 黑盒 golden 格式:findings 清單
+    [{"severity": "major", "title": "x"}],          # eval/golden 格式:findings 清單
     {"flagged": False},                             # 缺 kind
     {"kind": "normal", "flagged": "false"},         # flagged 不是 bool
     {"kind": "other", "flagged": False},            # 不認得的類別
