@@ -2345,8 +2345,13 @@ MUTANTS.update({
      '        if (f.get("file"), f.get("title")) != key:',
      '        if f.get("title") != key[1]:'),
  "後處理:取代時不保留較嚴重的等級": ("pipeline.py",
-     '    kept.append({**finding, "severity": worst})',
-     "    kept.append(finding)"),
+     '    kept.append({**finding, "severity": worst, "_source": PROGRAM_SOURCE})',
+     '    kept.append({**finding, "_source": PROGRAM_SOURCE})'),
+ # 經過 _put_program_finding 的 finding 一律是程式產生的 → 自動標 _source,
+ # 新增的 enforce_* 不必各自記得(判斷校準靠這個欄位決定碰不碰)
+ "後處理:程式專用標題的 finding 不標來源": ("pipeline.py",
+     '    kept.append({**finding, "severity": worst, "_source": PROGRAM_SOURCE})',
+     '    kept.append({**finding, "severity": worst})'),
  "後處理:解析失敗改回直接附加": ("pipeline.py",
      "            _put_program_finding(report, _parse_fail_finding(entry))",
      '            report.setdefault("findings", []).append(_parse_fail_finding(entry))'),
@@ -4018,6 +4023,156 @@ MUTANTS.update({
         + '        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],' + NL
         + '                "conditions": plan["conditions"],' + NL
         + '                "coverage_gaps": coverage_gaps,'),
+})
+
+
+# ---- 判斷校準:三道後處理都是「把模型的指控往下壓」,壓錯的代價是真缺陷
+# 從報告上消失。所以每個突變點問的都是同一件事:放寬之後,有沒有測試會紅。
+MUTANTS.update({
+ "校準:只驗一向也算驗過": ("pipeline.py",
+     '    return {True, False} <= {bool(r.get("expect_flagged")) for r in rs}',
+     "    return True"),
+ "校準:有覆蓋缺口也照樣降級": ("pipeline.py",
+     "    for gap in spec_exec.get(\"coverage_gaps\") or []:\n        if _names_id(cid, str(gap)):",
+     "    for gap in spec_exec.get(\"coverage_gaps\") or []:\n        if False:"),
+ "校準:條件編號用子字串比對(C10 的缺口算到 C1 身上)": ("pipeline.py",
+     '    return bool(re.search(rf"(?<![A-Za-z0-9_]){re.escape(cid)}(?![A-Za-z0-9_])", text))',
+     "    return cid in text"),
+ "校準:案例被仲裁剔除也算驗過": ("pipeline.py",
+     '    if not rs or any(r.get("dropped") for r in rs):',
+     "    if not rs:"),
+ "校準:案例結果不符預期也算驗過": ("pipeline.py",
+     '    if not all(r.get("ok") for r in rs):\n        return False',
+     "    if False:\n        return False"),
+ "校準:不取分支的基準案例(新格式只看變體)": ("pipeline.py",
+     "        elif rid.startswith(_BASE_CASE_PREFIX):",
+     "        elif False:"),
+ "校準:沒標分支的條件不取基準案例": ("pipeline.py",
+     '            if branch in (None, "", "*") or rid[len(_BASE_CASE_PREFIX):] == branch:',
+     "            if rid[len(_BASE_CASE_PREFIX):] == branch:"),
+ "校準:對不上任何條件也降級": ("pipeline.py",
+     "        if matched and all(_condition_verified(c, se) for c in matched):",
+     "        if all(_condition_verified(c, se) for c in matched):"),
+ "校準:命中一個泛用字眼就算對上": ("pipeline.py",
+     "    return bool(hits) and (strong or hits >= 2 or len(tokens) == 1)",
+     "    return bool(hits)"),
+ "校準:中文整串比對(不切二字)": ("pipeline.py",
+     "        out |= {word[i:i + 2] for i in range(len(word) - 1)}",
+     "        out.add(word)"),
+ "校準:沒有規格時不記要人看": ("pipeline.py",
+     '    if se.get("no_spec"):\n        _mark_needs_human(report, "無規格可對照,無法確認實作意圖")',
+     '    if se.get("no_spec"):\n        pass'),
+ # 判斷「這條是誰寫的」改用 _source 欄位(#39 review 第 4 點):靠標題兩個方向都會錯
+ "來源:程式補的 finding 不標 _source": ("pipeline.py",
+     '    return f.get("_source") == PROGRAM_SOURCE',
+     "    return False"),
+ "來源:改回用標題開頭判斷": ("pipeline.py",
+     '    return f.get("_source") == PROGRAM_SOURCE',
+     '    return str(f.get("title") or "").startswith("[")'),
+ "校準:程式補的 finding 也拿去對照": ("pipeline.py",
+     "        if not isinstance(f, dict) or _is_program_finding(f):\n"
+     "            continue\n"
+     "        if executed and str(f.get(\"file\") or \"\") != executed:",
+     "        if not isinstance(f, dict):\n"
+     "            continue\n"
+     "        if executed and str(f.get(\"file\") or \"\") != executed:"),
+ # 校準只對「實際被執行的那個檔案」加註:別的檔沒被跑過,這份結果對它沒有證據力
+ "校準:對沒被執行的檔案也加註": ("pipeline.py",
+     '        if executed and str(f.get("file") or "") != executed:\n            continue',
+     "        if False:\n            continue"),
+ # 加註不得改嚴重度(#39 review:降級讓 8 份真缺陷自動放行,其中 5 份是真的有錯)
+ "校準:加註時順手降成 info": ("pipeline.py",
+     '            why = f"執行驗證未重現(條件 {ids}),但指控仍在"',
+     '            f["severity"] = "info"\n'
+     '            why = f"執行驗證未重現(條件 {ids}),但指控仍在"'),
+ "校準:加註但不記要人看": ("pipeline.py",
+     "        _mark_needs_human(report, why)",
+     "        pass"),
+ # 待補:只看標題底下的條列項目、逐項比對、安全類不碰、不動嚴重度
+ # 項目名剛好含泛用字眼時(例如「**規格與條件**」),略過清單讓它不會只靠那些字眼命中
+ "待補:太泛的項目名也比對": ("pipeline.py",
+     "    if not parts or name.strip() in _PENDING_GENERIC:",
+     "    if not parts:"),
+ "待補:比對用整行而不是項目名": ("pipeline.py",
+     "    parts = _pending_parts(name)",
+     "    parts = _pending_parts(item)"),
+ "待補:項目名只要有一段出現就算": ("pipeline.py",
+     "                    if all(any(a in claim for a in alts) for alts in parts)), None)",
+     "                    if any(any(a in claim for a in alts) for alts in parts)), None)"),
+ "待補:段內的替代寫法要全部出現": ("pipeline.py",
+     "                    if all(any(a in claim for a in alts) for alts in parts)), None)",
+     "                    if all(all(a in claim for a in alts) for alts in parts)), None)"),
+ "待補:泛用後綴照樣參與比對": ("pipeline.py",
+     '            core = _NAME_SUFFIX.sub("", a.strip()) or a.strip()',
+     "            core = a.strip()"),
+ "待補:回到字詞重疊的比對": ("pipeline.py",
+     "        hit = next((name for name, parts in items" + NL
+     + "                    if all(any(a in claim for a in alts) for alts in parts)), None)",
+     "        hit = next((name for name, parts in items" + NL
+     + "                    if any(t and t in claim for t in _distinct_tokens(name))), None)"),
+ "待補:比對不抹掉反引號與粗體": ("pipeline.py",
+     "    return _NAME_NOISE.sub(\"\", str(text or \"\")).lower()",
+     "    return str(text or \"\").lower()"),
+ "待補:安全類的 finding 也碰": ("pipeline.py",
+     "        if _SECURITY_CLAIM.search(text):\n            continue",
+     "        if False:\n            continue"),
+ "待補:加註時順手降成 info": ("pipeline.py",
+     '        note = (f"(這條提到的「{hit}」,規格把它列在「待補 / 未載明」。"',
+     '        f["severity"] = "info"\n'
+     '        note = (f"(這條提到的「{hit}」,規格把它列在「待補 / 未載明」。"'),
+ "待補:加註寫成已經判定是同一件事": ("pipeline.py",
+     '                f"**如果講的就是這件事**,規格沒有寫這項要求,嚴重度不因此調整,"',
+     '                f"規格沒有寫這項要求,嚴重度不因此調整,"'),
+ "待補:不記要人看": ("pipeline.py",
+     '        _mark_needs_human(report, f"規格未載明:{hit}")',
+     "        pass"),
+ # 嚴重度只能被「執行出來的證據」調整:沙盒真的跑完、而且沒有 SQL 錯誤
+ "證據:沒跑成功也照樣降級": ("pipeline.py",
+     '    ran_ok = bool(se.get("case_results")) and not se.get("sql_error")',
+     "    ran_ok = True"),
+ "證據:SQL 錯誤也算跑成功": ("pipeline.py",
+     '    ran_ok = bool(se.get("case_results")) and not se.get("sql_error")',
+     '    ran_ok = bool(se.get("case_results"))'),
+ "證據:不是執行的那個檔也降級": ("pipeline.py",
+     '        if str(f.get("file") or "") != executed:\n            continue',
+     "        if False:\n            continue"),
+ "證據:不限「無法執行」類的指控": ("pipeline.py",
+     '        if f.get("severity") != "blocker" or not _UNRUNNABLE_CLAIM.search(_finding_text(f)):',
+     '        if f.get("severity") != "blocker":'),
+ "證據:降級時把 finding 整條移除": ("pipeline.py",
+     '        f["severity"] = "major"\n'
+     '        note = (f"(沙盒已實際執行成功:{executed} 在依規格生成的測資上編譯並執行完成,"',
+     '        f["severity"] = "info"\n'
+     '        note = (f"(沙盒已實際執行成功:{executed} 在依規格生成的測資上編譯並執行完成,"'),
+ "證據:降級後不交人工": ("pipeline.py",
+     '        _mark_needs_human(report, "指控的「無法執行」已被沙盒否證,其餘內容待確認")',
+     "        pass"),
+ # ---- 接線:三道都在執行驗證之後、rubric 與決策之前
+ "校準:整步沒接進管線": ("pipeline.py",
+     "        report = calibrate_with_execution(report)",
+     "        pass"),
+ "待補:整步沒接進管線": ("pipeline.py",
+     "        report = enforce_spec_pending(report, spec_text)",
+     "        pass"),
+ "斷言:整步沒接進管線": ("pipeline.py",
+     "        report = enforce_claim_evidence(report)",
+     "        pass"),
+ # 三道現在不動嚴重度,所以跟 rubric 的前後沒有差別;**要求是排在 apply_policy 之前**
+ # ——它們記的 _needs_human 是決策的硬條件,排在決策之後就等於沒記。
+ "校準:接在決策之後(needs_human 來不及被看到)": ("pipeline.py",
+     "        report = calibrate_with_execution(report)\n"
+     "        report = enforce_spec_pending(report, spec_text)\n"
+     "        report = enforce_claim_evidence(report)\n\n"
+     "        report = apply_rubric(report)\n"
+     "        report = apply_policy(report, mr, cfg.policy)",
+     "        report = apply_rubric(report)\n"
+     "        report = apply_policy(report, mr, cfg.policy)\n"
+     "        report = calibrate_with_execution(report)\n"
+     "        report = enforce_spec_pending(report, spec_text)\n"
+     "        report = enforce_claim_evidence(report)"),
+ "決策:不看「必須有人看」的理由": ("pipeline.py",
+     "          and not needs_human",
+     "          and True"),
 })
 
 
