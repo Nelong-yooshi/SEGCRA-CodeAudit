@@ -21,15 +21,88 @@ logging.disable(logging.INFO)  # sqlfluff 的 INFO 輸出會灌爆 stderr
 DIALECT = os.environ.get("SQL_DIALECT", "tsql")
 
 
-def _parse(sql: str):
+def parse_statements(sql: str):
+    """把一份 SQL 解析成語句清單。解析失敗會丟例外,呼叫端自己決定怎麼處理。
+
+    公開的名字:`pipeline` 與 `dbt_affected` 都在用它(#82 review)。
+    """
     return sqlglot.parse(sql, dialect=DIALECT)
+
+
+# 舊名字:等 pipeline 與 dbt_affected 的呼叫端換過去之後移除。先留著是因為那兩個
+# 檔案現在有在途的改動,一起改會撞在一起。
+_parse = parse_statements
+
+
+def _semicolon_cuts(sql: str) -> list[int]:
+    """分號的位置(切在分號**後面**)。字串、識別字、註解裡的分號不算。
+
+    **自己掃而不是用 sqlglot 的 tokenizer**:斷詞對沒收尾的引號或區塊註解會整個
+    失敗,而那正是這道要擋的手法 —— 在檔尾加一個 `'` 或 `/*`,整份就退回一次解析,
+    前面那句 `DELETE FROM t;` 的 blocker 又不見了,比巢狀運算式更容易做出來。
+
+    沒收尾的就吃到檔尾:那一段變成最後一「句」,解析失敗記成錯誤,**前面的句子照樣
+    逐句解析**。切錯的代價也只是那一段解析不了,不會吃掉別句。
+    """
+    cuts, i, n = [], 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == ";":
+            cuts.append(i + 1)
+            i += 1
+        elif ch == "'":                      # 字串('' 是跳脫,不是結束)
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+        elif ch in '"[':                     # 以引號或方括號包起來的識別字
+            j = sql.find('"' if ch == '"' else "]", i + 1)
+            i = n if j < 0 else j + 1
+        elif sql.startswith("--", i):        # 行註解
+            j = sql.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif sql.startswith("/*", i):        # 區塊註解(T-SQL 可以巢狀)
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if sql.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif sql.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        else:
+            i += 1
+    return cuts
+
+
+def _statement_chunks(sql: str) -> list[tuple[str, int]]:
+    """依分號切成一句一句,回傳 [(這一句的原文, 它在檔案裡的起始行 - 1)]。
+
+    切句用自己的掃描器(見 `_semicolon_cuts`):字串常值與註解裡的分號不算,
+    沒收尾的引號或註解也不會讓整份退回一次解析。
+    """
+    cuts = _semicolon_cuts(sql)
+    if not cuts:
+        return []
+    out, start = [], 0
+    for cut in cuts + ([len(sql)] if cuts[-1] < len(sql) else []):
+        chunk = sql[start:cut]
+        if chunk.strip(" \t\r\n;"):
+            out.append((chunk, sql.count("\n", 0, start)))
+        start = cut
+    return out
 
 
 def parse_ast(sql: str) -> str:
     """解析 SQL,回傳結構摘要:語句類型、涉及的表/欄位/JOIN、是否有 WHERE。"""
     out = []
     try:
-        statements = _parse(sql)
+        statements = parse_statements(sql)
     except Exception as e:
         # 這條只回給模型,而模型本來就看得到整份 SQL,所以不必像預掃那樣只留位置
         return json.dumps({"error": f"parse failed: {e}"}, ensure_ascii=False)
@@ -188,7 +261,7 @@ _SECRET_KINDS = {
 }
 
 
-def parse_error_text(e: Exception) -> str:
+def parse_error_text(e: Exception, line_offset: int = 0) -> str:
     """解析失敗的說明:**只留位置,不帶任何原文**。
 
     為什麼不是「把疑似憑證的部分遮掉」:要防的是「解析錯誤把原文帶出去」,跟那段原文
@@ -203,7 +276,9 @@ def parse_error_text(e: Exception) -> str:
     spots = []
     for d in getattr(e, "errors", None) or []:
         if isinstance(d, dict) and d.get("line") is not None:
-            spots.append(f"第 {d['line']} 行第 {d.get('col', '?')} 欄")
+            # 逐句解析時,行號是**那一句之內**的;加上這一句在檔案裡的起始行,
+            # 看留言的人才對得回原檔(#90 第 1 點)
+            spots.append(f"第 {d['line'] + line_offset} 行第 {d.get('col', '?')} 欄")
     where = "、".join(dict.fromkeys(spots))[:120] if spots else type(e).__name__
     return f"parse failed: 語法無法解析({where})"
 
@@ -467,18 +542,46 @@ def _text_rules(sql: str):
     return hits
 
 
+# 解析失敗時最多列幾句的位置。訊息會貼回 MR,不讓一份全壞的檔案洗出一長串。
+_MAX_PARSE_ERRORS = 5
+
+
+def _parse_each_statement(sql: str):
+    """逐句解析,回傳 (解析得出來的語句, 解析失敗的說明或 None)。
+
+    **一句解析不了,不可以吃掉整個檔案的命中**:原本是把整份一次丟給解析器,其中
+    一句壞掉(例如巢狀太深)就整份都不跑規則 —— 同一個檔裡那句 `DELETE FROM t;`
+    的 blocker 跟著不見,只剩一條「預掃無法解析」的 major,決策從擋下變成交人工。
+    而那是可以刻意做出來的(#90 第 1 點)。
+
+    解析失敗時 AST 規則對**那一句**無法執行,但文字層規則(R004 明碼憑證等)不需要
+    AST,由呼叫端對整份照跑 —— 否則一段解析不了的 SQL 會連明碼密碼都一起放過。
+
+    說明只留位置:它會變成 finding 的內文、貼回 MR 留言(見 parse_error_text)。
+    """
+    chunks = _statement_chunks(sql)
+    if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析
+        try:
+            return parse_statements(sql), None
+        except Exception as e:           # noqa: BLE001 — 解析失敗不中斷預掃
+            return [], parse_error_text(e)
+    statements, errors = [], []
+    for chunk, line_offset in chunks:
+        try:
+            statements.extend(parse_statements(chunk))
+        except Exception as e:           # noqa: BLE001
+            errors.append(parse_error_text(e, line_offset))
+    if not errors:
+        return statements, None
+    shown = list(dict.fromkeys(errors))[:_MAX_PARSE_ERRORS]
+    more = f"(還有 {len(errors) - len(shown)} 句)" if len(errors) > len(shown) else ""
+    return statements, ";".join(shown) + more
+
+
 def run_rules(sql: str) -> str:
     """執行 rule-base 檢查(組織既有規則的掛載點),回傳命中清單。"""
     hits = []
-    parse_error = None
-    try:
-        statements = _parse(sql)
-    except Exception as e:
-        # 解析失敗時 AST 規則無法執行,但文字層規則(R004 明碼憑證等)不需要 AST,
-        # 照樣要跑 —— 否則一段解析不了的 SQL 會連明碼密碼都一起放過。
-        # 這條訊息會變成 finding 的內文、貼回 MR 留言,所以**只留位置**
-        # (見 parse_error_text:sqlglot 的訊息夾著出錯位置附近的原文)
-        statements, parse_error = [], parse_error_text(e)
+    statements, parse_error = _parse_each_statement(sql)
     for st in statements:
         if st is None:
             continue

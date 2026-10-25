@@ -759,6 +759,156 @@ def copy_project(src: pathlib.Path, dst: pathlib.Path) -> None:
             shutil.copyfile(item, dst / item.name)
 
 
+# ---- 冷讀:另一支只看 MR 文字的模型呼叫(只能加擋)
+MUTANTS.update({
+ "冷讀:改動與全文不排序": ("cold_read.py",
+     "    return sections + _smallest_first(diffs) + _smallest_first(fulls)",
+     "    return sections + diffs + fulls"),
+ "冷讀:全文由大到小": ("cold_read.py",
+     "    return sorted(sections, key=lambda s: estimate_tokens_upper(_head(s) + s.text))",
+     "    return sorted(sections, key=lambda s: -estimate_tokens_upper(_head(s) + s.text))"),
+ "冷讀:排序用字元數而不是送出時的估計": ("cold_read.py",
+     "    return sorted(sections, key=lambda s: estimate_tokens_upper(_head(s) + s.text))",
+     "    return sorted(sections, key=lambda s: len(_head(s) + s.text))"),
+ "冷讀:分隔標記固定不變": ("cold_read.py",
+     "    token = secrets.token_hex(8)", '    token = "0" * 16'),
+ "冷讀:預算不生效": ("cold_read.py",
+     "        if cost > room:", "        if False:"),
+ "冷讀:截斷時不記沒送的段落": ("cold_read.py",
+     "            omitted.append(_label(s))", "            pass"),
+ "冷讀:放不下的段落連開頭也不送": ("cold_read.py",
+     "            if len(cut) > len(head):", "            if False:"),
+ "冷讀:刪掉的檔案也送內容": ("cold_read.py",
+     "        if _is_deleted(diff):", "        if False:"),
+ "冷讀:二進位檔照送": ("cold_read.py",
+     '        if "\\x00" in diff or "\\x00" in full:', "        if False:"),
+ "冷讀:不用檔案的完整內容": ("cold_read.py",
+     '        full = f.get("full_content")', "        full = None"),
+ "冷讀:不用取回的專案內容": ("cold_read.py",
+     "            full = head_texts.get(path)", "            full = None"),
+ "冷讀:全文排在改動前面(超過預算時改動沒送到)": ("cold_read.py",
+     "    return sections + _smallest_first(diffs) + _smallest_first(fulls)",
+     "    return sections + _smallest_first(fulls) + _smallest_first(diffs)"),
+ "冷讀:全文跟改動一樣也送兩份": ("cold_read.py",
+     "        if full and full != diff:", "        if full:"),
+ "冷讀:預算用 len/3(中文低估)": ("cold_read.py",
+     "        cost = estimate_tokens_upper(piece)", "        cost = len(piece) // 3"),
+ "冷讀:分隔標記不算進預算": ("cold_read.py",
+     '    budget = max(0, budget_tokens) - estimate_tokens_upper(f"{begin}\\n\\n{end}")',
+     "    budget = max(0, budget_tokens)"),
+ "冷讀:段落之間的分隔不算進預算": ("cold_read.py",
+     "        used += cost + 1", "        used += cost"),
+ "冷讀:切段時超過預算": ("cold_read.py",
+     "        if units > limit:", "        if units > limit + 3:"),
+ "冷讀:輸入不受上下文限制": ("cold_read.py",
+     "    return max(0, min(budget, room))", "    return max(0, budget)"),
+ "冷讀:預算讀不懂也照用": ("cold_read.py",
+     "    if not all(_is_int(v) for v in (budget, num_ctx, max_out)):" + NL + "        return 0",
+     "    if False:" + NL + "        return 0"),
+ "冷讀:沒有回報讀入量當成看完": ("cold_read.py",
+     "    if not _is_int(prompt_tokens) or prompt_tokens < 0:" + NL + "        return UNREAD_NO_USAGE",
+     "    if prompt_tokens is None:" + NL + "        return UNREAD_NO_USAGE"),
+ "冷讀:讀入量不看輸出上限": ("cold_read.py",
+     "    if prompt_tokens + max_out > num_ctx:", "    if prompt_tokens > num_ctx:"),
+ "冷讀:讀入量剛好到上限也算超過": ("cold_read.py",
+     "    if prompt_tokens + max_out > num_ctx:", "    if prompt_tokens + max_out >= num_ctx:"),
+ "冷讀:讀入量太少不擋": ("cold_read.py",
+     "    if prompt_tokens < len(sent) // MIN_PROMPT_TOKENS_DIVISOR:", "    if False:"),
+ "冷讀:不知道上下文上限也當成看完": ("cold_read.py",
+     "    if not (_is_int(num_ctx) and _is_int(max_out)):" + NL
+     + "        return UNREAD_NEAR_LIMIT                       # 不知道上限:無法確認沒有被截掉",
+     "    if False:" + NL
+     + "        return UNREAD_NEAR_LIMIT                       # 不知道上限:無法確認沒有被截掉"),
+ "冷讀:送出後不檢查讀入量": ("cold_read.py",
+     "    unread = unread_reason(meta, profile, SYSTEM_PROMPT + user)", "    unread = None"),
+ "冷讀:送出後沒看完不算沒看完": ("cold_read.py",
+     "truncated=bool(omitted) or unread is not None", "truncated=bool(omitted)"),
+ "冷讀:改動段不去掉 diff 前綴比對": ("cold_read.py",
+     "                texts = [s.text, _diff_body(s.text)] if s.part == PART_DIFF else [s.text]",
+     "                texts = [s.text]"),
+ "冷讀:內部紀錄不記沒看完的原因": ("cold_read.py",
+     '            "omitted": [_clip(o) for o in result.omitted],' + NL + '            "unread": result.unread}',
+     '            "omitted": [_clip(o) for o in result.omitted]}'),
+ "冷讀:偏高估計不算中文": ("config.py",
+     "            or 0xFF00 <= o <= 0xFFEF):" + NL + "        return 3",
+     "            or 0xFF00 <= o <= 0xFFEF):" + NL + "        return 1"),
+ "冷讀:偏高估計不算 BMP 以外的字": ("config.py",
+     "    if o > 0xFFFF:" + NL + "        return 6", "    if o > 0xFFFF:" + NL + "        return 1"),
+ "冷讀:flagged 不是 bool 也收": ("cold_read.py",
+     'not isinstance(doc.get("flagged"), bool)', 'doc.get("flagged") is None'),
+ "冷讀:quotes 的型別不檢查": ("cold_read.py",
+     "    if not isinstance(quotes, list) or not all(isinstance(q, str) for q in quotes):",
+     "    if False:"),
+ "冷讀:片段不限數量": ("cold_read.py",
+     "if q.strip()][:MAX_QUOTES]", "if q.strip()]"),
+ "冷讀:輸出被截斷照用": ("cold_read.py",
+     "    if output_truncated(meta, profile.max_output_tokens):", "    if False:"),
+ "冷讀:開工具": ("cold_read.py",
+     "                          use_tools=False, meta=meta)", "                          use_tools=True, meta=meta)"),
+ "冷讀:用主審查的模型設定": ("cold_read.py",
+     '    profile = cfg.role_profile("cold_read")', "    profile = cfg.profile()"),
+ "冷讀:片段不清理": ("cold_read.py",
+     "quotes=[_clip(q) for q in quotes] if flagged else []", "quotes=quotes if flagged else []"),
+ "冷讀:位置比對不忽略空白與大小寫": ("cold_read.py",
+     '    return " ".join(text.split()).casefold()', "    return text"),
+ "冷讀:檔名不比對": ("cold_read.py",
+     '                    hits.append(("檔名", s.path))', "                    pass"),
+ "冷讀:找不到位置時不記": ("cold_read.py",
+     '        for h in hits or [("位置無法確定", None)]:', "        for h in hits:"),
+ "冷讀:輸出的路徑不清理(終端機控制碼)": ("cold_read.py",
+     "[kind, _clip(path) if path is not None else None]", "[kind, path]"),
+ "冷讀:單獨入口輸出片段原文": ("cold_read.py",
+     '    return json.dumps({"flagged": result.flagged,',
+     '    return json.dumps({"quotes": list(result.quotes), "flagged": result.flagged,'),
+ "冷讀:失敗時維持原本流程(不記未完整)": ("pipeline.py",
+     '        return None, _incomplete_finding("冷讀", e)', "        return None, None"),
+ "冷讀:逾時不記": ("pipeline.py",
+     '    return None, _incomplete_finding("冷讀", timeout=COLD_READ_TIMEOUT_SECONDS)',
+     "    return None, None"),
+ "冷讀:逾時或外層取消時不取消冷讀": ("pipeline.py",
+     "        return await asyncio.wait_for(_cold_read_stage(cfg, mr, dbt_ctx), COLD_READ_TIMEOUT_SECONDS)",
+     "        return await asyncio.wait_for(asyncio.shield(_cold_read_stage(cfg, mr, dbt_ctx)),"
+     " COLD_READ_TIMEOUT_SECONDS)"),
+ "冷讀:沒有時間上限": ("pipeline.py",
+     "        return await asyncio.wait_for(_cold_read_stage(cfg, mr, dbt_ctx), COLD_READ_TIMEOUT_SECONDS)",
+     "        return await asyncio.wait_for(_cold_read_stage(cfg, mr, dbt_ctx), None)"),
+ "冷讀:審查流程沒有跑冷讀": ("pipeline.py",
+     "        cold, cold_incomplete = await _run_cold_read(cfg, mr, dbt_ctx)",
+     "        cold, cold_incomplete = None, None"),
+ "冷讀:失敗時留著模型輸出的同名紀錄": ("pipeline.py",
+     '    report["_cold_read"] = _cold_read_record(cold) if cold is not None else None',
+     '    report["_cold_read"] = _cold_read_record(cold) if cold is not None else report.get("_cold_read")'),
+ "冷讀:不認得的沒看完原因也寫進報告": ("pipeline.py",
+     "        if cold.unread in _COLD_READ_UNREAD:        # 固定文字;不認得的不寫",
+     "        if cold.unread:"),
+ "冷讀:未完整不併進報告": ("pipeline.py",
+     '            report_stub["findings"].append(cold_incomplete)', "            pass"),
+ "冷讀:只交出 .sql 的內容": ("pipeline.py",
+     '        texts = _cold_read_texts(mr.get("files", []), dbt_ctx)',
+     '        texts = _head_texts(mr.get("files", []), dbt_ctx)'),
+ "冷讀:審查流程沒接上": ("pipeline.py",
+     "        report = enforce_cold_read(report, cold)", "        pass"),
+ "冷讀:沒包進環節隔離": ("pipeline.py",
+     '@_isolated_stage("冷讀揭露")' + NL + "def enforce_cold_read(", "def enforce_cold_read("),
+ "冷讀:命中記成 info": ("pipeline.py",
+     '            "file": "(MR 內容)", "line": 0, "severity": "major", "citations": [],' + NL
+     + "            \"title\": _COLD_READ_TITLE,",
+     '            "file": "(MR 內容)", "line": 0, "severity": "info", "citations": [],' + NL
+     + "            \"title\": _COLD_READ_TITLE,"),
+ "冷讀:沒看完不報": ("pipeline.py",
+     "    if cold.truncated:", "    if False:"),
+ "冷讀:報告寫出片段原文": ("pipeline.py",
+     '("、".join(places) or "位置無法確定")', '("、".join(cold.quotes) or "位置無法確定")'),
+ "冷讀:模型輸出同標題就關得掉": ("pipeline.py",
+     "        _put_program_finding(report, flagged)", '        report.setdefault("findings", []).append(flagged)'),
+ "冷讀:位置不限列出數量": ("pipeline.py",
+     "cold.locations[:MAX_COLD_READ_LISTED]", "cold.locations"),
+ "冷讀:檔名不經 _code_span": ("pipeline.py",
+     '        return f"{_code_span(path)} 的檔名"', '        return f"{path} 的檔名"'),
+})
+
+
+
 # ---- 展開器從記憶體裡的專案檔案讀 macro(macro_files)
 MUTANTS.update({
  "字典來源:給了也不用": (
@@ -2309,10 +2459,10 @@ MUTANTS.update({
  # 內文就是它 —— 一樣會貼回 MR 留言、寫進 review_output/。要防的是「帶出原文」,
  # 跟那段原文像不像密碼無關,所以只留位置(用樣式遮只遮得到樣式認得的寫法)。
  "解析失敗:錯誤訊息照用 sqlglot 的原文": ("../toolbox/sqltools.py",
-     "        statements, parse_error = [], parse_error_text(e)",
-     '        statements, parse_error = [], f"parse failed: {e}"'),
+     "            return [], parse_error_text(e)",
+     '            return [], f"parse failed: {e}"'),
  "解析失敗:連 sqlglot 的描述一起帶出來": ("../toolbox/sqltools.py",
-     '            spots.append(f"第 {d[\'line\']} 行第 {d.get(\'col\', \'?\')} 欄")',
+     '            spots.append(f"第 {d[\'line\'] + line_offset} 行第 {d.get(\'col\', \'?\')} 欄")',
      '            spots.append(f"第 {d[\'line\']} 行 {d.get(\'description\', \'\')}")'),
  "解析失敗:其他例外照用訊息(不只留類型)": ("../toolbox/sqltools.py",
      '    where = "、".join(dict.fromkeys(spots))[:120] if spots else type(e).__name__',
@@ -2379,8 +2529,13 @@ MUTANTS.update({
      '        if (f.get("file"), f.get("title")) != key:',
      '        if f.get("title") != key[1]:'),
  "後處理:取代時不保留較嚴重的等級": ("pipeline.py",
-     '    kept.append({**finding, "severity": worst})',
-     "    kept.append(finding)"),
+     '    kept.append({**finding, "severity": worst, "_source": PROGRAM_SOURCE})',
+     '    kept.append({**finding, "_source": PROGRAM_SOURCE})'),
+ # 經過 _put_program_finding 的 finding 一律是程式產生的 → 自動標 _source,
+ # 新增的 enforce_* 不必各自記得(判斷校準靠這個欄位決定碰不碰)
+ "後處理:程式專用標題的 finding 不標來源": ("pipeline.py",
+     '    kept.append({**finding, "severity": worst, "_source": PROGRAM_SOURCE})',
+     '    kept.append({**finding, "severity": worst})'),
  "後處理:解析失敗改回直接附加": ("pipeline.py",
      "            _put_program_finding(report, _parse_fail_finding(entry))",
      '            report.setdefault("findings", []).append(_parse_fail_finding(entry))'),
@@ -4060,6 +4215,156 @@ MUTANTS.update({
 })
 
 
+# ---- 判斷校準:三道後處理都是「把模型的指控往下壓」,壓錯的代價是真缺陷
+# 從報告上消失。所以每個突變點問的都是同一件事:放寬之後,有沒有測試會紅。
+MUTANTS.update({
+ "校準:只驗一向也算驗過": ("pipeline.py",
+     '    return {True, False} <= {bool(r.get("expect_flagged")) for r in rs}',
+     "    return True"),
+ "校準:有覆蓋缺口也照樣降級": ("pipeline.py",
+     "    for gap in spec_exec.get(\"coverage_gaps\") or []:\n        if _names_id(cid, str(gap)):",
+     "    for gap in spec_exec.get(\"coverage_gaps\") or []:\n        if False:"),
+ "校準:條件編號用子字串比對(C10 的缺口算到 C1 身上)": ("pipeline.py",
+     '    return bool(re.search(rf"(?<![A-Za-z0-9_]){re.escape(cid)}(?![A-Za-z0-9_])", text))',
+     "    return cid in text"),
+ "校準:案例被仲裁剔除也算驗過": ("pipeline.py",
+     '    if not rs or any(r.get("dropped") for r in rs):',
+     "    if not rs:"),
+ "校準:案例結果不符預期也算驗過": ("pipeline.py",
+     '    if not all(r.get("ok") for r in rs):\n        return False',
+     "    if False:\n        return False"),
+ "校準:不取分支的基準案例(新格式只看變體)": ("pipeline.py",
+     "        elif rid.startswith(_BASE_CASE_PREFIX):",
+     "        elif False:"),
+ "校準:沒標分支的條件不取基準案例": ("pipeline.py",
+     '            if branch in (None, "", "*") or rid[len(_BASE_CASE_PREFIX):] == branch:',
+     "            if rid[len(_BASE_CASE_PREFIX):] == branch:"),
+ "校準:對不上任何條件也降級": ("pipeline.py",
+     "        if matched and all(_condition_verified(c, se) for c in matched):",
+     "        if all(_condition_verified(c, se) for c in matched):"),
+ "校準:命中一個泛用字眼就算對上": ("pipeline.py",
+     "    return bool(hits) and (strong or hits >= 2 or len(tokens) == 1)",
+     "    return bool(hits)"),
+ "校準:中文整串比對(不切二字)": ("pipeline.py",
+     "        out |= {word[i:i + 2] for i in range(len(word) - 1)}",
+     "        out.add(word)"),
+ "校準:沒有規格時不記要人看": ("pipeline.py",
+     '    if se.get("no_spec"):\n        _mark_needs_human(report, "無規格可對照,無法確認實作意圖")',
+     '    if se.get("no_spec"):\n        pass'),
+ # 判斷「這條是誰寫的」改用 _source 欄位(#39 review 第 4 點):靠標題兩個方向都會錯
+ "來源:程式補的 finding 不標 _source": ("pipeline.py",
+     '    return f.get("_source") == PROGRAM_SOURCE',
+     "    return False"),
+ "來源:改回用標題開頭判斷": ("pipeline.py",
+     '    return f.get("_source") == PROGRAM_SOURCE',
+     '    return str(f.get("title") or "").startswith("[")'),
+ "校準:程式補的 finding 也拿去對照": ("pipeline.py",
+     "        if not isinstance(f, dict) or _is_program_finding(f):\n"
+     "            continue\n"
+     "        if executed and str(f.get(\"file\") or \"\") != executed:",
+     "        if not isinstance(f, dict):\n"
+     "            continue\n"
+     "        if executed and str(f.get(\"file\") or \"\") != executed:"),
+ # 校準只對「實際被執行的那個檔案」加註:別的檔沒被跑過,這份結果對它沒有證據力
+ "校準:對沒被執行的檔案也加註": ("pipeline.py",
+     '        if executed and str(f.get("file") or "") != executed:\n            continue',
+     "        if False:\n            continue"),
+ # 加註不得改嚴重度(#39 review:降級讓 8 份真缺陷自動放行,其中 5 份是真的有錯)
+ "校準:加註時順手降成 info": ("pipeline.py",
+     '            why = f"執行驗證未重現(條件 {ids}),但指控仍在"',
+     '            f["severity"] = "info"\n'
+     '            why = f"執行驗證未重現(條件 {ids}),但指控仍在"'),
+ "校準:加註但不記要人看": ("pipeline.py",
+     "        _mark_needs_human(report, why)",
+     "        pass"),
+ # 待補:只看標題底下的條列項目、逐項比對、安全類不碰、不動嚴重度
+ # 項目名剛好含泛用字眼時(例如「**規格與條件**」),略過清單讓它不會只靠那些字眼命中
+ "待補:太泛的項目名也比對": ("pipeline.py",
+     "    if not parts or name.strip() in _PENDING_GENERIC:",
+     "    if not parts:"),
+ "待補:比對用整行而不是項目名": ("pipeline.py",
+     "    parts = _pending_parts(name)",
+     "    parts = _pending_parts(item)"),
+ "待補:項目名只要有一段出現就算": ("pipeline.py",
+     "                    if all(any(a in claim for a in alts) for alts in parts)), None)",
+     "                    if any(any(a in claim for a in alts) for alts in parts)), None)"),
+ "待補:段內的替代寫法要全部出現": ("pipeline.py",
+     "                    if all(any(a in claim for a in alts) for alts in parts)), None)",
+     "                    if all(all(a in claim for a in alts) for alts in parts)), None)"),
+ "待補:泛用後綴照樣參與比對": ("pipeline.py",
+     '            core = _NAME_SUFFIX.sub("", a.strip()) or a.strip()',
+     "            core = a.strip()"),
+ "待補:回到字詞重疊的比對": ("pipeline.py",
+     "        hit = next((name for name, parts in items" + NL
+     + "                    if all(any(a in claim for a in alts) for alts in parts)), None)",
+     "        hit = next((name for name, parts in items" + NL
+     + "                    if any(t and t in claim for t in _distinct_tokens(name))), None)"),
+ "待補:比對不抹掉反引號與粗體": ("pipeline.py",
+     "    return _NAME_NOISE.sub(\"\", str(text or \"\")).lower()",
+     "    return str(text or \"\").lower()"),
+ "待補:安全類的 finding 也碰": ("pipeline.py",
+     "        if _SECURITY_CLAIM.search(text):\n            continue",
+     "        if False:\n            continue"),
+ "待補:加註時順手降成 info": ("pipeline.py",
+     '        note = (f"(這條提到的「{hit}」,規格把它列在「待補 / 未載明」。"',
+     '        f["severity"] = "info"\n'
+     '        note = (f"(這條提到的「{hit}」,規格把它列在「待補 / 未載明」。"'),
+ "待補:加註寫成已經判定是同一件事": ("pipeline.py",
+     '                f"**如果講的就是這件事**,規格沒有寫這項要求,嚴重度不因此調整,"',
+     '                f"規格沒有寫這項要求,嚴重度不因此調整,"'),
+ "待補:不記要人看": ("pipeline.py",
+     '        _mark_needs_human(report, f"規格未載明:{hit}")',
+     "        pass"),
+ # 嚴重度只能被「執行出來的證據」調整:沙盒真的跑完、而且沒有 SQL 錯誤
+ "證據:沒跑成功也照樣降級": ("pipeline.py",
+     '    ran_ok = bool(se.get("case_results")) and not se.get("sql_error")',
+     "    ran_ok = True"),
+ "證據:SQL 錯誤也算跑成功": ("pipeline.py",
+     '    ran_ok = bool(se.get("case_results")) and not se.get("sql_error")',
+     '    ran_ok = bool(se.get("case_results"))'),
+ "證據:不是執行的那個檔也降級": ("pipeline.py",
+     '        if str(f.get("file") or "") != executed:\n            continue',
+     "        if False:\n            continue"),
+ "證據:不限「無法執行」類的指控": ("pipeline.py",
+     '        if f.get("severity") != "blocker" or not _UNRUNNABLE_CLAIM.search(_finding_text(f)):',
+     '        if f.get("severity") != "blocker":'),
+ "證據:降級時把 finding 整條移除": ("pipeline.py",
+     '        f["severity"] = "major"\n'
+     '        note = (f"(沙盒已實際執行成功:{executed} 在依規格生成的測資上編譯並執行完成,"',
+     '        f["severity"] = "info"\n'
+     '        note = (f"(沙盒已實際執行成功:{executed} 在依規格生成的測資上編譯並執行完成,"'),
+ "證據:降級後不交人工": ("pipeline.py",
+     '        _mark_needs_human(report, "指控的「無法執行」已被沙盒否證,其餘內容待確認")',
+     "        pass"),
+ # ---- 接線:三道都在執行驗證之後、rubric 與決策之前
+ "校準:整步沒接進管線": ("pipeline.py",
+     "        report = calibrate_with_execution(report)",
+     "        pass"),
+ "待補:整步沒接進管線": ("pipeline.py",
+     "        report = enforce_spec_pending(report, spec_text)",
+     "        pass"),
+ "斷言:整步沒接進管線": ("pipeline.py",
+     "        report = enforce_claim_evidence(report)",
+     "        pass"),
+ # 三道現在不動嚴重度,所以跟 rubric 的前後沒有差別;**要求是排在 apply_policy 之前**
+ # ——它們記的 _needs_human 是決策的硬條件,排在決策之後就等於沒記。
+ "校準:接在決策之後(needs_human 來不及被看到)": ("pipeline.py",
+     "        report = calibrate_with_execution(report)\n"
+     "        report = enforce_spec_pending(report, spec_text)\n"
+     "        report = enforce_claim_evidence(report)\n\n"
+     "        report = apply_rubric(report)\n"
+     "        report = apply_policy(report, mr, cfg.policy)",
+     "        report = apply_rubric(report)\n"
+     "        report = apply_policy(report, mr, cfg.policy)\n"
+     "        report = calibrate_with_execution(report)\n"
+     "        report = enforce_spec_pending(report, spec_text)\n"
+     "        report = enforce_claim_evidence(report)"),
+ "決策:不看「必須有人看」的理由": ("pipeline.py",
+     "          and not needs_human",
+     "          and True"),
+})
+
+
 # ---- 主審查的輸出被截斷
 # 失效是靜默的:被切斷的 JSON 會被修補成合法物件,報告只是比較短。
 P = "pipeline.py"
@@ -4287,20 +4592,28 @@ MUTANTS.update({
 E = "env_registry.py"
 MUTANTS.update({
  "設定表:掃描漏掉 helper 讀的(env_seconds 那幾個)": (E,
-     "                or _helper_name(func) in ENV_HELPERS):",
-     "                or False):"),
+     "            or _helper_name(func_src) in ENV_HELPERS)",
+     "            or False)"),
  "設定表:比對寫死 os. 開頭(換個 import 寫法就掃不到)": (E,
-     '        if (tail == "environ.get" or func.split(".")[-1] == "getenv" or setter',
-     '        if (tail == "os.environ.get" or func == "os.getenv" or setter'),
+     '    tail = ".".join(func_src.split(".")[-2:])',
+     '    tail = func_src'),
  "設定表:下標寫法比對寫死 os.environ": (E,
-     '                and ast.unparse(node.value).split(".")[-1] == "environ"',
-     '                and ast.unparse(node.value) == "os.environ"'),
+     '                and ast.unparse(node.value).split(".")[-1] == "environ"):',
+     '                and ast.unparse(node.value) == "os.environ"):'),
  "設定表:掃描只認 environ.get,漏掉 getenv": (E,
-     '        if (tail == "environ.get" or func.split(".")[-1] == "getenv" or setter',
-     '        if (tail == "environ.get" or setter'),
+     '            or func_src.split(".")[-1] == "getenv"',
+     '            or False'),
  "設定表:掃描漏掉 os.environ[\"X\"] 的下標寫法": (E,
      '        if (isinstance(node, ast.Subscript)',
      "        if (False and isinstance(node, ast.Subscript)"),
+ "設定表:名稱算不出來的讀法默默跳過": (E,
+     '            if _is_env_read(func):\n'
+     '                dynamic.append(',
+     '            if False:\n'
+     '                dynamic.append('),
+ "設定表:掃描範圍少了進入點檔案": (E,
+     '    for name in SCAN_FILES:',
+     '    for name in ():'),
  "設定表:setdefault 設的值當成程式的預設值": (E,
      "        return None if self.is_setter else const_value(self.default)",
      "        return const_value(self.default)"),
@@ -4308,10 +4621,56 @@ MUTANTS.update({
      '                and node.func.id in ("str", "int", "float") and len(node.args) == 1):',
      "                and False):"),
  "設定表:掃描範圍少一個目錄": (E,
-     'SCAN_DIRS = ("orchestrator", "toolbox", "scripts", "eval")',
-     'SCAN_DIRS = ("orchestrator", "toolbox", "eval")'),
+     'SCAN_DIRS = ("orchestrator", "toolbox", "scripts", "eval", "tools")',
+     'SCAN_DIRS = ("orchestrator", "toolbox", "eval", "tools")'),
 })
 
+
+# ---- 一句解析失敗不可以吃掉整個檔案的命中(#90 第 1 點)
+TOOLS = "../toolbox/sqltools.py"
+MUTANTS.update({
+ "逐句:整份一次解析(一句壞掉就全部不檢查)": (TOOLS,
+     "    chunks = _statement_chunks(sql)" + NL
+     + "    if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析",
+     "    chunks = []" + NL
+     + "    if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析"),
+ "逐句:一句壞掉就放棄其餘的句子": (TOOLS,
+     "        except Exception as e:           # noqa: BLE001" + NL
+     + "            errors.append(parse_error_text(e, line_offset))",
+     "        except Exception as e:           # noqa: BLE001" + NL
+     + "            return statements, parse_error_text(e, line_offset)"),
+ "逐句:用字串 split 切句(字串與註解裡的分號會切錯)": (TOOLS,
+     "    cuts, i, n = [], 0, len(sql)",
+     '    return [i + 1 for i, ch in enumerate(sql) if ch == ";"]' + NL
+     + "    cuts, i, n = [], 0, len(sql)"),
+ "逐句:沒收尾的引號讓整份退回一次解析": (TOOLS,
+     "    cuts = _semicolon_cuts(sql)",
+     "    from sqlglot.tokens import Tokenizer, TokenType" + NL
+     + "    try:" + NL
+     + "        tokens = Tokenizer(dialect=DIALECT).tokenize(sql)" + NL
+     + "    except Exception:" + NL
+     + "        return []" + NL
+     + "    cuts = [t.end + 1 for t in tokens if t.token_type == TokenType.SEMICOLON]"),
+ "逐句:巢狀的區塊註解只認最內層": (TOOLS,
+     "                if sql.startswith(\"/*\", i):" + NL
+     + "                    depth, i = depth + 1, i + 2",
+     "                if False:" + NL
+     + "                    depth, i = depth + 1, i + 2"),
+ # 「`''` 當成字串結束」不列為突變點:**它是等價的**。把跳脫當成「結束再開一個新
+ # 字串」之後,被標成「在字串裡」的字元範圍完全一樣(兩種解讀都是一次吃掉兩個引號),
+ # 所以找到的分號位置也一樣 —— 20 萬組隨機輸入比對過,沒有一組不同。留著只會得到
+ # 一個永遠抓不到的突變點。
+ "逐句:行號不加上這一句的起始行": (TOOLS,
+     "            errors.append(parse_error_text(e, line_offset))",
+     "            errors.append(parse_error_text(e))"),
+ "逐句:解析失敗的句子不記成解析錯誤": (TOOLS,
+     "    if not errors:" + NL + "        return statements, None",
+     "    return statements, None" + NL + "    if not errors:" + NL
+     + "        return statements, None"),
+ "逐句:錯誤訊息不設則數上限": (TOOLS,
+     "    shown = list(dict.fromkeys(errors))[:_MAX_PARSE_ERRORS]",
+     "    shown = list(dict.fromkeys(errors))"),
+})
 
 # ---- 取不到規格 ≠ 沒有規格(#90 第 2 點)。混在一起的話,報告會叫開發者去補一份
 # 其實已經存在的規格,而維運看不出是 token 設錯了。
@@ -4353,15 +4712,6 @@ MUTANTS.update({
  "規格:拿不到時照樣叫人補規格": (S,
      "    if not spec_text and unavailable:",
      "    if False:"),
- "規格:404 一律當成檔案不存在(專案/commit 找不到也算)": (G,
-     '            return (None, None) if _FILE_NOT_FOUND in body else (None, "not_found")',
-     "            return None, None"),
- "規格:404 一律當成拿不到(檔案不存在也算)": (G,
-     '            return (None, None) if _FILE_NOT_FOUND in body else (None, "not_found")',
-     '            return None, "not_found"'),
- "規格:拿不到時照樣叫人補規格": (S,
-     "    if not spec_text and unavailable:",
-     "    if False:"),
 })
 
 # ---- 評測用的 token 用量(#84)。數字錯了不會有人發現,只會得到錯的結論。
@@ -4378,6 +4728,9 @@ MUTANTS.update({
      "                if value is not None:" + NL
      + "                    meta[key] = (meta.get(key) or 0) + value",
      "                meta[key] = (meta.get(key) or 0) + (value or 0)"),
+ "用量:沒回報的輪數不記(總量少算看不出來)": (A,
+     '            missing = prompt_tokens is None or completion is None',
+     '            missing = False'),
  "用量:讀入的量不記": (A,
      "            meta[\"prompt_tokens\"] = prompt_tokens",
      "            meta[\"prompt_tokens\"] = None"),
