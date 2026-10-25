@@ -13,7 +13,10 @@ from dataclasses import dataclass
 
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
 # 掃描範圍:會在正式執行時跑到的程式。tests/ 自己設的環境變數不算設定參數。
-SCAN_DIRS = ("orchestrator", "toolbox", "scripts", "eval")
+# 進入點也要掃:`tools/`、`demo.py` 一樣是部署的人會跑的東西,漏掉的話在那裡新增的
+# 參數不會被要求寫進文件。範圍跟進入點檢查那一條測試對齊。
+SCAN_DIRS = ("orchestrator", "toolbox", "scripts", "eval", "tools")
+SCAN_FILES = ("demo.py",)
 # 讀環境變數的 helper(定義在 config.py)。名稱前面可能有底線(模組內私有的版本)。
 ENV_HELPERS = frozenset({"env_seconds", "env_float", "env_seed", "env_effort",
                          "env_int", "env_bool"})
@@ -72,48 +75,88 @@ def _helper_name(func_src: str) -> str:
     return func_src.split(".")[-1].lstrip("_")
 
 
-def scan_file(path: pathlib.Path, rel: str | None = None) -> list[EnvRead]:
-    """一個檔案裡所有「讀環境變數」的地方。"""
-    rel = rel or str(path)
+def _is_env_read(func_src: str) -> bool:
+    """這個被呼叫的東西是不是在讀環境變數。
+
+    取結尾比對,不寫死 `os.` 開頭:`from os import environ`、`import os as o` 都還是
+    同一件事,而寫死前綴的話換個 import 寫法就整個掃不到。
+    """
+    tail = ".".join(func_src.split(".")[-2:])
+    return (tail in ("environ.get", "environ.setdefault")
+            or func_src.split(".")[-1] == "getenv"
+            or _helper_name(func_src) in ENV_HELPERS)
+
+
+def _scan(path: pathlib.Path, rel: str) -> tuple[list[EnvRead], list[EnvRead]]:
+    """(名稱是字串常值的讀法, 名稱算不出來的讀法)。"""
     try:
         tree = ast.parse(path.read_text(encoding="utf-8"))
     except (SyntaxError, UnicodeDecodeError):
-        return []
-    out = []
+        return [], []
+    out: list[EnvRead] = []
+    dynamic: list[EnvRead] = []
     for node in ast.walk(tree):
         # os.environ["X"](`from os import environ` 的 environ["X"] 也算:比對結尾就好,
         # 寫死 "os.environ" 的話,換個 import 寫法就整個掃不到)
         if (isinstance(node, ast.Subscript)
-                and ast.unparse(node.value).split(".")[-1] == "environ"
-                and isinstance(node.slice, ast.Constant)
-                and isinstance(node.slice.value, str)):
-            out.append(EnvRead(node.slice.value, f"{rel}:{node.lineno}", None))
+                and ast.unparse(node.value).split(".")[-1] == "environ"):
+            if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+                out.append(EnvRead(node.slice.value, f"{rel}:{node.lineno}", None))
+            else:
+                dynamic.append(EnvRead(ast.unparse(node)[:60], f"{rel}:{node.lineno}", None))
             continue
         if not isinstance(node, ast.Call):
             continue
         func = ast.unparse(node.func)
-        if not node.args or not isinstance(node.args[0], ast.Constant):
+        if not node.args:
             continue
-        name = node.args[0].value
+        name = node.args[0].value if isinstance(node.args[0], ast.Constant) else None
         if not isinstance(name, str):
+            # 名稱不是字串常值(`os.getenv(f"SANDBOX_{x}")`)。**不可以默默跳過**:
+            # 跳過的話掃描少看一個參數,而一致性檢查照樣綠 —— 文件缺一個參數,
+            # 對部署的人來說那個參數就等於不存在。記下來,由測試逐一認帳。
+            if _is_env_read(func):
+                dynamic.append(EnvRead(ast.unparse(node)[:60], f"{rel}:{node.lineno}", None))
             continue
         default = ast.unparse(node.args[1]) if len(node.args) > 1 else None
-        # 取結尾比對,不寫死 "os." 開頭:`from os import environ`、`import os as o`
-        # 都還是同一件事,而寫死前綴的話換個 import 寫法就整個掃不到。
-        tail = ".".join(func.split(".")[-2:])
-        setter = tail == "environ.setdefault"
-        if (tail == "environ.get" or func.split(".")[-1] == "getenv" or setter
-                or _helper_name(func) in ENV_HELPERS):
+        setter = ".".join(func.split(".")[-2:]) == "environ.setdefault"
+        if _is_env_read(func):
             out.append(EnvRead(name, f"{rel}:{node.lineno}", default, setter))
-    return out
+    return out, dynamic
+
+
+def scan_file(path: pathlib.Path, rel: str | None = None) -> list[EnvRead]:
+    """一個檔案裡所有「讀環境變數」的地方(名稱是字串常值的那些)。"""
+    return _scan(path, rel or str(path))[0]
+
+
+def _scan_targets(root: pathlib.Path):
+    for d in SCAN_DIRS:
+        yield from sorted((root / d).rglob("*.py"))
+    for name in SCAN_FILES:
+        f = root / name
+        if f.exists():
+            yield f
 
 
 def scan_repo(root: pathlib.Path | None = None) -> dict[str, list[EnvRead]]:
     """{環境變數名稱: [讀取的地方…]},照名稱排序。"""
     root = root or PKG_ROOT
     found: dict[str, list[EnvRead]] = {}
-    for d in SCAN_DIRS:
-        for f in sorted((root / d).rglob("*.py")):
-            for read in scan_file(f, str(f.relative_to(root))):
-                found.setdefault(read.name, []).append(read)
+    for f in _scan_targets(root):
+        for read in scan_file(f, str(f.relative_to(root))):
+            found.setdefault(read.name, []).append(read)
     return dict(sorted(found.items()))
+
+
+def scan_repo_dynamic(root: pathlib.Path | None = None) -> list[EnvRead]:
+    """名稱算不出來的讀法(`os.getenv(f"SANDBOX_{x}")`),照出現位置排序。
+
+    這種讀法掃不出參數名稱,文件的一致性檢查就看不到它。**不默默跳過**:列出來,
+    由測試逐一認帳,新加的動態讀法得先寫進文件、再進放行清單。
+    """
+    root = root or PKG_ROOT
+    out = []
+    for f in _scan_targets(root):
+        out.extend(_scan(f, str(f.relative_to(root)))[1])
+    return sorted(out, key=lambda r: r.where)

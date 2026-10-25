@@ -12,13 +12,9 @@ Code review 是上正式環境前最後一道,漏抓的代價(帶著問題進正
 (通過數 371 → 108、少抓 292 個植入缺陷,乾淨報告一份也沒變乾淨)。所以這個檔案裡
 **有一半的測試是在證明「不該動的沒有被動」** —— 那些例子直接取自那次重放。
 """
-import asyncio
 import pathlib
-import sys
 
 import pytest
-
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from orchestrator import pipeline
 from orchestrator.pipeline import (apply_policy, apply_rubric,

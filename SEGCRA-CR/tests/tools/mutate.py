@@ -4403,20 +4403,28 @@ MUTANTS.update({
 E = "env_registry.py"
 MUTANTS.update({
  "設定表:掃描漏掉 helper 讀的(env_seconds 那幾個)": (E,
-     "                or _helper_name(func) in ENV_HELPERS):",
-     "                or False):"),
+     "            or _helper_name(func_src) in ENV_HELPERS)",
+     "            or False)"),
  "設定表:比對寫死 os. 開頭(換個 import 寫法就掃不到)": (E,
-     '        if (tail == "environ.get" or func.split(".")[-1] == "getenv" or setter',
-     '        if (tail == "os.environ.get" or func == "os.getenv" or setter'),
+     '    tail = ".".join(func_src.split(".")[-2:])',
+     '    tail = func_src'),
  "設定表:下標寫法比對寫死 os.environ": (E,
-     '                and ast.unparse(node.value).split(".")[-1] == "environ"',
-     '                and ast.unparse(node.value) == "os.environ"'),
+     '                and ast.unparse(node.value).split(".")[-1] == "environ"):',
+     '                and ast.unparse(node.value) == "os.environ"):'),
  "設定表:掃描只認 environ.get,漏掉 getenv": (E,
-     '        if (tail == "environ.get" or func.split(".")[-1] == "getenv" or setter',
-     '        if (tail == "environ.get" or setter'),
+     '            or func_src.split(".")[-1] == "getenv"',
+     '            or False'),
  "設定表:掃描漏掉 os.environ[\"X\"] 的下標寫法": (E,
      '        if (isinstance(node, ast.Subscript)',
      "        if (False and isinstance(node, ast.Subscript)"),
+ "設定表:名稱算不出來的讀法默默跳過": (E,
+     '            if _is_env_read(func):\n'
+     '                dynamic.append(',
+     '            if False:\n'
+     '                dynamic.append('),
+ "設定表:掃描範圍少了進入點檔案": (E,
+     '    for name in SCAN_FILES:',
+     '    for name in ():'),
  "設定表:setdefault 設的值當成程式的預設值": (E,
      "        return None if self.is_setter else const_value(self.default)",
      "        return const_value(self.default)"),
@@ -4424,8 +4432,8 @@ MUTANTS.update({
      '                and node.func.id in ("str", "int", "float") and len(node.args) == 1):',
      "                and False):"),
  "設定表:掃描範圍少一個目錄": (E,
-     'SCAN_DIRS = ("orchestrator", "toolbox", "scripts", "eval")',
-     'SCAN_DIRS = ("orchestrator", "toolbox", "eval")'),
+     'SCAN_DIRS = ("orchestrator", "toolbox", "scripts", "eval", "tools")',
+     'SCAN_DIRS = ("orchestrator", "toolbox", "eval", "tools")'),
 })
 
 
@@ -4531,6 +4539,9 @@ MUTANTS.update({
      "                if value is not None:" + NL
      + "                    meta[key] = (meta.get(key) or 0) + value",
      "                meta[key] = (meta.get(key) or 0) + (value or 0)"),
+ "用量:沒回報的輪數不記(總量少算看不出來)": (A,
+     '            missing = prompt_tokens is None or completion is None',
+     '            missing = False'),
  "用量:讀入的量不記": (A,
      "            meta[\"prompt_tokens\"] = prompt_tokens",
      "            meta[\"prompt_tokens\"] = None"),

@@ -154,10 +154,10 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
                 print(f"[agent] 警告:估計送出 prompt ≈{sent_estimate} tokens,"
                       f"但端點回報只讀到 {prompt_tokens} tokens——context 可能被靜默截斷,"
                       f"這次生成結果可能不可信。")
+        completion = getattr(usage, "completion_tokens", None) if usage else None
         if meta is not None:
             # 每一輪都覆寫:呼叫端關心的是**最後一次**回應有沒有被截斷,
             # 中間輪次的工具呼叫回合即使碰到上限也會繼續跑下去。
-            completion = getattr(usage, "completion_tokens", None) if usage else None
             meta["finish_reason"] = resp.choices[0].finish_reason
             meta["completion_tokens"] = completion
             meta["prompt_tokens"] = prompt_tokens
@@ -172,9 +172,14 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
                                ("completion_tokens_total", completion)):
                 if value is not None:
                     meta[key] = (meta.get(key) or 0) + value
+            # 有幾輪沒回報,總量就少算幾輪的量,而光看總量看不出來。
+            # 記下來,量測的人才知道這個數字完不完整。一輪只要有一個數字沒回報就算,
+            # 因為少的那一側一樣會讓總量偏低。這個鍵從第一輪起就一定在,0 代表
+            # 「每一輪都有回報」,不是「沒在記」。
+            missing = prompt_tokens is None or completion is None
+            meta["rounds_without_usage"] = meta.get("rounds_without_usage", 0) + int(missing)
         _dump_response(dump_path, msg.content or "", resp.choices[0].finish_reason,
-                       getattr(usage, "completion_tokens", None) if usage else None,
-                       prompt_tokens,
+                       completion, prompt_tokens,
                        sum(estimate_tokens(m.get("content") or "") for m in messages))
         messages.append(msg.model_dump(exclude_none=True))
 
