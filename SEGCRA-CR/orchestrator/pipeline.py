@@ -219,18 +219,62 @@ MAIN_REVIEW_TIMEOUT_SECONDS = _main_review_timeout()
 # (主審查、冷讀、執行驗證)的上限都取「自己的上限」與「離截止還剩多少」的較小值:各自從自己開始
 # 算的上限加起來(1800 + 600 + 1200)比整份長,端點沒掛、只是慢時,外層會先把整份取消,確定性的
 # 結果跟著消失。剩不到 MIN_STAGE_SECONDS 就不開始,記成未完整。
-FINISH_RESERVE_SECONDS = 300
-MIN_STAGE_SECONDS = 30
+#
+# 收尾保留(FINISH_RESERVE_SECONDS)與每步最少秒數(MIN_STAGE_SECONDS)都可以用環境變數調,
+# 量法與量到的數字見 docs/07。收尾保留最多是整份的四分之一,每步最少秒數要比截止時間短:
+# 超過時改用上限或預設值並印警告(設成那樣等於模型的步驟永遠不跑)。
 _NO_TIME_REASON = "整份審查剩下的時間不夠(要留時間把結果寫回 MR)"
 
 
+def _finish_reserve(total: int) -> int:
+    """收尾保留的秒數:FINISH_RESERVE_SECONDS(預設 300),最多整份的四分之一。"""
+    reserve = env_seconds("FINISH_RESERVE_SECONDS", 300)
+    cap = total // 4
+    if reserve > cap:
+        print(f"[pipeline] 收尾保留 {reserve} 秒超過整份審查上限 {total} 秒的四分之一,"
+              f"改用 {cap} 秒(其餘留給模型的步驟)", flush=True)
+        return cap
+    return reserve
+
+
 def _review_budget() -> int:
-    """從審查開始到截止的秒數:整份的上限減掉收尾的時間(整份很短時收尾留四分之一)。"""
+    """從審查開始到截止的秒數:整份的上限減掉收尾保留。"""
     total = env_seconds("REVIEW_TIMEOUT_SECONDS", 2400)
-    return total - min(FINISH_RESERVE_SECONDS, total // 4)
+    return total - _finish_reserve(total)
 
 
 REVIEW_BUDGET_SECONDS = _review_budget()
+
+
+def _min_stage_seconds(budget: int) -> int:
+    """每一步至少要剩多少秒才開始:MIN_STAGE_SECONDS(預設 30)。不比截止時間短時改用預設值。"""
+    value = env_seconds("MIN_STAGE_SECONDS", 30)
+    if value >= budget:
+        print(f"[pipeline] MIN_STAGE_SECONDS={value} 不比整份審查的截止時間 {budget} 秒短,"
+              f"模型的步驟會永遠不跑;改用預設 30 秒", flush=True)
+        return 30
+    return value
+
+
+MIN_STAGE_SECONDS = _min_stage_seconds(REVIEW_BUDGET_SECONDS)
+
+
+class _StageClock:
+    """各階段花了幾秒(寫進報告的 `_stage_seconds`):調整各步的上限與收尾保留要照這些數字,
+    評測也用它統計有幾份會超過正式環境的截止時間(見 docs/07)。"""
+
+    def __init__(self) -> None:
+        self.start = self._last = time.monotonic()
+        self.seconds: dict[str, float] = {}
+
+    def lap(self, stage: str) -> None:
+        now = time.monotonic()
+        self.seconds[stage] = round(now - self._last, 1)
+        self._last = now
+
+    def finish(self) -> None:
+        self.lap("finish")
+        self.seconds["total"] = round(self._last - self.start, 1)
 
 
 def _stage_limit(own: float, deadline: float) -> float | None:
@@ -1614,7 +1658,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
     from .dbt_render import start_review_invocation
     profile = cfg.profile(profile_name)
     # 整份的截止時間從這裡算(webhook 的總時間上限也是從呼叫 review_mr 開始算)
-    review_deadline = time.monotonic() + REVIEW_BUDGET_SECONDS
+    clock = _StageClock()
+    review_deadline = clock.start + REVIEW_BUDGET_SECONDS
     skills = load_skills()
     # 這份審查的 dbt 展開(預掃的一般與增量、受影響 model 的前後)共用一個 invocation_id
     start_review_invocation()
@@ -1788,8 +1833,10 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
 
         trace = [] if capture is not None else None
         output_meta: dict = {}
+        clock.lap("prepare")
         raw = await _run_main_review(cfg, profile, system, user, hub, trace, output_meta, mr_id,
                                      review_deadline)
+        clock.lap("main_review")
         # 冷讀(只看 MR 文字)在主審查之後依序跑,見 _run_cold_read。主審查判定端點無法使用時
         # 不再呼叫模型,直接記成未完整(交人工)
         if _endpoint_unavailable(output_meta):
@@ -1798,6 +1845,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             cold, cold_incomplete = await _run_cold_read(cfg, mr, dbt_ctx, review_deadline)
         if cold_incomplete is not None:
             report_stub["findings"].append(cold_incomplete)
+        clock.lap("cold_read")
         if capture is not None:
             capture["system_prompt"] = system
             capture["user_prompt"] = user
@@ -1862,6 +1910,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 失敗或逾時要看得出是哪一個階段:run_spec_exec 把現在在跑哪一段寫進 progress,
         # 逾時是外層丟的、它看不到裡面,所以只能這樣問。沙盒階段另外收一個截止時間——
         # 它是同步呼叫,wait_for 插不進去(見 spec_exec._in_thread)。
+        clock.lap("postprocess")
         progress: dict = {}
         # 上限不超過整份的截止時間(見 _stage_limit);沙盒階段的截止時間跟著縮
         spec_limit = _stage_limit(SPEC_EXEC_TIMEOUT_SECONDS, review_deadline)
@@ -1900,6 +1949,11 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             # 沒有結果也要留下各階段花了多少秒:時間上限要照這些數字訂,
             # 而「逾時那次」正是最需要知道時間花在哪裡的一次。
             report["_spec_exec_stage_seconds"] = progress.get("seconds", {})
+        clock.lap("spec_exec")
+        # 收尾(finish)與總時間要等回寫完才記得到,由 clock.finish() 補進同一個 dict。
+        # 模型自己輸出的同名欄位在這裡被蓋掉
+        report["_stage_seconds"] = clock.seconds
+        report["_review_deadline_seconds"] = REVIEW_BUDGET_SECONDS   # 評測看得出這輪用的是哪一種截止時間
         report = enforce_dbt_unexecuted(report, mr, dbt_ctx, cfg.dbt)  # dbt 的變更沒被執行驗證到
         report = enforce_spec_change(report, mr)  # MR 改到規格檔:改了什麼、前後是否一致
 
@@ -1928,6 +1982,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         if await _superseded(hub, mr_id, mr.get("head_sha") or mr.get("sha")):
             report["writeback_skipped"] = "已有更新的 commit,這次審查的結論不再回寫"
             print(f"[pipeline] MR !{mr_id} 已有更新的 commit,略過回寫", flush=True)
+            clock.finish()
             if capture is not None:
                 capture["report"] = report
             return report
@@ -1956,6 +2011,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             "name": "segcra/review",
             "description": f"{decision}:{report.get('summary', '')[:180]}",
         })
+        clock.finish()
         if capture is not None:
             capture["report"] = report
         return report

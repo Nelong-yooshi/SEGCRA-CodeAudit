@@ -471,21 +471,57 @@ def test_每一步的上限(monkeypatch, left, own, expected):
     ({"REVIEW_TIMEOUT_SECONDS": "3600"}, 3300),
     ({"REVIEW_TIMEOUT_SECONDS": "800"}, 600),    # 整份很短:收尾留四分之一
     ({"REVIEW_TIMEOUT_SECONDS": "壞掉"}, 2100),
+    ({"FINISH_RESERVE_SECONDS": "120"}, 2280),   # 收尾保留可以調
+    ({"FINISH_RESERVE_SECONDS": "900"}, 1800),   # 最多整份的四分之一(600)
+    ({"FINISH_RESERVE_SECONDS": "壞掉"}, 2100),
+    ({"REVIEW_TIMEOUT_SECONDS": "800", "FINISH_RESERVE_SECONDS": "100"}, 700),
 ])
 def test_整份審查的截止時間(monkeypatch, env, expected):
-    monkeypatch.delenv("REVIEW_TIMEOUT_SECONDS", raising=False)
+    for k in ("REVIEW_TIMEOUT_SECONDS", "FINISH_RESERVE_SECONDS"):
+        monkeypatch.delenv(k, raising=False)
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     assert pipeline._review_budget() == expected
 
 
+@pytest.mark.parametrize("env,total,expected,warned", [
+    (None, 2400, 300, False),
+    ("120", 2400, 120, False),
+    ("600", 2400, 600, False),                   # 剛好四分之一
+    ("601", 2400, 600, True),
+    (None, 800, 200, True),                      # 整份很短:預設的 300 也被縮,照樣說
+])
+def test_收尾保留最多整份的四分之一_縮了要說(monkeypatch, capsys, env, total, expected, warned):
+    monkeypatch.delenv("FINISH_RESERVE_SECONDS", raising=False)
+    if env is not None:
+        monkeypatch.setenv("FINISH_RESERVE_SECONDS", env)
+    assert pipeline._finish_reserve(total) == expected
+    assert ("收尾保留" in capsys.readouterr().out) is warned
+
+
+@pytest.mark.parametrize("env,budget,expected,warned", [
+    (None, 2100, 30, False),
+    ("10", 2100, 10, False),
+    ("2099", 2100, 2099, False),
+    ("2100", 2100, 30, True),                    # 不比截止時間短:模型的步驟永遠不跑
+    ("9000", 2100, 30, True),
+    ("壞掉", 2100, 30, False),                   # 讀不懂:env_seconds 自己退回預設並警告
+])
+def test_每步最少秒數要比截止時間短(monkeypatch, capsys, env, budget, expected, warned):
+    monkeypatch.delenv("MIN_STAGE_SECONDS", raising=False)
+    if env is not None:
+        monkeypatch.setenv("MIN_STAGE_SECONDS", env)
+    assert pipeline._min_stage_seconds(budget) == expected
+    assert ("永遠不跑" in capsys.readouterr().out) is warned
+
+
 def test_截止時間比每一步的上限加起來短(monkeypatch):
     """預設值下各步自己的上限加起來比整份長,所以才需要截止時間;截止也要留收尾的時間。"""
-    for k in ("REVIEW_TIMEOUT_SECONDS", "MAIN_REVIEW_TIMEOUT_SECONDS"):
+    for k in ("REVIEW_TIMEOUT_SECONDS", "MAIN_REVIEW_TIMEOUT_SECONDS", "FINISH_RESERVE_SECONDS"):
         monkeypatch.delenv(k, raising=False)
     budget = pipeline._review_budget()
     assert pipeline._main_review_timeout() + 600 + 1200 > budget
-    assert budget + pipeline.FINISH_RESERVE_SECONDS == 2400
+    assert budget + pipeline._finish_reserve(2400) == 2400 and budget == 2100
 
 
 def test_逾時時寫的秒數是整數():
