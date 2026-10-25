@@ -62,8 +62,8 @@ def test_字串裡的分號不會把一句切成兩半():
     assert hits == [] or all(h["rule"] != "R001" for h in hits)  # 有 WHERE,不該命中
 
 
-def test_斷詞失敗時退回整份解析():
-    """引號沒收這種連斷詞都失敗的內容,行為跟以前一樣(整份當一句)。"""
+def test_整份都是沒收尾的引號時記成解析錯誤():
+    """沒收尾的引號吃到檔尾;整份只有這一段,它就是唯一的一句,解析失敗要看得見。"""
     out, _ = _out("SELECT 'no end")
     assert isinstance(out, dict) and out.get("error")
 
@@ -144,8 +144,8 @@ def test_特製內容不會讓切句變慢():
 
 
 def test_切句不需要在函式裡匯入():
-    """`sqlglot.tokens` 的 import 原本寫在函式裡(#99 review 第 2 點)。
-    現在切句不靠 tokenizer,那段 import 整個不需要了。"""
+    """切句是純字元掃描,不靠 sqlglot 的斷詞器,所以函式裡不該有任何 import ——
+    有的話代表又繞回斷詞器,沒收尾的引號會讓整份退回一次解析。"""
     import inspect
 
     from toolbox import sqltools
