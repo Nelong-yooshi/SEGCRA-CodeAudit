@@ -362,8 +362,31 @@ _ENV_VAR_RE = re.compile(r"(?i)@@(SERVERNAME|SERVICENAME|VERSION|SPID)\b"
 # 不完全貼切,但報得出來比一條都不報好。
 _SYS = _named("sys")
 _OBJ = _named(r"\w+")
+# 回傳執行環境的系統預存程序:`sp_who` 給每個連線的主機名稱、登入帳號與資料庫,
+# `sp_helpserver` 給伺服器名稱,`xp_msver` 給版本與主機資訊 —— 跟 `HOST_NAME()`、
+# `@@SERVERNAME` 是同一類資訊,所以歸 R005。
+_ENV_PROCS = ("sp_who", "sp_who2", "sp_helpserver", "sp_server_info", "sp_helpdb",
+              "xp_msver")
+
+
+def _procs(names) -> str:
+    """這幾支預存程序的比對,**前面接什麼都算**。
+
+    `sys.`、`master.dbo.`、`master..`、方括號、雙引號都是同一支 —— 跟 `sp_executesql`
+    同一種比法。只認沒有限定名稱的那一種,等於加三個字就繞過去。
+    """
+    return r'(?<![\w@])[\["]?(?:' + "|".join(names) + r')[\]"]?(?!\w)'
+
+
+# `sys.<物件>` 那一條不要跟別的分支重複命中:同一句出現兩條說法不同的 finding,
+# 看的人會以為是兩件事。`sp_executesql` 由 R009 報;上面那幾支由下面自己的分支報
+# (前綴不限)。沒列到的 `sys.sp_*` 照樣由 `sys.<物件>` 那條接住。
+_SP_ELSEWHERE = ("sp_executesql",) + _ENV_PROCS
 _ENV_CATALOG_RE = re.compile(
-    r"(?i)(?<!\w)" + _SYS + _GAP + r"\." + _GAP + r'(?![\["]?sp_executesql\b)' + _OBJ
+    r"(?i)(?<!\w)" + _SYS + _GAP + r"\." + _GAP
+    + r'(?![\["]?(?:' + "|".join(_SP_ELSEWHERE) + r')\b)' + _OBJ
+    # 回傳執行環境的系統預存程序(前面有沒有 sys. 都算)
+    + r"|" + _procs(_ENV_PROCS)
     # 舊式的系統表名(master..sysdatabases、master.dbo.sysobjects),沒有 sys. 前綴
     + r"|(?<!\w)[\[\"]?sys(databases|objects|columns|users|logins|processes|servers|indexes)[\]\"]?(?!\w)"
     r"|(?<!\w)[\[\"]?INFORMATION_SCHEMA[\]\"]?" + _GAP + r"\.")

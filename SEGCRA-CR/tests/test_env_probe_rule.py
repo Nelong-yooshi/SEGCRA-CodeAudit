@@ -183,22 +183,65 @@ def test_sp_executesql不重複報(sql):
 
 
 @pytest.mark.parametrize("sql", [
-    # 回傳執行環境的系統預存程序:跟 HOST_NAME()、@@SERVERNAME 是同一類資訊
-    "EXEC sys.sp_who",
-    "EXEC sys.sp_helpserver",
-    "EXEC sys.sp_server_info",
-    "EXEC sys.sp_helpdb",
-    # 把帳號加進 sysadmin / db_owner:R008 只認 GRANT/REVOKE/DENY 這些新式寫法
+    "EXEC sys.sp_helptext 'dbo.p'",
     "EXEC sys.sp_addsrvrolemember 'app', 'sysadmin'",
     "EXEC sys.sp_addrolemember 'db_owner', 'app'",
-    'EXEC "sys"."sp_addsrvrolemember" \'app\', \'sysadmin\'',
 ])
-def test_sp_executesql以外的系統預存程序照樣命中(sql):
-    """只排除別條已經報的那一支,不是整個 `sys.sp_` 都排除:其餘的沒有別的規則接手,
-    排掉就變成一條都不報。類別不完全貼切,但報得出來比漏掉好。"""
+def test_沒有列到的sys預存程序照樣由系統目錄那條接住(sql):
+    """只排除別的分支已經報的那幾支,不是整個 `sys.sp_` 都排除——排掉就變成一條都
+    不報。把帳號加進 sysadmin / db_owner 的那幾支,等 R008 認舊式寫法之後再歸過去
+    (#91),在那之前由這裡接住。"""
     hits = _r005(sql)
     assert len(hits) == 1, f"沒抓到:{sql}"
     assert hits[0]["severity"] == "major"
+
+
+# 回傳執行環境的系統預存程序。寫法很多種,只認其中一種等於加三個字就繞過去。
+_ENV_PROC_SPELLINGS = [
+    ("EXEC sp_who", "不加前綴"),
+    ("sp_who", "批次第一句可以不寫 EXEC"),
+    ("INSERT INTO #t EXEC sp_who", "把結果收進暫存表"),
+    ("EXEC sys.sp_who", "sys. 前綴"),
+    ("EXEC master.dbo.sp_who", "三段式"),
+    ("EXEC master..sp_who", "中間段省略"),
+    ("EXEC [sp_who]", "方括號"),
+    ('EXEC "sys"."sp_who"', "雙引號"),
+    ("EXEC sp_who2", "sp_who2"),
+    ("EXEC sp_helpserver", "伺服器名稱"),
+    ("EXEC sp_server_info", "伺服器資訊"),
+    ("EXEC sp_helpdb", "資料庫資訊"),
+    ("EXEC xp_msver", "版本與主機資訊"),
+    ("EXEC master..xp_msver", "xp_msver 加前綴"),
+]
+
+
+@pytest.mark.parametrize("sql,label", _ENV_PROC_SPELLINGS,
+                         ids=[lab for _, lab in _ENV_PROC_SPELLINGS])
+def test_回傳執行環境的系統預存程序命中R005(sql, label):
+    """`sp_who` 回傳每個連線的主機名稱、登入帳號與資料庫,`sp_helpserver` 回傳伺服器
+    名稱,`xp_msver` 回傳版本與主機資訊 —— 跟 HOST_NAME()、@@SERVERNAME 是同一類。
+    原本只有帶 sys. 前綴的會被當成系統目錄而命中。"""
+    hits = _r005(sql)
+    assert len(hits) == 1, f"沒抓到:{sql}"
+    assert hits[0]["severity"] == "major"
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT sp_who_flag FROM t",                 # 欄位名以 sp_who 開頭
+    "SELECT * FROM sp_helpdb_log",               # 表名含那幾個字
+    "EXEC dbo.sp_whoever",                       # 自家的預存程序
+    "SELECT xp_msver_col FROM t",
+])
+def test_名稱只是含那幾個字不誤報(sql):
+    assert _r005(sql) == []
+
+
+def test_同一支不出現兩種說法():
+    """`sys.sp_who` 同時符合「sys.<物件>」與「系統預存程序」兩個分支。重複列的話,
+    同一句會出現兩條說法不同的 finding,看的人會以為是兩件事。"""
+    hits = _r005("EXEC sys.sp_who")
+    assert len(hits) == 1
+    assert hits[0]["message"].count("sp_who") == 1, hits[0]["message"]
 
 
 @pytest.mark.parametrize("sql", [
