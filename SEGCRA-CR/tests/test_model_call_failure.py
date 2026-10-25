@@ -6,6 +6,7 @@
 """
 import asyncio
 import json
+import time
 
 import httpx
 import openai
@@ -293,7 +294,7 @@ def test_主審查用自己的時間上限():
         import unittest.mock as m
         with m.patch.object(pipeline, "run_agent", run), \
                 m.patch.object(pipeline, "MAIN_REVIEW_TIMEOUT_SECONDS", 0.05):
-            return await pipeline._run_main_review(None, None, "", "", None, None, seen, "1")
+            return await pipeline._run_main_review(None, None, "", "", None, None, seen, "1", _far())
 
     assert asyncio.run(go()) is None and seen["failed"] == "timeout"
 
@@ -313,7 +314,7 @@ def test_等主審查時外層被取消_模型呼叫一起取消():
         import unittest.mock as m
         with m.patch.object(pipeline, "run_agent", run):
             task = asyncio.ensure_future(
-                pipeline._run_main_review(None, None, "", "", None, None, {}, "1"))
+                pipeline._run_main_review(None, None, "", "", None, None, {}, "1", _far()))
             await asyncio.sleep(0.05)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
@@ -352,3 +353,192 @@ def test_只有連不上與逾時算端點無法使用():
     assert pipeline._endpoint_unavailable({"failed": "connection"})
     for kind in ("rate_limited", "rejected", "server_error", "other", None):
         assert not pipeline._endpoint_unavailable({"failed": kind})
+
+
+# ─────────────────── 整份審查的截止時間 ───────────────────
+
+def _far():
+    return time.monotonic() + 3600
+
+
+def test_主審查用掉大部分時間之後_整份仍在上限內結束_確定性結果照常(staged, monkeypatch):
+    """端點沒掛、只是慢:主審查用掉大部分時間,冷讀與執行驗證只能用剩下的,剩不夠就不開始。
+    整份在截止時間內結束,確定性的結果照常出現,決策不是自動放行。"""
+    # 審查開始到主審查之前(取 MR、預掃、工具伺服器啟動)也要時間,數字留寬一點
+    monkeypatch.setattr(pipeline, "REVIEW_BUDGET_SECONDS", 10.0)
+    monkeypatch.setattr(pipeline, "MIN_STAGE_SECONDS", 6.0)
+
+    async def slow_ok():
+        await asyncio.sleep(5)                  # 主審查自己的上限(1800)內,但用掉大部分整份的時間
+        return json.dumps({"summary": "沒問題", "score": 100, "findings": []}, ensure_ascii=False)
+
+    t0 = time.monotonic()
+    report, calls = staged(slow_ok, sql="DELETE FROM t", outer=60)
+    assert time.monotonic() - t0 < 10.0 + 3.0    # 截止時間加上收尾,遠在外層之前
+    assert calls == ["main"]                     # 剩不到 6 秒:冷讀、執行驗證都沒開始
+    assert any(f["title"].startswith("[R001]") for f in report["findings"])
+    stages = _stages(report)
+    for stage in ("冷讀", "執行驗證"):
+        assert pipeline._NO_TIME_REASON in stages[stage]["detail"]
+    assert _failed(report) == []                 # 主審查本身有完成
+    assert report["decision"] != "auto_approved"
+
+
+def test_剩下的時間比冷讀自己的上限短時_冷讀只能用剩下的(staged, monkeypatch):
+    monkeypatch.setattr(pipeline, "REVIEW_BUDGET_SECONDS", 8.0)
+    monkeypatch.setattr(pipeline, "MIN_STAGE_SECONDS", 0.5)
+
+    async def main_ok():
+        await asyncio.sleep(1)
+        return json.dumps({"summary": "沒問題", "score": 100, "findings": []}, ensure_ascii=False)
+
+    async def slow_cold(cfg, mr, head_texts=None):
+        await asyncio.sleep(60)                 # 冷讀自己的上限是 600 秒
+
+    monkeypatch.setattr(pipeline, "_cold_read", slow_cold)
+    t0 = time.monotonic()
+    report, calls = staged(main_ok, outer=60)
+    assert time.monotonic() - t0 < 8.0 + 3.0
+    cold = _stages(report)["冷讀"]
+    assert "逾時" in cold["title"]               # 用剩下的時間跑,到截止就停
+    assert "被整份審查的截止時間縮短了(原本是 600 秒)" in cold["detail"]
+    assert "沒有執行" in _stages(report)["執行驗證"]["title"]
+
+
+def test_預掃用掉大部分時間時_主審查也不超過截止時間(monkeypatch):
+    """主審查的上限一樣取小的:剩下的比 MAIN_REVIEW_TIMEOUT_SECONDS 短時用剩下的。"""
+    seen = {}
+
+    async def run(cfg, profile, system, user, hub, meta=None, **kw):
+        await asyncio.sleep(60)
+
+    async def go():
+        import unittest.mock as m
+        with m.patch.object(pipeline, "run_agent", run), \
+                m.patch.object(pipeline, "MIN_STAGE_SECONDS", 0.1):
+            t0 = time.monotonic()
+            out = await pipeline._run_main_review(None, None, "", "", None, None, seen, "1",
+                                                  time.monotonic() + 0.3)
+            return out, time.monotonic() - t0
+
+    out, spent = asyncio.run(go())
+    assert out is None and seen["failed"] == "timeout" and spent < 2
+
+
+def test_剩下的時間不夠時不呼叫主審查_說明不寫成端點的問題(monkeypatch, capsys):
+    calls = []
+
+    async def run(cfg, profile, system, user, hub, meta=None, **kw):
+        calls.append(1)
+
+    async def go():
+        import unittest.mock as m
+        with m.patch.object(pipeline, "run_agent", run):
+            return await pipeline._run_main_review(None, None, "", "", None, None, meta, "1",
+                                                   time.monotonic() + 5)
+
+    meta = {}
+    assert asyncio.run(go()) is None and calls == [] and meta["failed"] == "no_time"
+    assert "沒有呼叫主審查模型" in capsys.readouterr().out
+    report = pipeline.enforce_truncation({"findings": []}, meta, 8192)
+    [f] = _failed(report)
+    assert pipeline._MODEL_FAILURE_TEXT["no_time"] in f["detail"]
+    assert "審查環境的問題" not in f["detail"] and "維運" not in f["suggestion"]
+    assert not pipeline._endpoint_unavailable(meta)
+
+
+def test_端點的問題照舊寫維運():
+    report = pipeline.enforce_truncation({"findings": []}, {"failed": "connection"}, 8192)
+    [f] = _failed(report)
+    assert "審查環境的問題" in f["detail"] and "維運" in f["suggestion"]
+
+
+@pytest.mark.parametrize("left,own,expected", [
+    (100.0, 600, 100.0),                         # 剩的比自己的上限短:用剩的
+    (5000.0, 600, 600),                          # 剩很多:用自己的
+    (29.0, 600, None),                           # 不到 MIN_STAGE_SECONDS:不開始
+    (30.0, 600, 30.0),                           # 剛好:開始
+    (-5.0, 600, None),                           # 已經過了截止
+])
+def test_每一步的上限(monkeypatch, left, own, expected):
+    monkeypatch.setattr(pipeline.time, "monotonic", lambda: 1000.0)
+    got = pipeline._stage_limit(own, 1000.0 + left)
+    assert got == expected
+
+
+@pytest.mark.parametrize("env,expected", [
+    ({}, 2100),                                  # 2400 留 300 收尾
+    ({"REVIEW_TIMEOUT_SECONDS": "3600"}, 3300),
+    ({"REVIEW_TIMEOUT_SECONDS": "800"}, 600),    # 整份很短:收尾留四分之一
+    ({"REVIEW_TIMEOUT_SECONDS": "壞掉"}, 2100),
+])
+def test_整份審查的截止時間(monkeypatch, env, expected):
+    monkeypatch.delenv("REVIEW_TIMEOUT_SECONDS", raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    assert pipeline._review_budget() == expected
+
+
+def test_截止時間比每一步的上限加起來短(monkeypatch):
+    """預設值下各步自己的上限加起來比整份長,所以才需要截止時間;截止也要留收尾的時間。"""
+    for k in ("REVIEW_TIMEOUT_SECONDS", "MAIN_REVIEW_TIMEOUT_SECONDS"):
+        monkeypatch.delenv(k, raising=False)
+    budget = pipeline._review_budget()
+    assert pipeline._main_review_timeout() + 600 + 1200 > budget
+    assert budget + pipeline.FINISH_RESERVE_SECONDS == 2400
+
+
+def test_逾時時寫的秒數是整數():
+    assert pipeline._seconds(287.9) == 287 and pipeline._seconds(0.2) == 1
+
+
+def test_執行驗證只能用剩下的時間_沙盒的截止時間跟著縮(staged, monkeypatch):
+    """主審查、冷讀都很快,執行驗證卡住:到整份的截止時間就停,記成逾時;交給沙盒的截止時間
+    也不超過整份的截止時間。"""
+    monkeypatch.setattr(pipeline, "REVIEW_BUDGET_SECONDS", 6.0)
+    monkeypatch.setattr(pipeline, "MIN_STAGE_SECONDS", 0.5)
+    seen = {}
+
+    async def hang_spec(cfg, hub, mr, *a, deadline=None, **kw):
+        seen["left"] = deadline - time.monotonic()
+        await asyncio.sleep(60)
+
+    monkeypatch.setattr(pipeline, "run_spec_exec", hang_spec)
+
+    async def ok():
+        return json.dumps({"summary": "沒問題", "score": 100, "findings": []}, ensure_ascii=False)
+
+    t0 = time.monotonic()
+    report, calls = staged(ok, outer=60)
+    assert time.monotonic() - t0 < 6.0 + 3.0
+    assert 0 < seen["left"] <= 6.0                       # 不是執行驗證自己的 1200 秒
+    spec = [f for f in report["findings"] if "逾時" in f["title"]]
+    assert spec and "被整份審查的截止時間縮短了(原本是 1200 秒)" in spec[0]["detail"]
+
+
+def test_一開始剩的時間就不夠時_三步都不呼叫模型_確定性結果照常(staged, monkeypatch):
+    """前面的檢查用掉了幾乎全部時間:主審查、冷讀、執行驗證都不開始,各自寫出原因;主審查的說明
+    寫「時間不夠」,不寫成端點的問題。確定性的結果照常出現,決策交人工。"""
+    monkeypatch.setattr(pipeline, "REVIEW_BUDGET_SECONDS", 0.5)
+    monkeypatch.setattr(pipeline, "MIN_STAGE_SECONDS", 1.0)
+
+    async def never():
+        raise AssertionError("不應該呼叫主審查")
+
+    report, calls = staged(never, sql="DELETE FROM t", outer=60)
+    assert calls == []
+    assert any(f["title"].startswith("[R001]") for f in report["findings"])
+    [f] = _failed(report)
+    assert pipeline._MODEL_FAILURE_TEXT["no_time"] in f["detail"] and "維運" not in f["suggestion"]
+    assert report["_output_meta"]["failed"] == "no_time"
+    stages = _stages(report)
+    for stage in ("冷讀", "執行驗證"):
+        assert pipeline._NO_TIME_REASON in stages[stage]["detail"]
+    assert report["decision"] != "auto_approved"
+
+
+def test_逾時沒被縮短時不加說明():
+    f = pipeline._timeout_finding("冷讀", 600, 600)
+    assert "截止時間" not in f["detail"] and "600 秒" in f["detail"]
+    g = pipeline._timeout_finding("冷讀", 87.6, 600)
+    assert "87 秒" in g["detail"] and "原本是 600 秒" in g["detail"]

@@ -5,6 +5,7 @@
 """
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -472,18 +473,24 @@ def _hanging(cancelled):
     return hangs
 
 
+def _far():
+    """離整份審查的截止還很久(只看冷讀自己的上限時用)。"""
+    return time.monotonic() + 3600
+
+
 def test_冷讀超過時間上限就取消並記成逾時(monkeypatch, real_cold_read):
     cancelled = []
     monkeypatch.setattr(pipeline, "_cold_read", _hanging(cancelled))
     monkeypatch.setattr(pipeline, "COLD_READ_TIMEOUT_SECONDS", 0.2)
 
     async def main():
-        out = await pipeline._run_cold_read(load_config(), _mr(), None)
+        out = await pipeline._run_cold_read(load_config(), _mr(), None, _far())
         # 在 asyncio.run 收尾之前看:收尾時它會自己取消還沒完成的工作,在那之後看分不出來
         return out, list(cancelled)
 
     (result, incomplete), seen = asyncio.run(main())
     assert result is None and incomplete["stage"] == "冷讀" and "逾時" in incomplete["title"]
+    assert "截止時間縮短" not in incomplete["detail"]       # 用的是冷讀自己的上限
     assert seen == [True], "逾時後沒有取消冷讀:那個請求會一直佔著端點"
 
 
@@ -493,7 +500,7 @@ def test_等冷讀時外層被取消_冷讀一起取消(monkeypatch, real_cold_r
     monkeypatch.setattr(pipeline, "_cold_read", _hanging(cancelled))
 
     async def main():
-        task = asyncio.create_task(pipeline._run_cold_read(load_config(), _mr(), None))
+        task = asyncio.create_task(pipeline._run_cold_read(load_config(), _mr(), None, _far()))
         await asyncio.sleep(0.05)               # 冷讀已經開始
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -514,7 +521,7 @@ def test_冷讀的時間從冷讀開始算(monkeypatch, real_cold_read):
 
     async def main():
         await asyncio.sleep(0.6)                # 主審查跑得比冷讀的上限還久
-        return await pipeline._run_cold_read(load_config(), _mr(), None)
+        return await pipeline._run_cold_read(load_config(), _mr(), None, _far())
 
     assert asyncio.run(main()) == (ColdRead(flagged=False), None)
 
@@ -523,7 +530,7 @@ def test_冷讀自己丟的逾時例外記成未完整_不當成外層逾時(mon
     async def inner_timeout(cfg, mr, head_texts=None):
         raise asyncio.TimeoutError()
     monkeypatch.setattr(pipeline, "_cold_read", inner_timeout)
-    result, incomplete = asyncio.run(pipeline._run_cold_read(load_config(), _mr(), None))
+    result, incomplete = asyncio.run(pipeline._run_cold_read(load_config(), _mr(), None, _far()))
     assert result is None and incomplete["stage"] == "冷讀" and "逾時" not in incomplete["title"]
 
 
