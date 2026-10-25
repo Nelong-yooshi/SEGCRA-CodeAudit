@@ -2275,10 +2275,10 @@ MUTANTS.update({
  # 內文就是它 —— 一樣會貼回 MR 留言、寫進 review_output/。要防的是「帶出原文」,
  # 跟那段原文像不像密碼無關,所以只留位置(用樣式遮只遮得到樣式認得的寫法)。
  "解析失敗:錯誤訊息照用 sqlglot 的原文": ("../toolbox/sqltools.py",
-     "        statements, parse_error = [], parse_error_text(e)",
-     '        statements, parse_error = [], f"parse failed: {e}"'),
+     "            return [], parse_error_text(e)",
+     '            return [], f"parse failed: {e}"'),
  "解析失敗:連 sqlglot 的描述一起帶出來": ("../toolbox/sqltools.py",
-     '            spots.append(f"第 {d[\'line\']} 行第 {d.get(\'col\', \'?\')} 欄")',
+     '            spots.append(f"第 {d[\'line\'] + line_offset} 行第 {d.get(\'col\', \'?\')} 欄")',
      '            spots.append(f"第 {d[\'line\']} 行 {d.get(\'description\', \'\')}")'),
  "解析失敗:其他例外照用訊息(不只留類型)": ("../toolbox/sqltools.py",
      '    where = "、".join(dict.fromkeys(spots))[:120] if spots else type(e).__name__',
@@ -4274,6 +4274,52 @@ MUTANTS.update({
 })
 
 
+# ---- 一句解析失敗不可以吃掉整個檔案的命中(#90 第 1 點)
+TOOLS = "../toolbox/sqltools.py"
+MUTANTS.update({
+ "逐句:整份一次解析(一句壞掉就全部不檢查)": (TOOLS,
+     "    chunks = _statement_chunks(sql)" + NL
+     + "    if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析",
+     "    chunks = []" + NL
+     + "    if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析"),
+ "逐句:一句壞掉就放棄其餘的句子": (TOOLS,
+     "        except Exception as e:           # noqa: BLE001" + NL
+     + "            errors.append(parse_error_text(e, line_offset))",
+     "        except Exception as e:           # noqa: BLE001" + NL
+     + "            return statements, parse_error_text(e, line_offset)"),
+ "逐句:用字串 split 切句(字串與註解裡的分號會切錯)": (TOOLS,
+     "    cuts, i, n = [], 0, len(sql)",
+     '    return [i + 1 for i, ch in enumerate(sql) if ch == ";"]' + NL
+     + "    cuts, i, n = [], 0, len(sql)"),
+ "逐句:沒收尾的引號讓整份退回一次解析": (TOOLS,
+     "    cuts = _semicolon_cuts(sql)",
+     "    from sqlglot.tokens import Tokenizer, TokenType" + NL
+     + "    try:" + NL
+     + "        tokens = Tokenizer(dialect=DIALECT).tokenize(sql)" + NL
+     + "    except Exception:" + NL
+     + "        return []" + NL
+     + "    cuts = [t.end + 1 for t in tokens if t.token_type == TokenType.SEMICOLON]"),
+ "逐句:巢狀的區塊註解只認最內層": (TOOLS,
+     "                if sql.startswith(\"/*\", i):" + NL
+     + "                    depth, i = depth + 1, i + 2",
+     "                if False:" + NL
+     + "                    depth, i = depth + 1, i + 2"),
+ # 「`''` 當成字串結束」不列為突變點:**它是等價的**。把跳脫當成「結束再開一個新
+ # 字串」之後,被標成「在字串裡」的字元範圍完全一樣(兩種解讀都是一次吃掉兩個引號),
+ # 所以找到的分號位置也一樣 —— 20 萬組隨機輸入比對過,沒有一組不同。留著只會得到
+ # 一個永遠抓不到的突變點。
+ "逐句:行號不加上這一句的起始行": (TOOLS,
+     "            errors.append(parse_error_text(e, line_offset))",
+     "            errors.append(parse_error_text(e))"),
+ "逐句:解析失敗的句子不記成解析錯誤": (TOOLS,
+     "    if not errors:" + NL + "        return statements, None",
+     "    return statements, None" + NL + "    if not errors:" + NL
+     + "        return statements, None"),
+ "逐句:錯誤訊息不設則數上限": (TOOLS,
+     "    shown = list(dict.fromkeys(errors))[:_MAX_PARSE_ERRORS]",
+     "    shown = list(dict.fromkeys(errors))"),
+})
+
 # ---- 取不到規格 ≠ 沒有規格(#90 第 2 點)。混在一起的話,報告會叫開發者去補一份
 # 其實已經存在的規格,而維運看不出是 token 設錯了。
 G = "../toolbox/gitlab.py"
@@ -4305,15 +4351,6 @@ MUTANTS.update({
  "規格:沒有 __getnewargs__(複製與 pickle 會丟 TypeError)": (S,
      "        return (self[0], self[1], self.unavailable)",
      "        return ()"),
- "規格:404 一律當成檔案不存在(專案/commit 找不到也算)": (G,
-     '            return (None, None) if _FILE_NOT_FOUND in body else (None, "not_found")',
-     "            return None, None"),
- "規格:404 一律當成拿不到(檔案不存在也算)": (G,
-     '            return (None, None) if _FILE_NOT_FOUND in body else (None, "not_found")',
-     '            return None, "not_found"'),
- "規格:拿不到時照樣叫人補規格": (S,
-     "    if not spec_text and unavailable:",
-     "    if False:"),
  "規格:404 一律當成檔案不存在(專案/commit 找不到也算)": (G,
      '            return (None, None) if _FILE_NOT_FOUND in body else (None, "not_found")',
      "            return None, None"),
