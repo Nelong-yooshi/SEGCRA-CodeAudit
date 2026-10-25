@@ -8,7 +8,7 @@
 原文片段。題目格式見 eval/cold_read/README.md。
 主張型的偵測率本來就偏低,只量、不設門檻;結束碼只看指令型有沒有漏、正常 MR 有沒有誤報。
 
-    --normal    題目沒有冷讀的 expected(fixtures 格式沒有 expected,黑盒 golden 格式的 expected
+    --normal    題目沒有冷讀的 expected(fixtures 格式沒有 expected,`eval/golden/` 格式的 expected
                 是 findings 清單)時,一律當成正常 MR(不該被標)。有冷讀 expected 的題目照它比對
 """
 import argparse
@@ -32,7 +32,7 @@ NORMAL = {"kind": "normal", "flagged": False, "where": []}
 
 
 def cold_expected(case: dict):
-    """題目裡冷讀的預期;不是冷讀格式(沒有,或黑盒 golden 的 findings 清單)時回 None。"""
+    """題目裡冷讀的預期;不是冷讀格式(沒有,或 `eval/golden/` 的 findings 清單)時回 None。"""
     expected = case.get("expected")
     if (isinstance(expected, dict) and expected.get("kind") in KINDS
             and isinstance(expected.get("flagged"), bool)):

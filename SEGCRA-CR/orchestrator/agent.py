@@ -163,7 +163,7 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
             meta["prompt_tokens"] = prompt_tokens
             # 另外**累加**:有工具呼叫時一輪會跑好幾次,每一次都把整串對話重讀一遍,
             # 所以總量遠大於最後一次。只記最後一次的話,工具用得多的 MR 反而看起來
-            # 很便宜,跟黑盒量到的總量對不起來(#84)。
+            # 很便宜,跟模型端點那邊記的總量對不起來。
             #
             # 端點沒回 usage 的那一輪不加(不要把 None 當 0 加進去之後還記成有值);
             # 整份都沒有任何一輪回報時,鍵根本不存在 → 呼叫端讀到 None,
