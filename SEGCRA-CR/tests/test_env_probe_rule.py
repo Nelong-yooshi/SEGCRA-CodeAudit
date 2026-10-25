@@ -156,6 +156,52 @@ def test_review_補齊的寫法都命中R005(probe):
 
 
 @pytest.mark.parametrize("sql", [
+    'SELECT * FROM "sys"."databases"',                       # 雙引號識別字
+    'SELECT * FROM "master"."sys"."objects"',                # 三段式都加雙引號
+    'SELECT * FROM "sys".objects',                           # 只有前半加
+    'SELECT * FROM sys."objects"',                           # 只有後半加
+    'SELECT * FROM "INFORMATION_SCHEMA"."TABLES"',
+    'SELECT * FROM "master"."dbo"."sysdatabases"',           # 舊式系統表名加雙引號
+])
+def test_雙引號識別字照樣命中R005(sql):
+    """SQL Server 預設 QUOTED_IDENTIFIER ON,`"sys"."databases"` 是可用的寫法。
+    只認方括號的話,換一種引號就繞過去了(#27 review 留給規則層那張處理的項目)。"""
+    hits = _r005(sql)
+    assert len(hits) == 1, f"沒抓到:{sql}"
+    assert hits[0]["severity"] == "major"
+
+
+@pytest.mark.parametrize("sql", [
+    "EXEC sys.sp_executesql N'SELECT 1'",
+    "EXEC [sys].[sp_executesql] N'SELECT 1'",
+    'EXEC "sys"."sp_executesql" N\'SELECT 1\'',
+])
+def test_sp_executesql不重複報(sql):
+    """這一支已經由 R009(動態 SQL)報。同一句出現兩條說法不同的 finding,看的人會
+    以為是兩件事。"""
+    assert _r005(sql) == []
+
+
+@pytest.mark.parametrize("sql", [
+    # 回傳執行環境的系統預存程序:跟 HOST_NAME()、@@SERVERNAME 是同一類資訊
+    "EXEC sys.sp_who",
+    "EXEC sys.sp_helpserver",
+    "EXEC sys.sp_server_info",
+    "EXEC sys.sp_helpdb",
+    # 把帳號加進 sysadmin / db_owner:R008 只認 GRANT/REVOKE/DENY 這些新式寫法
+    "EXEC sys.sp_addsrvrolemember 'app', 'sysadmin'",
+    "EXEC sys.sp_addrolemember 'db_owner', 'app'",
+    'EXEC "sys"."sp_addsrvrolemember" \'app\', \'sysadmin\'',
+])
+def test_sp_executesql以外的系統預存程序照樣命中(sql):
+    """只排除別條已經報的那一支,不是整個 `sys.sp_` 都排除:其餘的沒有別的規則接手,
+    排掉就變成一條都不報。類別不完全貼切,但報得出來比漏掉好。"""
+    hits = _r005(sql)
+    assert len(hits) == 1, f"沒抓到:{sql}"
+    assert hits[0]["severity"] == "major"
+
+
+@pytest.mark.parametrize("sql", [
     # 延續原本那組:名稱剛好含關鍵字不誤報
     "SELECT current_user_id, session_user_id FROM t",        # 欄位名含 niladic 函式名
     "SELECT t.user_name FROM t",                             # 欄位叫 user_name(沒有括號)
