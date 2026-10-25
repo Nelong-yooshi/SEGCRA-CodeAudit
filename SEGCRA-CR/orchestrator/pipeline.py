@@ -26,6 +26,8 @@ from .dbt_affected import (
     AffectedCheck, SpecForModels, check_affected_models, impact_finding, specs_by_priority,
 )
 from .change_view import build_full_text_section
+from .cold_read import (UNREAD_NEAR_LIMIT, UNREAD_NO_USAGE, UNREAD_TOO_FEW, ColdRead,
+                        cold_read as _cold_read, record as _cold_read_record)
 from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_hidden_writes import IN_TAGS, UNREACHED, UNVERIFIED, WRITE_KEYWORDS, find_hidden_writes
 from .dbt_render import is_dbt_template, render_model_isolated
@@ -190,6 +192,8 @@ INCOMPLETE_TITLE_PREFIX = "審查未完整"
 # 但整段沒有,大規格的測資生成可以久到讓一次審查永遠不回來,所以整段也要有上限。
 # 逾時不是當成通過,而是交人工(`stage_seconds` 記下各階段耗時,之後調上限有根據)。
 SPEC_EXEC_TIMEOUT_SECONDS = env_seconds("SPEC_EXEC_TIMEOUT_SECONDS", 1200)
+# 冷讀的時間上限(主審查之後依序跑,從冷讀開始算;見 _run_cold_read)
+COLD_READ_TIMEOUT_SECONDS = env_seconds("COLD_READ_TIMEOUT_SECONDS", 600)
 
 
 def _incomplete_finding(stage: str, exc: BaseException | None = None,
@@ -1070,6 +1074,49 @@ def _full_text_section(files: list[dict], dbt_ctx: DbtContext | None, budget: in
     return build_full_text_section(files, _head_texts(files, dbt_ctx), budget)
 
 
+async def _cold_read_stage(cfg: Config, mr: dict, dbt_ctx: DbtContext | None
+                           ) -> tuple[ColdRead | None, dict | None]:
+    """冷讀(見 cold_read)。回傳 (結果, 未完整的 finding)。
+
+    任何失敗都記成環節未完整(交人工),不往外丟:冷讀是資安防線,失敗時「沒命中」跟「沒看」
+    分不出來,不能維持原本的流程。只有被取消會往外丟。時間上限見 _run_cold_read。"""
+    try:
+        texts = _cold_read_texts(mr.get("files", []), dbt_ctx)
+        return await _cold_read(cfg, mr, texts), None
+    except Exception as e:                  # noqa: BLE001 — 任何失敗都記成未完整
+        return None, _incomplete_finding("冷讀", e)
+
+
+async def _run_cold_read(cfg: Config, mr: dict, dbt_ctx: DbtContext | None
+                         ) -> tuple[ColdRead | None, dict | None]:
+    """主審查之後依序跑冷讀,最多 COLD_READ_TIMEOUT_SECONDS 秒(從冷讀開始算),逾時記成未完整。
+
+    用 asyncio.wait_for:它被取消時會一起取消冷讀(asyncio.wait 不會),外層的總時間上限、
+    新 commit 取消舊審查都會傳進來,不會留下沒人收尾、還在打模型的請求。
+    依序而不是跟主審查平行:開發與黑盒用的端點一次只處理一個請求,平行省不到時間;正式環境量過
+    省得到時間再改回平行。"""
+    try:
+        return await asyncio.wait_for(_cold_read_stage(cfg, mr, dbt_ctx), COLD_READ_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        return None, _incomplete_finding("冷讀", timeout=COLD_READ_TIMEOUT_SECONDS)
+
+
+def _cold_read_texts(files, dbt_ctx: DbtContext | None) -> dict:
+    """冷讀用:取回的 dbt 專案裡,每個變更檔(不限副檔名)的 head 內容。
+
+    跟 _head_texts 不同,不只放 .sql:冷讀是偵測器,yml、文件、SVG 裡藏的文字正是它要看的;
+    它的輸出只有判定與位置,不會把內容帶進主審查的 prompt。"""
+    if dbt_ctx is None or not isinstance(files, list):
+        return {}
+    texts = {}
+    for f in files:
+        if isinstance(f, dict) and isinstance(f.get("path"), str):
+            text = dbt_ctx.head_text(f["path"])
+            if isinstance(text, str) and text:
+                texts[f["path"]] = text
+    return texts
+
+
 def _head_texts(files: list[dict], dbt_ctx: DbtContext | None) -> dict:
     """{路徑: 變更後的完整內容}。mock 模式的 fixture 自帶 full_content;真實模式下,dbt 專案
     裡的檔案用取回的 head commit 內容。兩者都沒有的檔案不列(prompt 只有它的 diff)。
@@ -1637,6 +1684,10 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         output_meta: dict = {}
         raw = await run_agent(cfg, profile, system, user, hub, trace=trace,
                               meta=output_meta)
+        # 冷讀(只看 MR 文字)在主審查之後依序跑,見 _run_cold_read
+        cold, cold_incomplete = await _run_cold_read(cfg, mr, dbt_ctx)
+        if cold_incomplete is not None:
+            report_stub["findings"].append(cold_incomplete)
         if capture is not None:
             capture["system_prompt"] = system
             capture["user_prompt"] = user
@@ -1688,6 +1739,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         if injection_hits:
             report["_injection_scan"] = injection_hits
         report = enforce_injection(report, injection_hits)  # 確定性 blocker,不論模型是否被攻陷
+        report = enforce_cold_read(report, cold)  # 冷讀命中或沒看完:交人工(只能加擋)
         report = enforce_truncation(report, output_meta, profile.max_output_tokens)  # 輸出被截斷
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
         report = enforce_tool_refusals(report, hub.refused_calls)  # 模型要求了寫入工具
@@ -3282,6 +3334,62 @@ def enforce_injection(report: dict, hits: list[dict]) -> dict:
         "suggestion": "移除 MR 描述/註解中試圖指示審查器的文字;若為誤植請改寫。",
         "citations": [], "_source": PROGRAM_SOURCE})
     report["_injection_scan"] = hits
+    return report
+
+
+_COLD_READ_TITLE = "冷讀判定有文字在對審查者或審查工具說話"
+_COLD_READ_TRUNCATED_TITLE = "冷讀沒有看完(輸入超過上限,或被端點截掉)"
+# 報告最多列幾個位置 / 沒看完的段落
+MAX_COLD_READ_LISTED = 20
+_COLD_READ_UNREAD = (UNREAD_NO_USAGE, UNREAD_NEAR_LIMIT, UNREAD_TOO_FEW)
+
+
+def _cold_read_place(kind: str, path) -> str:
+    if kind == "檔名":
+        return f"{_code_span(path)} 的檔名"
+    if kind == "內容":
+        return _code_span(path)
+    return kind                             # 標題、說明、位置無法確定(固定文字)
+
+
+@_isolated_stage("冷讀揭露")
+def enforce_cold_read(report: dict, cold: ColdRead | None) -> dict:
+    """冷讀的結果寫進報告。只能加擋:命中、沒看完各補一條 major(交人工);沒命中不補。
+    冷讀失敗(cold 是 None)時,未完整的那條已經在 _cold_read_stage 記下。
+
+    報告只寫位置(標題、說明、哪個檔案、哪個檔名),**不寫模型挑出的原文**:那是 MR 作者寫的
+    文字,貼回留言等於把它再送一次。片段只留在內部紀錄 `_cold_read`(不貼回 MR)。
+    標題只能由程式產生(見 _put_program_finding)。"""
+    # 一律由程式寫:冷讀失敗時是 None,模型自己輸出的同名欄位會被蓋掉
+    report["_cold_read"] = _cold_read_record(cold) if cold is not None else None
+    if cold is None:
+        return report
+    if cold.flagged:
+        places = [_cold_read_place(k, p) for k, p in cold.locations[:MAX_COLD_READ_LISTED]]
+        flagged = {
+            "file": "(MR 內容)", "line": 0, "severity": "major", "citations": [],
+            "title": _COLD_READ_TITLE,
+            "detail": ("另一支只看 MR 文字的模型判定,有文字在對審查者或審查工具說話(要求放行、改嚴重度、"
+                       "略過檢查、宣稱已核准或已測過等)。位置:" + ("、".join(places) or "位置無法確定")
+                       + "。原文不貼在這裡;請人工檢查這些位置的文字,並確認審查結論沒有被它影響。"),
+            "suggestion": "移除對審查者或審查工具說話的文字;變更說明只描述改了什麼、為什麼改。"}
+        _put_program_finding(report, flagged)
+    if cold.truncated:
+        reasons = []
+        if cold.omitted:
+            listed = "、".join(_code_span(o) for o in cold.omitted[:MAX_COLD_READ_LISTED])
+            more = (f" 等 {len(cold.omitted)} 段" if len(cold.omitted) > MAX_COLD_READ_LISTED else "")
+            reasons.append(f"冷讀的輸入超過上限(models.yaml 的 budget.cold_read,且不超過模型的上下文),"
+                           f"以下段落沒有完整送出:{listed}{more}。")
+        if cold.unread in _COLD_READ_UNREAD:        # 固定文字;不認得的不寫
+            reasons.append(f"{cold.unread}。")
+        truncated = {
+            "file": "(MR 內容)", "line": 0, "severity": "major", "citations": [],
+            "title": _COLD_READ_TRUNCATED_TITLE,
+            "detail": ("".join(reasons) or "冷讀沒有看完全部的輸入。")
+                      + "沒看到的部分不知道有沒有對審查者說話的文字,需人工確認。",
+            "suggestion": "MR 拆小;或確認上述段落沒有對審查者或審查工具說話的文字。"}
+        _put_program_finding(report, truncated)
     return report
 
 
