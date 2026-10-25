@@ -106,6 +106,21 @@ def test_某一輪沒回報用量_那一輪不加(monkeypatch):
     assert meta["prompt_tokens"] == 3000
 
 
+def test_沒回報用量的輪數記下來(monkeypatch):
+    """沒回報的那幾輪不加進總量,所以總量是低估的——低估多少,光看總量看不出來。
+    0 代表每一輪都有回報,不是「沒在記」。"""
+    meta = _run(monkeypatch, [(1000, 20, True), (None, None, True), (3000, 40, False)])
+    assert meta["rounds_without_usage"] == 1, "三輪裡只有中間那一輪沒回報"
+    assert _run(monkeypatch, [(1000, 20, False)], use_tools=False)[
+        "rounds_without_usage"] == 0
+
+
+def test_只回報一邊也算沒回報(monkeypatch):
+    """少的那一側一樣會讓總量偏低。"""
+    meta = _run(monkeypatch, [(1000, None, False)], use_tools=False)
+    assert meta["rounds_without_usage"] == 1
+
+
 def test_整份都沒回報用量_總量是None(monkeypatch):
     """跟 completion_tokens 沒回報時同一個意思:鍵不存在,呼叫端讀到 None。"""
     meta = _run(monkeypatch, [(None, None, False)], use_tools=False)
