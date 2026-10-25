@@ -4110,6 +4110,27 @@ MUTANTS.update({
 })
 
 
+# ---- 背景執行緒的收尾(#53 的 _in_thread)
+MUTANTS.update({
+ "收尾:例外不先綁到自己的變數(lambda 跑的時候 e 已經被刪掉 → 永遠掛著)": (S,
+     "            exc = e" + NL
+     + "            settle(lambda: fut.cancelled() or fut.set_exception(exc))",
+     "            settle(lambda: fut.cancelled() or fut.set_exception(e))"),
+ "收尾:迴圈關掉之後照樣硬丟回去": (S,
+     "        try:" + NL
+     + "            loop.call_soon_threadsafe(apply)" + NL
+     + "        except RuntimeError:                  # 迴圈已經關了" + NL
+     + "            pass",
+     "        loop.call_soon_threadsafe(apply)"),
+ # 原本這條是「連正常的結果也安靜丟掉」(把 settle 換成 pass)。那個改法會讓**每一個**
+ # 碰到沙盒的測試都掛住(20 個檔、900 多條),整個套件撐到工具的逾時 —— 偵測得到,
+ # 但不是乾淨的失敗,而逐條加上限不可行。換成同樣有意義、但會立刻失敗的形狀:
+ # 結果交回去了,內容卻是空的。
+ "收尾:正常的結果換成 None(呼叫端拿到空的)": (S,
+     "        settle(lambda: fut.cancelled() or fut.set_result(out))",
+     "        settle(lambda: fut.cancelled() or fut.set_result(None))"),
+})
+
 # ---- 危險 SQL 原語(#41 第 1 點)。每一條問的都是同一件事:放寬之後有沒有測試會紅。
 T = "../toolbox/sqltools.py"
 MUTANTS.update({

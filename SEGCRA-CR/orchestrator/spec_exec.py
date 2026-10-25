@@ -1853,13 +1853,32 @@ async def _in_thread(fn, *args):
     fut: asyncio.Future = loop.create_future()
     ctx = contextvars.copy_context()
 
+    def settle(apply):
+        """把結果交回事件迴圈。迴圈已經關掉就安靜放掉。
+
+        逾時之後外層不等這個執行緒,它可能在迴圈收掉之後才跑完 —— 那時
+        `call_soon_threadsafe` 會丟 `RuntimeError: Event loop is closed`,而這個例外
+        發生在 daemon 執行緒裡,沒有人接:正式環境的 log 每逾時一次就多一段看起來很
+        嚴重的 traceback,排查的人會先去追它;測試套件則是長期掛著警告。
+        逾時的結果本來就不要了,放掉是對的,但要**安靜地**放掉。
+        """
+        try:
+            loop.call_soon_threadsafe(apply)
+        except RuntimeError:                  # 迴圈已經關了
+            pass
+
     def runner():
         try:
             out = ctx.run(fn, *args)
         except BaseException as e:            # noqa: BLE001 — 原樣交回給 await 端
-            loop.call_soon_threadsafe(lambda: fut.cancelled() or fut.set_exception(e))
+            # **要先綁到自己的變數**:`except ... as e` 的 e 在區塊結束時就被刪掉,
+            # 而這個 lambda 是丟給事件迴圈稍後才跑的。直接捕捉 e 的話,跑的時候會丟
+            # NameError,fut 永遠不會有結果,await 就**永遠掛著** —— 沙盒丟例外時
+            # 整個執行驗證卡住,要等外層的時間上限才被砍掉。
+            exc = e
+            settle(lambda: fut.cancelled() or fut.set_exception(exc))
         else:
-            loop.call_soon_threadsafe(lambda: fut.cancelled() or fut.set_result(out))
+            settle(lambda: fut.cancelled() or fut.set_result(out))
 
     threading.Thread(target=runner, name="spec-exec-sandbox", daemon=True).start()
     return await fut
