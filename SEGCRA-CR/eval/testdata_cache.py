@@ -31,6 +31,10 @@
     (`eval/preflight.py:check_testset`):換了凍結檔,兩份 baseline 不可比。
     沒凍結任何規格時 `frozen_count` 為 0,不影響既有 baseline。
 
+凍結檔記下這份測資是**怎麼生成的**(`generation`,見 GENERATIONS):模型逐筆寫測資與預期值,
+或模型抽結構、程式產生資料與預期值。兩種的覆蓋與預期值錯誤率要分開比,凍結檔裡有就不必另外記。
+加這個欄位之前凍結的檔案沒有記錄,讀的時候標成「未記錄」,不猜。
+
 只在呼叫端明確套用 wrap() 時才生效(見 run_eval.py 的 --frozen-testdata),
 不改 orchestrator/spec_exec.py 本身,正式審查管線的行為不受影響。
 """
@@ -43,6 +47,20 @@ from orchestrator import spec_exec
 
 EVAL_DIR = Path(__file__).resolve().parent
 CACHE_DIR = EVAL_DIR / "testdata_cache"
+
+# 測資的生成方式 → 給人看的說法
+GENERATIONS = {
+    "model_cases": "模型逐筆寫測資與預期值",
+    "structure": "模型抽結構,程式產生資料與預期值",
+}
+
+
+def generation_label(data: dict) -> str:
+    """凍結檔記的生成方式。加這個欄位之前凍結的檔案沒有記錄,標成未記錄,不猜。"""
+    g = data.get("generation")
+    if g is None:
+        return "未記錄(加這個欄位之前凍結的)"
+    return GENERATIONS.get(g, f"不認得的值:{g}")
 
 
 def _sha(text: str) -> str:
@@ -104,7 +122,7 @@ def load(spec_code: str, spec_text: str, *, model: str) -> dict | None:
 
 
 def save(spec_code: str, spec_text: str, plan: dict, gaps: list[str],
-        *, profile: str, model: str, force: bool = False,
+        *, profile: str, model: str, generation: str, force: bool = False,
         cost: dict | None = None) -> None:
     """存檔前檢查覆蓋度:預設拒絕凍結一份有缺口的測資計畫——不然凍住的
     等於把一次不完整的取樣當成「這條規則以後每次 golden set 都只驗這幾個案例」,
@@ -121,7 +139,12 @@ def save(spec_code: str, spec_text: str, plan: dict, gaps: list[str],
         不必另外維護一份紀錄
       * 它也讓「案例數 vs 偵測能力 vs 時間」這個取捨有據可循——實測 R-140 從
         19 個案例降到 8 個,突變偵測一樣 10/10
+
+    `generation` 是這份測資的生成方式(GENERATIONS 的鍵),**一定要寫明**:兩種方式的
+    覆蓋與預期值錯誤率要分開比,記錯或沒記就比不出來。
     """
+    if generation not in GENERATIONS:
+        raise ValueError(f"生成方式要寫明是 {' / '.join(GENERATIONS)} 其中一種,收到 {generation!r}")
     if gaps and not force:
         raise ValueError(
             f"這份測資計畫有 {len(gaps)} 個覆蓋缺口,預設不凍結:{'; '.join(gaps)}\n"
@@ -137,6 +160,7 @@ def save(spec_code: str, spec_text: str, plan: dict, gaps: list[str],
         "coverage_gaps": gaps,
         "case_count": len(plan["cases"]),
         "row_count": sum(len(c.get("rows") or []) for c in plan["cases"]),
+        "generation": generation,
         "cost": cost or {},
         "plan": plan,
     }, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -171,11 +171,15 @@ async def main() -> int:
             return 1
         print("--force:仍然存檔。")
 
+    # 生成方式:程式照結構產生的測資會在 plan 裡帶 generation;沒帶的是模型逐筆寫的
+    # (結構化生成接上之前唯一的方式)。不認得的值 save() 會擋下來。
+    generation = plan.get("generation", "model_cases")
     try:
         testdata_cache.save(
             args.spec_code, spec_text, plan, gaps,
             profile=(args.profile or cfg.roles.get("testgen") or cfg.default_profile),
             model=testdata_cache.testgen_model(cfg, args.profile),
+            generation=generation,
             force=args.force,
             cost={"llm_calls": calls["n"], "generation_seconds": gen_seconds,
                   "sandbox_seconds": sandbox_seconds,
@@ -184,7 +188,8 @@ async def main() -> int:
         print(f"\n{e}")
         return 1
 
-    print(f"\n已凍結到 eval/testdata_cache/{args.spec_code}.json")
+    print(f"\n已凍結到 eval/testdata_cache/{args.spec_code}.json"
+          f"(生成方式:{testdata_cache.GENERATIONS[generation]})")
     print("0 缺口不代表每個條件都驗到了:commit 前請逐條看過反向案例,"
           "並跑 eval/check_frozen_testdata.py 確認寫錯的 SQL 都抓得到。")
     return 0
