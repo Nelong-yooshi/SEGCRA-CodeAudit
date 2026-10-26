@@ -82,7 +82,7 @@ def test_凍結檔要記下呼叫次數與耗時(tmp_path, monkeypatch):
     plan = {"schema_ddl": ["CREATE TABLE t (id INT)"], "conditions": [],
             "cases": [{"case_id": "a", "rows": [["t", 1], ["t", 2]]},
                       {"case_id": "b", "rows": [["t", 3]]}]}
-    tc.save("R-X", "規格", plan, [], profile="review", model="m",
+    tc.save("R-X", "規格", plan, [], profile="review", model="m", generation="model_cases",
             cost={"llm_calls": 4, "generation_seconds": 3600.0,
                   "sandbox_seconds": 2.6, "resumed_from": False})
     d = _json.loads((tmp_path / "R-X.json").read_text(encoding="utf-8"))
@@ -104,6 +104,6 @@ def test_沒給cost也存得起來(tmp_path, monkeypatch):
     monkeypatch.setattr(tc, "CACHE_DIR", tmp_path)
     monkeypatch.setattr(tc, "_path", lambda code: tmp_path / f"{code}.json")
     tc.save("R-Y", "規格", {"schema_ddl": [], "conditions": [], "cases": []}, [],
-            profile="review", model="m")
+            profile="review", model="m", generation="model_cases")
     d = _json.loads((tmp_path / "R-Y.json").read_text(encoding="utf-8"))
     assert d["cost"] == {} and d["row_count"] == 0
