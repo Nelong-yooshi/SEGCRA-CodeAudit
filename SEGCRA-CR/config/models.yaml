@@ -137,6 +137,12 @@ policy:
 #
 # project_dir(選填):dbt 專案在 repo 裡的目錄,也就是 dbt_project.yml 所在的位置。
 #   不寫或空字串 = repo 根目錄。只接受 repo 內的相對目錄(英數與 _ . -,以 / 分段)。
+#
+# sqlserver_schema_concat(選填,true / false):dbt 專案沒寫
+#   dbt_sqlserver_use_default_schema_concat(flags 與 vars 都沒寫)時,自訂 schema 要不要接在
+#   target 的 schema 後面。這是部署端 dbt-sqlserver 的預設值,不同版本相反,請照部署端裝的版本填。
+#   不寫時,有自訂 schema 的 model 表名記成無法確定(見 docs/09-dbt展開與反查.md)。
+#   只接受布林,字串 "false" 會在載入設定時報錯。
 dbt:
   enabled: false
   database: ""

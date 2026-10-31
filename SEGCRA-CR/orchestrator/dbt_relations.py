@@ -13,11 +13,16 @@ model 存在、source() 才能套用 sources.yml 的 schema / identifier(PR #10 
     「來源 × 表」展開成上億筆。設定區塊走訪時記住走過的節點;屬性檔的來源、表、model
     合計超過 MAX_PROPERTY_ENTRIES 筆就判成看不懂(無法確定),不會被「別名炸彈」拖垮
 
+**表名照 dbt 的規則算**(model 的 alias / schema / database,`naming`):字串常值的設定照
+dbt 的合併順序取值——dbt_project.yml(資料夾由淺到深)→ 屬性檔的 `config:` → model 檔的
+`config()`,每個設定各自覆蓋。schema 的組法見 `_schema_concat`。
+
 不處理(一律視為無法確定,保留提醒):dbt 套件(packages.yml / dependencies.yml)
-的 model 與 source、會改變表名的設定(alias、自訂 schema、snapshot 的 target_schema /
-target_database、generate_*_name、樣板值)、ephemeral(被引用時展開成 CTE,不是表名)、
+的 model 與 source、樣板值或不是字串的 alias / schema / database、snapshot 的 target_schema /
+target_database、generate_*_name、ephemeral(被引用時展開成 CTE,不是表名)、
 停用(enabled 不是 true)、model 版本(versions)、同名的 model(含 model 與 seed /
-snapshot 同名)、Python model(內容不讀)、macro 裡呼叫的 config()、config.set()。
+snapshot 同名)、算出來表名相同的 model、Python model(內容不讀)、macro 裡呼叫的 config()、
+config.set()。
 偵測不到(會被當成確定):先把 config 指給別的變數再呼叫它的 set(`{% set c = config %}`
 之後 `c.set(...)`)——名為 config 的區域變數很常見,只看字面分不出來。
 seed / snapshot / Python model 的名稱由呼叫端提供(打包下載只收 .sql / .yml 的內容);
@@ -39,6 +44,16 @@ _NAME_KEYS = frozenset({"alias", "schema", "database", "+alias", "+schema", "+da
 # 呼叫端、本來就一律無法確定——拿來判整個專案,只會讓所有 model 都失去表名驗證
 _ENTRY_NAME_KEYS = _NAME_KEYS | frozenset(
     key for name in ("target_schema", "target_database") for key in (name, "+" + name))
+# 照 dbt 規則算出值的三個設定(model 的 config;dbt_project.yml 另外接受 + 前綴)
+_NAMING = ("alias", "schema", "database")
+# 只在指名某一個 snapshot 的地方出現時算無法確定(不模擬)
+_TARGET_KEYS = frozenset({"target_schema", "target_database"})
+# dbt-sqlserver 的旗標:自訂 schema 要不要接在 target 的 schema 後面(見 _schema_concat)
+SCHEMA_CONCAT_KEY = "dbt_sqlserver_use_default_schema_concat"
+_UNSET = object()
+# 屬性檔 config: 裡只認不加前綴的 alias / schema / database;加了 + 的寫法與 snapshot 的
+# target_* 一樣看不懂(不知道 dbt 認不認,寧可記成無法確定)
+_OTHER_NAME_KEYS = _TARGET_KEYS | {"+" + k for k in (*_TARGET_KEYS, *_NAMING)}
 _MATERIALIZED_KEYS = ("materialized", "+materialized")
 _ENABLED_KEYS = ("enabled", "+enabled")
 # 專案自訂 schema / alias / database 的命名規則:我們不模擬,只偵測
@@ -107,8 +122,8 @@ def project_info_from_files(files: dict, *, model_paths=("models",), macro_paths
         return DbtProjectInfo()
     model_dirs = tuple(p.rstrip("/") for p in model_paths)
     macro_dirs = tuple(p.rstrip("/") for p in macro_paths)
-    project_name, global_uncertain, project_ok, all_sources_uncertain = _read_dbt_project(
-        files.get("dbt_project.yml"))
+    (project_name, global_uncertain, project_ok, all_sources_uncertain,
+     models_block, schema_concat, concat_unset) = _read_dbt_project(files.get("dbt_project.yml"))
     # 沒確認過根目錄的檔案,就當作「可能有套件」
     has_packages = (root_files_checked is not True
                     or any(name in files for name in _PACKAGE_FILES))
@@ -116,6 +131,9 @@ def project_info_from_files(files: dict, *, model_paths=("models",), macro_paths
     models: set[str] = set()
     model_files: dict[str, int] = {}        # 名稱 → 檔案數(同名的 model dbt 會編譯失敗)
     uncertain_models: set[str] = set()
+    model_fqn: dict[str, list[str]] = {}     # 名稱 → dbt 的 fqn(專案名、資料夾、model 名)
+    sql_naming: dict[str, dict] = {}         # 名稱 → model 檔 config() 設的值
+    yml_naming: dict[str, dict] = {}         # 名稱 → 屬性檔 config: 設的值
     sources: dict = {}
     uncertain_sources: set = set()
     properties_ok = True
@@ -137,11 +155,16 @@ def project_info_from_files(files: dict, *, model_paths=("models",), macro_paths
             name = path.rsplit("/", 1)[-1][:-4]
             models.add(name)
             model_files[name] = model_files.get(name, 0) + 1
-            if _config_may_rename(content):
+            model_fqn[name] = [project_name or "", *_model_dirs_of(path, model_dirs), name]
+            naming = _config_naming(content)
+            if naming is None:
                 uncertain_models.add(name)
+            else:
+                sql_naming[name] = naming
         elif _under(path, model_dirs) and lower.endswith((".yml", ".yaml")):
             try:
-                _read_properties(content, sources, uncertain_sources, uncertain_models, budget)
+                _read_properties(content, sources, uncertain_sources, uncertain_models, budget,
+                                 yml_naming)
             except _Unreadable:
                 properties_ok = False
         elif _under(path, macro_dirs) and lower.endswith(".sql"):
@@ -159,6 +182,11 @@ def project_info_from_files(files: dict, *, model_paths=("models",), macro_paths
     if all_sources_uncertain:
         # dbt_project.yml 的 sources 區塊有停用等設定,或 dbt_project.yml 看不懂
         uncertain_sources.update(sources)
+    if not properties_ok:
+        # 看不懂的屬性檔裡可能就有某個 model 的 alias / schema / database:不知道是哪個 model
+        global_uncertain = global_uncertain or "有屬性檔看不懂,model 的表名設定可能漏看"
+    naming = _merge_naming(models, uncertain_models, model_fqn, models_block, yml_naming,
+                           sql_naming)
 
     complete = properties_ok and project_ok and not has_packages
     return DbtProjectInfo(
@@ -170,7 +198,137 @@ def project_info_from_files(files: dict, *, model_paths=("models",), macro_paths
         global_uncertain=global_uncertain,
         refs_complete=complete and other_ref_names is not None,
         sources_complete=complete,
+        naming=naming,
+        schema_concat=schema_concat,
+        schema_concat_unset=concat_unset,
     )
+
+
+def _model_dirs_of(path: str, model_dirs: tuple[str, ...]) -> list[str]:
+    """model 檔在 model 目錄底下的資料夾(dbt 的 fqn 中間那幾段)。"""
+    for d in model_dirs:
+        if path.startswith(d + "/"):
+            return path[len(d) + 1:].split("/")[:-1]
+    return []
+
+
+def _merge_naming(models: set, uncertain: set, fqn: dict, models_block, yml_naming: dict,
+                  sql_naming: dict) -> dict:
+    """表名確定的 model 各自的 alias / schema / database(None = 沒設),照 dbt 的合併順序:
+    dbt_project.yml(資料夾由淺到深)→ 屬性檔的 config: → model 檔的 config(),每個設定各自
+    覆蓋。任何一層看不懂、或明寫 null / None 想蓋掉上層的值(_overlay),就把那個 model 加進
+    uncertain。
+
+    算出來表名相同的 model(例如資料夾層級設了同一個 alias)dbt 會編譯失敗,也加進 uncertain。"""
+    naming = {}
+    for name in sorted(models):
+        if name in uncertain or name not in fqn:
+            continue
+        merged = _project_naming(models_block, fqn[name])
+        layers = (yml_naming.get(name, {}), sql_naming.get(name, {}))
+        if merged is None or not all(_overlay(merged, layer) for layer in layers):
+            uncertain.add(name)
+            continue
+        naming[name] = {k: merged.get(k) for k in _NAMING}
+    # 撞名:alias(沒設就是 model 名稱)、schema、database 的自訂值都一樣。dbt 三個都會去掉
+    # 頭尾空白;SQL Server 的名稱預設不分大小寫
+    seen: dict = {}
+    for name, n in naming.items():
+        key = tuple(_fold(v) for v in (n["database"], n["schema"], n["alias"] or name))
+        seen.setdefault(key, []).append(name)
+    for names in seen.values():
+        if len(names) > 1:
+            uncertain.update(names)
+            for name in names:
+                naming.pop(name, None)
+    return naming
+
+
+def _fold(value):
+    """比對撞名用:字串去掉頭尾空白、不分大小寫;None(沒設)照舊。"""
+    return value.strip().lower() if isinstance(value, str) else value
+
+
+def _project_naming(models_block, fqn: list[str]) -> dict | None:
+    """dbt_project.yml 的 models 區塊對這個 model 設的 alias / schema / database。
+    從最外層往 fqn(專案名、資料夾、model 名)走,越深的蓋過越淺的;看不懂回 None。"""
+    merged: dict = {}
+    node = models_block
+    for part in [None, *fqn]:
+        if part is not None:
+            node = node.get(part) if isinstance(node, dict) else None
+        if not isinstance(node, dict):
+            break
+        level = _level_naming(node)
+        if level is None or not _overlay(merged, level):
+            return None
+    return merged
+
+
+def _overlay(merged: dict, layer: dict) -> bool:
+    """把這一層的設定蓋到 merged 上。明寫 null / None 想蓋掉上層設的值時,dbt 是清掉還是保留
+    上層的值沒有逐一查證,回 False(無法確定);上層也沒設時 None 就是沒設。"""
+    for key, value in layer.items():
+        if value is None and merged.get(key) is not None:
+            return False
+        merged[key] = value
+    return True
+
+
+def _level_naming(node: dict) -> dict | None:
+    """dbt_project.yml 某一層直接設的 alias / schema / database。`+` 前綴與不加前綴都算設定
+    (值是物件的不加前綴的鍵是子目錄);兩種寫法同時出現而值不同、或值不是字串 / null 時看不懂。"""
+    out: dict = {}
+    for key in _NAMING:
+        plain, plus = node.get(key, _UNSET), node.get("+" + key, _UNSET)
+        if isinstance(plain, dict):
+            plain = _UNSET                   # 名稱剛好叫 schema 的子目錄
+        values = [v for v in (plain, plus) if v is not _UNSET]
+        if not values:
+            continue
+        if len(values) == 2 and values[0] != values[1]:
+            return None
+        value = _literal(values[-1])
+        if value is _UNSET:
+            return None
+        out[key] = value
+    return out
+
+
+def _literal(value):
+    """設定檔裡的值:字串常值照用、null 是沒設;樣板值與其他型別看不懂(回 _UNSET)。"""
+    if value is None:
+        return None
+    if isinstance(value, str) and not _templated(value):
+        return value
+    return _UNSET
+
+
+def _schema_concat(raw: dict) -> tuple[bool | None, bool]:
+    """自訂 schema 要不要接在 target 的 schema 後面,回傳 (結果, 專案沒有決定)。
+
+    照 dbt-sqlserver 的 sqlserver__generate_schema_name:旗標(flags 的
+    dbt_sqlserver_use_default_schema_concat)或舊寫法的同名 var 任一個是 true 就串接
+    (`<target.schema>_<自訂>`),否則自訂值原樣用。旗標沒寫時用轉接器的預設值,而這個預設在
+    不同版本相反(1.9.2 是 false、1.12 的預覽版是 true),所以**專案沒寫時回 (None, True)**,由呼叫端
+    用部署端設定的預設補上。值不是布林、或 var 寫在專案層級的子區塊裡時無法確定(None, False)。"""
+    flags, variables = raw.get("flags", {}), raw.get("vars", {})
+    if not isinstance(flags, (dict, type(None))) or not isinstance(variables, (dict, type(None))):
+        return None, False
+    flags, variables = flags or {}, variables or {}
+    if any(isinstance(v, dict) and SCHEMA_CONCAT_KEY in v for v in variables.values()):
+        return None, False                   # 專案層級的 var:哪個 model 吃到哪個值不模擬
+    var = variables.get(SCHEMA_CONCAT_KEY, _UNSET)
+    if var is not _UNSET and not isinstance(var, bool):
+        return None, False
+    if var is True:
+        return True, False
+    flag = flags.get(SCHEMA_CONCAT_KEY, _UNSET)
+    if flag is _UNSET:
+        return None, True
+    if not isinstance(flag, bool):
+        return None, False
+    return flag, False
 
 
 def _under(path: str, dirs: tuple[str, ...]) -> bool:
@@ -200,35 +358,59 @@ def _config_bodies(text: str) -> list[str] | None:
     return bodies
 
 
-def _config_may_rename(text: str) -> bool:
-    """config() 會不會讓被引用時的表名不是 model 名稱。寧可多判(只是保留提醒),不可漏判:
-    每個參數都必須是「名稱 = 常值」,名稱不是 alias / schema / database,materialized 也
-    不是 ephemeral(被引用時展開成 CTE),enabled 不是 false(停用的 model 被引用會編譯
-    失敗)——否則一律判成可能會改。
+def _config_naming(text: str) -> dict | None:
+    """model 檔裡的 config() 設的 alias / schema / database(字串常值;`None` 是沒設)。
+    看不懂、或會讓表名無法確定時回 None。寧可多判(只是保留提醒),不可漏判:
+    每個參數都必須是「名稱 = 常值」;alias / schema / database 要是字串或 None,名稱要是小寫
+    (dbt 的設定名稱分大小寫);不能有 target_schema / target_database;materialized 不是
+    ephemeral(被引用時展開成 CTE);enabled 不是 false(停用的 model 被引用會編譯失敗)。
     `config({'alias': 'x'})`、`config(**c)`、`config(materialized=var('m'))`、
-    沒有右括號的 `config(`,都看不懂 → 會改。
+    沒有右括號的 `config(`,都看不懂。
     `{% do config.set('alias', 'x') %}`(與 `config['set']`、`config|attr('set')`)不看
-    參數,一律算會改。"""
+    參數,一律算看不懂。同一個檔有好幾個 config(),後面的蓋過前面的。"""
     if _CONFIG_SET.search(text):
-        return True
+        return None
     bodies = _config_bodies(text)
     if bodies is None:
-        return True
+        return None
+    naming: dict = {}
     for body in bodies:
         pos = 0
         # 從 pos 往後找有沒有剩下的內容,不切片複製(切片會讓參數很多時變成平方時間)
         while _NON_SPACE.search(body, pos):
             m = _CONFIG_ARG.match(body, pos)
             if m is None:
-                return True
-            key, value = m.group(1).lower(), m.group(2)
-            if key in _ENTRY_NAME_KEYS or (key == "materialized"
-                                     and value.strip("'\"").lower() == "ephemeral"):
-                return True
+                return None
+            name, value = m.group(1), m.group(2)
+            key = name.lower()
+            if key in _TARGET_KEYS or (key == "materialized"
+                                       and value.strip("'\"").lower() == "ephemeral"):
+                return None
             if key == "enabled" and value.lower() != "true":
-                return True                 # 停用的 model 被 ref() 時 dbt 會編譯失敗
+                return None                 # 停用的 model 被 ref() 時 dbt 會編譯失敗
+            if key in _NAMING:
+                literal = _arg_literal(value)
+                if literal is _UNSET or name != key:
+                    return None
+                naming[key] = literal
             pos = m.end()
-    return False
+    return naming
+
+
+def _arg_literal(value: str):
+    """config() 參數的值:引號包起來的字串照用、None / none 是沒設,其他看不懂(_UNSET)。"""
+    if value[:1] in ("'", '"'):
+        return value[1:-1]
+    if value in ("None", "none"):
+        return None
+    return _UNSET
+
+
+def _config_may_rename(text: str) -> bool:
+    """macro 檔裡的 config() 會不會改掉呼叫它的 model 的表名(看不出是哪些 model 呼叫,
+    有設 alias / schema / database 或看不懂就算會改)。"""
+    naming = _config_naming(text)
+    return naming is None or bool(naming)
 
 
 def _materialization_unknown(value) -> bool:
@@ -262,28 +444,35 @@ def _load(text: str):
 
 
 def _read_dbt_project(text):
-    """回傳 (專案名稱, ref() 的專案層級不確定原因, 是否讀得懂, source() 是否全部無法確定)。
-    沒有 dbt_project.yml 也算讀不懂;讀不懂時 sources 區塊的設定(例如停用)也看不到。"""
+    """回傳 (專案名稱, ref() 的專案層級不確定原因, 是否讀得懂, source() 是否全部無法確定,
+    models 區塊, 自訂 schema 是否串接, 串接與否專案沒決定)。
+    沒有 dbt_project.yml 也算讀不懂;讀不懂時 sources 區塊的設定(例如停用)也看不到。
+
+    models 區塊的 alias / schema / database 不在這裡判成整個專案無法確定:逐一照資料夾算
+    (_project_naming);ephemeral 與停用仍然是整個專案無法確定。"""
     if text is None:
-        return None, None, False, True
+        return None, None, False, True, None, None, False
     try:
         raw = _load(text)
     except _Unreadable:
-        return None, "dbt_project.yml 無法解析", False, True
+        return None, "dbt_project.yml 無法解析", False, True, None, None, False
     if not isinstance(raw, dict):
-        return None, "dbt_project.yml 無法解析", False, True
+        return None, "dbt_project.yml 無法解析", False, True, None, None, False
     name = raw.get("name") if isinstance(raw.get("name"), str) else None
+    concat, unset = _schema_concat(raw)
+    models_block = raw.get("models")
     sources_uncertain = _sets_names(raw.get("sources"))
     for block in ("models", "seeds", "snapshots", "sources"):
-        if _sets_names(raw.get(block)):
+        if _sets_names(raw.get(block), names=block != "models"):
             return (name, f"dbt_project.yml 的 {block} 設定了 alias / schema / database、"
-                          "ephemeral 或停用", True, sources_uncertain)
-    return name, None, True, sources_uncertain
+                          "ephemeral 或停用", True, sources_uncertain, models_block, concat, unset)
+    return name, None, True, sources_uncertain, models_block, concat, unset
 
 
-def _sets_names(node) -> bool:
+def _sets_names(node, names: bool = True) -> bool:
     """dbt_project.yml 的設定區塊裡,有沒有任何會改變表名的設定(值不是子目錄的物件):
-    alias / schema / database、materialized 為 ephemeral / 樣板值,或 enabled 不是 true。
+    alias / schema / database(names=False 時不看:models 區塊的這三個由 _project_naming
+    逐一照資料夾算)、materialized 為 ephemeral / 樣板值,或 enabled 不是 true。
     記住走過的節點:YAML 別名讓同一個物件可以被引用很多次,不重複走。"""
     seen: set[int] = set()
     stack = [node]
@@ -294,7 +483,7 @@ def _sets_names(node) -> bool:
         seen.add(id(cur))
         if isinstance(cur, dict):
             for key, value in cur.items():
-                if key in _NAME_KEYS and not isinstance(value, dict):
+                if names and key in _NAME_KEYS and not isinstance(value, dict):
                     return True
                 if (key in _MATERIALIZED_KEYS and not isinstance(value, dict)
                         and _materialization_unknown(value)):
@@ -309,7 +498,7 @@ def _sets_names(node) -> bool:
 
 
 def _read_properties(text: str, sources: dict, uncertain_sources: set,
-                     uncertain_models: set, budget: _Budget) -> None:
+                     uncertain_models: set, budget: _Budget, naming: dict) -> None:
     doc = _load(text)
     if doc is None:
         return                              # 空的屬性檔
@@ -336,24 +525,59 @@ def _read_properties(text: str, sources: dict, uncertain_sources: set,
             # 樣板值不採用(展開不了),退回 dbt 的預設;資料庫名一律不讀(見 DbtProjectInfo)
             sources[key] = (None if _templated(schema) else schema,
                             None if _templated(identifier) else identifier)
-    # seed / snapshot 的屬性同樣可以設 alias 等,被 ref() 時一樣受影響
-    for model in (*_list(doc.get("models")), *_list(doc.get("seeds")), *_list(doc.get("snapshots"))):
-        budget.spend()
-        if not isinstance(model, dict) or not _plain_name(model.get("name")):
-            raise _Unreadable
-        config = model.get("config")
-        # 逐一查固定的幾個鍵,不把整個 config 轉成集合:被別名共用的大 config 不會放大工作量
-        if ((isinstance(config, dict) and _has_name_key(config))
-                or _has_name_key(model) or "versions" in model):
-            uncertain_models.add(model["name"])
+    # seed / snapshot 的屬性同樣可以設 alias 等,被 ref() 時一樣受影響(它們的表名本來就無法確定)
+    for section in ("models", "seeds", "snapshots"):
+        for model in _list(doc.get(section)):
+            budget.spend()
+            if not isinstance(model, dict) or not _plain_name(model.get("name")):
+                raise _Unreadable
+            name, config = model["name"], model.get("config")
+            # 逐一查固定的幾個鍵,不把整個 config 轉成集合:被別名共用的大 config 不會放大工作量
+            if section != "models":
+                if (isinstance(config, dict) and _has_name_key(config)) or _has_name_key(model):
+                    uncertain_models.add(name)
+                continue
+            # model:config: 裡的 alias / schema / database 照值算;寫在 config: 外面、版本、
+            # snapshot 的鍵、ephemeral、停用,或同一個 model 在屬性檔出現兩次,都無法確定
+            values = _config_values(config) if config is not None else {}
+            if (values is None or _has_name_key(model) or "versions" in model
+                    or (isinstance(config, dict) and _has_other_key(config)) or name in naming):
+                uncertain_models.add(name)
+                naming.setdefault(name, {})
+                continue
+            naming[name] = values
+
+
+def _config_values(config) -> dict | None:
+    """屬性檔 config: 區塊設的 alias / schema / database;不是物件或值看不懂回 None。"""
+    if not isinstance(config, dict):
+        return None
+    out = {}
+    for key in _NAMING:
+        if key in config:
+            value = _literal(config[key])
+            if value is _UNSET:
+                return None
+            out[key] = value
+    return out
+
+
+def _has_other_key(mapping: dict) -> bool:
+    """alias / schema / database 以外,會讓表名無法確定的鍵:snapshot 的 target_*、加了 +
+    的寫法,或 _unusable 的那幾種。"""
+    return any(key in mapping for key in _OTHER_NAME_KEYS) or _unusable(mapping)
 
 
 def _has_name_key(mapping: dict) -> bool:
-    """有會改變表名的鍵:alias / schema / database、materialized 為 ephemeral / 樣板值,
-    或 enabled 不是 true。"""
-    return (any(key in mapping for key in _ENTRY_NAME_KEYS)
-            or any(key in mapping and _materialization_unknown(mapping[key])
-                   for key in _MATERIALIZED_KEYS)
+    """有會改變表名的鍵:alias / schema / database(含 + 前綴與 snapshot 的 target_*),
+    或 _unusable 的那幾種。"""
+    return any(key in mapping for key in _ENTRY_NAME_KEYS) or _unusable(mapping)
+
+
+def _unusable(mapping: dict) -> bool:
+    """被引用時沒有表名可用:materialized 為 ephemeral / 樣板值,或 enabled 不是 true。"""
+    return (any(key in mapping and _materialization_unknown(mapping[key])
+                for key in _MATERIALIZED_KEYS)
             or any(key in mapping and _maybe_disabled(mapping[key]) for key in _ENABLED_KEYS))
 
 

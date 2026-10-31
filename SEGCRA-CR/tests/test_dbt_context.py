@@ -226,6 +226,23 @@ def test_專案資訊認得model():
     assert ctx.info.refs_complete is True
 
 
+@pytest.mark.parametrize("cfg_value, project_flag, expected", [
+    (True, None, True),          # 專案沒寫:用設定檔的預設
+    (False, None, False),
+    (None, None, None),          # 都沒設:無法確定
+    (True, False, False),        # 專案自己寫了:不讓設定檔蓋過
+    (False, True, True),
+])
+def test_自訂_schema_要不要串接_專案沒寫時用設定檔的預設(cfg_value, project_flag, expected):
+    files = dict(PROJECT)
+    if project_flag is not None:
+        files["dbt_project.yml"] += ("flags:\n  dbt_sqlserver_use_default_schema_concat: "
+                                     f"{str(project_flag).lower()}\n")
+    cfg = dict(CFG, **({"sqlserver_schema_concat": cfg_value} if cfg_value is not None else {}))
+    ctx = _ctx(files, cfg=cfg)
+    assert ctx.info.schema_concat is expected
+
+
 def test_相對路徑與完整內容():
     ctx = _ctx()
     assert ctx.relative("models/mrt_big.sql") == "models/mrt_big.sql"
