@@ -331,8 +331,21 @@ class _SpecExecSkipped(Exception):
 _ISOLATED_STAGES: dict[str, str] = {}
 
 
-async def _superseded(hub, mr_id: str, reviewed_sha: str | None) -> bool:
-    """這次審查的 commit 是不是已經被新的取代了?
+async def _current_mr(hub, mr_id: str) -> dict:
+    """回寫前取一次 MR 目前的 head 與 `diff_refs`(不取檔案內容)。問不出來時回 {}。
+
+    同一份結果做兩件事:比對這次審查是不是已經被取代(`_superseded`),以及開行內討論
+    要的位置。每條 finding 各取一次的話,收尾的請求有三到四成花在重複取同一份 `diff_refs`。
+    """
+    try:
+        now = await hub.call_json("gitlab__get_mr_refs", {"mr_id": mr_id})
+    except Exception:                        # noqa: BLE001 — 問不出來就當作沒有資料
+        return {}
+    return now if isinstance(now, dict) else {}   # 形狀不對(清單、字串、None)也當作沒有資料
+
+
+def _superseded(now: dict, reviewed_sha: str | None) -> bool:
+    """這次審查的 commit 是不是已經被新的取代了?`now` 是 `_current_mr` 的結果。
 
     問不出來(API 失敗、拿不到 sha)時回 False —— 往「照常回寫」倒:這道檢查的目的是
     避免舊結論蓋掉新結論,但「因為問不到就不回寫」會變成另一種無聲失敗(MR 上什麼都
@@ -340,12 +353,36 @@ async def _superseded(hub, mr_id: str, reviewed_sha: str | None) -> bool:
     """
     if not reviewed_sha:
         return False
-    try:
-        now = await hub.call_json("gitlab__get_mr_diff", {"mr_id": mr_id})
-        current = (now or {}).get("head_sha") or (now or {}).get("sha")
-    except Exception:                        # noqa: BLE001 — 問不出來就當作沒被取代
-        return False
+    current = now.get("head_sha") or now.get("sha")
     return bool(current) and current != reviewed_sha
+
+
+# 總結裡最多列幾條沒有確定貼上的 finding(其餘只寫條數)
+_UNPOSTED_LISTED = 20
+
+
+def _posted(result: str) -> bool:
+    """`post_inline_comment` 有沒有確定貼上。回 `ok: false`(送出後不知道 GitLab 有沒有建立),
+    或工具本身丟例外(ToolHub 回的是錯誤字串),都算沒有確定貼上。"""
+    try:
+        return json.loads(result).get("ok") is True
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _unposted_section(unposted: list[dict]) -> str:
+    """總結裡列出沒有確定貼上的 finding(行內討論送出後連線中斷、逾時或 5xx)。
+
+    這些不改貼一般留言:GitLab 可能已經建立了討論、只是回應沒送到,改貼的話同一條會出現
+    兩次。列在總結裡,看的人才知道可能少了哪幾條。"""
+    if not unposted:
+        return ""
+    shown = unposted[:_UNPOSTED_LISTED]
+    lines = [f"- `{fd.get('file', '')}:{fd.get('line') or 0}` {fd.get('title', '')}" for fd in shown]
+    if len(unposted) > len(shown):
+        lines.append(f"- 其餘 {len(unposted) - len(shown)} 條見完整的審查報告")
+    return (f"\n\n**有 {len(unposted)} 條意見沒有確定貼上**(送出後連線中斷、逾時或 GitLab "
+            f"回應錯誤;為了不重複貼,沒有改貼成一般留言):\n" + "\n".join(lines))
 
 
 def _spec_exec_stage(progress: dict) -> str:
@@ -1989,7 +2026,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 比對 MR 目前的 head sha:不一樣就不貼,報告照樣回傳給呼叫端(給 eval 與
         # 測試用),只是不寫回 GitLab。
         # head_sha 是 real 模式帶的;mock 模式(eval / 測試)只有 sha,一樣拿來比
-        if await _superseded(hub, mr_id, mr.get("head_sha") or mr.get("sha")):
+        now = await _current_mr(hub, mr_id)
+        if _superseded(now, mr.get("head_sha") or mr.get("sha")):
             report["writeback_skipped"] = "已有更新的 commit,這次審查的結論不再回寫"
             print(f"[pipeline] MR !{mr_id} 已有更新的 commit,略過回寫", flush=True)
             clock.finish()
@@ -1997,19 +2035,26 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                 capture["report"] = report
             return report
 
+        # 開行內討論的位置用剛取回的 diff_refs,不再每條重取
+        refs = {k: str(now.get(k) or "") for k in ("base_sha", "head_sha", "start_sha")}
+        unposted = []
         for fd in report.get("findings", []):
-            await hub.call("gitlab__post_inline_comment", {
+            result = await hub.call("gitlab__post_inline_comment", {
                 "mr_id": mr_id, "file": fd.get("file", ""), "line": int(fd.get("line") or 0),
                 "severity": fd.get("severity", "info"),
-                "body": _format_comment(fd),
+                "body": _format_comment(fd), **refs,
             })
+            if not _posted(result):
+                unposted.append(fd)
+        report["_writeback"] = {"unposted": len(unposted)}
         decision = report.get("decision", "needs_human")
         decision_text = {"auto_approved": "✅ 小幅變更且無實質問題,自動放行",
                          "needs_human": "👤 請人工確認後裁決",
                          "blocked": "⛔ 有 blocker 級問題,修正前不得合入"}[decision]
         await hub.call("gitlab__post_summary", {
             "mr_id": mr_id,
-            "body": f"**決策:{decision_text}**\n\n{report.get('summary', '')}",
+            "body": f"**決策:{decision_text}**\n\n{report.get('summary', '')}"
+                    + _unposted_section(unposted),
             "score": int(report.get("score", 0)), "verdict": report.get("verdict", "needs_changes"),
         })
         await hub.call("gitlab__set_label",

@@ -6,6 +6,7 @@
   * 沒有對應行號的 finding(line <= 0)直接貼一般留言,開頭寫「無對應行號」,不拿第 0 行去開
     行內討論、再靠 API 失敗分流
 """
+import httpx
 import pytest
 import sqlglot.errors
 
@@ -51,10 +52,13 @@ def api(monkeypatch):
 
     def fake(method, path, **kw):
         calls.append((method, path, kw.get("json")))
-        if method == "GET":
-            return {"diff_refs": {"base_sha": "b", "head_sha": "h", "start_sha": "s"}}
+        if method == "GET":   # diff_refs 是完整的 commit 編號(格式不對的會被當成拿不到位置)
+            return {"diff_refs": {"base_sha": "b" * 40, "head_sha": "c" * 40, "start_sha": "d" * 40}}
         if path.endswith("/discussions") and kw.get("json", {}).get("position", {}).get("new_line") == 99:
-            raise RuntimeError("行號不在 diff 裡")
+            # 行號不在 diff 裡:GitLab 回 400(明確拒絕,一定沒有建立)
+            req = httpx.Request("POST", "https://gitlab.invalid" + path)
+            raise httpx.HTTPStatusError("行號不在 diff 裡", request=req,
+                                        response=httpx.Response(400, request=req))
         return {}
     monkeypatch.setattr(gitlab, "REAL_MODE", True)
     monkeypatch.setattr(gitlab, "_api", fake)

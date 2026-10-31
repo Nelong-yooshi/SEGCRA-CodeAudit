@@ -502,9 +502,40 @@ def get_file(path: str, ref: str = "", mr_id: str = "") -> str:
     return _PROSE[code].format(path=path)
 
 
+def get_mr_refs(mr_id: str) -> str:
+    """MR 目前的 head 與 `diff_refs`(`base_sha`、`head_sha`、`start_sha`),**不取檔案內容**。
+
+    回寫前用它比對這次審查是不是已經被新的 commit 取代,同一份結果也拿來開行內討論:
+    `get_mr_diff` 會連每個檔案的內容一起取,只為了比對 sha 不值得。拿不到 `diff_refs` 時
+    三個欄位是 None,見 `_diff_refs`。"""
+    mr_id = _check_mr_id(mr_id)
+    if REAL_MODE:
+        mr = _api("GET", f"/merge_requests/{mr_id}")
+        return json.dumps({"sha": mr.get("sha", ""), **_diff_refs(mr)}, ensure_ascii=False)
+    mr = _mock_mr(mr_id)
+    return json.dumps({"sha": mr.get("sha", f"mock-{mr_id}"), **_diff_refs(mr)},
+                      ensure_ascii=False)
+
+
+def _rejected_by_gitlab(e: Exception) -> bool:
+    """GitLab 收到請求、明確拒絕(4xx,例如行號對不上 diff)。這種一定沒有建立任何東西。
+
+    連線中斷、逾時、5xx 都不算:那些情況**不知道 GitLab 有沒有建立**,只是回應沒送到。"""
+    import httpx
+    return isinstance(e, httpx.HTTPStatusError) and 400 <= e.response.status_code < 500
+
+
 def post_inline_comment(mr_id: str, file: str, line: int, body: str,
-                        severity: str = "info") -> str:
-    """在 MR 的特定檔案行號留下審查意見。"""
+                        severity: str = "info", base_sha: str = "", head_sha: str = "",
+                        start_sha: str = "") -> str:
+    """在 MR 的特定檔案行號留下審查意見。
+
+    `base_sha`、`head_sha`、`start_sha`(MR 的 `diff_refs`)由呼叫端帶進來,一份審查只取一次
+    (見 `get_mr_refs`);沒帶齊時才自己取。
+
+    行內討論被 GitLab 拒絕(4xx)時退成一般留言。連線中斷、逾時、5xx 時**不退**:GitLab 可能
+    已經建立了討論、只是回應沒送到,再貼一般留言同一條就出現兩次。這時回傳
+    `{"ok": false, "uncertain": true}`,由呼叫端記下來。"""
     if REAL_MODE:
         text = f"**[{severity}]** {body}"
         if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
@@ -513,16 +544,27 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
             _api("POST", f"/merge_requests/{mr_id}/notes",
                  json={"body": f"`{file}`(無對應行號)\n\n{text}"})
             return json.dumps({"ok": True}, ensure_ascii=False)
+        note = {"body": f"`{file}:{line}`\n\n{text}"}
+        refs = _diff_refs({"diff_refs": {"base_sha": base_sha, "head_sha": head_sha,
+                                         "start_sha": start_sha}})
+        if not all(refs.values()):
+            try:
+                refs = _diff_refs(_api("GET", f"/merge_requests/{mr_id}"))
+            except Exception:
+                refs = {}
+        if not refs or not all(refs.values()):
+            # 拿不到行內討論的位置:還沒送出任何東西,貼一般留言不會重複
+            _api("POST", f"/merge_requests/{mr_id}/notes", json=note)
+            return json.dumps({"ok": True}, ensure_ascii=False)
         try:
-            mr = _api("GET", f"/merge_requests/{mr_id}")
-            pos = {"position_type": "text", "new_path": file, "new_line": line,
-                   **{k: mr["diff_refs"][k] for k in ("base_sha", "head_sha", "start_sha")}}
             _api("POST", f"/merge_requests/{mr_id}/discussions",
-                 json={"body": text, "position": pos})
-        except Exception:
+                 json={"body": text, "position": {"position_type": "text", "new_path": file,
+                                                   "new_line": line, **refs}})
+        except Exception as e:
+            if not _rejected_by_gitlab(e):
+                return json.dumps({"ok": False, "uncertain": True}, ensure_ascii=False)
             # 行號對不上 diff 時退成一般留言,不讓單一 finding 卡住整份審查
-            _api("POST", f"/merge_requests/{mr_id}/notes",
-                 json={"body": f"`{file}:{line}`\n\n{text}"})
+            _api("POST", f"/merge_requests/{mr_id}/notes", json=note)
     else:
         _mock_output(mr_id, "inline", {"file": file, "line": line,
                                        "severity": severity, "body": body})

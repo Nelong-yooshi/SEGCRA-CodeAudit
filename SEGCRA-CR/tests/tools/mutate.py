@@ -692,13 +692,11 @@ MUTANTS.update({
      "def enforce_lint_incomplete("),
  # 第 3 點:舊審查不得把結論貼上去
  "回寫:不確認是不是最新的那次審查": ("pipeline.py",
-     '        if await _superseded(hub, mr_id, mr.get("head_sha") or mr.get("sha")):',
+     '        if _superseded(now, mr.get("head_sha") or mr.get("sha")):',
      "        if False:"),
  "回寫:問不出目前的 sha 就不回寫(變成另一種無聲失敗)": ("pipeline.py",
-     "    except Exception:                        # noqa: BLE001 — 問不出來就當作沒被取代" + NL
-     + "        return False",
-     "    except Exception:" + NL
-     + "        return True"),
+     "    return bool(current) and current != reviewed_sha",
+     "    return not current or current != reviewed_sha"),
  # 第 9 點:參數讀不懂要退回預設值,不可以讓 webhook 起不來
  "設定:秒數讀不懂就讓程式起不來": ("config.py",
      "        print(f\"[config] 警告:環境變數 {name} 的值不是正整數秒數({raw!r}),\"" + NL
@@ -1854,8 +1852,11 @@ MUTANTS.update({
      "    _put_program_finding(report, finding)\n    return report",
      '    report.setdefault("findings", []).insert(0, finding)\n    return report'),
  "工具:MR 編號不檢查(get_mr_diff 可打別的端點)": ("../toolbox/gitlab.py",
-     "    mr_id = _check_mr_id(mr_id)\n    if REAL_MODE:",
-     "    if REAL_MODE:"),
+     "    mr_id = _check_mr_id(mr_id)\n    if REAL_MODE:\n        mr = _api(\"GET\", f\"/merge_requests/{mr_id}\")\n        changes",
+     "    if REAL_MODE:\n        mr = _api(\"GET\", f\"/merge_requests/{mr_id}\")\n        changes"),
+ "工具:MR 編號不檢查(get_mr_refs 可打別的端點)": ("../toolbox/gitlab.py",
+     "    mr_id = _check_mr_id(mr_id)\n    if REAL_MODE:\n        mr = _api(\"GET\", f\"/merge_requests/{mr_id}\")\n        return",
+     "    if REAL_MODE:\n        mr = _api(\"GET\", f\"/merge_requests/{mr_id}\")\n        return"),
  "工具:mock 讀 fixture 不檢查 MR 編號(路徑穿越)": ("../toolbox/gitlab.py",
      '    f = FIXTURES_DIR / f"mr_{_check_mr_id(mr_id)}.json"',
      '    f = FIXTURES_DIR / f"mr_{mr_id}.json"'),
@@ -4468,9 +4469,9 @@ MUTANTS.update({
         "        report[\"_review_deadline_seconds\"] = REVIEW_BUDGET_SECONDS",
         "        report.setdefault(\"_review_deadline_seconds\", REVIEW_BUDGET_SECONDS)"),
     "階段耗時:收尾在回寫前就記": (P,
-        "        for fd in report.get(\"findings\", []):" + NL + "            await hub.call(\"gitlab__post_inline_comment\"",
+        "        for fd in report.get(\"findings\", []):" + NL + "            result = await hub.call(\"gitlab__post_inline_comment\"",
         "        clock.finish(); clock.finish = lambda: None" + NL
-        + "        for fd in report.get(\"findings\", []):" + NL + "            await hub.call(\"gitlab__post_inline_comment\""),
+        + "        for fd in report.get(\"findings\", []):" + NL + "            result = await hub.call(\"gitlab__post_inline_comment\""),
     "階段耗時:回寫完不記收尾": (P,
         "        clock.finish()" + NL + "        if capture is not None:" + NL + "            capture[\"report\"] = report" + NL + "        return report",
         "        if capture is not None:" + NL + "            capture[\"report\"] = report" + NL + "        return report"),
@@ -4914,6 +4915,48 @@ MUTANTS.update({
  "規格:拿不到時照樣叫人補規格": (S,
      "    if not spec_text and unavailable:",
      "    if False:"),
+})
+
+# ---- 回寫 MR:diff_refs 只取一次;行內討論失敗時分清楚「被拒絕」與「不知道有沒有建立」
+MUTANTS.update({
+    "回寫位置:不知道有沒有建立也當成被拒絕": (G,
+        "    return isinstance(e, httpx.HTTPStatusError) and 400 <= e.response.status_code < 500",
+        "    return True"),
+    "回寫位置:5xx 也當成被拒絕": (G,
+        "400 <= e.response.status_code < 500", "400 <= e.response.status_code < 600"),
+    "回寫位置:400 不當成被拒絕": (G,
+        "400 <= e.response.status_code < 500", "401 <= e.response.status_code < 500"),
+    "回寫位置:不用呼叫端帶的位置": (G,
+        "        if not all(refs.values()):" + NL + "            try:",
+        "        if True:" + NL + "            try:"),
+    "回寫位置:呼叫端帶的 sha 不檢查格式": (G,
+        '        refs = _diff_refs({"diff_refs": {"base_sha": base_sha, "head_sha": head_sha,' + NL
+        + '                                         "start_sha": start_sha}})',
+        '        refs = {"base_sha": base_sha, "head_sha": head_sha,' + NL
+        + '                                         "start_sha": start_sha}'),
+    "回寫位置:不知道有沒有建立時照樣改貼": (G,
+        "            if not _rejected_by_gitlab(e):", "            if False:"),
+    "回寫位置:拿不到位置時照樣開行內討論": (G,
+        "        if not refs or not all(refs.values()):", "        if False:"),
+    "回寫位置:每條自己重取 diff_refs": (P,
+        '                "body": _format_comment(fd), **refs,', '                "body": _format_comment(fd),'),
+    "回寫位置:沒貼上的不記": (P, "            if not _posted(result):", "            if False:"),
+    "回寫位置:總結不列沒貼上的": (P,
+        "                    + _unposted_section(unposted),", '                    + "",'),
+    "回寫位置:ok 不是 true 也算貼上": (P,
+        '        return json.loads(result).get("ok") is True',
+        '        return bool(json.loads(result).get("ok"))'),
+    "回寫位置:總結列出全部沒貼上的": (P,
+        "    shown = unposted[:_UNPOSTED_LISTED]", "    shown = unposted"),
+    "回寫位置:問不出 MR 時往外丟": (P,
+        "    except Exception:                        # noqa: BLE001 — 問不出來就當作沒有資料" + NL
+        + "        return {}",
+        "    except Exception:                        # noqa: BLE001 — 問不出來就當作沒有資料" + NL
+        + "        raise"),
+    "回寫位置:取回的不是物件也照用": (P,
+        "    return now if isinstance(now, dict) else {}", "    return now or {}"),
+    "回寫位置:mock 模式的 sha 不拿來比": (P,
+        '    current = now.get("head_sha") or now.get("sha")', '    current = now.get("head_sha")'),
 })
 
 # ---- 評測用的 token 用量(#84)。數字錯了不會有人發現,只會得到錯的結論。
