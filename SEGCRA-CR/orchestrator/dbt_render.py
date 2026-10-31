@@ -225,10 +225,17 @@ class DbtProjectInfo:
     uncertain_models   被引用時表名無法確定的 model / seed / snapshot(alias / schema / database、
                        ephemeral、停用、同名、版本、Python model 等;見 dbt_relations)
     uncertain_sources  schema / identifier 是樣板值、無法確定的來源表
-    global_uncertain   整個專案層級的不確定(自訂 generate_*_name、dbt_project.yml 的
-                       +schema / +alias 等);非 None 時所有 ref() 都視為無法確定
+    global_uncertain   整個專案層級的不確定(自訂 generate_*_name、macro 裡的 config() 等);
+                       非 None 時所有 ref() 都視為無法確定
     refs_complete      ref() 找不到就一定不存在(已知 seed/snapshot、沒用套件、屬性檔都解析得了)
     sources_complete   source() 找不到就一定沒宣告(沒用套件、屬性檔都解析得了)
+    naming             {model 名稱: {"alias", "schema", "database": 字串或 None}}:表名確定的 model
+                       設的自訂值(None = 沒設)。合併順序照 dbt:dbt_project.yml(資料夾由淺到深)
+                       → 屬性檔的 config: → model 檔的 config();見 dbt_relations
+    schema_concat      自訂 schema 要不要接在 target 的 schema 後面(dbt-sqlserver 的
+                       dbt_sqlserver_use_default_schema_concat):True / False;None = 無法確定
+    schema_concat_unset  專案自己沒有決定(flags 與 vars 都沒寫):由部署端設定的預設值補上
+                       (設定檔 dbt.sqlserver_schema_concat,見 dbt_context)
     """
     project_name: str | None = None
     ref_names: frozenset = frozenset()
@@ -238,6 +245,9 @@ class DbtProjectInfo:
     global_uncertain: str | None = None
     refs_complete: bool = False
     sources_complete: bool = False
+    naming: dict = field(default_factory=dict)
+    schema_concat: bool | None = None
+    schema_concat_unset: bool = False
 
 
 class DbtRenderError(Exception):
@@ -448,6 +458,35 @@ def _check_ident(kind: str, value) -> str:
     return value
 
 
+def model_identity(project: "DbtProjectInfo | None", name: str, schema: str) -> tuple[str, str, bool]:
+    """model 被引用時的 (表名, 綱要, 確不確定),照 dbt 的預設規則:
+
+      * 表名:alias 有值(非空字串)就用它去掉頭尾空白,否則用 model 名稱(generate_alias_name)
+      * 綱要:自訂 schema 沒設就是 target 的 schema(呼叫端給的 schema);設了就看要不要串接
+        (generate_schema_name;dbt-sqlserver 的旗標見 DbtProjectInfo.schema_concat):要串接是
+        `<schema>_<自訂>`,不串接是自訂值去掉頭尾空白
+      * 不確定:沒有專案資訊、專案層級無法確定、這個 model 無法確定、不知道要不要串接,
+        或算出來的表名 / 綱要不是英數與底線(會被拼進 SQL 識別字,不接受)。不確定時一律照
+        model 名稱與 target 的 schema 展開,只是記成不確定、不讓展開失敗
+
+    資料庫名不在這裡:一律用呼叫端給的 database(約定的假名,見 DbtProjectInfo)。"""
+    if project is None or project.global_uncertain or name in project.uncertain_models:
+        return name, schema, False
+    naming = project.naming.get(name)
+    if naming is None:
+        return name, schema, False
+    alias = naming["alias"].strip() if naming.get("alias") else name
+    custom = naming.get("schema")
+    if custom is None:
+        return (alias, schema, True) if _IDENT.fullmatch(alias) else (name, schema, False)
+    if project.schema_concat is None:
+        return name, schema, False
+    rel_schema = f"{schema}_{custom.strip()}" if project.schema_concat else custom.strip()
+    if not (_IDENT.fullmatch(alias) and _IDENT.fullmatch(rel_schema)):
+        return name, schema, False
+    return alias, rel_schema, True
+
+
 def _make_relations(database: str | None, schema: str, usage: dict,
                     project: "DbtProjectInfo | None" = None):
     """dbt 的 ref() / source(),比照正式環境展開成 "<database>"."<schema>"."<表>"。
@@ -462,6 +501,7 @@ def _make_relations(database: str | None, schema: str, usage: dict,
         dbt compile 一樣會失敗,這種 MR 合進去會讓排程壞掉
       * 找不到但無法確定(專案用了套件等),或有會改變表名的設定 → 記 uncertain,
         仍以慣例展開(規則層不看表名,不影響判斷)
+      * 找得到的 model 照 dbt 的規則套用 alias 與自訂 schema(model_identity)
     """
 
     def relation(name, rel_schema=schema) -> str:
@@ -488,7 +528,7 @@ def _make_relations(database: str | None, schema: str, usage: dict,
             missing(project.refs_complete,
                     f"ref() 指向不存在的套件 {package}(dbt 會編譯失敗)")
         elif name in project.ref_names:
-            if project.global_uncertain or name in project.uncertain_models:
+            if not model_identity(project, name, schema)[2]:
                 usage["uncertain"] = True
         else:
             missing(project.refs_complete,
@@ -509,6 +549,9 @@ def _make_relations(database: str | None, schema: str, usage: dict,
         name = _check_ident("表", args[-1])      # 先過白名單,錯誤訊息才可以帶名稱
         if project is not None:
             check_ref(args[0] if len(args) == 2 else None, name)
+            if len(args) == 1 or args[0] == project.project_name:
+                alias, rel_schema, _ = model_identity(project, name, schema)
+                return relation(alias, rel_schema)
         return relation(name)
 
     def source(source_name, table_name):
@@ -537,8 +580,9 @@ def _make_relations(database: str | None, schema: str, usage: dict,
             return _UnavailableRelation("model 名稱不合法(只接受英數與底線),無法提供 {{ this }}")
         if database is None:
             return _UnavailableRelation("未設定 database,無法提供 {{ this }}")
-        text = f'"{database}"."{_check_ident("綱要", schema)}"."{name}"'
-        return _Relation(text, database, schema, name)
+        alias, rel_schema, _ = model_identity(project, name, schema)
+        text = f'"{database}"."{_check_ident("綱要", rel_schema)}"."{alias}"'
+        return _Relation(text, database, rel_schema, alias)
 
     return ref, source, this
 
@@ -547,7 +591,7 @@ def _mark_this_used(usage: dict, project: "DbtProjectInfo | None", name: str) ->
     """記下用到這個 model 的表名(比照 ref(自己)):表名會改變的設定記 uncertain。
     什麼時候算用到見 render_model;多記只會多帶一句提醒,不影響判斷。"""
     usage["used"] = True
-    if project is not None and (project.global_uncertain or name in project.uncertain_models):
+    if project is not None and not model_identity(project, name, DEFAULT_SCHEMA)[2]:
         usage["uncertain"] = True
 
 

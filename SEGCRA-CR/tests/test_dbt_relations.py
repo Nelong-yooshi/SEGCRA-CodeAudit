@@ -2,7 +2,8 @@
 
 PR #10 review 列的三個落差:ref() 不驗證 model 是否存在、source() 不讀 sources.yml、
 不套用 alias / 自訂 schema。有專案資訊時:
-  * 找得到的照 dbt 的規則展開(以真正的 dbt compile 標準答案驗證逐字一致)
+  * 找得到的照 dbt 的規則展開(以真正的 dbt compile 標準答案驗證逐字一致);alias 與自訂
+    schema 的計算另見 tests/test_dbt_relation_names.py
   * 找不到、而且能確定不存在 → 展開失敗(dbt 一樣會失敗)
   * 無法確定(套件、缺 seed 名單、會改表名的設定、樣板值)→ 保留提醒,不冤枉開發者
   * 資料庫名一律是呼叫端給的約定假名,不採用 sources.yml 宣告的資料庫
@@ -162,20 +163,31 @@ def test_wrong_input_shapes_give_fully_uncertain_default(kwargs):
 
 
 @pytest.mark.parametrize("yml", [
-    "models:\n  shop:\n    marts:\n      +schema: marts\n",
-    "models:\n  shop:\n    +alias: x\n",
-    "models:\n  +database: other\n",
     "seeds:\n  shop:\n    +schema: ref_data\n",
     "snapshots:\n  shop:\n    schema: snaps\n",
-], ids=["schema", "alias", "database", "seeds", "snapshots"])
-def test_dbt_project_name_settings_make_every_ref_uncertain(yml):
+], ids=["seeds", "snapshots"])
+def test_dbt_project_seed_snapshot_name_settings_make_every_ref_uncertain(yml):
+    """seed / snapshot 的表名設定不模擬(它們的內容看不到);models 區塊的照資料夾算,
+    見 tests/test_dbt_relation_names.py。"""
     info = _info(BASE | {"dbt_project.yml": "name: shop\n" + yml})
     assert info.global_uncertain
 
 
-def test_folder_named_schema_is_not_a_setting():
+@pytest.mark.parametrize("yml", [
+    "models:\n  shop:\n    marts:\n      +schema: marts\n",
+    "models:\n  shop:\n    +alias: x\n",
+    "models:\n  +database: other\n",
+], ids=["schema", "alias", "database"])
+def test_dbt_project_model_name_settings_are_resolved_not_global(yml):
+    info = _info(BASE | {"dbt_project.yml": "name: shop\n" + yml})
+    assert info.global_uncertain is None
+
+
+@pytest.mark.parametrize("block", ["models", "seeds", "snapshots"])
+def test_folder_named_schema_is_not_a_setting(block):
     """目錄名稱剛好叫 schema(值是物件)不是設定。"""
-    info = _info(BASE | {"dbt_project.yml": "name: shop\nmodels:\n  shop:\n    schema:\n      +materialized: view\n"})
+    yml = f"name: shop\n{block}:\n  shop:\n    schema:\n      +materialized: view\n"
+    info = _info(BASE | {"dbt_project.yml": yml})
     assert info.global_uncertain is None
 
 
@@ -189,13 +201,19 @@ def test_custom_generate_name_macros_make_every_ref_uncertain(macro):
 
 
 @pytest.mark.parametrize("files, model", [
-    ({"models/p.yml": "models:\n  - name: stg_txn\n    config:\n      alias: txn\n"}, "stg_txn"),
-    ({"models/p.yml": "models:\n  - name: stg_txn\n    config: {schema: stg}\n"}, "stg_txn"),
     ({"models/p.yml": "models:\n  - name: stg_txn\n    versions: [{v: 1}]\n"}, "stg_txn"),
-    ({"models/stg/stg_txn.sql": "{{ config(alias='txn') }} select 1"}, "stg_txn"),
-    ({"models/stg/stg_txn.sql": "{{ config(\n  materialized='view',\n  schema='x') }}"}, "stg_txn"),
-], ids=["yml-alias", "yml-schema", "versions", "infile-alias", "infile-schema-multiline"])
-def test_per_model_name_settings(files, model):
+    ({"models/p.yml": "models:\n  - name: stg_txn\n    config:\n      alias: \"{{ var('a') }}\"\n"},
+     "stg_txn"),
+    ({"models/p.yml": "models:\n  - name: stg_txn\n    config: {schema: [stg]}\n"}, "stg_txn"),
+    ({"models/p.yml": "models:\n  - name: stg_txn\n    alias: txn\n"}, "stg_txn"),
+    ({"models/p.yml": "models:\n  - name: stg_txn\n    config: {+alias: txn}\n"}, "stg_txn"),
+    ({"models/p.yml": "models:\n  - name: stg_txn\n    config: {target_schema: s}\n"}, "stg_txn"),
+    ({"models/p.yml": "models:\n  - name: stg_txn\n  - name: stg_txn\n"}, "stg_txn"),
+], ids=["versions", "yml-templated", "yml-not-a-string", "outside-config", "plus-in-properties",
+        "target-schema", "listed-twice"])
+def test_per_model_name_settings_that_stay_uncertain(files, model):
+    """字串常值的 alias / schema / database 照值算(見 tests/test_dbt_relation_names.py);
+    這些寫法不模擬,維持無法確定。"""
     assert model in _info(BASE | files).uncertain_models
 
 
@@ -213,16 +231,19 @@ def test_config_without_name_settings_is_certain():
     "{{ config(c) }} select 1",                                       # 位置參數是變數
     "{{ config(materialized=var('m')) }} select 1",                   # 執行期才知道
     "{{ config(post_hook=')', **var('c')) }} select 1",               # 字串裡的括號
-    "{{ config(materialized='view', alias='x') }} select 1",          # 第二個參數才改名
-    "{{ config(materialized='view',\n  schema='x') }} select 1",
+    "{{ config(materialized='view', alias=var('a')) }} select 1",     # 第二個參數的值看不懂
+    "{{ config(materialized='view',\n  schema=1) }} select 1",        # schema 不是字串
+    "{{ config(Alias='x') }} select 1",                               # 設定名稱分大小寫
+    "{{ config(target_schema='x') }} select 1",                       # snapshot 的鍵
     "{{ config(materialized='view' ~ 'x') }} select 1",               # 樣板運算
     "{{ config(materialized='view'",                                  # 沒有右括號
 ], ids=["dict", "double-star", "ephemeral", "ephemeral-upper", "set-then-star", "positional-var",
-        "var-materialized", "paren-in-string", "second-arg", "multiline-second-arg", "concat",
-        "unclosed"])
+        "var-materialized", "paren-in-string", "second-arg-var", "multiline-not-a-string",
+        "upper-case-key", "target-schema", "concat", "unclosed"])
 def test_config_forms_that_may_rename_are_uncertain(src):
-    """#19 review:被引用時表名可能不是 model 名稱的寫法,一律判成無法確定(只是保留提醒)。
-    做法是白名單:每個參數都要是「名稱 = 常值」,看不懂的一律算可能改名。"""
+    """review:被引用時表名可能不是照 dbt 規則算得出來的寫法,一律判成無法確定(只是保留
+    提醒)。做法是白名單:每個參數都要是「名稱 = 常值」,alias / schema / database 要是字串或
+    None;看不懂的一律算可能改名。字串常值照值算,見 tests/test_dbt_relation_names.py。"""
     assert "stg_txn" in _info(BASE | {"models/stg/stg_txn.sql": src}).uncertain_models
 
 
@@ -574,7 +595,8 @@ def test_malicious_schema_or_identifier_is_never_spliced(template, value):
 
 
 def test_uncertain_model_ref_keeps_notice():
-    info = _info(BASE | {"models/p.yml": "models:\n  - name: stg_txn\n    config: {alias: t}\n"})
+    info = _info(BASE | {"models/p.yml": ("models:\n  - name: stg_txn\n"
+                                          "    config: {alias: \"{{ var('a') }}\"}\n")})
     r = _render("{{ ref('stg_txn') }}", info)
     assert r.ok and r.relation_notice
 

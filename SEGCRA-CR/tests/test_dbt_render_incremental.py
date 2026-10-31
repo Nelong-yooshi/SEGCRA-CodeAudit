@@ -157,7 +157,7 @@ def test_專案資訊說這個model表名無法確定時_帶無法確定的提�
              "models/stg_txn.sql": "select 1 as id",
              "models/mrt_daily.sql": MODEL,
              "models/props.yml": ("version: 2\nmodels:\n  - name: mrt_daily\n"
-                                  "    config:\n      alias: daily_v2\n")}
+                                  "    config:\n      alias: \"{{ var('a') }}\"\n")}
     info = project_info_from_files(files, other_ref_names=(), root_files_checked=True)
     assert "mrt_daily" in info.uncertain_models
     r = _render(incremental=True, project=info)
