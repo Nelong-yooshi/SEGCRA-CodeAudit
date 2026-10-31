@@ -25,9 +25,9 @@
 
 **取消舊審查(`_trigger` / `_cancel`)**:模組層一個 `_inflight: dict`({mr_iid: (event_loop, task)})配 `threading.Lock`。`_trigger(mr_iid, head_sha)` 先試著取消同一個 MR 進行中的那次(跨執行緒要用 `loop.call_soon_threadsafe(task.cancel)`,task 屬於那個執行緒的迴圈),再開一條新的 thread。取消只會在下一個真正的等待點生效,所以舊的那次有可能一路走到回寫 —— `review_mr` 在回寫前會比對 MR 目前的 head sha,發現已被取代就不貼(見 `orchestrator/pipeline.py:_superseded`)。
 
-**背景執行(`_trigger` → `_run_review`)**:審查耗時數十秒到數分鐘,而 GitLab webhook 有逾時限制,所以 `_trigger` 起一個 `threading.Thread(daemon=True)` 跑 `_run_review` 後**立刻**回 200。`_run_review` 內用 `asyncio.run(review_mr(_cfg, str(mr_iid), profile_name=PROFILE))` 跑完整管線(profile 由 `REVIEW_PROFILE` 環境變數決定,預設 `review`)。HTTP 服務本身用 `ThreadingHTTPServer`,審查進行中仍能收後續事件。
+**背景執行(`_trigger` → `_run_review`)**:審查耗時數十秒到數分鐘,而 GitLab webhook 有逾時限制,所以 `_trigger` 起一個 `threading.Thread(daemon=True)` 跑 `_run_review` 後**立刻**回 200。`_run_review` 在這條執行緒開自己的事件迴圈,用 `run_until_complete` 跑 `asyncio.wait_for(review_mr(_cfg, str(mr_iid), profile_name=PROFILE), REVIEW_TIMEOUT_SECONDS)`(profile 由 `REVIEW_PROFILE` 環境變數決定,預設 `review`);迴圈與 task 登記在 `_inflight`,新 commit 進來時才取消得到。HTTP 服務本身用 `ThreadingHTTPServer`,審查進行中仍能收後續事件。
 
-**Graceful 失敗(`_run_review`)**:整段包在 try/except——模型連不上、fixture 不存在、管線任何 exception 都只印 `[webhook] MR !N 審查失敗:...` 到 stdout,server 不死;`finally` 保證把 iid 從 `_inflight` 移除,失敗的 MR 之後還能再觸發。payload 不是合法 JSON 回 400。`log_message` 覆寫為靜音,stdout 只留自己的結構化 print。
+**Graceful 失敗(`_run_review`)**:整段包在 try/except——模型連不上、fixture 不存在、管線任何 exception 都只印 `[webhook] MR !N 審查失敗:...` 到 stdout,server 不死;`finally` 保證把 iid 從 `_inflight` 移除,失敗的 MR 之後還能再觸發。**關掉事件迴圈前先收尾**(`_close_loop`,跟 `asyncio.run` 收尾一樣):取消還沒結束的工作並等它們收完,再收掉 async generator 與預設的執行緒池,最後才關迴圈。外層逾時或新 commit 取消舊審查時,審查裡另外開的工作(背景的模型呼叫等)會一起被取消,不會留下沒人收尾、還在打模型的請求。等待有上限(`_LOOP_CLEANUP_SECONDS`,30 秒):吞掉取消、繼續跑的工作不會讓這條執行緒卡住,照樣關掉並記一筆 log。收尾出錯不往外丟,log 只寫例外類型。payload 不是合法 JSON 回 400。`log_message` 覆寫為靜音,stdout 只留自己的結構化 print。
 
 **資料流**:GitLab 事件 → `POST /gitlab-webhook`(驗 token)→ 路由抽出 `mr_iid`(update 事件另外看 `oldrev`)→ 取消同 MR 進行中的審查 → 背景 thread 跑 `review_mr` → 管線經 `toolbox/gitlab.py` 回寫 GitLab:逐條 finding 行內留言、總評留言(決策文字)、`ai-review::<decision>` label、commit status `segcra/review`(`auto_approved` → success,`needs_human`/`blocked` → failed,description 帶原因;見 `orchestrator/pipeline.py` 決策回寫段)。
 

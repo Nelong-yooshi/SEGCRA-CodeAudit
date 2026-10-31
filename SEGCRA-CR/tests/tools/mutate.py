@@ -4942,5 +4942,30 @@ MUTANTS.update({
 })
 
 
+# webhook 每份審查的事件迴圈:關掉前取消並等完還沒結束的工作(跟 asyncio.run 收尾一樣,等待有上限)
+W = "../scripts/webhook_server.py"
+MUTANTS.update({
+    "迴圈收尾:直接關迴圈": (W, "        _close_loop(loop, mr_iid)", "        loop.close()"),
+    "迴圈收尾:不取消剩下的工作": (W,
+        "        for t in pending:" + NL + "            t.cancel()",
+        "        for t in pending:" + NL + "            pass"),
+    "迴圈收尾:不等取消的工作收完": (W,
+        "            _, still = loop.run_until_complete(asyncio.wait(pending, timeout=_LOOP_CLEANUP_SECONDS))",
+        "            _, still = set(), set(pending)"),
+    "迴圈收尾:等待沒有上限": (W,
+        "asyncio.wait(pending, timeout=_LOOP_CLEANUP_SECONDS)", "asyncio.wait(pending, timeout=None)"),
+    "迴圈收尾:等不完也不說": (W,
+        "            if still:", "            if False:"),
+    "迴圈收尾:例外連訊息一起記": (W,
+        "收尾時有工作丟出 {type(t.exception()).__name__}", "收尾時有工作丟出 {t.exception()!r}"),
+    "迴圈收尾:收尾出錯往外丟": (W,
+        "        except Exception as e:" + NL + '            print(f"[webhook] MR !{mr_iid} 收尾({step})出錯',
+        "        except ZeroDivisionError as e:" + NL + '            print(f"[webhook] MR !{mr_iid} 收尾({step})出錯'),
+    "迴圈收尾:不收 async generator 與執行緒池": (W,
+        '    for step in ("shutdown_asyncgens", "shutdown_default_executor"):',
+        "    for step in ():"),
+    "迴圈收尾:關掉的迴圈還掛在執行緒上": (W, "    asyncio.set_event_loop(None)", "    pass"),
+})
+
 if __name__ == "__main__":
     sys.exit(main())
