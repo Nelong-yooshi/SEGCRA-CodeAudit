@@ -74,7 +74,7 @@ def test_收尾包含回寫(staged, monkeypatch):
 
 
 def test_已有更新的_commit_不回寫時也記到收尾(staged, monkeypatch):
-    async def superseded(*a, **kw):
+    def superseded(*a, **kw):
         return True
     monkeypatch.setattr(pipeline, "_superseded", superseded)
     report, _ = staged(_slow_main(0))
@@ -156,6 +156,7 @@ def test_量收尾的工具跑得動_回寫走真的_gitlab_模組(tmp_path, mon
     req = r["finish_requests"]
     assert r["findings"] >= 3                       # 兩條 R001 + 一條模型的
     assert req["PUT label"] == 1 and req["POST commit status"] == 1
-    assert req["GET diffs"] == 1                    # 只算收尾的(回寫前比對 head 那一次)
+    # 收尾只取一次 MR(比對 head 與 diff_refs 共用),不取檔案內容、不每條重取
+    assert req["GET MR"] == 1 and "GET diffs" not in req and "GET 檔案" not in req
     assert req.get("POST 行內討論", 0) + req.get("POST 一般留言", 0) >= r["findings"] + 1  # + 總結
     assert list(r["stage_seconds"]) == STAGES

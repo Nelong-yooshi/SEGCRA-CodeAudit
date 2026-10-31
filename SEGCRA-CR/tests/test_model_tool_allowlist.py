@@ -21,6 +21,8 @@ READ_ONLY = {
     "memory__retrieve_knowledge", "memory__get_conventions", "memory__check_style",
     "memory__lookup_similar_reviews", "load_skill",
 }
+# 唯讀、但只給管線自己用:模型用不到(get_mr_diff 已經有同樣的資料),照最小權限不開放
+PIPELINE_READ = {"gitlab__get_mr_refs"}
 WRITE_TOOLS = {
     "gitlab__post_inline_comment", "gitlab__post_summary", "gitlab__set_commit_status",
     "gitlab__create_rule_mr", "gitlab__set_label",
@@ -48,14 +50,14 @@ def test_白名單就是這十個唯讀工具():
 
 def test_每個已註冊的工具都被歸類():
     """新增工具時要決定它屬於哪一類;沒歸類就會在這裡紅。"""
-    assert set(_hub().tools) == READ_ONLY | WRITE_TOOLS
+    assert set(_hub().tools) == READ_ONLY | PIPELINE_READ | WRITE_TOOLS
 
 
 def test_交給模型的工具清單只有白名單():
     hub = _hub()
     names = _names(hub.openai_tools)
     assert names == READ_ONLY
-    assert not names & WRITE_TOOLS
+    assert not names & (WRITE_TOOLS | PIPELINE_READ)
 
 
 def test_沒有註冊的工具不會因為在白名單就出現():
@@ -301,4 +303,4 @@ def test_數字的_MR_編號照常(good, monkeypatch, tmp_path):
 def test_工具組沒有不在任何一類的函式():
     """TOOL_GROUPS 新增函式時,這個檔案的分類也要一起更新(避免默默開放或漏列)。"""
     names = {f"{g}__{fn.__name__}" for g, fns in tool_hub.TOOL_GROUPS.items() for fn in fns}
-    assert names == (READ_ONLY - {"load_skill"}) | WRITE_TOOLS
+    assert names == (READ_ONLY - {"load_skill"}) | PIPELINE_READ | WRITE_TOOLS

@@ -24,7 +24,7 @@ from toolbox import gitlab, memory, sqltools
 
 # 工具組:group 名 → 該組要暴露的函式(全名 = f"{group}__{fn.__name__}")
 TOOL_GROUPS = {
-    "gitlab": [gitlab.get_mr_diff, gitlab.get_file, gitlab.post_inline_comment,
+    "gitlab": [gitlab.get_mr_diff, gitlab.get_mr_refs, gitlab.get_file, gitlab.post_inline_comment,
                gitlab.post_summary, gitlab.set_commit_status, gitlab.create_rule_mr,
                gitlab.set_label],
     "sqltools": [sqltools.parse_ast, sqltools.lint, sqltools.run_rules],
