@@ -79,6 +79,50 @@ def _notify_incomplete(mr_iid: int, reason: str, head_sha: str | None = None) ->
               flush=True)
 
 
+# 關掉事件迴圈前,等還沒結束的工作收尾最多幾秒。正常的工作被取消後立刻結束(模型請求的
+# 連線跟著斷掉);等不完的是吞掉取消、繼續跑的工作,為它卡住整條執行緒不值得,照關並記下來。
+_LOOP_CLEANUP_SECONDS = 30
+
+
+def _close_loop(loop: asyncio.AbstractEventLoop, mr_iid: int) -> None:
+    """跟 `asyncio.run` 收尾的做法一樣:取消還沒結束的工作、等它們收完,收掉 async generator
+    與預設的執行緒池,最後才關迴圈。
+
+    直接 `loop.close()` 的話,審查裡另外開的工作(背景的模型呼叫等)不會被取消:外層逾時、
+    或新 commit 取消舊審查時,打到模型的請求沒有人收尾,端點照樣把它生成完,Python 也只會
+    在之後某個時間點印「Task was destroyed but it is pending!」。
+
+    跟 `asyncio.run` 不同的是等待有上限(`_LOOP_CLEANUP_SECONDS`)。每一步各自 try,收尾出錯
+    不往外丟;log 只寫例外的類型,不寫訊息(訊息可能帶主機位址或模型輸出)。
+    """
+    try:
+        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        for t in pending:
+            t.cancel()
+        if pending:
+            _, still = loop.run_until_complete(asyncio.wait(pending, timeout=_LOOP_CLEANUP_SECONDS))
+            if still:
+                print(f"[webhook] MR !{mr_iid} 有 {len(still)} 個工作取消後 "
+                      f"{_LOOP_CLEANUP_SECONDS} 秒仍沒結束,照樣關掉事件迴圈", flush=True)
+        for t in pending:
+            # 取出例外,免得之後又印一次「Task exception was never retrieved」
+            if t.done() and not t.cancelled() and t.exception() is not None:
+                print(f"[webhook] MR !{mr_iid} 收尾時有工作丟出 {type(t.exception()).__name__}",
+                      flush=True)
+    except Exception as e:
+        print(f"[webhook] MR !{mr_iid} 取消剩下的工作時出錯:{type(e).__name__}", flush=True)
+    for step in ("shutdown_asyncgens", "shutdown_default_executor"):
+        try:
+            loop.run_until_complete(asyncio.wait_for(getattr(loop, step)(), _LOOP_CLEANUP_SECONDS))
+        except Exception as e:
+            print(f"[webhook] MR !{mr_iid} 收尾({step})出錯:{type(e).__name__}", flush=True)
+    try:
+        loop.close()
+    except Exception as e:
+        print(f"[webhook] MR !{mr_iid} 關閉事件迴圈出錯:{type(e).__name__}", flush=True)
+    asyncio.set_event_loop(None)
+
+
 def _run_review(mr_iid: int, head_sha: str | None = None):
     """在自己的執行緒與事件迴圈裡跑一份審查。
 
@@ -112,10 +156,7 @@ def _run_review(mr_iid: int, head_sha: str | None = None):
         with _lock:
             if _inflight.get(mr_iid, (None, None))[1] is task:
                 _inflight.pop(mr_iid, None)
-        try:
-            loop.close()
-        except Exception:
-            pass
+        _close_loop(loop, mr_iid)
 
 
 def _cancel(mr_iid: int) -> bool:
