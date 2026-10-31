@@ -87,21 +87,41 @@
      檔名清單取得,snapshot 的名稱寫在 `{% snapshot %}` 區塊上)、所有屬性檔都解析得了、呼叫端
      以 `root_files_checked=True` 明確確認已檢查專案根目錄的 `packages.yml` /
      `dependencies.yml`(沒傳進來不等於沒有)
-   - **只偵測、不模擬**:alias、自訂 schema、snapshot 的 `target_schema` / `target_database`
+   - **表名照 dbt 的規則算**(model 的 alias / schema;`model_identity`):
+     - 字串常值的設定照 dbt 的合併順序取值:`dbt_project.yml`(`models:` 底下照資料夾由淺到深,
+       指名 model 的最優先;`+alias` 與不加前綴的 `alias` 都算)→ 屬性檔的 `config:` →
+       model 檔的 `config()`(同一個檔有好幾個,後面的蓋過前面的)。每個設定各自覆蓋
+     - alias:有值(非空字串)用它去掉頭尾空白,否則用 model 名稱(dbt 的 `generate_alias_name`)
+     - schema:沒有自訂值是 target 的 schema(`dbo`);有自訂值時看要不要串接(下一點)
+     - database:一律用約定的假名(見下面「資料庫名」那點),model 設的不採用
+     - 算出來表名相同的 model(例如資料夾層級設了同一個 alias)dbt 會編譯失敗,記成無法確定;
+       算出來的名稱不是英數與底線時也記成無法確定(照 model 名稱展開,不讓展開失敗)
+     - 對照:`tests/dbt_reference/relation_names.py` 的合成小專案與預期表名照 dbt 的原始碼推出;
+       有 dbt-sqlserver 的環境可以用它的 `write` / `check` 拿 `dbt parse` 的 manifest 驗證
+   - **自訂 schema 要不要串接**(dbt-sqlserver 的 `sqlserver__generate_schema_name`):
+     `dbt_project.yml` 的 `flags.dbt_sqlserver_use_default_schema_concat` 或同名 `vars` 任一個是
+     true 就串接(`<target schema>_<自訂>`),否則自訂值原樣用。**兩個都沒寫時看轉接器的預設值,
+     而這個預設在不同版本相反**(1.9.2 是 false、1.12 的預覽版是 true),所以由部署端在設定檔填
+     `dbt.sqlserver_schema_concat`(見 10 篇);沒填就記成無法確定。值不是布林、或 var 寫在專案
+     層級的子區塊裡時也是無法確定,部署端的預設不蓋過
+   - **只偵測、不模擬**:snapshot 的 `target_schema` / `target_database`
      (dbt 用它們覆蓋 schema / database;只看屬性檔與 `config()` 的參數。`dbt_project.yml` 的
      `+target_schema` 不讓整個專案無法確定:snapshot 本來就一律無法確定,見下一點)、
-     `generate_*_name`、樣板值、ephemeral
+     `generate_*_name`、樣板值或不是字串的 alias / schema / database、屬性檔裡寫在 `config:`
+     外面或加了 `+` 的 alias / schema / database、ephemeral
      (被引用時展開成 CTE,不是表名)、停用(`enabled` 不是 true,被引用時 dbt 編譯失敗)、
-     model 版本、同名的 model(dbt 編譯失敗;model 與 seed / snapshot 同名也算)、
-     Python model(內容不讀)、macro 裡呼叫的 `config()`(作用在呼叫它的 model 上,
-     看不出是哪些,整個專案都無法確定);屬性檔的 `seeds:` / `snapshots:` 區段同樣檢查。
-     有這類設定就保留提醒;規則層檢查語法結構、不看表名,模擬的成本高、價值低
+     model 版本、同名的 model(dbt 編譯失敗;model 與 seed / snapshot 同名也算)、同一個 model
+     在屬性檔出現兩次、明寫 null / None 想蓋掉上層設的值(dbt 是清掉還是保留沒有逐一查證)、
+     Python model(內容不讀)、macro 裡呼叫的 `config()`(作用在呼叫它的
+     model 上,看不出是哪些,整個專案都無法確定)、看不懂的屬性檔(裡面可能就有某個 model 的
+     alias,整個專案都無法確定);屬性檔與 `dbt_project.yml` 的 `seeds:` / `snapshots:` 區段
+     有表名設定時同樣無法確定。有這類設定就保留提醒
    - **呼叫端提供的名稱(seed / snapshot / Python model)只代表存在,表名一律無法確定**
      (#19 review):只有名稱、看不到內容,而 snapshot 的 `target_schema`、Python model 的
      `dbt.config()` 都寫在內容裡。`ref()` 得到名單上沒有的名稱時照樣判成不存在
    - **model 檔內 `config()` 的偵測用白名單**:每個參數都必須是「名稱 = 常值」(字串、數字、
-     布林、字串清單),名稱不是 alias / schema / database,`materialized` 也不是 ephemeral,
-     才算確定。字典寫法、`**` 展開、變數、`var()`、樣板運算、沒有右括號,一律算可能改名——
+     布林、字串清單),alias / schema / database 要是字串或 `None`(名稱分大小寫),不能有
+     `target_schema` / `target_database`,`materialized` 也不是 ephemeral,才算確定。字典寫法、`**` 展開、變數、`var()`、樣板運算、沒有右括號,一律算可能改名——
      看不懂的寫法會自動往「無法確定」靠,不會漏判。屬性檔與 `dbt_project.yml` 的
      `materialized` 為 ephemeral 或樣板值時同樣無法確定
    - **`config.set()` 一律算可能改名**(#19 review):dbt 的 `config.set(name, value)` 等同
