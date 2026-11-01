@@ -2824,11 +2824,11 @@ MUTANTS.update({
      '            yield h, found[0]'),
  # 切語句只略過「切不出來」;程式自己的錯往外丟(環節隔離記成未完整)
  "行號:切語句時程式的錯也吞掉": ("pipeline.py",
-     "    except (SqlglotError, RecursionError):   # 切不出來就不寫行號",
-     "    except Exception:"),
+     "        except (SqlglotError, RecursionError):\n            return None",
+     "        except Exception:\n            return None"),
  "行號:巢狀太深往外丟": ("pipeline.py",
-     "    except (SqlglotError, RecursionError):   # 切不出來就不寫行號",
-     "    except SqlglotError:"),
+     "        except (SqlglotError, RecursionError):   # 這一句不寫行號,其他句照寫",
+     "        except SqlglotError:   # 這一句不寫行號,其他句照寫"),
  "受影響:切語句時程式的錯也吞掉": ("dbt_affected.py",
      "    except (SqlglotError, RecursionError):   # 切不出來就只能整個 model 合計比較",
      "    except Exception:"),
@@ -2850,9 +2850,14 @@ MUTANTS.update({
  "行號:檔案太大也算": ("pipeline.py",
      '        if (not isinstance(text, str) or not text or len(text) > MAX_LINE_SOURCE_CHARS\n',
      '        if (not isinstance(text, str) or not text\n'),
- "行號:切出來的數量對不上也寫": ("pipeline.py",
-     '    if len(firsts) != len(statements):\n        return None',
-     '    if False:\n        return None'),
+ "行號:一段切出兩句以上也照寫(對不準是哪一句)": ("pipeline.py",
+     '        if len(statements) != 1:   # 一段切出兩句以上:對不準是哪一句,寧可不寫\n'
+     '            continue',
+     '        if False:\n            continue'),
+ "行號:一句解析失敗就整份不寫(連好的那幾句也沒有)": ("pipeline.py",
+     '        except (SqlglotError, RecursionError):   # 這一句不寫行號,其他句照寫\n'
+     '            continue',
+     '        except (SqlglotError, RecursionError):\n            return None'),
  # dbt 樣板展開後的命中:經對應表對回原始檔
  "行號對回:近似對齊的對應表也用": ("pipeline.py",
      '    return rendered.line_map if rendered.map_method == "sentinel" and rendered.line_map else None',
@@ -2873,7 +2878,7 @@ MUTANTS.update({
  "行號對回:被空白控制接起來的第二句也寫": ("pipeline.py",
      "    if not alone:" + NL + "        return 0", "    if False:" + NL + "        return 0"),
  "行號對回:不看語句前面同一行有沒有別的內容": ("pipeline.py",
-     "        alone = not sql[line_start:tok.start].strip()", "        alone = True"),
+     "        alone = not sql[line_start:chunk.start].strip()", "        alone = True"),
  "行號對回:macro 產生的語句也寫(不比固定文字)": ("pipeline.py",
      "    if not prefix or not rendered_lines[rendered_line - 1].lstrip().startswith(prefix):",
      "    if False:"),
@@ -2902,8 +2907,9 @@ MUTANTS.update({
      "                           prescan(hub, mr[\"files\"], cfg.dbt, dbt_ctx, rendered, line_maps), [])",
      "                           prescan(hub, mr[\"files\"], cfg.dbt, dbt_ctx, rendered, None), [])"),
  "行號:只有註解的語句也算": ("pipeline.py",
-     '                      and not isinstance(st, exp.Semicolon)]',
-     '                      ]'),
+     '            statements = [st for st in parse_statements(chunk.text) if st is not None\n'
+     '                          and not isinstance(st, exp.Semicolon)]',
+     '            statements = [st for st in parse_statements(chunk.text) if st is not None]'),
  "行號:檔案與預掃結果對不上也寫": ("pipeline.py",
      '        if (not isinstance(f, dict) or entry.get("path") != f.get("path")',
      '        if (not isinstance(f, dict)'),
@@ -4832,7 +4838,7 @@ MUTANTS.update({
 TOOLS = "../toolbox/sqltools.py"
 MUTANTS.update({
  "逐句:整份一次解析(一句壞掉就全部不檢查)": (TOOLS,
-     "    chunks = _statement_chunks(sql)" + NL
+     "    chunks = statement_chunks(sql)" + NL
      + "    if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析",
      "    chunks = []" + NL
      + "    if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析"),
@@ -4854,10 +4860,10 @@ MUTANTS.update({
      + "        return []" + NL
      + "    cuts = [t.end + 1 for t in tokens if t.token_type == TokenType.SEMICOLON]"),
  "逐句:巢狀的區塊註解只認最內層": (TOOLS,
-     "                if sql.startswith(\"/*\", i):" + NL
-     + "                    depth, i = depth + 1, i + 2",
-     "                if False:" + NL
-     + "                    depth, i = depth + 1, i + 2"),
+     "        if sql.startswith(\"/*\", i):" + NL
+     + "            depth, i = depth + 1, i + 2",
+     "        if False:" + NL
+     + "            depth, i = depth + 1, i + 2"),
  # 「`''` 當成字串結束」不列為突變點:**它是等價的**。把跳脫當成「結束再開一個新
  # 字串」之後,被標成「在字串裡」的字元範圍完全一樣(兩種解讀都是一次吃掉兩個引號),
  # 所以找到的分號位置也一樣 —— 20 萬組隨機輸入比對過,沒有一組不同。留著只會得到

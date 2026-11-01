@@ -277,14 +277,25 @@ def test_樣板標記只在註解裡時也不寫():
         assert all(h.get("line") is None for h in pre[0]["rules"]), raw
 
 
-def test_切出來的語句數量與_token_對不上時不寫(monkeypatch):
-    """兩邊數量不同時一一對應會錯位;寧可不寫。"""
+def test_一段切出兩句以上時那一段不寫行號(monkeypatch):
+    """對不準是哪一句,寧可不寫 —— 但只影響那一段,其他句照寫。"""
     import sqlglot
 
-    real = pipeline._parse
-    monkeypatch.setattr(pipeline, "_parse",
-                        lambda sql: [sqlglot.parse_one("SELECT 0", dialect="tsql"), *real(sql)])
-    assert _rendered_starts(TWO_DELETES) is None
-    pre = _pre(TWO_DELETES)
-    _attach_statement_lines(pre, _files(TWO_DELETES))
-    assert all(h.get("line") is None for h in pre[0]["rules"])
+    real = pipeline.parse_statements
+    monkeypatch.setattr(
+        pipeline, "parse_statements",
+        lambda sql: ([sqlglot.parse_one("SELECT 0", dialect="tsql"), *real(sql)]
+                     if "accounts" in sql else real(sql)))
+    starts = _rendered_starts(TWO_DELETES)
+    assert starts is not None
+    assert not any("accounts" in k for k in starts), "被動手腳的那一段不該有行號"
+    assert any("transactions" in k for k in starts), "其他句照樣要有行號"
+
+
+def test_一句解析失敗不影響其他句的行號():
+    """原本整份一次解析,一句壞掉就整個檔案都不寫行號 —— 連好的那幾句也沒有,
+    而解析不了的那一句正是最值得標出位置的。"""
+    sql = "DELETE FROM transactions;\nSELECT * FROM (((((((((((;\nDELETE FROM accounts;"
+    starts = _rendered_starts(sql)
+    assert starts is not None
+    assert sorted(v[0][0] for v in starts.values()) == [1, 3], starts

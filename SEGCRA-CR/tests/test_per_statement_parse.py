@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from toolbox.sqltools import _statement_chunks, run_rules
+from toolbox.sqltools import run_rules, statement_chunks
 
 DEEP = "SELECT " + "(1+" * 50 + "1" + ")" * 50 + ";"      # sqlglot 遞迴太深
 PURGE = "DELETE FROM t;"
@@ -51,7 +51,7 @@ def test_只有一句而且壞掉時照舊回解析錯誤():
     ("SELECT 1", 0),                                # 只有一句 → 照舊整份解析
 ])
 def test_依分號切句(sql, count):
-    assert len(_statement_chunks(sql)) == count
+    assert len(statement_chunks(sql)) == count
 
 
 def test_字串裡的分號不會把一句切成兩半():
@@ -96,12 +96,13 @@ def test_文字層規則不受影響():
     assert "R004" in [h["rule"] for h in hits]
 
 
-def test_解析進入點有公開的名字():
-    """`pipeline` 與 `dbt_affected` 都在用它(#82 review)。舊名字先留著當別名:
-    那兩個檔案現在有在途的改動,一起改會撞在一起。"""
+def test_解析與切句的進入點都是公開的名字():
+    """`pipeline` 與 `dbt_affected` 都在用它們。舊的 `_parse` 別名已經拿掉——
+    底線開頭的名字被別的模組 import,看起來像內部實作卻是介面。"""
     from toolbox import sqltools
     assert sqltools.parse_statements("SELECT 1")
-    assert sqltools._parse is sqltools.parse_statements
+    assert sqltools.statement_chunks("SELECT 1; SELECT 2")
+    assert not hasattr(sqltools, "_parse"), "別名應該已經拿掉"
 
 
 # ─────────── 斷詞失敗不可以讓整份退回一次解析(#99 review 第 1 點)───────────
@@ -132,7 +133,7 @@ def test_檔尾沒收尾時前面的句子照樣跑規則(tail, label):
     ("SELECT 1 /* a /* x */ ; y */ FROM t; DELETE FROM u", 2),
 ])
 def test_切句認得字串與註解(sql, count):
-    assert len(_statement_chunks(sql)) == count
+    assert len(statement_chunks(sql)) == count
 
 
 def test_特製內容不會讓切句變慢():
@@ -149,6 +150,6 @@ def test_切句不需要在函式裡匯入():
     import inspect
 
     from toolbox import sqltools
-    src = inspect.getsource(sqltools._statement_chunks) + inspect.getsource(
+    src = inspect.getsource(sqltools.statement_chunks) + inspect.getsource(
         sqltools._semicolon_cuts)
     assert "import" not in src

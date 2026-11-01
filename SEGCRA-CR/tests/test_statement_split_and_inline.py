@@ -22,8 +22,8 @@ from toolbox import gitlab
 def test_切不出語句時回_None(monkeypatch, error, split):
     def fail(sql):
         raise error
-    monkeypatch.setattr(pipeline, "_parse", fail)
-    monkeypatch.setattr(dbt_affected, "_parse", fail)
+    monkeypatch.setattr(pipeline, "parse_statements", fail)
+    monkeypatch.setattr(dbt_affected, "parse_statements", fail)
     assert split() is None
 
 
@@ -32,8 +32,8 @@ def test_切不出語句時回_None(monkeypatch, error, split):
 def test_程式自己的錯往外丟_不默默當成切不出來(monkeypatch, split):
     def bug(sql):
         raise AttributeError("程式的錯")
-    monkeypatch.setattr(pipeline, "_parse", bug)
-    monkeypatch.setattr(dbt_affected, "_parse", bug)
+    monkeypatch.setattr(pipeline, "parse_statements", bug)
+    monkeypatch.setattr(dbt_affected, "parse_statements", bug)
     with pytest.raises(AttributeError):
         split()
 

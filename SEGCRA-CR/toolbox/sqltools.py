@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+from typing import NamedTuple
 
 import sqlglot
 from sqlglot import exp
@@ -31,7 +32,23 @@ def parse_statements(sql: str):
 
 # 舊名字:等 pipeline 與 dbt_affected 的呼叫端換過去之後移除。先留著是因為那兩個
 # 檔案現在有在途的改動,一起改會撞在一起。
-_parse = parse_statements
+
+
+def _skip_block_comment(sql: str, i: int, end: int) -> int:
+    """跳過從 i 開始的區塊註解,回傳註解後的位置。
+
+    **T-SQL 的區塊註解可以巢狀**:`/* a /* b */ 還在註解裡 */`。只找第一個 `*/` 的話,
+    內層一閉合就以為註解結束了,夾在中間的分號會被當成切點。沒收尾的吃到結尾。
+    """
+    depth, i = 1, i + 2
+    while i < end and depth:
+        if sql.startswith("/*", i):
+            depth, i = depth + 1, i + 2
+        elif sql.startswith("*/", i):
+            depth, i = depth - 1, i + 2
+        else:
+            i += 1
+    return i
 
 
 def _semicolon_cuts(sql: str) -> list[int]:
@@ -67,24 +84,48 @@ def _semicolon_cuts(sql: str) -> list[int]:
             j = sql.find("\n", i)
             i = n if j < 0 else j + 1
         elif sql.startswith("/*", i):        # 區塊註解(T-SQL 可以巢狀)
-            depth, i = 1, i + 2
-            while i < n and depth:
-                if sql.startswith("/*", i):
-                    depth, i = depth + 1, i + 2
-                elif sql.startswith("*/", i):
-                    depth, i = depth - 1, i + 2
-                else:
-                    i += 1
+            i = _skip_block_comment(sql, i, n)
         else:
             i += 1
     return cuts
 
 
-def _statement_chunks(sql: str) -> list[tuple[str, int]]:
-    """依分號切成一句一句,回傳 [(這一句的原文, 它在檔案裡的起始行 - 1)]。
+class Chunk(NamedTuple):
+    """切出來的一句。
+
+    text         這一句的原文(含前面的註解與空白)
+    line_offset  它在檔案裡的起始行 - 1(解析錯誤的行號要加上它才對得回原檔)
+    start        **第一個有意義的字元**在整份 SQL 裡的位置(跳過前面的空白與註解)
+                 —— 要寫出「這一句在第幾行」「它是不是那一行的第一段內容」時用它
+    """
+    text: str
+    line_offset: int
+    start: int
+
+
+def _first_token(sql: str, i: int, end: int) -> int:
+    """從 i 往後找第一個不是空白、也不在註解裡的位置;整段都是空白與註解時回 end。"""
+    while i < end:
+        if sql[i].isspace() or sql[i] == ";":
+            i += 1
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = end if j < 0 else j + 1
+        elif sql.startswith("/*", i):
+            i = _skip_block_comment(sql, i, end)
+        else:
+            return i
+    return end
+
+
+def statement_chunks(sql: str) -> list[Chunk]:
+    """依分號切成一句一句。
 
     切句用自己的掃描器(見 `_semicolon_cuts`):字串常值與註解裡的分號不算,
     沒收尾的引號或註解也不會讓整份退回一次解析。
+
+    **切句的邏輯只留這一份**:預掃逐句解析、展開後的行號對回原始檔、受影響 model 的
+    逐句比較,三處都用它。各寫各的時候,補了一處就會漏掉另外兩處。
     """
     cuts = _semicolon_cuts(sql)
     if not cuts:
@@ -93,7 +134,8 @@ def _statement_chunks(sql: str) -> list[tuple[str, int]]:
     for cut in cuts + ([len(sql)] if cuts[-1] < len(sql) else []):
         chunk = sql[start:cut]
         if chunk.strip(" \t\r\n;"):
-            out.append((chunk, sql.count("\n", 0, start)))
+            out.append(Chunk(chunk, sql.count("\n", 0, start),
+                             _first_token(sql, start, cut)))
         start = cut
     return out
 
@@ -589,14 +631,14 @@ def _parse_each_statement(sql: str):
 
     說明只留位置:它會變成 finding 的內文、貼回 MR 留言(見 parse_error_text)。
     """
-    chunks = _statement_chunks(sql)
+    chunks = statement_chunks(sql)
     if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析
         try:
             return parse_statements(sql), None
         except Exception as e:           # noqa: BLE001 — 解析失敗不中斷預掃
             return [], parse_error_text(e)
     statements, errors = [], []
-    for chunk, line_offset in chunks:
+    for chunk, line_offset, _ in chunks:
         try:
             statements.extend(parse_statements(chunk))
         except Exception as e:           # noqa: BLE001
