@@ -412,36 +412,94 @@ def get_mr_diff(mr_id: str) -> str:
 #
 # 拿不到釘住的版本時**不退回目標分支**,而是明講取不到——退回去就是 #22 原本的
 # bug,而且沒有任何徵兆。
-def get_file(path: str, ref: str = "", mr_id: str = "") -> str:
-    """取得 repo 內檔案的完整內容(看 diff 不夠時用)。"""
-    if REAL_MODE:
-        import urllib.parse
-        import httpx
-        ref = ref or review_ref() or ""
-        if not ref:
-            return ("(無法取得審查中的版本:這次審查沒有釘住 commit。"
-                    "請依 diff 判斷,或交人工確認。)")
-        token = _read_token()
-        if not token:
-            return ("(無法讀取檔案:未設定唯讀的 GITLAB_READ_TOKEN。"
-                    "請依 diff 判斷,或交人工確認。)")
+# 取不到檔案的原因:固定代碼 → 給人看的說法。**只有這一份**:代碼在 gitlab.py 判斷,
+# 說法也放在這裡,呼叫端(執行驗證、dbt 反查)引用它 —— 分成兩份的話,新增一個代碼
+# 要同時改三個地方,漏掉的那邊會在組訊息時丟 KeyError,而那是審查跑到一半的時候。
+#
+# 說法只寫**哪一類設定**出了問題,不寫環境變數名:這段會貼回 MR,而 MR 上該看到的是
+# 「環節 + 問題 + 代碼」;代碼對應哪個設定寫在 docs/10,維運照代碼查(#89 第 3 點)。
+UNAVAILABLE_TEXT = {
+    "no_read_token": "取檔用的唯讀憑證沒有設定。",      # nosec B105 — 這是錯誤代碼,不是憑證
+    "no_review_ref": "這次審查沒有釘住 commit。",
+    "not_found": "專案或 commit 找不到(專案編號、權限或 commit 設定有問題)。",
+    "too_large": "檔案超過單檔大小上限。",
+    "fetch_failed": "向 GitLab 取檔失敗。",
+    "not_a_spec": "取回的內容不是規格的格式。",
+}
+
+# 給模型看的訊息(get_file 的回傳)。模型拿到的是文字,不是代碼。
+_PROSE = {
+    # 連給模型的文字也不寫環境變數名:模型可能把它抄進 finding,而 finding 會貼回
+    # MR —— 繞一圈還是外流了設定細節。模型需要知道的是「這個檔拿不到」。
+    "no_read_token": ("(無法讀取檔案:取檔用的唯讀憑證沒有設定。"
+                      "請依 diff 判斷,或交人工確認。)"),      # nosec B105 — 同上
+    "no_review_ref": ("(無法取得審查中的版本:這次審查沒有釘住 commit。"
+                      "請依 diff 判斷,或交人工確認。)"),
+    "not_found": "(無法讀取檔案:專案或 commit 找不到。請依 diff 判斷,或交人工確認。)",
+    "too_large": "({path} 超過單檔上限,未取回完整內容。請依 diff 判斷,或交人工確認。)",
+    "fetch_failed": "(無法讀取檔案:取檔失敗。請依 diff 判斷,或交人工確認。)",
+}
+_ABSENT_PROSE = "(repo 內無 {path})"
+_MOCK_ABSENT_PROSE = "(mock 模式無 {path} 的完整內容,請依 diff 判斷)"
+# GitLab 的 404 分得出是哪一種:檔案不存在才是「確實沒有」,專案或 commit 找不到是
+# 環境的問題(權限不足時 GitLab 也回 404 而不是 403)。
+_FILE_NOT_FOUND = "file not found"
+
+
+def fetch_file(path: str, ref: str = "", mr_id: str = "") -> tuple[str | None, str | None]:
+    """取檔給**管線**用:回 (內容, 拿不到的代碼)。
+
+    兩個都是 None 代表「這個檔案確實不存在」。
+
+    **為什麼不是回一段文字讓呼叫端去判斷**:檔案的內容與錯誤訊息如果走同一條路回來,
+    呼叫端只能比對字串,而那段字串可以由 MR 決定 —— 把規格檔的內容寫成跟錯誤訊息
+    一字不差,報告就會說「驗證環境的問題」,維運去查一個沒有壞的設定。原因要跟內容
+    分開回,照 HTTP 狀態碼判斷,不要從內容猜。
+    """
+    if not REAL_MODE:
+        mr = _mock_mr(mr_id) if mr_id else None
+        for f in (mr or {}).get("files", []):
+            if f["path"] == path and "full_content" in f:
+                return f["full_content"], None
+        return None, None
+    import urllib.parse
+    import httpx
+    ref = ref or review_ref() or ""
+    if not ref:
+        return None, "no_review_ref"
+    token = _read_token()
+    if not token:
+        return None, "no_read_token"
+    try:
         r = httpx.get(
             f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}/repository/files/"
             f"{urllib.parse.quote(path, safe='')}/raw",
             headers={"PRIVATE-TOKEN": token}, params={"ref": ref}, timeout=30)
         if r.status_code == 404:
-            return f"(repo 內無 {path})"
+            # 只有「檔案不存在」算確實沒有;專案/commit 找不到、權限不足都是環境問題
+            body = (r.text or "").lower()
+            return (None, None) if _FILE_NOT_FOUND in body else (None, "not_found")
         r.raise_for_status()
         if len(r.content) > MAX_FILE_BYTES:
-            return (f"({path} 超過單檔上限 {MAX_FILE_BYTES} bytes,未取回完整內容。"
-                    f"請依 diff 判斷,或交人工確認。)")
-        return r.text
-    mr = _mock_mr(mr_id) if mr_id else None
-    if mr:
-        for f in mr["files"]:
-            if f["path"] == path and "full_content" in f:
-                return f["full_content"]
-    return f"(mock 模式無 {path} 的完整內容,請依 diff 判斷)"
+            return None, "too_large"
+        return r.text, None
+    except Exception:      # noqa: BLE001 — 原始錯誤不帶出去,只回代碼
+        return None, "fetch_failed"
+
+
+def get_file(path: str, ref: str = "", mr_id: str = "") -> str:
+    """取得 repo 內檔案的完整內容(看 diff 不夠時用)。**給審查模型的工具**。
+
+    模型拿到的是文字,所以把 `fetch_file` 的代碼轉成說明句。管線自己要分辨
+    「拿不到」與「確實沒有」時,直接用 `fetch_file`,不要比對這裡的文字 ——
+    那段文字也可能是檔案的內容(見 fetch_file 的說明)。
+    """
+    text, code = fetch_file(path, ref, mr_id)
+    if text is not None:
+        return text
+    if code is None:
+        return (_ABSENT_PROSE if REAL_MODE else _MOCK_ABSENT_PROSE).format(path=path)
+    return _PROSE[code].format(path=path)
 
 
 def post_inline_comment(mr_id: str, file: str, line: int, body: str,

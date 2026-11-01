@@ -14,7 +14,8 @@ import re
 
 import pytest
 
-from orchestrator.env_registry import PKG_ROOT, scan_file, scan_repo
+from orchestrator.env_registry import (PKG_ROOT, scan_file, scan_repo,
+                                       scan_repo_dynamic)
 
 DOC = PKG_ROOT / "docs" / "10-設定參數.md"
 # 表格列:| `NAME` | 預設值 | …
@@ -42,6 +43,59 @@ def documented() -> dict[str, str]:
         elif line.startswith("#"):
             in_table = False          # 換一節就重新等下一張表的表頭
     return out
+
+
+# 名稱算不出來的讀法:掃描看不到參數名稱,所以文件的一致性檢查也看不到它。
+# 認帳用的清單,比對 (檔案, 表達式原文) 而不是行號——行號會因為上下改動而變。
+_KNOWN_DYNAMIC = {
+    # helper 本體:名稱是參數,實際的名稱在呼叫端(那些是字串常值,照樣掃得到)
+    ("orchestrator/config.py", "os.environ[name]"),
+    ("orchestrator/config.py", "os.environ.get(name)"),
+    # 把 config/sandbox.env 的內容塞進環境:鍵來自那個檔案,不是程式寫死的
+    ("orchestrator/spec_exec.py", "os.environ.setdefault(k.strip(), v.strip())"),
+}
+
+
+def test_名稱算不出來的讀法會被列出來(tmp_path):
+    """只驗「沒有未認帳的」不夠:整個不收集的話那份清單是空的,測試照樣綠。
+    這條從正面驗——這種寫法一定要出現在清單裡。"""
+    from orchestrator.env_registry import _scan
+
+    f = tmp_path / "x.py"
+    f.write_text('import os\nk = "A"\na = os.getenv(f"SANDBOX_{k}")\n'
+                 'b = os.environ[k]\nc = os.getenv("REAL_NAME")\n', encoding="utf-8")
+    static, dynamic = _scan(f, "x.py")
+    assert [r.name for r in static] == ["REAL_NAME"]
+    assert len(dynamic) == 2, [r.name for r in dynamic]
+    assert all(r.where.startswith("x.py:") for r in dynamic)
+
+
+def test_動態讀法只有已知的那幾處():
+    """`os.getenv(f"SANDBOX_{x}")` 這種寫法掃不出名稱。默默跳過的話,掃描少看一個
+    參數而這裡照樣綠,文件就會缺一個參數——對部署的人來說那個參數等於不存在。
+    新加的動態讀法要先寫進 docs/10,再加進這個清單。"""
+    unknown = sorted((r.where, r.name) for r in scan_repo_dynamic()
+                     if (r.where.split(":")[0], r.name) not in _KNOWN_DYNAMIC)
+    assert unknown == [], f"沒認帳的動態讀法:{unknown}"
+
+
+def test_掃描範圍含進入點():
+    """`tools/`、`demo.py` 也是部署的人會跑的東西,在那裡新增的參數一樣要寫進文件。"""
+    from orchestrator.env_registry import SCAN_DIRS, SCAN_FILES
+    assert "tools" in SCAN_DIRS and "demo.py" in SCAN_FILES
+    where = [r.where for reads in scan_repo().values() for r in reads]
+    assert any(w.startswith("demo.py") for w in where), "demo.py 沒有被掃到"
+
+
+def test_範例設定檔裡的變數都在表裡():
+    """`config/*.env.example` 是部署的人實際會複製的檔案,也是第二個會走鐘的來源:
+    改了名字只改表、沒改範例檔的話,照著範例設的人會設到一個沒人讀的變數。"""
+    doc = documented()
+    for sample in sorted((PKG_ROOT / "config").glob("*.env.example")):
+        for line in sample.read_text(encoding="utf-8").splitlines():
+            if "=" in line and not line.lstrip().startswith("#"):
+                name = line.split("=", 1)[0].strip()
+                assert name in doc, f"{sample.name} 的 {name} 沒有寫進 {DOC.name}"
 
 
 def test_程式讀的每個環境變數都寫進文件():

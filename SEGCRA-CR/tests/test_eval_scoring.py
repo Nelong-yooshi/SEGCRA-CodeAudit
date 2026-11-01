@@ -29,7 +29,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "eval"))
 from run_eval import (  # noqa: E402
-    auto_approve_blockers, finding_matches, is_style_finding, match_expected, spec_desc,
+    auto_approve_blockers, finding_matches, is_style_finding, match_expected,
+    read_signal, spec_desc,
 )
 
 POLICY = {
@@ -268,3 +269,38 @@ def test_有決策但缺_policy_signals_要明確講出來():
     """不該靜靜回空清單——那會被誤讀成「沒有任何阻礙」。"""
     out = auto_approve_blockers({"decision": "needs_human"}, POLICY)
     assert out == ["無 _policy_signals"]
+
+
+# ───────── finding 的來源選擇器與校準訊號 ─────────
+
+def test_來源選擇器分得出程式補的與模型寫的():
+    """「程式不得把風格問題報成 major」要綁來源:模型照實多報是現在要的行為,
+    不指定來源的話,斷言會因為模型多報而紅,而那不是防線壞掉。"""
+    spec = {"source": "program", "severity": "major"}
+    assert finding_matches(spec, {"severity": "major", "_source": "program"})
+    assert not finding_matches(spec, {"severity": "major"})
+    assert not finding_matches(spec, {"severity": "major", "_source": "model"})
+
+
+def test_沒給來源時兩種都對得上():
+    spec = {"severity": "major"}
+    assert finding_matches(spec, {"severity": "major", "_source": "program"})
+    assert finding_matches(spec, {"severity": "major"})
+
+
+def test_校準訊號讀得到加註與降級():
+    r = {"_calibration": {"annotated": [{"title": "x"}], "downgraded": []}}
+    assert read_signal(r, "calibration_annotated") is True
+    assert read_signal(r, "calibration_downgraded") is False
+
+
+def test_沒有校準欄位時兩個訊號都是false():
+    assert read_signal({}, "calibration_annotated") is False
+    assert read_signal({}, "calibration_downgraded") is False
+
+
+def test_訊號名稱打錯要說有哪些可用():
+    import pytest
+    with pytest.raises(KeyError) as e:
+        read_signal({}, "calibration_dropped")
+    assert "calibration_annotated" in str(e.value)

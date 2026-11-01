@@ -1,0 +1,37 @@
+{
+  "title": "每日提領摘要:統一別名命名",
+  "description": "只改輸出欄位別名與排版,運算完全不變。",
+  "sha": "e1a1000000000000000000000000000000000802",
+  "files": [
+    {
+      "path": "sql/maintenance/export_daily_withdraw.sql",
+      "diff": "@@ -2 +2 @@\n-SELECT account_id, SUM(amount) AS total_amount\n+SELECT account_id AS acct, SUM(amount) AS amt",
+      "full_content": "-- 每日提領摘要:統一別名寫法\nSELECT account_id AS acct, SUM(amount) AS amt\nFROM transactions\nWHERE tx_time >= @start_date AND tx_time < @end_date\nGROUP BY account_id;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "calibration",
+    "intent": "851 的對照組:同樣沒有規格,但這次只有命名/風格可說。「不確定就 info」只適用在這種沒有任何依據的地方——**程式**不得把命名或風格類的問題補成 major。模型自己要報 major 是它的判斷,照實留著、由決策層交人工,不在這裡擋(現在的方向是寧可多報,再用證據過濾)。",
+    "expect_decision": [
+      "needs_human"
+    ],
+    "forbid_findings": [
+      {
+        "source": "program",
+        "severity": "major",
+        "title_contains_any": [
+          "命名",
+          "別名",
+          "風格",
+          "可讀",
+          "排版"
+        ]
+      }
+    ],
+    "expect_signals": {
+      "needs_human_marked": true,
+      "calibration_downgraded": false
+    }
+  }
+}

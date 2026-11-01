@@ -1,8 +1,8 @@
 """`run_agent` 回填的 token 用量(#84)——不呼叫真的模型。
 
-#84 要回答的是「每份 MR 的審查讀進多少、生成多少」。只記最後一次呼叫的話,有工具
+要回答的是「每份 MR 的審查讀進多少、生成多少」。只記最後一次呼叫的話,有工具
 呼叫的審查一輪會跑好幾次、每次都把整串對話重讀一遍,總量遠大於最後一次 —— 工具用
-得多的 MR 反而看起來很便宜,跟黑盒量到的總量對不起來。
+得多的 MR 反而看起來很便宜,跟模型端點那邊記的總量對不起來。
 
 `_output_meta_record`(pipeline)已經在等這三個欄位,沒有回填的話報告裡永遠是 None。
 """
@@ -104,6 +104,21 @@ def test_某一輪沒回報用量_那一輪不加(monkeypatch):
     assert meta["prompt_tokens_total"] == 4000
     assert meta["completion_tokens_total"] == 60
     assert meta["prompt_tokens"] == 3000
+
+
+def test_沒回報用量的輪數記下來(monkeypatch):
+    """沒回報的那幾輪不加進總量,所以總量是低估的——低估多少,光看總量看不出來。
+    0 代表每一輪都有回報,不是「沒在記」。"""
+    meta = _run(monkeypatch, [(1000, 20, True), (None, None, True), (3000, 40, False)])
+    assert meta["rounds_without_usage"] == 1, "三輪裡只有中間那一輪沒回報"
+    assert _run(monkeypatch, [(1000, 20, False)], use_tools=False)[
+        "rounds_without_usage"] == 0
+
+
+def test_只回報一邊也算沒回報(monkeypatch):
+    """少的那一側一樣會讓總量偏低。"""
+    meta = _run(monkeypatch, [(1000, None, False)], use_tools=False)
+    assert meta["rounds_without_usage"] == 1
 
 
 def test_整份都沒回報用量_總量是None(monkeypatch):

@@ -1,0 +1,22 @@
+{
+  "title": "每日提領摘要:統一別名命名",
+  "description": "別名改成 snake_case,方便下游使用。",
+  "files": [
+    {
+      "path": "models/mrt_daily_withdraw.sql",
+      "diff": "@@ -0,0 +1,4 @@\n+select account_id as account_id, sum(amount) as total_amount -- 金額單位:元\n+from {{ ref('stg_txn') }}\n+group by account_id\n+\n",
+      "full_content": "select account_id as account_id, sum(amount) as total_amount -- 金額單位:元\nfrom {{ ref('stg_txn') }}\ngroup by account_id\n"
+    },
+    {
+      "path": "models/props.yml",
+      "diff": "@@ -0,0 +1,8 @@\n+version: 2\n+models:\n+  - name: mrt_daily_withdraw\n+    description: 每日提領摘要\n+    columns:\n+      - name: total_amount\n+        description: 當日提領合計(元)\n+\n",
+      "full_content": "version: 2\nmodels:\n  - name: mrt_daily_withdraw\n    description: 每日提領摘要\n    columns:\n      - name: total_amount\n        description: 當日提領合計(元)\n"
+    }
+  ],
+  "expected": {
+    "flagged": false,
+    "kind": "normal",
+    "where": []
+  },
+  "_note": "正常:dbt model 與屬性檔"
+}

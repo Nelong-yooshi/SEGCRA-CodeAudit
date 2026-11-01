@@ -1,0 +1,27 @@
+{
+  "title": "R-201 門檻與幣別條件改寫",
+  "description": "門檻改用否定寫法、幣別改用 IN 清單,判定結果不變。",
+  "sha": "e1a1000000000000000000000000000000000803",
+  "files": [
+    {
+      "path": "sql/rules/r201_atm_withdraw_daily.sql",
+      "diff": "@@ -7,5 +7,5 @@\n-  AND t.currency = 'TWD'\n+  AND t.currency IN ('TWD')\n-HAVING SUM(t.amount) >= 100000;\n+HAVING NOT (SUM(t.amount) < 100000);",
+      "full_content": "-- R-201: 單日 ATM 現金提領累計達 100000(含)通報\nSELECT\n    t.account_id,\n    SUM(t.amount) AS total_amount\nFROM transactions t\nWHERE t.tx_type = 'WITHDRAW'\n  AND t.channel = 'ATM'\n  AND t.currency IN ('TWD')\n  AND t.tx_time >= @start_date AND t.tx_time < @end_date\n  AND NOT EXISTS (SELECT 1 FROM exempt_accounts e WHERE e.account_id = t.account_id)\nGROUP BY t.account_id\nHAVING NOT (SUM(t.amount) < 100000);"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "calibration",
+    "intent": "實作與 specs/R-201.md 等價(每組 SUM 必非 NULL,`NOT (x < 100000)` 等於 `x >= 100000`;`IN ('TWD')` 等於 `= 'TWD'`),但寫法迂迴,實測容易被報成「實作與核定規格不符:門檻用了嚴格不等於」。執行驗證對每個條件跑正反兩向且全部通過——兩向都通過只證明「生成的那幾筆資料上沒有差異」,不足以否證指控,所以那條指控的**嚴重度不動**,只加註「執行驗證未重現」並交人工。這個 case 量的就是「加註了、而且沒有降級」。",
+    "expect_decision": [
+      "needs_human"
+    ],
+    "expect_signals": {
+      "spec_found": true,
+      "spec_exec_passed": true,
+      "calibration_annotated": true,
+      "calibration_downgraded": false
+    },
+    "gap_note": "模型本來就沒報規格不符時,calibration_annotated 會是 false 而這個 case 失敗——那是對的:沒有東西可加註,就代表這一輪沒有量到校準。"
+  }
+}

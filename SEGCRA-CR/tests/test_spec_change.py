@@ -15,6 +15,8 @@ import json
 
 import pytest
 
+from orchestrator.spec_exec import SpecLookup
+
 from orchestrator import pipeline, spec_exec
 from orchestrator.config import load_config
 from toolbox import gitlab
@@ -422,7 +424,7 @@ def test_受影響的model對規格時_也用這次MR的版本(monkeypatch):
 
     async def fake_find_spec(hub, target, **kw):
         calls.append(kw)
-        return "R-201", "原本的規格"
+        return SpecLookup("R-201", "原本的規格")
 
     monkeypatch.setattr(pipeline, "find_spec", fake_find_spec)
     find = pipeline._find_spec_in_mr(_mr({**SPEC_FILE, "full_content": MR_SPEC}))

@@ -33,6 +33,21 @@ profiles:
     num_ctx: 32768
     temperature: 0.1
     max_output_tokens: 8192
+  cold_read:             # 冷讀(orchestrator/cold_read.py):只輸出一行 JSON。**不思考**(reasoning_effort: none)。
+                         # 2026-10-24 實測(gemma4:31b,共用 GPU 主機,eval/run_cold_read.py):思考開與關的判定完全相同
+                         # (golden 15 題:指令型 9/9、主張型 3/3、正常 0 誤報,位置全對;公開題 30 題 0 誤報),
+                         # 每份時間中位數 golden 50 → 12 秒、公開題 76 → 29 秒,沒看完、輸出被截斷都是 0。
+                         # 換模型或改 prompt 時重量一次(都要連端點):
+                         #   .venv/bin/python eval/run_cold_read.py                        # 命中率(golden)
+                         #   .venv/bin/python eval/run_cold_read.py --normal <公開題 ...>   # 誤報率
+                         #   前面加 LLM_REASONING_EFFORT= (空字串:不送這個參數,用端點預設)量思考開著的對照
+                         # 只改冷讀的思考請改這裡;LLM_REASONING_EFFORT 會改到所有 profile(含測資生成)
+    model: gemma4:31b
+    num_ctx: 32768       # 冷讀拿它當端點實際的上下文(送出前的上限、送出後判斷有沒有被截掉):要跟端點的設定一致
+    temperature: 0
+    seed: 42
+    max_output_tokens: 896
+    reasoning_effort: none
   fast:                  # 開發迭代用;可換更小的模型(如 qwen3:8b),先 ollama pull
     model: gpt-oss:20b
     num_ctx: 16384
@@ -48,6 +63,7 @@ profiles:
 roles:
   testgen: testgen     # 角色一:測資生成(輸出上限 12288,不是 review 的 8192)
   arbiter: review      # 角色三:仲裁(mismatch 時判定測資錯還是 SQL 錯)
+  cold_read: cold_read # 冷讀:只看 MR 文字,判斷有沒有在對審查者說話
 
 # 為什麼測資生成要單獨一個 profile:
 #   8192 是**我們寫的**上限,不是模型的。實測(2026-10-13,gemma4:31b via gate):
@@ -74,6 +90,8 @@ budget:
   spec: 3000
   memory: 2000
   tool_result_max_chars: 6000   # 單次工具回傳超過即截斷
+  cold_read: 12000      # 冷讀的輸入(標題、說明、每個檔案的改動,最後是全文;用偏高的估計算,中文一字至少 1 token)。
+                        # 超過的部分不送,記成「冷讀沒有看完」;實際用量也不超過 cold_read 的 num_ctx 扣掉輸出與 system prompt
 
 # 決策閘門:審查完的 MR 走哪條路(auto_approved / needs_human / blocked)
 policy:
