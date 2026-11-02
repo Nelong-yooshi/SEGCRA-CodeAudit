@@ -69,8 +69,8 @@ def test_全部符合時回None並附上沙盒耗時(monkeypatch):
 
 def test_凍結檔要記下呼叫次數與耗時(tmp_path, monkeypatch):
     """為什麼存進檔案而不是只印出來:這些數字決定「哪些規格適合線上現場生」與
-    「上限該訂多少」,不該每次要用就重跑一輪(大規格一輪 70 分鐘);黑盒評測也要
-    「記下每份規格花多久」(#45 的討論)。"""
+    「上限該訂多少」,不該每次要用就重跑一輪(大規格一輪 70 分鐘);評測也要
+    記下每份規格花多久。"""
     import json as _json
     import sys as _sys
     from pathlib import Path as _Path
