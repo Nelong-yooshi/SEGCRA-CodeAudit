@@ -153,3 +153,62 @@ def test_切句不需要在函式裡匯入():
     src = inspect.getsource(sqltools.statement_chunks) + inspect.getsource(
         sqltools._semicolon_cuts)
     assert "import" not in src
+
+
+# ─────────── 沒有分號的多句(#105 第 1 點)───────────
+#
+# `DELETE FROM t` 換行接 `SELECT 1 AS x`,兩句都正確但沒有分號。整份當成一句就解析
+# 不了,於是一條 AST 規則都不跑 —— 那句 DELETE 沒有 WHERE 的 blocker 也跟著不見。
+# 部署端的 dbt model 是一個檔一句碰不到,但 T-SQL 不寫分號很常見。
+
+@pytest.mark.parametrize("sql,rules", [
+    ("DELETE FROM t\nSELECT 1 AS x", ["R001"]),
+    ("UPDATE t SET a = 1\nDELETE FROM u", ["R001", "R001"]),
+    ("SELECT 1 AS x\nDELETE FROM t", ["R001"]),
+    ("DELETE FROM a;\nDELETE FROM b\nSELECT 1 AS x", ["R001", "R001"]),  # 混著分號
+    ("delete from t\nselect 1 as x", ["R001"]),                          # 小寫
+])
+def test_沒有分號也切得開(sql, rules):
+    out, hits = _out(sql)
+    assert not (isinstance(out, dict) and out.get("error")), out
+    assert [h["rule"] for h in hits if h["rule"] == "R001"] == rules
+
+
+@pytest.mark.parametrize("sql", [
+    "INSERT INTO t\nSELECT 1",                      # 延續寫法:SELECT 是 INSERT 的一部分
+    "SELECT 1\nUNION ALL\nSELECT 2",
+    "DELETE FROM t\nWHERE x = 1",                   # WHERE 另起一行
+    "WITH c AS (SELECT 1)\nSELECT * FROM c",
+    "SELECT 'a\nDELETE FROM t'",                    # 字串裡的關鍵字
+    "SELECT 1 AS x\n-- DELETE FROM t\nFROM t",     # 註解裡的關鍵字
+])
+def test_正常寫法不會被切錯(sql):
+    """只在**解析不了**時才試關鍵字切,而這些本來就解析得過 —— 根本走不到那一步。"""
+    out, hits = _out(sql)
+    assert not (isinstance(out, dict) and out.get("error")), out
+    assert [h for h in hits if h["rule"] == "R001"] == []
+
+
+def test_切完還是解析不了就當作沒切過():
+    """不要把「一句壞掉」變成「好幾句壞掉」:每一段都解析得過才採用。"""
+    out, _ = _out("DELETE FROM t\nSELECT * FROM ((((")
+    assert isinstance(out, dict) and out.get("error"), "整段仍然記成解析失敗"
+
+
+def test_關鍵字切句也只有一份():
+    """三處(規則層、行號對回、受影響比較)共用 parsed_chunks。"""
+    from orchestrator import dbt_affected, pipeline
+    from toolbox import sqltools
+
+    sql = "DELETE FROM t\nSELECT 1 AS x"
+    assert len(sqltools.parsed_chunks(sql)) == 2
+    assert len(dbt_affected._statement_keys(sql)) == 2
+    assert len(pipeline._rendered_starts(sql) or {}) == 2
+
+
+def test_只切出一段不算切過():
+    """切出來只有一段,等於沒切 —— 照舊回報那一段解析失敗,不要換一個位置重報一次。"""
+    from toolbox.sqltools import _split_by_keyword
+
+    assert _split_by_keyword("\nSELECT 1 AS x", 0) is None
+    assert _split_by_keyword("DELETE FROM t\nSELECT 1 AS x", 0) is not None

@@ -2458,8 +2458,8 @@ MUTANTS.update({
  # 內文就是它 —— 一樣會貼回 MR 留言、寫進 review_output/。要防的是「帶出原文」,
  # 跟那段原文像不像密碼無關,所以只留位置(用樣式遮只遮得到樣式認得的寫法)。
  "解析失敗:錯誤訊息照用 sqlglot 的原文": ("../toolbox/sqltools.py",
-     "            return [], parse_error_text(e)",
-     '            return [], f"parse failed: {e}"'),
+     "            errors.append(parse_error_text(err, chunk.line_offset))",
+     '            errors.append(f"parse failed: {err}")'),
  "解析失敗:連 sqlglot 的描述一起帶出來": ("../toolbox/sqltools.py",
      '            spots.append(f"第 {d[\'line\'] + line_offset} 行第 {d.get(\'col\', \'?\')} 欄")',
      '            spots.append(f"第 {d[\'line\']} 行 {d.get(\'description\', \'\')}")'),
@@ -2823,18 +2823,12 @@ MUTANTS.update({
      '            yield h, found[used[key]]',
      '            yield h, found[0]'),
  # 切語句只略過「切不出來」;程式自己的錯往外丟(環節隔離記成未完整)
- "行號:切語句時程式的錯也吞掉": ("pipeline.py",
-     "        except (SqlglotError, RecursionError):\n            return None",
-     "        except Exception:\n            return None"),
- "行號:巢狀太深往外丟": ("pipeline.py",
-     "        except (SqlglotError, RecursionError):   # 這一句不寫行號,其他句照寫",
-     "        except SqlglotError:   # 這一句不寫行號,其他句照寫"),
- "受影響:切語句時程式的錯也吞掉": ("dbt_affected.py",
-     "    except (SqlglotError, RecursionError):   # 切不出來就只能整個 model 合計比較",
-     "    except Exception:"),
- "受影響:切語句時巢狀太深往外丟": ("dbt_affected.py",
-     "    except (SqlglotError, RecursionError):   # 切不出來就只能整個 model 合計比較",
-     "    except SqlglotError:"),
+ # 「程式的錯也吞掉」「巢狀太深」現在由 sqltools.parsed_chunks 的 catch 決定,
+ # 突變點放在那裡(切句:…),這裡不重複列:同一個判斷只該有一個突變點。
+ "受影響:壞掉的那一句不留位置(後面的句子全部錯位)": ("dbt_affected.py",
+     "            keys.append(None)                    # 這一句比不了,但位置要留著\n"
+     "            continue",
+     "            continue"),
  "留言:沒有行號也開行內討論": ("../toolbox/gitlab.py",
      "        if isinstance(line, bool) or not isinstance(line, int) or line <= 0:",
      "        if False:"),
@@ -2855,9 +2849,9 @@ MUTANTS.update({
      '            continue',
      '        if False:\n            continue'),
  "行號:一句解析失敗就整份不寫(連好的那幾句也沒有)": ("pipeline.py",
-     '        except (SqlglotError, RecursionError):   # 這一句不寫行號,其他句照寫\n'
-     '            continue',
-     '        except (SqlglotError, RecursionError):\n            return None'),
+     "        if err is not None:                  # 這一句不寫行號,其他句照寫\n"
+     "            continue",
+     "        if err is not None:\n            return None"),
  # dbt 樣板展開後的命中:經對應表對回原始檔
  "行號對回:近似對齊的對應表也用": ("pipeline.py",
      '    return rendered.line_map if rendered.map_method == "sentinel" and rendered.line_map else None',
@@ -2906,10 +2900,9 @@ MUTANTS.update({
  "行號對回:預掃沒記對應表": ("pipeline.py",
      "                           prescan(hub, mr[\"files\"], cfg.dbt, dbt_ctx, rendered, line_maps), [])",
      "                           prescan(hub, mr[\"files\"], cfg.dbt, dbt_ctx, rendered, None), [])"),
- "行號:只有註解的語句也算": ("pipeline.py",
-     '            statements = [st for st in parse_statements(chunk.text) if st is not None\n'
-     '                          and not isinstance(st, exp.Semicolon)]',
-     '            statements = [st for st in parse_statements(chunk.text) if st is not None]'),
+ # 「只有註解的語句也算」這個突變點拿掉了:逐句解析之後,只有註解的那一段結果是
+ # [None],`st is not None` 已經濾掉,原本多排除的 exp.Semicolon 是死碼(整份一次
+ # 解析的時代才會出現)。死碼的突變抓不到,也不該為了抓它而留著死碼。
  "行號:檔案與預掃結果對不上也寫": ("pipeline.py",
      '        if (not isinstance(f, dict) or entry.get("path") != f.get("path")',
      '        if (not isinstance(f, dict)'),
@@ -4839,18 +4832,40 @@ TOOLS = "../toolbox/sqltools.py"
 MUTANTS.update({
  "逐句:整份一次解析(一句壞掉就全部不檢查)": (TOOLS,
      "    chunks = statement_chunks(sql)" + NL
-     + "    if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析",
+     + "    if not chunks:" + NL
+     + "        chunks = ([Chunk(sql, 0, _first_token(sql, 0, len(sql)))]",
      "    chunks = []" + NL
-     + "    if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析"),
+     + "    if not chunks:" + NL
+     + "        chunks = ([Chunk(sql, 0, _first_token(sql, 0, len(sql)))]"),
  "逐句:一句壞掉就放棄其餘的句子": (TOOLS,
-     "        except Exception as e:           # noqa: BLE001" + NL
-     + "            errors.append(parse_error_text(e, line_offset))",
-     "        except Exception as e:           # noqa: BLE001" + NL
-     + "            return statements, parse_error_text(e, line_offset)"),
+     "        else:                            # noqa: BLE001 — 解析失敗不中斷預掃" + NL
+     + "            errors.append(parse_error_text(err, chunk.line_offset))",
+     "        else:" + NL
+     + "            return statements, parse_error_text(err, chunk.line_offset)"),
  "逐句:用字串 split 切句(字串與註解裡的分號會切錯)": (TOOLS,
-     "    cuts, i, n = [], 0, len(sql)",
-     '    return [i + 1 for i, ch in enumerate(sql) if ch == ";"]' + NL
-     + "    cuts, i, n = [], 0, len(sql)"),
+     '    return [i + 1 for i, ch in _scan_code(sql) if ch == ";"]',
+     '    return [i + 1 for i, ch in enumerate(sql) if ch == ";"]'),
+ # 沒有分號的多句 T-SQL(#105 第 1 點)
+ "無分號:整份當一句,不以關鍵字再切": (TOOLS,
+     "        pieces = _split_by_keyword(chunk.text, chunk.line_offset)",
+     "        pieces = None"),
+ "無分號:切完沒有全部解析得過也採用": (TOOLS,
+     "        except (SqlglotError, RecursionError):   # 有一段解析不了就當作沒切過" + NL
+     + "            return None",
+     "        except (SqlglotError, RecursionError):" + NL
+     + "            pass"),
+ "無分號:行中的關鍵字也切(WHERE x IN (SELECT …) 會被切斷)": (TOOLS,
+     '            if ch == "\\n" and _KEYWORD_LINE_RE.match(sql, i + 1)]',
+     "            if _KEYWORD_LINE_RE.match(sql, i)]"),
+ "無分號:只切出一段也算切過": (TOOLS,
+     "    if len(out) < 2:" + NL + "        return None",
+     "    if False:" + NL + "        return None"),
+ "切句:程式自己的錯也當成解析不了": (TOOLS,
+     "def parsed_chunks(sql: str, catch=(SqlglotError, RecursionError)",
+     "def parsed_chunks(sql: str, catch=Exception"),
+ "切句:巢狀太深往外丟(整份審查中斷)": (TOOLS,
+     "def parsed_chunks(sql: str, catch=(SqlglotError, RecursionError)",
+     "def parsed_chunks(sql: str, catch=(SqlglotError,)"),
  "逐句:沒收尾的引號讓整份退回一次解析": (TOOLS,
      "    cuts = _semicolon_cuts(sql)",
      "    from sqlglot.tokens import Tokenizer, TokenType" + NL
@@ -4869,8 +4884,8 @@ MUTANTS.update({
  # 所以找到的分號位置也一樣 —— 20 萬組隨機輸入比對過,沒有一組不同。留著只會得到
  # 一個永遠抓不到的突變點。
  "逐句:行號不加上這一句的起始行": (TOOLS,
-     "            errors.append(parse_error_text(e, line_offset))",
-     "            errors.append(parse_error_text(e))"),
+     "            errors.append(parse_error_text(err, chunk.line_offset))",
+     "            errors.append(parse_error_text(err))"),
  "逐句:解析失敗的句子不記成解析錯誤": (TOOLS,
      "    if not errors:" + NL + "        return statements, None",
      "    return statements, None" + NL + "    if not errors:" + NL

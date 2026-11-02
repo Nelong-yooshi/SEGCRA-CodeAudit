@@ -14,10 +14,6 @@ from typing import NamedTuple
 
 from pathlib import Path
 
-import sqlglot
-from sqlglot import exp
-from sqlglot.errors import SqlglotError
-from sqlglot.tokens import TokenType
 
 from .agent import MAX_ITERATIONS, extract_json, output_truncated, run_agent
 from .config import (DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, env_seconds,
@@ -45,7 +41,7 @@ from .spec_exec import SpecLookup, find_spec, run_spec_exec
 from .tool_hub import ToolHub
 from toolbox.sqltools import LINT_INCOMPLETE_CODE, LINT_MAX_CHARS, LINT_TIMEOUT_SECONDS
 from toolbox.sqltools import run_rules
-from toolbox.sqltools import DIALECT, parse_statements, statement_chunks
+from toolbox.sqltools import DIALECT, parse_statements, parsed_chunks
 
 SYSTEM_TEMPLATE = """你是資深資料庫工程主管,負責審查 SQL merge request。\
 你的審查將直接決定 MR 能否合入,必須精準、可回溯、給得出修改建議。
@@ -2803,28 +2799,13 @@ def _rendered_starts(sql: str) -> dict | None:
 
     一句都切不出來(整份就是一句、而且解析不了)回 None、不寫行號;其他例外是程式的錯,
     往外丟,由呼叫端的環節隔離記成未完整,不默默變成 0。"""
-    chunks = statement_chunks(sql)
-    if not chunks:                           # 整份就是一句
-        try:
-            statements = [st for st in parse_statements(sql) if st is not None
-                          and not isinstance(st, exp.Semicolon)]
-        except (SqlglotError, RecursionError):
-            return None
-        if len(statements) != 1:
-            return None
-        chunks, statements_by_chunk = [], None
-        full = statements[0].sql(dialect=DIALECT)
-        start = len(sql) - len(sql.lstrip())
-        line_start = sql.rfind("\n", 0, start) + 1
-        return {full[:200]: [(sql.count("\n", 0, start) + 1, full,
-                              not sql[line_start:start].strip(), 1)]}
     by_text: dict[str, list] = {}
-    for n, chunk in enumerate(chunks, 1):
-        try:
-            statements = [st for st in parse_statements(chunk.text) if st is not None
-                          and not isinstance(st, exp.Semicolon)]
-        except (SqlglotError, RecursionError):   # 這一句不寫行號,其他句照寫
+    for n, (chunk, parsed, err) in enumerate(parsed_chunks(sql), 1):
+        if err is not None:                  # 這一句不寫行號,其他句照寫
             continue
+        # 只有註解的那一段,逐句解析的結果是 [None],`st is not None` 就濾掉了 ——
+        # 不必再排除分號節點(整份一次解析的時代才需要)。
+        statements = [st for st in parsed if st is not None]
         if len(statements) != 1:   # 一段切出兩句以上:對不準是哪一句,寧可不寫
             continue
         full = statements[0].sql(dialect=DIALECT)
@@ -2832,7 +2813,7 @@ def _rendered_starts(sql: str) -> dict | None:
         alone = not sql[line_start:chunk.start].strip()
         by_text.setdefault(full[:200], []).append(
             (sql.count("\n", 0, chunk.start) + 1, full, alone, n))
-    return by_text
+    return by_text or None
 
 
 _TAG_OPENERS = ("{{", "{%", "{#")

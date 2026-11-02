@@ -11,6 +11,7 @@ from typing import NamedTuple
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.errors import SqlglotError
 
 from orchestrator.config import env_seconds
 from orchestrator.isolation import run_isolated
@@ -51,23 +52,17 @@ def _skip_block_comment(sql: str, i: int, end: int) -> int:
     return i
 
 
-def _semicolon_cuts(sql: str) -> list[int]:
-    """分號的位置(切在分號**後面**)。字串、識別字、註解裡的分號不算。
+def _scan_code(sql: str):
+    """逐一吐出「不在字串、識別字、註解裡」的位置與字元:`(位置, 字元)`。
 
-    **自己掃而不是用 sqlglot 的 tokenizer**:斷詞對沒收尾的引號或區塊註解會整個
-    失敗,而那正是這道要擋的手法 —— 在檔尾加一個 `'` 或 `/*`,整份就退回一次解析,
-    前面那句 `DELETE FROM t;` 的 blocker 又不見了,比巢狀運算式更容易做出來。
-
-    沒收尾的就吃到檔尾:那一段變成最後一「句」,解析失敗記成錯誤,**前面的句子照樣
-    逐句解析**。切錯的代價也只是那一段解析不了,不會吃掉別句。
+    切句的兩個掃描器(分號、行首關鍵字)共用這一份:字串常值、`[...]`/`"..."` 識別字、
+    行註解與可巢狀的區塊註解整段跳過,沒收尾的就吃到檔尾。各寫一份的話,補了一邊的
+    跳脫規則就會漏掉另一邊。
     """
-    cuts, i, n = [], 0, len(sql)
+    i, n = 0, len(sql)
     while i < n:
         ch = sql[i]
-        if ch == ";":
-            cuts.append(i + 1)
-            i += 1
-        elif ch == "'":                      # 字串('' 是跳脫,不是結束)
+        if ch == "'":                        # 字串('' 是跳脫,不是結束)
             i += 1
             while i < n:
                 if sql[i] == "'":
@@ -80,14 +75,27 @@ def _semicolon_cuts(sql: str) -> list[int]:
         elif ch in '"[':                     # 以引號或方括號包起來的識別字
             j = sql.find('"' if ch == '"' else "]", i + 1)
             i = n if j < 0 else j + 1
-        elif sql.startswith("--", i):        # 行註解
+        elif sql.startswith("--", i):        # 行註解:停在換行上,換行本身還要看得到
             j = sql.find("\n", i)
-            i = n if j < 0 else j + 1
+            i = n if j < 0 else j
         elif sql.startswith("/*", i):        # 區塊註解(T-SQL 可以巢狀)
             i = _skip_block_comment(sql, i, n)
         else:
+            yield i, ch
             i += 1
-    return cuts
+
+
+def _semicolon_cuts(sql: str) -> list[int]:
+    """分號的位置(切在分號**後面**)。字串、識別字、註解裡的分號不算。
+
+    **自己掃而不是用 sqlglot 的 tokenizer**:斷詞對沒收尾的引號或區塊註解會整個
+    失敗,而那正是這道要擋的手法 —— 在檔尾加一個 `'` 或 `/*`,整份就退回一次解析,
+    前面那句 `DELETE FROM t;` 的 blocker 又不見了,比巢狀運算式更容易做出來。
+
+    沒收尾的就吃到檔尾:那一段變成最後一「句」,解析失敗記成錯誤,**前面的句子照樣
+    逐句解析**。切錯的代價也只是那一段解析不了,不會吃掉別句。
+    """
+    return [i + 1 for i, ch in _scan_code(sql) if ch == ";"]
 
 
 class Chunk(NamedTuple):
@@ -137,6 +145,96 @@ def statement_chunks(sql: str) -> list[Chunk]:
             out.append(Chunk(chunk, sql.count("\n", 0, start),
                              _first_token(sql, start, cut)))
         start = cut
+    return out
+
+
+# 語句開頭的關鍵字。**沒有分號的多句**要靠它們切:`DELETE FROM t` 換行接
+# `SELECT 1 AS x`,兩句都正確但沒有分號,整份當成一句就解析不了 —— 於是一條 AST 規則
+# 都不跑,那句 `DELETE` 沒有 WHERE 的 blocker 也跟著不見。T-SQL 不寫分號很常見。
+_STMT_KEYWORDS = (
+    "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "TRUNCATE",
+    "CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "DENY", "BACKUP", "RESTORE",
+    "EXEC", "EXECUTE", "DECLARE", "SET", "PRINT", "USE", "IF", "WHILE", "BEGIN",
+)
+# `.match(sql, i)` 本身就從 i 開始比,不要加 `^`:沒有 MULTILINE 時 `^` 只在整份的
+# 開頭才成立,加了就等於永遠不切。
+_KEYWORD_LINE_RE = re.compile(r"(?i)[ \t]*(?:" + "|".join(_STMT_KEYWORDS) + r")\b")
+
+
+def _keyword_cuts(sql: str) -> list[int]:
+    """每一行的開頭位置,**而且那一行以語句關鍵字開頭、又不在字串或註解裡**。
+
+    只認「行首」而不是任何位置:在行中認關鍵字會把 `WHERE x IN (SELECT …)` 切斷。
+    """
+    return [i + 1 for i, ch in _scan_code(sql)
+            if ch == "\n" and _KEYWORD_LINE_RE.match(sql, i + 1)]
+
+
+def _split_by_keyword(text: str, line_offset: int) -> list[Chunk] | None:
+    """解析不了的一段,改以行首的語句關鍵字再切一次;**每一段都解析得過才算數**。
+
+    **只在解析失敗時才試**,而且全部解析得過才採用:正常寫法(`INSERT INTO t` 換行接
+    `SELECT …`、`UNION ALL`、CTE、`MERGE … WHEN MATCHED THEN UPDATE`)本來就解析得過,
+    根本不會走到這裡 —— 所以切錯把它們拆散的風險不存在。切完還是有一段解析不了的,
+    就當作沒切過,照舊回報那一段解析失敗,不會把「一句壞掉」變成「好幾句壞掉」。
+    """
+    cuts = _keyword_cuts(text)
+    if not cuts:
+        return None
+    out, start = [], 0
+    for cut in list(cuts) + [len(text)]:
+        piece = text[start:cut]
+        if piece.strip(" \t\r\n;"):
+            out.append(Chunk(piece, line_offset + text.count("\n", 0, start),
+                             _first_token(text, start, cut)))
+        start = cut
+    if len(out) < 2:
+        return None
+    for chunk in out:
+        try:
+            if not [st for st in parse_statements(chunk.text) if st is not None]:
+                return None
+        except (SqlglotError, RecursionError):   # 有一段解析不了就當作沒切過
+            return None
+    return out
+
+
+def parsed_chunks(sql: str, catch=(SqlglotError, RecursionError)
+                  ) -> list[tuple[Chunk, list, Exception | None]]:
+    """切句 + 逐句解析,一次做完:[(這一句, 解析出來的語句, 解析失敗的例外或 None)]。
+
+    **三處共用這一個進入點**(預掃的規則層、展開後行號對回原始檔、受影響 model 的
+    比較):切句與「解析不了時怎麼辦」只留一份,補一處不會漏掉另外兩處。
+
+    兩層:先依分號切;某一段解析不了,再試著以行首的語句關鍵字切開(沒有分號的多句
+    T-SQL),每一段都解析得過才採用。兩層都不行,那一段就記成解析失敗 —— 失敗只影響
+    那一段,其他句照常。
+
+    整份連一個分號都沒有時也走同一條路:整份當成一段,解析不了就試關鍵字切。
+
+    `catch` 是「算是解析不了」的例外種類,預設只收解析器自己的錯與遞迴太深 ——
+    **程式自己的錯(AttributeError 之類)要往外丟**,由呼叫端的環節隔離記成未完整,
+    不默默變成「這一句沒有命中」。預掃那一層放寬成 `Exception`:它不能因為一句壞掉
+    就中斷整份審查。
+    """
+    chunks = statement_chunks(sql)
+    if not chunks:
+        chunks = ([Chunk(sql, 0, _first_token(sql, 0, len(sql)))]
+                  if sql.strip(" \t\r\n;") else [])
+    out = []
+    for chunk in chunks:
+        try:
+            out.append((chunk, parse_statements(chunk.text), None))
+            continue
+        except catch as e:
+            err = e
+        pieces = _split_by_keyword(chunk.text, chunk.line_offset)
+        if pieces is None:
+            out.append((chunk, [], err))
+            continue
+        for piece in pieces:                        # 上面已經確認每一段都解析得過
+            out.append((Chunk(piece.text, piece.line_offset, chunk.start + piece.start),
+                        parse_statements(piece.text), None))
     return out
 
 
@@ -631,18 +729,12 @@ def _parse_each_statement(sql: str):
 
     說明只留位置:它會變成 finding 的內文、貼回 MR 留言(見 parse_error_text)。
     """
-    chunks = statement_chunks(sql)
-    if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析
-        try:
-            return parse_statements(sql), None
-        except Exception as e:           # noqa: BLE001 — 解析失敗不中斷預掃
-            return [], parse_error_text(e)
     statements, errors = [], []
-    for chunk, line_offset, _ in chunks:
-        try:
-            statements.extend(parse_statements(chunk))
-        except Exception as e:           # noqa: BLE001
-            errors.append(parse_error_text(e, line_offset))
+    for chunk, parsed, err in parsed_chunks(sql, catch=Exception):
+        if err is None:
+            statements.extend(parsed)
+        else:                            # noqa: BLE001 — 解析失敗不中斷預掃
+            errors.append(parse_error_text(err, chunk.line_offset))
     if not errors:
         return statements, None
     shown = list(dict.fromkeys(errors))[:_MAX_PARSE_ERRORS]

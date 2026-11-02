@@ -281,9 +281,11 @@ def test_一段切出兩句以上時那一段不寫行號(monkeypatch):
     """對不準是哪一句,寧可不寫 —— 但只影響那一段,其他句照寫。"""
     import sqlglot
 
-    real = pipeline.parse_statements
+    from toolbox import sqltools
+
+    real = sqltools.parse_statements
     monkeypatch.setattr(
-        pipeline, "parse_statements",
+        sqltools, "parse_statements",
         lambda sql: ([sqlglot.parse_one("SELECT 0", dialect="tsql"), *real(sql)]
                      if "accounts" in sql else real(sql)))
     starts = _rendered_starts(TWO_DELETES)

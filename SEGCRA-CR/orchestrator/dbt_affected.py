@@ -32,14 +32,13 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 
-from sqlglot.errors import SqlglotError
 
 from .config import DBT_DATABASE_PLACEHOLDER
 from .dbt_context import DbtContext
 from .dbt_impact import ImpactReport
 from .dbt_render import DEFAULT_ISOLATED_TIMEOUT_S, render_model_isolated
 from toolbox.gitlab import UNAVAILABLE_TEXT
-from toolbox.sqltools import DIALECT, parse_statements, statement_chunks
+from toolbox.sqltools import DIALECT, parsed_chunks
 
 MAX_CHECKED_MODELS = 50
 MAX_SPEC_LOOKUPS = 20          # 規格逐一向 GitLab 探測,數量另外設限
@@ -390,21 +389,13 @@ def _statement_keys(sql: str) -> list[str | None] | None:
     看不出來。壞掉的那一句用 None 佔位,位置照樣對得齊,其他句照常逐句比。
 
     一句都切不出來(整份就是一句、而且解析不了)才回 None。"""
-    chunks = statement_chunks(sql)
-    if not chunks:
-        try:
-            return [st.sql(dialect=DIALECT)[:200] for st in parse_statements(sql)
-                    if st is not None]
-        except (SqlglotError, RecursionError):   # 切不出來就只能整個 model 合計比較
-            return None
     keys: list[str | None] = []
-    for chunk in chunks:
-        try:
-            keys.extend(st.sql(dialect=DIALECT)[:200] for st in parse_statements(chunk.text)
-                        if st is not None)
-        except (SqlglotError, RecursionError):
+    for _chunk, parsed, err in parsed_chunks(sql):
+        if err is not None:
             keys.append(None)                    # 這一句比不了,但位置要留著
-    return keys
+            continue
+        keys.extend(st.sql(dialect=DIALECT)[:200] for st in parsed if st is not None)
+    return keys or None                          # 一句都切不出來:只能整個 model 合計比較
 
 
 # ------------------------------------------------------------------ 整理成一條 finding
