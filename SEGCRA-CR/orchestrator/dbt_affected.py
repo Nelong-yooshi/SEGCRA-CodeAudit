@@ -24,10 +24,8 @@ macro 反查(dbt_context 準備好的 ImpactReport)只說「哪些 model 受影�
     剩下的時間;時間到了還沒做完的 model 記成沒有檢查、沒查規格
 """
 import asyncio
-import contextvars
 import dataclasses
 import re
-import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -38,6 +36,7 @@ from .config import DBT_DATABASE_PLACEHOLDER
 from .dbt_context import DbtContext
 from .dbt_impact import ImpactReport
 from .dbt_render import DEFAULT_ISOLATED_TIMEOUT_S, render_model_isolated
+from .isolation import run_in_thread
 from toolbox.gitlab import UNAVAILABLE_TEXT
 from toolbox.sqltools import DIALECT, _parse
 
@@ -232,34 +231,12 @@ async def _spec_for(hub, ctx: DbtContext, rel: str, find_spec, specs: dict,
 
 
 async def _wait_in_thread(make_coroutine, seconds: float):
-    """在一條背景(daemon)執行緒裡用自己的事件迴圈跑 make_coroutine(),最多等 seconds 秒,
-    逾時丟 asyncio.TimeoutError。
-
-    不用 asyncio.to_thread:那會用預設的執行緒池,審查結束時 asyncio.run 會等池裡卡住的
-    執行緒跑完,時間上限就守不住。逾時後那條執行緒繼續跑到它自己的請求逾時為止,結果丟掉。
-
-    呼叫端的 contextvars 要一起帶過去(asyncio.to_thread 也是這樣做):新開的執行緒不會繼承,
-    而這次審查釘住的 commit(toolbox.gitlab 的 review_ref)就存在 ContextVar 裡,讀不到時
-    get_file 會回「無法取得審查中的版本」,受影響的 model 就全部查不到規格。"""
-    loop = asyncio.get_running_loop()
-    done = loop.create_future()
-
-    def deliver(setter, value):
-        if not done.done():
-            setter(value)
-
-    def work():
-        try:
-            outcome = (done.set_result, asyncio.run(make_coroutine()))
-        except BaseException as e:            # noqa: BLE001 — 交回原本的事件迴圈處理
-            outcome = (done.set_exception, e)
-        try:
-            loop.call_soon_threadsafe(deliver, *outcome)
-        except RuntimeError:
-            pass                               # 原本的事件迴圈已經結束:沒有人在等了
-
-    threading.Thread(target=contextvars.copy_context().run, args=(work,), daemon=True).start()
-    return await asyncio.wait_for(done, seconds)
+    """在一條背景執行緒裡用自己的事件迴圈跑 make_coroutine(),最多等 seconds 秒,逾時丟
+    asyncio.TimeoutError(見 isolation.run_in_thread:daemon 執行緒、帶上 contextvars——審查釘住的
+    commit 讀不到時 get_file 會回「無法取得審查中的版本」,受影響的 model 就全部查不到規格)。
+    逾時後那條執行緒繼續跑到它自己的請求逾時為止,結果丟掉。"""
+    return await asyncio.wait_for(
+        run_in_thread(lambda: asyncio.run(make_coroutine()), name="dbt-affected-spec"), seconds)
 
 
 async def _compare(hub, rel: str, dbt_cfg: dict, ctx: DbtContext, render, deadline, clock):

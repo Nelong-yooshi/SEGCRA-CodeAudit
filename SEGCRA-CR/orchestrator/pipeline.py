@@ -1919,7 +1919,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         #
         # 失敗或逾時要看得出是哪一個階段:run_spec_exec 把現在在跑哪一段寫進 progress,
         # 逾時是外層丟的、它看不到裡面,所以只能這樣問。沙盒階段另外收一個截止時間——
-        # 它是同步呼叫,wait_for 插不進去(見 spec_exec._in_thread)。
+        # 它是同步呼叫,wait_for 插不進去(見 isolation.run_in_thread)。
         clock.lap("postprocess")
         progress: dict = {}
         # 上限不超過整份的截止時間(見 _stage_limit);沙盒階段的截止時間跟著縮

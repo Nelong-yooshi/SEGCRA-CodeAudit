@@ -599,12 +599,12 @@ MUTANTS.update({
  # 第 1 點:execute_cases 是同步的 pymssql 呼叫,事件迴圈被它卡住,wait_for 插不進去。
  # 老闆實測:上限 1 秒、沙盒卡 6 秒 → 跑了 6 秒、沒有逾時、結果照常回傳。
  "逾時:沙盒不丟背景執行緒(事件迴圈被卡住)": ("spec_exec.py",
-     "        ex = await _in_thread(_execute, sql, plan, deadline)",
+     '        ex = await run_in_thread(_execute, sql, plan, deadline, name="spec-exec-sandbox")',
      "        ex = _execute(sql, plan, deadline)"),
- "逾時:背景執行緒不是 daemon(結束時會被拖住)": ("spec_exec.py",
-     '    threading.Thread(target=runner, name="spec-exec-sandbox", daemon=True).start()',
-     '    threading.Thread(target=runner, name="spec-exec-sandbox").start()'),
- "逾時:背景執行緒不帶 contextvars(釘住的版本讀不到)": ("spec_exec.py",
+ "逾時:背景執行緒不是 daemon(結束時會被拖住)": ("isolation.py",
+     '    threading.Thread(target=runner, name=name, daemon=True).start()',
+     '    threading.Thread(target=runner, name=name).start()'),
+ "逾時:背景執行緒不帶 contextvars(釘住的版本讀不到)": ("isolation.py",
      "            out = ctx.run(fn, *args)",
      "            out = fn(*args)"),
  "逾時:沙盒不看截止時間(照跑完所有案例)": ("spec_exec.py",
@@ -2765,9 +2765,6 @@ MUTANTS.update({
  'dbt範圍:只改 model 的判斷不用資源目錄設定': ('dbt_context.py',
      '    if all(path_kind(rel, project.model_paths, project.macro_paths, project.resource_paths) == "model"',
      '    if all(path_kind(rel, project.model_paths, project.macro_paths) == "model"'),
- '受影響:查規格的執行緒沒帶 contextvars': ('dbt_affected.py',
-     'threading.Thread(target=contextvars.copy_context().run, args=(work,), daemon=True)',
-     'threading.Thread(target=work, daemon=True)'),
  '專案接線:注入掃描不設總量上限': ('pipeline.py',
      '        if used + size > MAX_EXTRA_SCAN_CHARS:\n            skipped += 1',
      '        if False:\n            skipped += 1'),
@@ -4656,13 +4653,13 @@ MUTANTS.update({
 })
 
 
-# ---- 背景執行緒的收尾(#53 的 _in_thread)
+# ---- 背景執行緒的收尾(isolation.run_in_thread)
 MUTANTS.update({
- "收尾:例外不先綁到自己的變數(lambda 跑的時候 e 已經被刪掉 → 永遠掛著)": (S,
+ "收尾:例外不先綁到自己的變數(lambda 跑的時候 e 已經被刪掉 → 永遠掛著)": ("isolation.py",
      "            exc = e" + NL
-     + "            settle(lambda: fut.cancelled() or fut.set_exception(exc))",
-     "            settle(lambda: fut.cancelled() or fut.set_exception(e))"),
- "收尾:迴圈關掉之後照樣硬丟回去": (S,
+     + "            settle(lambda: fut.done() or fut.set_exception(exc))",
+     "            settle(lambda: fut.done() or fut.set_exception(e))"),
+ "收尾:迴圈關掉之後照樣硬丟回去": ("isolation.py",
      "        try:" + NL
      + "            loop.call_soon_threadsafe(apply)" + NL
      + "        except RuntimeError:                  # 迴圈已經關了" + NL
@@ -4672,9 +4669,9 @@ MUTANTS.update({
  # 碰到沙盒的測試都掛住(20 個檔、900 多條),整個套件撐到工具的逾時 —— 偵測得到,
  # 但不是乾淨的失敗,而逐條加上限不可行。換成同樣有意義、但會立刻失敗的形狀:
  # 結果交回去了,內容卻是空的。
- "收尾:正常的結果換成 None(呼叫端拿到空的)": (S,
-     "        settle(lambda: fut.cancelled() or fut.set_result(out))",
-     "        settle(lambda: fut.cancelled() or fut.set_result(None))"),
+ "收尾:正常的結果換成 None(呼叫端拿到空的)": ("isolation.py",
+     "        settle(lambda: fut.done() or fut.set_result(out))",
+     "        settle(lambda: fut.done() or fut.set_result(None))"),
 })
 
 # ---- 危險 SQL 原語(#41 第 1 點)。每一條問的都是同一件事:放寬之後有沒有測試會紅。

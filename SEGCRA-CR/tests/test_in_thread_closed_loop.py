@@ -1,4 +1,4 @@
-"""沙盒逾時之後,背景執行緒的收尾不得丟例外(#53 的 `_in_thread`)。
+"""沙盒逾時之後,背景執行緒的收尾不得丟例外(共用的 isolation.run_in_thread)。
 
 逾時的時候 `wait_for` 準時回來、審查往下走 —— 那部分是對的。但那個 daemon 執行緒
 還在跑,等它跑完要把結果交回事件迴圈,而那時迴圈可能已經關掉了。
@@ -13,7 +13,11 @@ import time
 
 import pytest
 
-from orchestrator.spec_exec import _in_thread
+from orchestrator.isolation import run_in_thread
+
+
+def _in_thread(fn):
+    return run_in_thread(fn, name="spec-exec-sandbox")
 
 
 def _run_and_abandon(fn, timeout=0.1):

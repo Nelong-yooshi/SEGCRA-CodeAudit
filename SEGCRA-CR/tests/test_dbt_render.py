@@ -1000,7 +1000,8 @@ def _imports_of(path: pathlib.Path) -> set[str]:
     # contextvars:一份審查共用一個 invocation_id(每條執行緒各自一個值),不帶來任何對外能力
     ("dbt_render.py", {"contextvars", "copy", "dataclasses", "difflib", "jinja2", "pathlib", "re",
                        "secrets", "types", ".isolation"}),
-    ("isolation.py", {"multiprocessing", "resource"}),
+    # asyncio、contextvars、threading:把同步呼叫丟到背景執行緒(run_in_thread),不帶來對外能力
+    ("isolation.py", {"asyncio", "contextvars", "multiprocessing", "resource", "threading"}),
     ("dbt_relations.py", {"re", "yaml", ".dbt_render"}),
 ])
 def test_module_imports_are_allowlisted(module, allowed):
