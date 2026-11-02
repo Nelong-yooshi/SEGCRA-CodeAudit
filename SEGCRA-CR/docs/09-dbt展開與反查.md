@@ -552,7 +552,7 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 開啟與回復的步驟、以及不接 GitLab 就能跑的範例,見 README「開啟 dbt 接線」與 `examples/dbt_wiring/`。
 mock 模式下,fixture 目錄若放了 MR 那個 commit 的專案(`<FIXTURES_DIR>/dbt_archives/<commit 編號>/`),
 接線會從那裡取得專案——打包成 GitLab 的形狀後交給同一個 `load_dbt_project`,解壓與檢查走同一條路;
-沒有放就不適用。預設的 `fixtures/` 與 golden set 都沒有放,行為不變。
+沒有放就不適用。預設的 `fixtures/` 沒有放,行為不變;golden set 只有 `mr_413`、`mr_862` 放了(哪些 case 會取回專案由 `tests/test_dbt_wiring_example.py` 鎖住)。
 
 **真實 GitLab 實測**(2026-10-12,測試用 GitLab、只含假資料的專案)。只讀取:不呼叫模型、不寫回
 GitLab;執行的是 `review_mr` 在呼叫模型之前的部分(取 MR → 取回專案 → 預掃 → 反查 → 檢查受影響的
@@ -592,7 +592,7 @@ major。加上非 SQL 檔的處理之後,改由非 SQL 檔的分類與設定比�
 
 **已知限制**
 
-- mock 模式而 fixture 沒有放專案時(預設的 `fixtures/`、golden set):macro 檔仍會被當成 model 展開
+- mock 模式而 fixture 沒有放專案時(預設的 `fixtures/`、golden set 裡沒有放專案的 case):macro 檔仍會被當成 model 展開
   (接線前的行為)。要在 mock 模式看到接線的效果,得照 `examples/dbt_wiring/` 的方式放專案
 - 注入掃描涵蓋 MR、取回的完整內容與預掃展開後的 SQL(會以規則命中的語句、解析錯誤的片段進 prompt);
   受影響 model 的展開結果不進 prompt(只有路徑、規則代號、語句序號),不另外掃。取回的完整內容與展開後的

@@ -457,3 +457,27 @@ def test_模型自己輸出的_dbt_exec_被蓋掉(run, monkeypatch):
                     {"models/mrt_BIG.sql": "SELECT 1 FROM {{ ref('stg_a') }}\n",
                      "models/stg_a.sql": "SELECT 1"})
     assert report["_dbt_exec"]["ok"] is False
+
+
+# ─────────────────── golden set 的 dbt model(mr_413) ───────────────────
+
+def test_golden_的_dbt_model_送進沙盒的是跟_mr_406_相同的_SQL(in_process, monkeypatch):
+    """mr_413 跟 mr_406 是同一份正確的 R-140 SQL,只把表名換成 source():照 golden set 的專案
+    (mock 模式從 eval/golden/dbt_archives/ 取回)展開後,送進沙盒的 SQL 要跟 mr_406 只差在表名
+    換成規格「資料表定義」的寫法。沙盒的結果由評測(凍結測資)驗,這裡不連資料庫。"""
+    import json
+
+    from orchestrator.config import PKG_ROOT
+    from toolbox import gitlab
+    golden = PKG_ROOT / "eval" / "golden"
+    monkeypatch.setattr(gitlab, "FIXTURES_DIR", golden)
+    mr = json.loads((golden / "mr_413.json").read_text(encoding="utf-8"))
+    plain = json.loads((golden / "mr_406.json").read_text(encoding="utf-8"))["files"][0]["full_content"]
+    spec = (PKG_ROOT / "specs" / "R-140.md").read_text(encoding="utf-8")
+    cfg = {"enabled": True, "database": DB}
+    ctx = prepare_dbt_context(mr, cfg, real_mode=False)
+    assert ctx.error is None and ctx.project is not None
+    exec_mr = pipeline._mr_for_spec_exec(mr, ctx)
+    out, record = _dbt_exec_mr(exec_mr, spec, spec, (), ctx, cfg)
+    assert record == {"file": "models/mrt_cash_inbound.sql", "ok": True, "reason": None}
+    assert out["files"][-1]["full_content"] == plain.replace("FROM txn_log t", "FROM [txn_log] t")

@@ -1,0 +1,6 @@
+name: golden_r140
+version: '1.0'
+config-version: 2
+profile: golden
+model-paths: ['models']
+macro-paths: ['macros']
