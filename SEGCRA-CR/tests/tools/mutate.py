@@ -34,6 +34,9 @@ NL = "\n"     # 突變點含多行時用它接,字串裡不寫跳脫比較好讀
 # 程式;其中「每個突變點剛好出現一次」那條在突變後必然失敗(那行已被改掉),若不
 # 排除,**每個突變都會被誤判成被抓到**。
 PYTEST_ARGS = ("-p", "no:cacheprovider", "--ignore=tests/test_mutate_tool.py")
+# 匯入檢查的上限:只 import 一個模組,正常是一兩秒。卡住當成匯入失敗處理比較安全
+# (那本來就不是一個能驗到行為的突變)。
+_IMPORT_TIMEOUT = 120
 
 # 金絲雀:改一行不影響任何行為的註解。它**必須存活**——若連它都被「抓到」,代表
 # 有某個與突變無關的原因讓套件失敗(漏複製檔案、測試互相干擾、工具自己的測試
@@ -3381,6 +3384,12 @@ def _run_mutant(src: pathlib.Path, mutant, python: str, timeout: int, env: dict)
             # 這道防線」,而是這個突變根本沒驗到任何行為。
             return "config", f"突變後的程式無法解析(第 {e.lineno} 行語法錯誤),驗不到任何行為"
         path.write_text(mutated, encoding="utf-8")
+        bad_import = _import_error(tmp, module, python, env)
+        if bad_import:
+            # 語法過得去、**匯入時才壞**的突變(典型是正規式寫壞):模組一匯入就炸,
+            # 於是每個測試檔都收集失敗、每條都紅。那跟語法錯誤是同一回事——沒有任何
+            # 一條測試驗到那個行為,卻看起來像被抓到。歸成設定錯誤,由工具自己擋掉。
+            return "config", f"突變後的模組匯入就失敗({bad_import}),驗不到任何行為"
         try:
             proc = subprocess.run([python, "-m", "pytest", "-x", "-q", *PYTEST_ARGS],
                                   cwd=tmp, capture_output=True, text=True, env=env,
@@ -3390,6 +3399,29 @@ def _run_mutant(src: pathlib.Path, mutant, python: str, timeout: int, env: dict)
         return _verdict(proc.returncode, proc.stdout)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _import_error(tmp: pathlib.Path, module: str, python: str, env: dict) -> str:
+    """在子行程匯入突變後的模組;匯入失敗回那個例外的簡述,成功回空字串。
+
+    只匯入、不跑測試:幾秒就有結果,而且不受測試本身的狀態影響。`sqlglot` 這類
+    第三方模組在匯入時就會編譯正規式,寫壞的話這一步就看得出來。
+    """
+    name = module.removesuffix(".py").replace("/", ".").lstrip(".")
+    if module.startswith("../toolbox/"):
+        name = "toolbox." + name.rsplit(".", 1)[-1]
+    elif not module.startswith("../"):
+        name = "orchestrator." + name
+    try:
+        proc = subprocess.run([python, "-c", f"import {name}"], cwd=tmp, capture_output=True,
+                              text=True, env=env, encoding="utf-8", errors="replace",
+                              timeout=_IMPORT_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return f"匯入超過 {_IMPORT_TIMEOUT} 秒"
+    if proc.returncode == 0:
+        return ""
+    last = [l for l in (proc.stderr or "").splitlines() if l.strip()]
+    return last[-1][:120] if last else f"退出碼 {proc.returncode}"
 
 
 def _verdict(returncode: int, stdout: str) -> tuple[str, str]:
