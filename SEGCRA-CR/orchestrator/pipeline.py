@@ -31,6 +31,8 @@ from .cold_read import (UNREAD_NEAR_LIMIT, UNREAD_NO_USAGE, UNREAD_TOO_FEW, Cold
 from .isolation import run_isolated
 from .dbt_impact import DEFAULT_ISOLATED_MEMORY_MB, DEFAULT_ISOLATED_TIMEOUT_S, macros_referenced
 from .dbt_context import DbtContext, prepare_dbt_context
+from .dbt_exec import render_for_exec
+from .dbt_impact import path_kind
 from .dbt_hidden_writes import IN_TAGS, UNREACHED, UNVERIFIED, WRITE_KEYWORDS, find_hidden_writes
 from .dbt_render import is_dbt_template, render_model_isolated
 from .dbt_asset_names import (ASSET as _ASSET_RULE, CHECK as _CHECK_RULE, GROUP as _GROUP_RULE,
@@ -864,6 +866,55 @@ def _mr_for_spec_exec(mr: dict, dbt_ctx: DbtContext | None) -> dict:
         head = dbt_ctx.head_text(f.get("path")) if isinstance(f, dict) else None
         files.append({**f, "full_content": head} if head is not None and is_dbt_template(head) else f)
     return {**mr, "files": files}
+
+
+def _dbt_exec_mr(exec_mr: dict, exec_text, spec_text, affected_specs: tuple[SpecForModels, ...],
+                 dbt_ctx: DbtContext | None, dbt_cfg: dict | None) -> tuple[dict, dict | None]:
+    """執行驗證要跑的檔案是 dbt model 時,先展開成沙盒用的純 SQL(見 dbt_exec)。
+
+    要跑的是哪個檔案跟 run_spec_exec 一樣:最後一個有內容的檔案。它是取回的 dbt 專案裡的
+    model(.sql、在 model 目錄、內容是樣板),而且有規格時才展開;規格是從受影響 model 借來的
+    (MR 自己沒有規格)時,還要是這個 model 對到的那份。
+    回傳 (交給執行驗證的 MR, 紀錄)。紀錄是 None 表示不適用(照舊交給執行驗證);
+    {"file", "ok", "reason"}:ok 時那個檔案的內容換成展開後的 SQL,不 ok 時 MR 不動
+    (執行驗證照舊回「尚未支援」),reason 是原因。"""
+    if not dbt_cfg or dbt_cfg.get("enabled") is not True:
+        return exec_mr, None
+    if dbt_ctx is None or dbt_ctx.project is None or dbt_ctx.error is not None:
+        return exec_mr, None
+    files = list(exec_mr.get("files", []))
+    last = None
+    for i, f in enumerate(files):
+        got = (f.get("full_content") or _sql_from_diff(f.get("diff", ""))) if isinstance(f, dict) else ""
+        if got:
+            last = (i, f, got)
+    if last is None:
+        return exec_mr, None
+    i, f, source = last
+    path = f.get("path") or ""
+    rel = dbt_ctx.relative(path)
+    project = dbt_ctx.project
+    if (rel is None or not rel.endswith(".sql") or not is_dbt_template(source)
+            or path_kind(rel, project.model_paths, project.macro_paths,
+                         project.resource_paths) != "model"):
+        return exec_mr, None
+    if not exec_text:
+        return exec_mr, None                 # 沒有規格:執行驗證自己會說
+    record = {"file": path, "ok": False, "reason": None}
+    if not spec_text and not (affected_specs and rel in affected_specs[0].models):
+        record["reason"] = "MR 沒有自己的規格,借用的受影響 model 規格不是這個 model 的"
+        return exec_mr, record
+    if DBT_DATABASE_PLACEHOLDER != dbt_cfg.get("database"):
+        record["reason"] = _DBT_DATABASE_MISMATCH
+        return exec_mr, record
+    sql, reason = render_for_exec(path, source, exec_text, dbt_cfg["database"],
+                                  _render_project(dbt_ctx))
+    if sql is None:
+        record["reason"] = reason
+        return exec_mr, record
+    files[i] = {**f, "full_content": sql}
+    record["ok"] = True
+    return {**exec_mr, "files": files}, record
 
 
 # 注入掃描額外加進去的內容(取回的完整內容、展開後的 SQL)合計最多幾個字元。展開可以把很短的
@@ -2032,6 +2083,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 上限不超過整份的截止時間(見 _stage_limit);沙盒階段的截止時間跟著縮
         spec_limit = _stage_limit(SPEC_EXEC_TIMEOUT_SECONDS, review_deadline)
         deadline = time.monotonic() + (spec_limit or 0)
+        dbt_exec = None
         try:
             # 端點無法使用時整段不跑:測資生成要呼叫模型。找不到規格等不用模型的結果這次不會出現,
             # 但它們本來就是交人工,決策不受影響;端點恢復後重新審查就看得到
@@ -2042,6 +2094,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             # 交給執行驗證的 MR 與規格也在 try 裡:組不出來同樣記成執行驗證未完成
             exec_mr = _mr_for_spec_exec(mr, dbt_ctx)
             exec_code, exec_text = _spec_for_exec(spec_code, spec_text, affected_specs, exec_mr)
+            exec_mr, dbt_exec = _dbt_exec_mr(exec_mr, exec_text, spec_text, affected_specs,
+                                             dbt_ctx, cfg.dbt)
             spec_result = await asyncio.wait_for(
                 run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text,
                               progress=progress, deadline=deadline),
@@ -2071,7 +2125,12 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 模型自己輸出的同名欄位在這裡被蓋掉
         report["_stage_seconds"] = clock.seconds
         report["_review_deadline_seconds"] = REVIEW_BUDGET_SECONDS   # 評測看得出這輪用的是哪一種截止時間
-        report = enforce_dbt_unexecuted(report, mr, dbt_ctx, cfg.dbt)  # dbt 的變更沒被執行驗證到
+        # 報告裡同名的欄位(模型可能自己輸出)一律蓋掉
+        report["_dbt_exec"] = dbt_exec
+        executed_dbt = (dbt_exec["file"] if dbt_exec and dbt_exec["ok"] and spec_result is not None
+                        and spec_result.get("executed_file") == dbt_exec["file"] else None)
+        report = enforce_dbt_exec_note(report, dbt_exec)  # dbt model 沒有送進沙盒的原因
+        report = enforce_dbt_unexecuted(report, mr, dbt_ctx, cfg.dbt, executed_dbt)  # dbt 的變更沒被執行驗證到
         report = enforce_spec_change(report, mr)  # MR 改到規格檔:改了什麼、前後是否一致
 
         # 判斷校準:嚴重度交給能確定性驗證的證據決定,不是模型的語氣,也不是
@@ -2716,7 +2775,7 @@ def _mr_touches_dbt(mr: dict, dbt_ctx: DbtContext | None, dbt_cfg: dict | None) 
 
 @_isolated_stage("dbt 未經執行驗證揭露")
 def enforce_dbt_unexecuted(report: dict, mr: dict, dbt_ctx: DbtContext | None,
-                           dbt_cfg: dict | None = None) -> dict:
+                           dbt_cfg: dict | None = None, executed_dbt: str | None = None) -> dict:
     """MR 改到 dbt 的東西(樣板、macro、屬性檔、專案設定檔),而執行驗證卻「通過」時,補一條 major。
 
     dbt 樣板目前不送沙盒(展開後的表名對不到沙盒的測資表),所以這種 MR 的執行驗證結果
@@ -2725,8 +2784,13 @@ def enforce_dbt_unexecuted(report: dict, mr: dict, dbt_ctx: DbtContext | None,
     「執行驗證通過」在這裡不成立。確定性補報,標題只能由程式產生。
 
     要排在執行驗證之後(看的是它的結果)。沒開 dbt 不受影響。mock 模式沒有取回專案,
-    一樣適用:樣板檔與純 SQL 檔混在同一個 MR 時,通過的是純 SQL 檔。"""
+    一樣適用:樣板檔與純 SQL 檔混在同一個 MR 時,通過的是純 SQL 檔。
+
+    executed_dbt 是展開後真的送進沙盒、而且就是執行驗證跑的那個 model(見 _dbt_exec_mr)。
+    它是這個 MR 唯一改到 dbt 的檔案時,通過的就是這個 model 本身,不補(_only_dbt_file)。"""
     if not _mr_touches_dbt(mr, dbt_ctx, dbt_cfg):
+        return report
+    if executed_dbt is not None and _only_dbt_file(mr, dbt_ctx, executed_dbt):
         return report
     if (report.get("_spec_exec") or {}).get("passed") is not True:
         return report            # 執行驗證自己已經說了沒通過 / 沒執行,不重複
@@ -2736,6 +2800,40 @@ def enforce_dbt_unexecuted(report: dict, mr: dict, dbt_ctx: DbtContext | None,
                   "dbt 樣板目前不會送進沙盒執行,這些變更沒有經過執行驗證,不得自動放行。",
         "suggestion": "以 dbt compile 取得展開後的 SQL,人工依核定規格核對。",
         "citations": []})
+    return report
+
+
+def _only_dbt_file(mr: dict, dbt_ctx: DbtContext | None, path: str) -> bool:
+    """MR 改到 dbt 的只有 path 這個檔案:其他檔案都不是 dbt 的東西。逐一問 dbt_context(有反查
+    結果時,也就是改到 macro、屬性檔、設定檔時,每個檔案都算),判斷跟 _mr_touches_dbt 一樣
+    寧可多算。"""
+    if dbt_ctx is None or dbt_ctx.error is not None:
+        return False
+    for f in mr.get("files", []):
+        if not isinstance(f, dict):
+            return False
+        if f.get("path") == path:
+            continue
+        if dbt_ctx.touches_dbt([f]) or is_dbt_template(f.get("full_content") or f.get("diff") or ""):
+            return False
+    return True
+
+
+_DBT_EXEC_NOTE_TITLE = "dbt model 沒有送進沙盒執行"
+
+
+@_isolated_stage("dbt 執行驗證說明")
+def enforce_dbt_exec_note(report: dict, dbt_exec: dict | None) -> dict:
+    """執行驗證要跑的 dbt model 沒能展開成沙盒用的 SQL 時,補一條 info 寫出原因。
+    決策不受影響(執行驗證自己已經回了「尚未支援」的 major),只讓審查者知道差在哪裡。"""
+    if not dbt_exec or dbt_exec.get("ok") or not dbt_exec.get("reason"):
+        return report
+    _put_program_finding(report, {
+        "file": dbt_exec["file"] or "(MR 內容)", "line": 0, "severity": "info",
+        "title": _DBT_EXEC_NOTE_TITLE,
+        "detail": f"執行驗證只支援只引用 source() 的 model;這個 model 沒有展開:{dbt_exec['reason']}。",
+        "suggestion": "以 dbt compile 取得展開後的 SQL,人工依核定規格核對。",
+        "citations": [], "_source": PROGRAM_SOURCE})
     return report
 
 
