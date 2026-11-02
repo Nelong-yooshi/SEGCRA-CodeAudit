@@ -96,7 +96,7 @@ class SpecLookup(tuple):
     def __getnewargs__(self):
         """複製與 pickle 都靠它。沒有的話 tuple 子類別會把 (code, text) 整個當成
         第一個參數傳回 __new__,三種都丟 TypeError —— 管線有 deepcopy(capture),
-        隔離子行程用 pickle 傳結果,踩到只是時間問題。"""
+        踩到只是時間問題。"""
         return (self[0], self[1], self.unavailable)
 
 
