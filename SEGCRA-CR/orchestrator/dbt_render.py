@@ -309,6 +309,13 @@ def _too_big(value) -> bool:
     return isinstance(value, (str, list, tuple)) and len(value) > MAX_OUTPUT_CHARS
 
 
+class DbtBlockInModel(jinja2.TemplateSyntaxError):
+    """model 檔裡的 `{% test %}` / `{% materialization %}` 區塊:dbt 解析得過,展開器不展開。
+
+    是 TemplateSyntaxError 的子類別(Jinja 解析到一半只能這樣中止),但**不是**語法錯誤:
+    呼叫端不可以把它當成「dbt 整個專案會失敗」。"""
+
+
 class _DbtBlocks(Extension):
     """dbt 自己加上去的區塊標籤,解析掉但不輸出任何內容。
 
@@ -320,18 +327,27 @@ class _DbtBlocks(Extension):
     dbt 自己也是以擴充處理這幾個標籤,而且同樣不會把內容編進 model 的 SQL,
     所以「解析掉並丟棄」與 dbt 的輸出一致。
 
-    **只在載入 macro 檔時生效**:model 檔裡出現這些標籤並不是合法的 dbt 寫法,
-    默默把那段丟掉會讓我們產出「比 dbt 少一段」的 SQL,還回報展開成功。
-    所以 model 階段一律照 Jinja 原本的行為當成未知標籤,硬失敗。
+    model 檔裡(dbt-core 1.12 實測:parse 與 compile 的結果):
+    - `{% docs %}`:dbt 解析得過、編譯出的 SQL 不含區塊內容。內容只是說明文字,不會被執行,
+      照樣丟棄
+    - `{% test %}`、`{% materialization %}`:dbt 一樣解析得過、編譯出的 SQL 不含區塊內容,但
+      區塊裡的 SQL 是 generic test 或自訂實體化,會在別的地方執行。默默丟掉的話,那段 SQL
+      就逃過預掃,還回報展開成功——所以照樣中止展開(DbtBlockInModel,不算語法錯誤)
+    - `{% snapshot %}`:dbt 也不認得(不認得的標籤,整個專案解析失敗),照 Jinja 的預設行為
+      當成未知標籤
     """
 
     tags = {"materialization", "test", "docs", "snapshot"}
 
     def parse(self, parser):
         tag = parser.stream.current.value
-        if not getattr(self.environment, "segcra_macro_phase", False):
-            raise jinja2.TemplateSyntaxError(
-                f"Encountered unknown tag '{tag}'.", parser.stream.current.lineno)
+        if not getattr(self.environment, "segcra_macro_phase", False) and tag != "docs":
+            lineno = parser.stream.current.lineno
+            if tag == "snapshot":
+                raise jinja2.TemplateSyntaxError(f"Encountered unknown tag '{tag}'.", lineno)
+            raise DbtBlockInModel(
+                f"model 檔裡的 {{% {tag} %}} 區塊:dbt 解析得過,但區塊裡的 SQL 會在別的地方執行,"
+                "展開器不展開這種區塊", lineno)
         next(parser.stream)
         while parser.stream.current.type != "block_end":   # 標籤上的參數一律略過
             next(parser.stream)
@@ -756,10 +772,20 @@ class RenderResult:
     relation_notice: str | None = None
     # 樣板(含它呼叫的 macro)有沒有呼叫 is_incremental();沒有就不必以增量模式再展開一次
     incremental_checked: bool = False
+    # ok=False 且失敗的原因是這份樣板**自己**的 Jinja 語法錯誤(含不認得的濾器、重複定義的
+    # block):dbt 解析這個檔時一樣失敗(dbt-core 1.12 實測)。error_line 是錯誤所在的行(1 起算)。
+    # 執行時的錯誤、macro 的問題、展開器的限制都不算
+    syntax_error: bool = False
+    error_line: int = 0
 
     def src_line(self, rendered_line: int) -> int:
         """渲染行(1-based)→ 原始行(1-based)。對應不到回 0 = 檔案層留言。"""
         return self.line_map.get(rendered_line, 0)
+
+
+def _error_line(e: jinja2.TemplateSyntaxError, source: str) -> int:
+    """語法錯誤所在的行,對回原始檔(展開前去掉的開頭空行加回來)。"""
+    return e.lineno + source[:len(source) - len(source.lstrip())].count("\n")
 
 
 def _safe_error(e: BaseException) -> str:
@@ -1233,8 +1259,15 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
                                                      invocation_id=invocation_id)
         # dbt 讀檔時會去掉頭尾空白再渲染(開頭空行不會出現在編譯結果裡)
         body = source.strip()
-        tree = env.parse(body)
-        clean = _render_capped(env.from_string(tree), MAX_OUTPUT_CHARS)
+        try:
+            tree = env.parse(body)
+            template = env.from_string(tree)
+        except DbtBlockInModel:
+            raise
+        except jinja2.TemplateSyntaxError as e:
+            return RenderResult(ok=False, error=_safe_error(e), syntax_error=True,
+                                error_line=_error_line(e, source))
+        clean = _render_capped(template, MAX_OUTPUT_CHARS)
         # 哨兵渲染會再呼叫一次;只算乾淨的那一次
         incremental_checked = env.segcra_incremental["called"]
         # 用到這個 model 的表名:增量模式一律算;一般模式看 model 本身有沒有寫到 this(只看

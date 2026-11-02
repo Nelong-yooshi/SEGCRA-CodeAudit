@@ -629,6 +629,8 @@ class _Expanded(NamedTuple):
     # 展開後的行 → 原始檔的行。只有哨兵法(逐行精確)才給;近似對齊(difflib)與對不上時是 None
     line_map: dict | None = None
     incremental_line_map: dict | None = None
+    # 展開失敗的原因是樣板自己的 Jinja 語法錯誤時,錯誤所在的行;其他失敗是 None
+    syntax_line: int | None = None
 
 
 def _render_project(dbt_ctx: DbtContext | None) -> dict:
@@ -700,7 +702,8 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict, dbt_ctx: DbtCont
         return _Expanded(sql, (f"dbt 專案裡有 {len(rendered.macro_conflicts)} 組同名的 macro"
                                "(dbt 會編譯失敗),無法確定展開結果"), None)
     if not rendered.ok:
-        return _Expanded(sql, rendered.error, None)
+        return _Expanded(sql, rendered.error, None,
+                         syntax_line=rendered.error_line if rendered.syntax_error else None)
     if not rendered.incremental_checked:
         return _Expanded(rendered.sql, None, rendered.relation_notice,
                          line_map=_sentinel_map(rendered))
@@ -1008,6 +1011,8 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
             render_ctx = dbt_ctx if in_project else None      # 專案外的檔案不給專案的 macro
             expanded = _dbt_expand_for_prescan(f.get("path", ""), sql, dbt_cfg, render_ctx)
             rule_sql, dbt_error, dbt_notice, incremental_sql = expanded[:4]
+            if expanded.syntax_line is not None and _parsed_whole_by_dbt(f.get("path"), render_ctx):
+                entry["dbt_syntax_line"] = expanded.syntax_line
             if dbt_error is None and line_maps is not None and _is_full_text(f, sql, dbt_ctx):
                 _keep_line_maps(line_maps, f.get("path"), sql, expanded)
             if dbt_error is None:
@@ -2399,7 +2404,36 @@ def enforce_dbt_asset_names(report: dict, mr: dict, dbt_ctx: DbtContext | None =
 _RENDER_FAIL_TITLE = "dbt 樣板展開失敗,rule-base 規則掃的是未展開的原文"
 
 
+def _in_dirs(rel: str, dirs) -> bool:
+    return any(rel == d or rel.startswith(d.rstrip("/") + "/") for d in dirs)
+
+
+def _parsed_whole_by_dbt(path, dbt_ctx: DbtContext | None) -> bool:
+    """dbt 解析專案時,會把這個檔整份當成 Jinja 樣板解析嗎(model、analysis、singular test 的
+    目錄)?這種檔有 Jinja 語法錯誤時,dbt 整個專案解析失敗(dbt-core 1.12 實測)。
+
+    snapshot 目錄的檔不算:展開器把它當 model 展開,`{% snapshot %}` 區塊本身就是不認得的標籤,
+    分不出是不是真的語法錯誤。沒有取回專案時也不算(不知道目錄設定)。"""
+    project = dbt_ctx.project if dbt_ctx is not None else None
+    rel = dbt_ctx.relative(path) if project is not None else None
+    return rel is not None and _in_dirs(
+        rel, project.model_paths + project.analysis_paths + project.test_paths)
+
+
+_TEMPLATE_SYNTAX_TITLE = "dbt 樣板有 Jinja 語法錯誤,dbt 整個專案會編譯失敗"
+
+
 def _render_fail_finding(entry: dict) -> dict:
+    line = entry.get("dbt_syntax_line")
+    if isinstance(line, int) and not isinstance(line, bool):
+        where = _code_span(entry["path"]) + (f" 第 {line} 行附近" if line else "")
+        return {"file": entry["path"], "line": line, "severity": "blocker",
+                "title": _TEMPLATE_SYNTAX_TITLE,
+                "detail": (f"{where}有 Jinja 語法錯誤(區塊沒有閉合、運算式寫錯、不認得的標籤或濾器、"
+                           "重複定義的 block 等)。dbt 解析專案時會失敗,部署端也會整個載入失敗,"
+                           "影響的不只這個檔案。這個檔案沒有展開,規則層掃的是未展開的原文。"),
+                "suggestion": "修正語法後,用 dbt parse 確認整個專案解析得過。",
+                "citations": [], "_source": PROGRAM_SOURCE}
     parse_note = ("未展開的原文也無法解析,語法樹規則整組沒有執行。" if entry.get("parse_error")
                   else "未展開的原文雖然解析得過,但那不是實際會執行的 SQL,"
                        "規則沒有命中不代表展開後沒有問題。")

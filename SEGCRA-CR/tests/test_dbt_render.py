@@ -329,14 +329,14 @@ def test_dbt_only_block_does_not_hide_macros_in_the_same_file(tmp_path):
     "{% materialization m, default %}SELECT secret{% endmaterialization %}\nSELECT 1",
 ])
 def test_dbt_only_block_in_model_is_a_hard_failure(tmp_path, source):
-    """model 檔裡用這些標籤不是合法的 dbt 寫法。
+    """model 檔裡的 generic test 與自訂實體化:dbt 解析得過,但區塊裡的 SQL 會在別的地方執行。
 
-    默默把那段丟掉,我們會產出「比 dbt 少一段」的 SQL 卻回報展開成功——
-    整段 SQL 就這樣逃過預掃。寧可硬失敗。
+    默默把那段丟掉,那段 SQL 就逃過預掃,還回報展開成功。寧可硬失敗——但不算語法錯誤
+    (dbt 不會因此整個專案失敗)。
     """
     r = _render(code_root=tmp_path, source=source)
-    assert not r.ok
-    assert "unknown tag" in r.error
+    assert not r.ok and not r.syntax_error
+    assert r.error.startswith("DbtBlockInModel:")
     assert "secret" not in r.sql
 
 
@@ -352,7 +352,7 @@ def test_dbt_only_block_in_model_still_fails_after_macros_are_loaded(tmp_path):
     r = _render(code_root=tmp_path,
                 source="{% test z(model) %}SELECT secret{% endtest %}SELECT {{ amt() }}")
     assert not r.ok
-    assert "unknown tag" in r.error
+    assert r.error.startswith("DbtBlockInModel:")
     assert "secret" not in r.sql
 
 
