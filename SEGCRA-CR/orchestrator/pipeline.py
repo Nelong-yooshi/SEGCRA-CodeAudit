@@ -37,6 +37,7 @@ from .dbt_asset_names import (ASSET as _ASSET_RULE, CHECK as _CHECK_RULE, GROUP 
                               versioned_models as _versioned_models)
 from .dbt_config_change import HIGH_RISK_NEW, config_changes, default_relative, is_dbt_yaml
 from .dbt_project import DbtProjectError, check_project_dir
+from .dbt_hidden_writes import MODELS_CHECKED, find_hidden_writes_in_macro
 from .dbt_render import (MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, MACRO_SYNTAX,
                          check_macro_files_isolated)
 from .security import scan_mr
@@ -658,6 +659,35 @@ def _hidden_writes(path: str, sql: str, expanded: "_Expanded", dbt_cfg: dict,
         return {UNVERIFIED: f"檢查寫入語句時發生非預期錯誤({type(e).__name__})"}
 
 
+def _macro_hidden_writes(path: str, dbt_cfg: dict, dbt_ctx: DbtContext) -> dict:
+    """MR 改到的 macro 檔裡、從呼叫它的 model 展開時沒有出現的寫入語句(見
+    dbt_hidden_writes.find_hidden_writes_in_macro)。呼叫它的 model 取自 macro 反查的結果,呼叫鏈
+    短的先展開;macro 檔換成插了記號的版本,其他照這次審查的專案資訊。被刪掉的檔(沒有 head 的
+    內容)由 find_hidden_writes_in_macro 回空的。
+    檢查本身出錯時記成無法確認(交人工),不當成沒有。"""
+    rel, source = dbt_ctx.relative(path), dbt_ctx.head_text(path)
+    if rel is None:
+        return {}
+    database = dbt_cfg.get("database")
+    if database != DBT_DATABASE_PLACEHOLDER:
+        return {UNVERIFIED: _DBT_DATABASE_MISMATCH}
+    project = _render_project(dbt_ctx)
+    files = dbt_ctx.project.files
+    impact = dbt_ctx.impact
+    ordered = sorted(impact.affected_models if impact is not None else (),
+                     key=lambda m: (len(m.chain), m.path))
+    models = list(dict.fromkeys(m.path for m in ordered if isinstance(files.get(m.path), str)))
+
+    def render(text: str, model: str, incremental: bool):
+        return render_model_isolated(model, source=files[model], database=database,
+                                     **{**project, "macro_files": {**project["macro_files"], rel: text}},
+                                     **({"incremental": True} if incremental else {}))
+    try:
+        return find_hidden_writes_in_macro(source, models, render)
+    except Exception as e:                   # noqa: BLE001 — macro 檔的檢查沒做完也不能當成沒有
+        return {UNVERIFIED: f"檢查寫入語句時發生非預期錯誤({type(e).__name__})"}
+
+
 def _sentinel_map(rendered) -> dict | None:
     return rendered.line_map if rendered.map_method == "sentinel" and rendered.line_map else None
 
@@ -1002,6 +1032,9 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
         incremental_sql = None
         if is_macro:
             entry["dbt_macro"] = True
+            hidden = _macro_hidden_writes(f.get("path", ""), dbt_cfg, dbt_ctx)
+            if hidden:
+                entry["dbt_hidden_writes"] = hidden
         elif dbt_error is not None:
             entry["dbt_render_error"] = dbt_error
         elif dbt_enabled and sql and is_dbt_template(sql):
@@ -2460,7 +2493,13 @@ def _hidden_write_finding(entry: dict) -> dict | None:
         return None
     parts, lines = [], []
     unreached, at = _hidden_write_list(hidden.get(UNREACHED))
-    if unreached:
+    models = hidden.get(MODELS_CHECKED)
+    if unreached and isinstance(models, int) and not isinstance(models, bool):
+        lines += at
+        parts.append(f"這些寫入語句從呼叫這個 macro 檔的 model 展開時都沒有出現(展開了 {models} 個 model;"
+                     f"有呼叫 is_incremental() 的也以增量模式展開過),可能寫在只有真正執行時才會進的分支,"
+                     f"或只在別處被執行:{unreached}。")
+    elif unreached:
         lines += at
         parts.append("這些寫入語句在這次審查的展開結果裡沒有出現(一般模式、增量模式都沒有),"
                      f"可能寫在只有真正執行時才會進的分支:{unreached}。")

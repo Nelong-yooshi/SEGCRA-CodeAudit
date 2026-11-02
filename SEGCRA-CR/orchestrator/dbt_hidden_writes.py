@@ -23,8 +23,12 @@
 * Jinja 註解不算:dbt 執行時也不會輸出。
 * 關鍵字拆開寫(`DEL{{ '' }}ETE`)也找得到:固定文字接起來再找一次。
 
+MR 改到的 macro 檔(find_hidden_writes_in_macro):同樣的方法,從呼叫它的 model 展開(把 macro 檔換成
+插了記號的版本);只看 macro 與自訂物化的區塊裡面。沒有 model 呼叫、或呼叫它的 model 都展開失敗時
+記成無法確認。
+
 找不到的:在 Jinja 裡用運算組出來的關鍵字(`'ETELED' | reverse`)——靜態看不出運算結果;
-以及藏在 macro 檔裡的(這裡只看 MR 改到的 model)。審查模型在 diff 裡看得到這些原文。
+以及 MR 沒改到的 macro 檔裡的。審查模型在 diff 裡看得到這些原文。
 
 結果只有關鍵字(固定集合)與行號,不帶原文。
 """
@@ -209,6 +213,41 @@ def _lines(text: str, found: list[tuple[int, str]]) -> list[dict]:
     return [{"line": bisect.bisect_left(breaks, pos) + 1, "keyword": kw} for pos, kw in found]
 
 
+def _too_many(literal: list) -> str | None:
+    """固定文字裡的寫入關鍵字太多時不逐一插記號,回原因(記成無法確認)。"""
+    if len(literal) > MAX_MARKED_KEYWORDS:
+        return f"固定文字裡的寫入關鍵字超過 {MAX_MARKED_KEYWORDS} 個,沒有逐一確認"
+    return None
+
+
+class _Probe:
+    """一份樣板原文插了記號的版本,以及比對「記號後面接著那段固定文字」要用的資料。"""
+
+    def __init__(self, source: str, literal: list[tuple[int, str]], token: str):
+        self.literal = literal
+        self.pattern = _marker_re(token)
+        self.marked = mark(source, literal, token)
+        self.tails = tails = _tails(source, literal)
+        # 記號後面那段可能夾著後面關鍵字的記號:比對的範圍要放寬這麼多,去掉記號後再比
+        self.room = [len(tails[n]) + len(_marker(token, len(literal))) * _inside(literal, n, tails[n])
+                     for n in range(len(literal))]
+
+    def reached(self, result, clean_sql: str) -> set[int] | str:
+        """插了記號那次的展開結果裡,展開到的關鍵字編號;無法確認時回原因(固定文字)。"""
+        if not getattr(result, "ok", False) or not isinstance(getattr(result, "sql", None), str):
+            return "加了檢查記號後展開失敗,無法確認寫入語句有沒有展開到"
+        sql, pattern = result.sql, self.pattern
+        if _UUID_RE.sub("", pattern.sub("", sql)) != _UUID_RE.sub("", clean_sql):
+            return "加了檢查記號後展開結果不同,樣板會因為內容改變輸出,無法確認"
+        reached: set[int] = set()
+        for m in pattern.finditer(sql):
+            n = int(m.group(1))
+            if n < len(self.literal) and pattern.sub("", sql[m.end():m.end() + self.room[n]]).lower() \
+                    .startswith(self.tails[n].lower()):
+                reached.add(n)
+        return reached
+
+
 def find_hidden_writes(source: str, clean: dict, render, *, token: str | None = None) -> dict:
     """樣板原文有寫入關鍵字、而規則層看不到時回 {種類: 內容};都看得到時回 {}。
 
@@ -228,32 +267,113 @@ def find_hidden_writes(source: str, clean: dict, render, *, token: str | None = 
         out[IN_TAGS] = _lines(source, in_tags)
     if not literal:
         return out
-    if len(literal) > MAX_MARKED_KEYWORDS:
-        out[UNVERIFIED] = f"固定文字裡的寫入關鍵字超過 {MAX_MARKED_KEYWORDS} 個,沒有逐一確認"
+    reason = _too_many(literal)
+    if reason:
+        out[UNVERIFIED] = reason
         return out
-    token = token or secrets.token_hex(8)
-    pattern = _marker_re(token)
-    marked = mark(source, literal, token)
-    tails = _tails(source, literal)
-    # 記號後面那段可能夾著後面關鍵字的記號:比對的範圍要放寬這麼多,去掉記號後再比
-    room = [len(tails[n]) + len(_marker(token, len(literal))) * _inside(literal, n, tails[n])
-            for n in range(len(literal))]
+    probe = _Probe(source, literal, token or secrets.token_hex(8))
     reached: set[int] = set()
     for incremental, clean_sql in clean.items():
-        result = render(marked, incremental)
-        if not getattr(result, "ok", False) or not isinstance(getattr(result, "sql", None), str):
-            out[UNVERIFIED] = "加了檢查記號後展開失敗,無法確認寫入語句有沒有展開到"
+        got = probe.reached(render(probe.marked, incremental), clean_sql)
+        if isinstance(got, str):
+            out[UNVERIFIED] = got
             return out
-        sql = result.sql
-        if _UUID_RE.sub("", pattern.sub("", sql)) != _UUID_RE.sub("", clean_sql):
-            out[UNVERIFIED] = "加了檢查記號後展開結果不同,樣板會因為內容改變輸出,無法確認"
-            return out
-        for m in pattern.finditer(sql):
-            n = int(m.group(1))
-            if n < len(literal) and pattern.sub("", sql[m.end():m.end() + room[n]]).lower() \
-                    .startswith(tails[n].lower()):
-                reached.add(n)
+        reached |= got
     unreached = [occ for n, occ in enumerate(literal) if n not in reached]
     if unreached:
         out[UNREACHED] = _lines(source, unreached)
+    return out
+
+
+# ------------------------------------------------------------------ macro 檔
+# dbt 會執行的區塊:macro(被 model、hook、其他 macro 呼叫)與自訂物化(被設定成這種物化的 model 執行)。
+# 區塊外面的內容 dbt 不執行(載入 macro 檔時只取定義)
+_BLOCK_START = re.compile(r"\{%-?\s*(macro|materialization)\b")
+_BLOCK_END = re.compile(r"\{%-?\s*end(macro|materialization)\b")
+
+
+def macro_blocks(text: str) -> list[tuple[int, int]]:
+    """macro 檔裡 `{% macro %}…{% endmacro %}` 與 `{% materialization %}…{% endmaterialization %}`
+    的範圍(含開頭與結尾的標記)。沒有結尾的區塊算到檔尾。"""
+    blocks, start = [], None
+    for kind, s, e in _segments(text):
+        if kind != "tag":
+            continue
+        if start is None and _BLOCK_START.match(text, s):
+            start = s
+        elif start is not None and _BLOCK_END.match(text, s):
+            blocks.append((start, e))
+            start = None
+    if start is not None:
+        blocks.append((start, len(text)))
+    return blocks
+
+
+def _within(blocks: list[tuple[int, int]], pos: int) -> bool:
+    k = bisect.bisect_right([s for s, _ in blocks], pos) - 1
+    return k >= 0 and pos < blocks[k][1]
+
+
+# MR 改到的 macro 檔最多從幾個呼叫它的 model 展開來確認(每個 model 一般模式兩次,
+# 有呼叫 is_incremental() 時增量模式再兩次)
+MAX_MACRO_MODELS = 3
+MODELS_CHECKED = "models_checked"
+
+
+def find_hidden_writes_in_macro(source: str, models, render, *, token: str | None = None,
+                                max_models: int = MAX_MACRO_MODELS) -> dict:
+    """MR 改到的 macro 檔:寫入關鍵字從呼叫它的 model 展開時有沒有出現。做法同 find_hidden_writes
+    (固定文字插記號、記號後面要接著那段固定文字、插了記號的輸出去掉記號後要跟沒插記號時相同),
+    只看 macro 與自訂物化的區塊裡面(區塊外 dbt 不執行)。
+
+    models  呼叫它的 model(依優先順序);依序展開,全部關鍵字都展開到就停,最多 max_models 個
+    render  render(macro 檔的內容, model, 是否增量模式) → 有 .ok、.sql、.incremental_checked 的展開結果
+            (同一支展開器、同樣的專案,只把這個 macro 檔換成給的內容)
+
+    回傳的種類同 find_hidden_writes,另外 MODELS_CHECKED:展開確認過的 model 數。沒有 model 呼叫、
+    或呼叫它的 model 都展開失敗時記成無法確認。"""
+    if not isinstance(source, str):
+        return {}
+    blocks = macro_blocks(source)
+    found, tagged = occurrences(source)
+    literal = [occ for occ in found if _within(blocks, occ[0])]
+    in_tags = [occ for occ in tagged if _within(blocks, occ[0])]
+    out: dict = {}
+    if in_tags:
+        out[IN_TAGS] = _lines(source, in_tags)
+    if not literal:
+        return out
+    reason = _too_many(literal)
+    if reason:
+        out[UNVERIFIED] = reason
+        return out
+    probe = _Probe(source, literal, token or secrets.token_hex(8))
+    reached: set[int] = set()
+    checked = 0
+    for model in list(models)[:max_models]:
+        clean = render(source, model, False)
+        if not getattr(clean, "ok", False):
+            continue                        # 這個 model 本身展開失敗(另有 finding),換下一個
+        modes = [(False, clean)]
+        if getattr(clean, "incremental_checked", False):
+            modes.append((True, render(source, model, True)))
+        for incremental, base in modes:
+            if not getattr(base, "ok", False) or not isinstance(getattr(base, "sql", None), str):
+                continue
+            got = probe.reached(render(probe.marked, model, incremental), base.sql)
+            if isinstance(got, str):
+                out[UNVERIFIED] = got
+                return out
+            reached |= got
+        checked += 1
+        if len(reached) == len(literal):
+            break
+    if not checked:
+        out[UNVERIFIED] = ("沒有呼叫這個 macro 檔的 model 可以展開(沒有 model 呼叫,或呼叫它的 model "
+                           "都展開失敗),無法確認寫入語句有沒有展開到")
+        return out
+    unreached = [occ for n, occ in enumerate(literal) if n not in reached]
+    if unreached:
+        out[UNREACHED] = _lines(source, unreached)
+        out[MODELS_CHECKED] = checked
     return out
