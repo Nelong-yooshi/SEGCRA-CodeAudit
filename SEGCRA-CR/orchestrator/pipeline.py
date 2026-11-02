@@ -1658,11 +1658,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
     """capture 給定時,記錄各階段中間產物(預掃前後、檢索到的知識、模型原始輸出、
     agent 工具對話、最終報告),供產生逐字 transcript。
 
-    cfg.dbt["enabled"] 為 True 時,prescan() 會呼叫 render_model_isolated()
-    (multiprocessing 的 spawn context)。**呼叫端的進入點程式必須有
-    `if __name__ == "__main__":` 保護**,否則 Windows 上 spawn 會重新匯入整個
-    頂層模組,連帶把呼叫 review_mr() 的那段程式碼也重跑一次——demo.py 與
-    scripts/webhook_server.py 都已經這樣寫,寫新的進入點時比照辦理。
+    cfg.dbt["enabled"] 為 True 時,prescan() 會呼叫 render_model_isolated()(在子行程展開,
+    見 isolation)。
     """
     import copy
     from .dbt_render import start_review_invocation

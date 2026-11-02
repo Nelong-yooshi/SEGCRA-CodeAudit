@@ -13,7 +13,7 @@
 - **`orchestrator/dbt_impact.py`**:MR 只改 macro 或 config 註冊表時,反查出呼叫它的
   model(diff 裡看不到那些檔案),並依 model 檔名對應到核定規格。
 
-兩者共用 **`orchestrator/isolation.py`**(子行程隔離:逾時、記憶體上限)。
+兩者共用 **`orchestrator/isolation.py`**(子行程隔離:逾時、記憶體上限、拿不到 token 與密碼、結果只用 JSON 傳回)。
 
 對應 Issue #7 的四點。接進審查管線的部分以 `config/models.yaml` 的 `dbt.enabled`
 控制,**預設關閉**:目前已接上「預掃前展開」與「依檔名對應規格」;macro 反查尚未
@@ -211,7 +211,16 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 ### 共用與供應鏈
 
 - **子行程隔離**(`isolation.py`):逾時強制終止;Linux 上限制記憶體;子行程異常結束、
-  被系統終止、拋例外、**啟動失敗**一律收斂成失敗結果,訊息不帶輸入內容
+  被系統終止、拋例外、**啟動失敗**一律收斂成失敗結果,訊息不帶輸入內容。它也是安全邊界的一層
+  (Jinja 沙箱萬一有逃逸漏洞時):
+  - 以 subprocess 啟動,只給 `CHILD_ENV_NAMES` 列的環境變數(系統執行需要的、子行程裡的模組匯入時讀的
+    `SQL_DIALECT`、`LINT_TIMEOUT_SECONDS`);`GITLAB_*`、`SANDBOX_*`、模型端點的通行碼一開始就不給。
+    在子行程裡才刪掉不夠(Linux 的 `/proc/self/environ` 仍留著啟動時的那一份)。子行程用到的模組
+    新增讀環境變數的地方時,`tests/test_isolation.py` 會要求決定給不給
+  - 參數與結果都用 JSON 傳遞,不用 pickle:主行程只建出基本型別、容器與呼叫端列出的 dataclass
+    (欄位名稱要完全一致);不是 JSON、形狀不對、超過 256 MB、巢狀超過 64 層都算失敗,錯誤訊息去掉
+    控制字元並截短
+  - 限制:子行程讀得到磁碟上的檔案(跟主行程同一個帳號)
 - dbt 內建 macro 名稱清單由 `dbt parse` 產生,**只收錄名稱,不含任何程式碼**;來源套件
   版本與授權取自套件中繼資料(dbt-core、dbt-adapters 為 Apache-2.0,dbt-sqlserver 為 MIT)
 - 產生標準答案的腳本只傳白名單內的環境變數給 dbt,並關閉 dbt 的匿名使用統計
@@ -283,7 +292,8 @@ golden set 的標準答案才不會跟著變;約定值寫在 `orchestrator/confi
    `all_models_possibly_affected=True`
 3. 必須傳入 `base_files`(所有被修改檔案的變更前內容)與 `added_paths`(本次新增的檔案)
 4. 檔案內容以字典傳入,不要傳由 MR 資料拼出來的路徑
-5. 呼叫端要有 `if __name__ == "__main__":` 保護(multiprocessing spawn 的要求)
+5. 子行程只拿到 `isolation.CHILD_ENV_NAMES` 列的環境變數(token、密碼不給),參數與結果以 JSON
+   傳遞;dataclass 要由呼叫端列在 `run_isolated(types=...)`
 
 ## 怎麼驗證它在動
 
@@ -502,7 +512,7 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 |---|---|
 | `relation_notice` 改成確定性揭露 | 完成(#14):`enforce_dbt_notice` |
 | macro 目錄的取檔方式決定並實作 | 完成:依 commit 打包下載(#20),接進管線(本節) |
-| 進入點有 `if __name__ == "__main__":` 保護 | `demo.py`、`scripts/webhook_server.py`、`tools/prescan.py`、`eval/run_eval.py` 都有;`tests/test_entrypoint_guard.py` 另外自動找出 `scripts/`、`tools/`、`eval/` 底下用到管線的腳本,檢查最外層不直接執行。展開、macro 反查、專案資訊與 lint 都開子行程(spawn);進入點少了保護時,子行程會把整支程式從頭重跑一次。實際踩到時的結果是專案資訊整理失敗 → 當成取不回專案 → 交人工 |
+| 進入點有 `if __name__ == "__main__":` 保護 | `demo.py`、`scripts/webhook_server.py`、`tools/prescan.py`、`eval/run_eval.py` 都有;`tests/test_entrypoint_guard.py` 另外自動找出 `scripts/`、`tools/`、`eval/` 底下用到管線的腳本,檢查最外層不直接執行。進入點在模組最外層開始審查的話,import 它(測試、其他腳本)就會跑一次審查。子行程以 subprocess 啟動,不會重新匯入進入點 |
 | 資料庫假名確定並寫進文件,設錯要擋下 | 完成(#16):固定為 `DBT_PLACEHOLDER`,載入設定與展開前各檢查一次 |
 
 開啟與回復的步驟、以及不接 GitLab 就能跑的範例,見 README「開啟 dbt 接線」與 `examples/dbt_wiring/`。

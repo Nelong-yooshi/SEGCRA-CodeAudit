@@ -1001,7 +1001,10 @@ def _imports_of(path: pathlib.Path) -> set[str]:
     ("dbt_render.py", {"contextvars", "copy", "dataclasses", "difflib", "jinja2", "pathlib", "re",
                        "secrets", "types", ".isolation"}),
     # asyncio、contextvars、threading:把同步呼叫丟到背景執行緒(run_in_thread),不帶來對外能力
-    ("isolation.py", {"asyncio", "contextvars", "multiprocessing", "resource", "threading"}),
+    # subprocess:以固定的進入點啟動 sys.executable(不經 shell、不帶 MR 內容);json:參數與結果的
+    # 傳遞格式;importlib:子行程照「模組:名稱」找回函式
+    ("isolation.py", {"asyncio", "contextvars", "dataclasses", "importlib", "json", "math", "os",
+                      "pathlib", "resource", "subprocess", "sys", "threading"}),
     ("dbt_relations.py", {"re", "yaml", ".dbt_render"}),
 ])
 def test_module_imports_are_allowlisted(module, allowed):
@@ -1059,8 +1062,8 @@ def test_isolation_returns_result_and_fails_closed_on_crash_or_exception():
 
 
 def test_isolation_start_failure_is_closed():
-    """子行程啟動失敗(例如參數不能 pickle)也要收斂成失敗,不可把例外丟給呼叫端。"""
-    result = _isolated(len, lambda x: x)      # lambda 不能 pickle
+    """子行程啟動失敗(例如參數不能傳遞)也要收斂成失敗,不可把例外丟給呼叫端。"""
+    result = _isolated(len, lambda x: x)      # lambda 不能經 JSON 傳遞
     assert result[0] == "失敗"
     assert "子行程" in result[1]
 

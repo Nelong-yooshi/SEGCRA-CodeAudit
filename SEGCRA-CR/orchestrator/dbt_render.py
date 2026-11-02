@@ -1349,7 +1349,8 @@ def check_macro_files_isolated(*, timeout_s: float = DEFAULT_ISOLATED_TIMEOUT_S,
                                **kwargs) -> MacroCheck:
     """在獨立子行程中做 check_macro_files(理由同 render_model_isolated)。不丟例外。"""
     result = run_isolated(check_macro_files, (), kwargs, timeout_s=timeout_s,
-                          max_memory_mb=max_memory_mb, on_failure=_macro_check_failure)
+                          max_memory_mb=max_memory_mb, on_failure=_macro_check_failure,
+                          types=(MacroCheck, DbtProjectInfo))
     return result if isinstance(result, MacroCheck) else MacroCheck(ok=False)
 
 
@@ -1365,16 +1366,15 @@ def render_model_isolated(model_path, *, timeout_s: float = DEFAULT_ISOLATED_TIM
 
     Jinja 沙箱防得了任意程式執行,防不了「一個跑不完的迴圈」或「一個吃光記憶體的
     字串」。這裡用行程邊界兜底(見 isolation.run_isolated):超過 timeout_s 秒強制
-    終止;Linux 上另以 RLIMIT_AS 限制記憶體。任何異常一律收斂成 ok=False。
-
-    呼叫端程式的進入點需有 `if __name__ == "__main__":` 保護(multiprocessing spawn 的要求)。
+    終止;Linux 上另以 RLIMIT_AS 限制記憶體;子行程拿不到 token 與密碼。任何異常一律收斂成 ok=False。
     """
     # 一份審查裡的展開共用一個 invocation_id(見 _REVIEW_INVOCATION_ID);呼叫端指定時照用
     review_id = _REVIEW_INVOCATION_ID.get()
     if review_id is not None:
         kwargs.setdefault("invocation_id", review_id)
     result = run_isolated(render_model, (model_path,), kwargs, timeout_s=timeout_s,
-                          max_memory_mb=max_memory_mb, on_failure=_render_failure)
+                          max_memory_mb=max_memory_mb, on_failure=_render_failure,
+                          types=(RenderResult, DbtProjectInfo))
     if not isinstance(result, RenderResult):
         return _render_failure("DbtRenderError: 展開子行程回傳了非預期的資料")
     return result
