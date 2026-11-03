@@ -244,13 +244,33 @@ RULES = [
 # 改掉之後,**留言與結果檔裡還留著一份**,而留言不會跟著 diff 消失。
 # 其他程式補報的 finding 一律不回顯作者寫的文字(注入掃描、寫入工具、截斷、同檔多處),
 # 這裡要一致。
+# 鍵名(像憑證的那些)。三處共用:鍵=值、位置參數的前後文、欄位比較的降級判斷。
+_CRED_KEY = (r"password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token"
+             r"|token|credential|conn(?:ection)?[_-]?string")
+# 寫死的值。涵蓋三種寫法,**都要排除佔位符**(`{{ }}`、`${}`、`env_var(...)`):
+# 那些是「去別的地方拿」,不是寫死;R004 是 blocker,誤報會直接把 MR 擋下來。
+#   1. 引號包起來的值,前面可以有 T-SQL 的 N 前綴:`PASSWORD = N'6789'`
+#   2. 沒加引號的值。**冒號與等號要分開**:
+#      YAML 的 `password: 6789`、`password: S3cr3tPass` —— 冒號後面什麼都算;
+#      SQL 的 `SET @pwd = 6789` —— 等號後面只認數字開頭的,不然 `password = other_column`
+#      這種拿欄位比較的寫法會被當成寫死的值
+#   3. 連線字串裡的 `帳號:密碼@主機`
+# 佔位符不是寫死的值:`{{ }}`、`${}`、`env_var(...)` 都是「去別的地方拿」。往後看一行
+# 之內,引號裡面也要看得到(值本身就包在引號裡)。R004 是 blocker,誤報會直接擋下 MR。
+_NOT_HARDCODED = r"(?![^\n]{0,60}(?:\{\{|\$\{|env_var\s*\())"
+_QUOTED = r'''N?'[^'\n]{1,}'|N?"[^"\n]{1,}"'''
 _SECRET_RE = re.compile(
     r"""(?ix)
-    (?P<key>password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token
-       |token|credential|conn(ection)?[_-]?string)
-    \s*[:=]\s*['"][^'"]{3,}['"]
+    (?P<key>""" + _CRED_KEY + r""")\s*(?:
+        :\s*""" + _NOT_HARDCODED + r"""(?:""" + _QUOTED + r"""|[^\s#,;)\n]{1,})
+      | =\s*""" + _NOT_HARDCODED + r"""(?:""" + _QUOTED + r"""|[0-9][\w.$-]{0,})
+    )
     | (?P<url>://[^:/\s'"]+:[^@/\s'"]+@)          # user:pass@host 連線字串
     """)
+_SECRET_PROC_RE = re.compile(
+    r"""(?ix)(?<![\w.@\[])(?P<proc>sp_addlogin|sp_adduser|sp_password
+        |sp_addlinkedsrvlogin|sp_setapprole|sp_addapprole)\b
+        [^\n;]{0,200}?,\s*""" + _NOT_HARDCODED + r"""N?'[^'\n]{1,}'""")
 # 命中的鍵名 → **我們自己的**分類標籤。連鍵名都不原樣回顯:大小寫與 `api-key`/`api_key`
 # 這些寫法也是作者的文字,而分類標籤是固定字串,說明的資訊量一樣夠。
 _SECRET_KINDS = {
@@ -285,10 +305,40 @@ def parse_error_text(e: Exception, line_offset: int = 0) -> str:
 
 def _secret_kind(m: "re.Match") -> str:
     """命中的是哪一類憑證(固定字串,不含任何比對到的原文)。"""
-    if m.group("url"):
+    groups = m.groupdict()
+    if groups.get("proc"):
+        return "建立登入或改密碼的預存程序,密碼寫成字串常值"
+    if groups.get("url"):
         return "連線字串含帳號與密碼"
-    key = re.sub(r"[_-]", "", m.group("key") or "").lower()
+    key = re.sub(r"[_-]", "", groups.get("key") or "").lower()
     return f"{_SECRET_KINDS.get(key, '憑證')}類的鍵指定了字串常值"
+
+
+# 「欄位 = 字串」的比較**有時**不是寫死憑證:`WHERE token = 'ACTIVE'` 是拿狀態值在比對,
+# 而 R004 是 blocker,這種誤報會直接把 MR 擋下來。降級成 H004 交模型判斷。
+#
+# **但降級要收得很窄**,不然會把真的憑證放掉:`WHERE password = 'hunter2'`、
+# `AND password = 'P@ssw0rd-2026'` 都是寫死的密碼,只是寫在比較裡。三個條件同時成立
+# 才降級:
+#   1. 前面是 WHERE / AND / OR / ON(是比較,不是賦值或設定)
+#   2. 值看起來是狀態碼:只有字母或底線、不長 —— 'ACTIVE'、'LEGACY'、'N'。
+#      有數字或符號的('hunter2'、'sk-live-0000'、'P@ssw0rd-2026')一律當成憑證
+#   3. 鍵名不是密碼家族:password / passwd / pwd 的比較照樣 blocker
+_COMPARE_HEAD_RE = re.compile(r"(?i)(?:WHERE|AND|OR|ON)\s+(?:\w+\s*\.\s*)?$")
+# `.match(sql, pos)` 本身就從 pos 開始比,不要加 `^`:沒有 MULTILINE 時 `^` 只在整份的
+# 開頭才成立,加了就等於永遠不降級。
+_STATUS_VALUE_RE = re.compile(r"""(?ix)\s*[:=]\s*N?(['"])([A-Za-z_]{1,16})\1""")
+_PASSWORD_KEYS = frozenset({"password", "passwd", "pwd"})
+
+
+def _is_comparison(sql: str, m: "re.Match") -> bool:
+    key = re.sub(r"[_-]", "", (m.groupdict().get("key") or "")).lower()
+    if not key or key in _PASSWORD_KEYS:
+        return False
+    line_start = sql.rfind("\n", 0, m.start()) + 1
+    if not _COMPARE_HEAD_RE.search(sql[line_start:m.start()]):
+        return False
+    return bool(_STATUS_VALUE_RE.match(sql, m.end("key")))
 # H004:看起來異常的查詢(撈憑證欄位、明碼比對密碼)——交 LLM 判斷是否正當
 _CRED_COL_RE = re.compile(r"(?i)\bSELECT\b[^;]*\b(password|passwd|pwd|secret|"
                           r"api[_-]?key|token|private[_-]?key|cvv|card[_-]?no)\b")
@@ -546,8 +596,8 @@ def _env_hints(sql: str) -> list[tuple[str, str, str]]:
 
 def _text_rules(sql: str):
     hits = []
-    m = _SECRET_RE.search(sql)
-    if m:
+    m = _SECRET_RE.search(sql) or _SECRET_PROC_RE.search(sql)
+    if m and not _is_comparison(sql, m):
         hits.append(("R004", "blocker",
                      f"疑似硬編碼憑證/密碼/金鑰於 SQL:{_secret_kind(m)}——"
                      f"一律禁止,應改用參數/密鑰管理服務"))

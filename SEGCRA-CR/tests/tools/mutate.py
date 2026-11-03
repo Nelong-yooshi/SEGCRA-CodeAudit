@@ -2472,13 +2472,35 @@ MUTANTS.update({
  "R004:訊息回顯比對到的原文": ("../toolbox/sqltools.py",
      'f"疑似硬編碼憑證/密碼/金鑰於 SQL:{_secret_kind(m)}——"',
      'f"疑似硬編碼憑證/密碼/金鑰於 SQL:「{m.group(0)[:40]}」——"'),
+ # 偵測範圍(#67):漏抓等於密碼進正式環境,誤報直接把 MR 擋下來
+ "R004:不認 N 前綴的字串(T-SQL 的 N'…' 漏抓)": ("../toolbox/sqltools.py",
+     '_QUOTED = r\'\'\'N?\'[^\'\\n]{1,}\'|N?"[^"\\n]{1,}"\'\'\'',
+     '_QUOTED = r\'\'\'\'[^\'\\n]{1,}\'|"[^"\\n]{1,}"\'\'\''),
+ 'R004:佔位符也當成寫死的值(env_var 被報成 blocker)': ("../toolbox/sqltools.py",
+     '_NOT_HARDCODED = r"(?![^\\n]{0,60}(?:\\{\\{|\\$\\{|env_var\\s*\\())"',
+     '_NOT_HARDCODED = r""'),
+ 'R004:不認位置參數(sp_addlogin 的密碼漏抓)': ("../toolbox/sqltools.py",
+     '    m = _SECRET_RE.search(sql) or _SECRET_PROC_RE.search(sql)',
+     '    m = _SECRET_RE.search(sql)'),
+ 'R004:欄位比較不降級(狀態值的比較被擋下)': ("../toolbox/sqltools.py",
+     '    if m and not _is_comparison(sql, m):',
+     '    if m:'),
+ 'R004:密碼家族的比較也降級(寫死的密碼被放過)': ("../toolbox/sqltools.py",
+     '    if not key or key in _PASSWORD_KEYS:',
+     '    if not key:'),
+ 'R004:降級不看值像不像狀態碼(hunter2 也放過)': ("../toolbox/sqltools.py",
+     '    return bool(_STATUS_VALUE_RE.match(sql, m.end("key")))',
+     '    return True'),
+ 'R004:等號後面的識別字也算寫死(欄位比較被誤報)': ("../toolbox/sqltools.py",
+     '      | =\\s*""" + _NOT_HARDCODED + r"""(?:""" + _QUOTED + r"""|[0-9][\\w.$-]{0,})',
+     '      | =\\s*""" + _NOT_HARDCODED + r"""(?:""" + _QUOTED + r"""|[^\\s#,;)\\n]{1,})'),
  "R004:回顯鍵名原文(大小寫與寫法是作者的文字)": ("../toolbox/sqltools.py",
-     '    key = re.sub(r"[_-]", "", m.group("key") or "").lower()' + NL
+     '    key = re.sub(r"[_-]", "", groups.get("key") or "").lower()' + NL
      + "    return f\"{_SECRET_KINDS.get(key, '憑證')}類的鍵指定了字串常值\"",
-     '    key = m.group("key") or ""' + NL
+     '    key = groups.get("key") or ""' + NL
      + '    return f"{key} 指定了字串常值"'),
  "R004:連線字串那一支也報成鍵": ("../toolbox/sqltools.py",
-     '    if m.group("url"):' + NL + '        return "連線字串含帳號與密碼"',
+     '    if groups.get("url"):' + NL + '        return "連線字串含帳號與密碼"',
      "    if False:" + NL + '        return "連線字串含帳號與密碼"'),
 })
 
