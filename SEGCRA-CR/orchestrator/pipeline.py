@@ -1975,6 +1975,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_claim_evidence(report)
 
         report = apply_rubric(report)
+        # 規則層命中的代號由程式從預掃結果寫進報告(模型輸出的同名欄位在這裡被蓋掉),
+        # 決策閘門據此判斷;這一步出錯時記成環節未完整,一樣不得自動放行
+        report["_rule_hits"] = _step(report, "規則命中彙整", _rule_hit_codes, None, pre)
         report = apply_policy(report, mr, cfg.policy)
         if not report.get("decision"):
             # 決策閘門自己壞掉時沒有決策可用——不能留空(呼叫端會以為沒問題)。
@@ -3399,6 +3402,20 @@ def enforce_claim_evidence(report: dict) -> dict:
     return report
 
 
+def _rule_hit_codes(pre: list[dict]) -> list[str]:
+    """預掃裡規則層(R 系列)命中的代號,排序、不重複。決策閘門的硬條件用(見 apply_policy)。
+
+    從預掃結果算,不從 finding 認:模型可以自己寫一條同標題的 finding,也可以把命中的那條
+    寫成 info。檢核點(H 系列)與學到的風格(S 系列)不算。"""
+    codes = set()
+    for entry in pre if isinstance(pre, list) else []:
+        for hit in entry.get("rules", []) if isinstance(entry, dict) else []:
+            code = hit.get("rule") if isinstance(hit, dict) else None
+            if isinstance(code, str) and code.startswith("R"):
+                codes.add(code)
+    return sorted(codes)
+
+
 @_isolated_stage("決策閘門")
 def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     """決策閘門(確定性):auto_approved / needs_human / blocked。
@@ -3444,6 +3461,13 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     # allowed_severities 只許 info 擋著(未完成的那條是 major),設定一放寬,
     # 沒跑完的審查就會被當成「沒問題」自動放行。跟執行驗證一樣不可由設定關閉。
     incomplete = review_incomplete(report)
+    # 規則層有命中、冷讀命中或沒看完 → 不得自動放行,也**寫死在程式裡**。只靠設定檔的
+    # allowed_severities 只許 info 擋著的話(命中至少是 minor、冷讀那條是 major),設定一放寬,
+    # 規則層驗到差異、或有文字在對審查者說話的 MR 就會被自動放行。兩個訊號都是程式寫的
+    # (`_rule_hits` 從預掃結果算、`_cold_read` 由冷讀那一道寫),不看 finding 的標題或嚴重度。
+    rule_hits = [str(code) for code in (report.get("_rule_hits") or [])]
+    cold = report.get("_cold_read")
+    cold_read = isinstance(cold, dict) and (cold.get("flagged") is True or cold.get("truncated") is True)
 
     blk = policy.get("block", {})
     if sum(s == "blocker" for s in
@@ -3458,6 +3482,8 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
           and not needs_human
           and not spec_changed
           and not incomplete
+          and not rule_hits
+          and not cold_read
           and report.get("score", 0) >= aa.get("min_score", 101)
           and severities <= set(aa.get("allowed_severities", []))
           and not (aa.get("forbid_pending_hints", True) and pending_hints))
@@ -3468,7 +3494,9 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
                                  "spec_exec_passed": spec_exec_ok,
                                  "needs_human": needs_human,
                                  "spec_changed": spec_changed,
-                                 "incomplete": incomplete}
+                                 "incomplete": incomplete,
+                                 "rule_hits": rule_hits,
+                                 "cold_read": cold_read}
     return report
 
 

@@ -43,13 +43,22 @@ LLM 審完、執行驗證跑完之後,管線用兩個**確定性函式**把「�
    - `diff_lines ≤ policy.auto_approve.max_diff_lines`(models.yaml 設 30;policy 沒設時預設 0,等於不放行)
    - `not new_rule`
    - `spec_exec_ok`(**硬條件,寫死在程式,models.yaml 的註解也明講不可設定關閉**)
+   - 下面幾項也是**寫死在程式的硬條件**,不可由設定關閉:
+     - 沒有 `_needs_human`(無規格可對照、規格未載明等「意圖無法確認」的理由)
+     - `not spec_changed`(MR 改到規格檔)
+     - `not incomplete`(有環節沒完成,見 `review_incomplete`)
+     - `not rule_hits`:規則層(R 系列)沒有任何命中。`report["_rule_hits"]` 由程式從預掃結果算
+       (`_rule_hit_codes`),模型輸出的同名欄位會被蓋掉;不看 finding 的標題或嚴重度(模型可以自己寫一條
+       同標題的 finding,或把命中寫成 info)。彙整這一步出錯時記成環節未完整
+     - `not cold_read`:冷讀沒有命中、也看完了(`report["_cold_read"]` 的 `flagged`、`truncated`)
    - `score ≥ policy.auto_approve.min_score`(models.yaml 設 95;沒設時預設 101,等於不放行)
    - `severities ⊆ policy.auto_approve.allowed_severities`(models.yaml 只允許 `[info]`)
    - `not (forbid_pending_hints and pending_hints)`(models.yaml 設 true:有待確認檢核點一律不放行)
 3. 其餘 → `needs_human`。
-4. 訊號寫進 `report["_policy_signals"]`(change_lines / new_rule / severities / pending_hints / spec_exec_passed)供稽核,決策寫 `report["decision"]`。`policy` 段整個缺席時直接 `needs_human`(fail-safe)。
+4. 訊號寫進 `report["_policy_signals"]`(change_lines / new_rule / severities / pending_hints / spec_exec_passed /
+   needs_human / spec_changed / incomplete / rule_hits / cold_read)供稽核,決策寫 `report["decision"]`。`policy` 段整個缺席時直接 `needs_human`(fail-safe)。
 
-與 `config/models.yaml` 的對應:`policy.auto_approve.{max_diff_lines, min_score, allowed_severities, forbid_pending_hints}` 與 `policy.block.min_blockers` 一一對應上述條件;唯一不在 yaml 的是 `spec_exec_ok`,因為它不是可調參數而是不變量。
+與 `config/models.yaml` 的對應:`policy.auto_approve.{max_diff_lines, min_score, allowed_severities, forbid_pending_hints}` 與 `policy.block.min_blockers` 一一對應上述條件;寫死在程式的那幾項(`spec_exec_ok`、`_needs_human`、`spec_changed`、`incomplete`、`rule_hits`、`cold_read`)不在 yaml,因為它們不是可調參數而是不變量。規則層命中與冷讀命中在預設設定下也擋得住(`allowed_severities` 只許 info),寫死是為了設定放寬之後一樣擋得住。
 
 ### 3. commit status 回寫(`orchestrator/pipeline.py:review_mr` 尾段 → `toolbox/gitlab.py:set_commit_status`)
 
