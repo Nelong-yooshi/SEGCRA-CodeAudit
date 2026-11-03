@@ -2517,11 +2517,17 @@ MUTANTS.update({
  "R005:不抓不帶括號的身分函式": ("../toolbox/sqltools.py",
      r'(SYSTEM_USER|CURRENT_USER|SESSION_USER)\b"',
      r'(SYSTEM_USER)\b"'),
- # review 的小建議:「沙盒」範圍太廣,同一個檔案裡其他 major 提到沙盒就會讓 R005
- # 被當成已經報過。
- "R005:已報判定關鍵詞含「沙盒」(範圍過廣)": ("pipeline.py",
-     '"R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys."],',
-     '"R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys.", "沙盒"],'),
+ # 規則命中一律補報(#104):原本用關鍵詞猜「模型已經報過」,泛用的字眼會讓模型講
+ # 別的事情時整條不補 —— 安靜地漏報,要到稽核才發現。
+ "補報:規則命中改回看模型有沒有提到": ("pipeline.py",
+     "            missing, exact = hits, True",
+     "            missing, exact = _coverage(before, entry[\"path\"], [code], hits)"),
+ "補報:只補第一處(同一個檔案的其他命中漏掉)": ("pipeline.py",
+     "            missing, exact = hits, True",
+     "            missing, exact = hits[:1], True"),
+ "補報:行號回到「不確定就不寫」": ("pipeline.py",
+     "            missing, exact = hits, True",
+     "            missing, exact = hits, False"),
 })
 
 # ---- 注入掃描的總量上限:放得下一份展開結果
@@ -2550,10 +2556,10 @@ MUTANTS.update({
  "後處理:解析失敗改回直接附加": ("pipeline.py",
      "            _put_program_finding(report, _parse_fail_finding(entry))",
      '            report.setdefault("findings", []).append(_parse_fail_finding(entry))'),
- "規則補報:不看嚴重度(info 可蓋掉 blocker)": ("pipeline.py",
+ "檢核點:不看嚴重度(不認得的嚴重度也算回應)": ("pipeline.py",
      '            if i not in covered and rank >= need[i]:',
      '            if i not in covered:'),
- "規則補報:嚴重度差一級也算報過": ("pipeline.py",
+ "檢核點:嚴重度差一級也算回應(不認得的也算)": ("pipeline.py",
      '            if i not in covered and rank >= need[i]:',
      '            if i not in covered and rank >= need[i] - 1:'),
  "規則補報:summary 提到也算報過": ("pipeline.py",
@@ -2562,9 +2568,7 @@ MUTANTS.update({
  "規則補報:檔名也拿來比對關鍵詞": ("pipeline.py",
      '        text = " ".join(str(f.get(k) or "") for k in ("title", "detail", "suggestion"))',
      "        text = json.dumps(f, ensure_ascii=False)"),
- "規則補報:不認得的嚴重度當成最輕": ("pipeline.py",
-     '    need = [_SEVERITY_RANK.get(h.get("severity", "major"), _SEVERITY_RANK["blocker"])',
-     '    need = [_SEVERITY_RANK.get(h.get("severity", "major"), 0)'),
+
  # ---- 同一個檔案有多處相同規則的命中(#28 review)
  "規則補報:同檔有一條報過就全部不補(一條抵多處)": ("pipeline.py",
      '    return [h for i, h in enumerate(hits) if i not in covered]',
@@ -2572,7 +2576,10 @@ MUTANTS.update({
  "規則補報:引用同一句的兩條 finding 各抵一處": ("pipeline.py",
      '        (quoted if refs else generic).append((rank, refs or range(len(hits))))',
      '        generic.append((rank, range(len(hits))))'),
- "規則補報:沒引用語句的 finding 先對應(會多補)": ("pipeline.py",
+ # 「命中的嚴重度不認得時當成最輕」不列為突變點:**它已經是等價的**。_coverage 現在
+ # 只剩檢核點在用(規則改成一律補報),而檢核點呼叫時把每一處都改成 info,那個預設值
+ # 永遠用不到。留著只會得到一個永遠抓不到的突變點。
+ "檢核點:沒引用語句的回應先對應(會多補一條未回應)": ("pipeline.py",
      '    for n, (rank, options) in enumerate(quoted + generic):   # 有引用語句的先對應',
      '    for n, (rank, options) in enumerate(generic + quoted):'),
  "規則補報:語句比對分大小寫與空白": ("pipeline.py",

@@ -2140,25 +2140,6 @@ def _needs_secure_sql(pre: list[dict]) -> bool:
     return any(h.get("rule") in _SECURE_SQL_RULES for e in pre for h in e.get("rules", []))
 
 
-# rule 命中 → 判定「模型已涵蓋」的關鍵詞(報告全文含任一即視為已報,避免重複)
-_RULE_KEYWORDS = {
-    "R001": ["WHERE", "全表", "整表", "整張表", "purge"],
-    "R002": ["SELECT *", "明列欄位", "star"],
-    "R003": ["NOT IN", "NULL 陷阱", "NOT EXISTS"],
-    "R004": ["憑證", "密碼", "金鑰", "硬編碼", "hardcode", "credential", "secret"],
-    # 「沙盒」刻意不列(#27 review 的建議):它的範圍太廣,同一個檔案裡模型的其他
-    # major 只要提到沙盒,R005 就會被當成已經報過而不補報。
-    "R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys."],
-    # 危險 SQL 原語:關鍵詞要用那一類**特有**的字。原本這幾種會被報成「語法錯誤」
-    # 「效能問題」,所以泛用的字眼(「外部」「權限」)不能用——模型用它講別的事情時,
-    # 這一條就會被當成已經報過而不補報。
-    "R006": ["OPENROWSET", "OPENDATASOURCE", "OPENQUERY", "BULK INSERT", "linked server",
-             "四段式"],
-    "R007": ["xp_cmdshell", "作業系統指令", "作業系統命令"],
-    "R008": ["GRANT", "REVOKE", "EXECUTE AS", "ALTER ROLE", "授權", "權限授予"],
-    "R009": ["動態 SQL", "sp_executesql", "字串串接", "組出來再執行"],
-    "R010": ["run_query", "編譯期", "compile"],
-}
 
 
 _PARSE_FAIL_TITLE = "預掃無法解析此檔的 SQL,rule-base 規則未執行"
@@ -2668,10 +2649,16 @@ def _hit_line(hit: dict, exact: bool) -> int:
 
 
 def _count_note(code: str, total: int, missing: int, n: int) -> str:
-    """同一個檔案同一個代碼有多處命中時,附在補的說明後面的數量(只有一處時不加)。"""
+    """同一個檔案同一個代碼有多處命中時,附在補的說明後面的數量(只有一處時不加)。
+
+    檢核點(`enforce_hints`)仍然要判斷模型回應了幾處,所以保留 `missing`;規則
+    (`enforce_rules`)一律補報,兩個數字相同,說明就只寫「共幾處、這是第幾條」。
+    """
     if total <= 1:
         return ""
-    return (f"(這個檔案共有 {total} 處命中 {code},模型的 finding 只對應到 {total - missing} 處;"
+    answered = ("" if missing == total
+                else f",模型的 finding 只對應到 {total - missing} 處")
+    return (f"(這個檔案共有 {total} 處命中 {code}{answered};"
             f"這是程式補上的第 {n} 條,共 {missing} 條。請逐一檢查每一處。)")
 
 
@@ -2915,8 +2902,12 @@ def enforce_rules(report: dict, pre: list[dict]) -> dict:
             if code.startswith("R"):       # hint(H 系列)由 enforce_hints 處理
                 by_code.setdefault(code, []).append(h)
         for code, hits in by_code.items():
-            missing, exact = _coverage(before, entry["path"], _RULE_KEYWORDS.get(code, [code]),
-                                       hits)
+            # **一律補報,不看模型有沒有提到**(#104)。規則命中是程式判定的事實,
+            # 不需要靠猜來決定要不要說。原本用關鍵詞猜「模型已經講過同一件事」,而那
+            # 會誤中:模型在別的 finding 裡提到 `GRANT`,R008 就整條不補 —— 代價是
+            # 安靜地漏報,要到稽核才會發現。重複的部分由 sanitize_findings 的同檔
+            # 近似標題去重處理,代價只是有人多看一眼。
+            missing, exact = hits, True
             for n, h in enumerate(missing, 1):
                 detail = h.get("message", "") + (
                     "(這個命中在 is_incremental() 為 True 的增量分支裡)"
