@@ -14,6 +14,11 @@ GitLab 設定:專案 → Settings → Webhooks → URL 指到 http://<本機>:80
 Secret token 填 GITLAB_WEBHOOK_SECRET、勾 Merge request events 與 Comments
 (留言 /review 可重審)。健康檢查:GET /health。
 
+什麼時候審:MR 開啟、重開、推了新 commit、從 Draft 標成 Ready。Draft 的 MR 不審(開發中反覆推
+commit,每推一次就整份審一次);Draft 期間要看,留言 /review。/review 要寫在留言開頭(一行只寫
+`/review`,或後面空一格再寫別的),內文或網址裡出現 /review 不算。同一個 MR 短時間內連續觸發時,
+等 WEBHOOK_DEBOUNCE_SECONDS 秒沒有新事件才開始,只審最後一次。
+
 審查完成後管線會回寫 commit status(name=segcra/review):
 auto_approved → success;needs_human / blocked → failed(description 帶原因)。
 搭配專案設定「Pipelines must succeed」+ protected branch,即為 CE 的 merge 閘門。
@@ -23,6 +28,7 @@ import asyncio
 import hmac
 import json
 import os
+import re
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -42,6 +48,11 @@ _cfg = load_config()
 # 執行驗證那一段自己另有上限(pipeline.SPEC_EXEC_TIMEOUT_SECONDS,預設 1200 秒),
 # 這裡是整份的天花板,要比它大。
 REVIEW_TIMEOUT_SECONDS = env_seconds("REVIEW_TIMEOUT_SECONDS", 2400)
+# 同一個 MR 短時間內連續觸發(連推幾個 commit、連續留言)時,等這麼多秒沒有新事件才開始審:
+# 每份審查都是完整的模型呼叫,每來一個事件就開一份再取消,只是白白佔住模型
+DEBOUNCE_SECONDS = env_seconds("WEBHOOK_DEBOUNCE_SECONDS", 10)
+# 留言開頭的 /review 指令(後面是空白或結尾)。寫在內文、網址裡、或 /reviews 都不算
+_REVIEW_COMMAND = re.compile(r"\A\s*/review(?:\s|\Z)")
 
 # 每個 MR 一份進行中的紀錄:{mr_iid: (event_loop, task)}。
 # 用它做兩件事:同一 MR 推新 commit 時取消舊的那次、以及知道誰還在跑。
@@ -178,15 +189,91 @@ def _cancel(mr_iid: int) -> bool:
         return False
 
 
+# 還在等的審查:{mr_iid: 計時器}。計時器到了才真的開始(見 _trigger)
+_pending: dict = {}
+
+
 def _trigger(mr_iid: int, head_sha: str | None = None) -> str:
-    # 同一個 MR 推了新 commit:取消舊的那次,改審新的(#45)。
-    # 原本是 debounce(略過新的那次),但那會讓**新的 commit 不被審查**——
-    # 舊的那次審的是舊程式,結論貼到新的 commit 上是錯的。
+    """排一份審查:DEBOUNCE_SECONDS 秒內同一個 MR 沒有新事件才開始;有的話重新計時,改審最新的。
+
+    開始時,同一個 MR 還有進行中的審查就取消它、改審新的:舊的那次審的是舊程式,
+    結論貼到新的 commit 上是錯的。"""
+    timer = threading.Timer(DEBOUNCE_SECONDS, _start, args=(mr_iid, head_sha))
+    timer.daemon = True
+    with _lock:
+        old = _pending.get(mr_iid)
+        _pending[mr_iid] = timer
+    if old is not None:
+        old.cancel()
+    timer.start()
+    return f"review scheduled for MR !{mr_iid}"
+
+
+def _start(mr_iid: int, head_sha: str | None) -> None:
+    """計時器到了:這個計時器還是這個 MR 最新的那一個,才開始審查。
+
+    計時器取消得太晚(已經在跑這個函式)時,新的事件已經換上新的計時器,這裡就不開始,
+    不會出現兩份。"""
+    with _lock:
+        if _pending.get(mr_iid) is not threading.current_thread():
+            return
+        _pending.pop(mr_iid)
     if _cancel(mr_iid):
         print(f"[webhook] MR !{mr_iid} 取消進行中的舊審查,改審新的", flush=True)
     print(f"[webhook] → 觸發審查 MR !{mr_iid}(profile={PROFILE})", flush=True)
     threading.Thread(target=_run_review, args=(mr_iid, head_sha), daemon=True).start()
-    return f"review triggered for MR !{mr_iid}"
+
+
+def _is_draft(attrs: dict) -> bool:
+    """MR 是不是 Draft。GitLab 較早的版本用 work_in_progress 這個欄位,兩個都認。"""
+    return attrs.get("draft") is True or attrs.get("work_in_progress") is True
+
+
+def _became_ready(changes) -> bool:
+    """這次 update 是不是把 Draft 標成 Ready(changes 裡 draft 從 true 變成 false)。"""
+    if not isinstance(changes, dict):
+        return False
+    for key in ("draft", "work_in_progress"):
+        change = changes.get(key)
+        if isinstance(change, dict) and change.get("previous") is True and change.get("current") is False:
+            return True
+    return False
+
+
+def _review_command(note) -> bool:
+    return isinstance(note, str) and _REVIEW_COMMAND.match(note) is not None
+
+
+def _handle(payload: dict) -> str:
+    """一個 webhook 事件要不要觸發審查;回傳回給 GitLab 的文字。觸發時排一份審查(_trigger)。"""
+    kind = payload.get("object_kind")
+    if kind == "merge_request":
+        attrs = payload.get("object_attributes", {})
+        action, iid = attrs.get("action"), attrs.get("iid")
+        if action in TRIGGER_ACTIONS and iid is not None:
+            if _is_draft(attrs):
+                # Draft 不審:開發中反覆推 commit,每推一次就整份審一次。標成 Ready 時再審
+                return "ignored (draft)"
+            if action == "update" and not attrs.get("oldrev") and not _became_ready(
+                    payload.get("changes")):
+                # GitLab 的 action=update 不只代表推了新 commit:改 label、標題、
+                # 描述、指派人都是 update——**包括審查自己最後 set_label 那一下**。
+                # 只有推了新 commit 時才會帶 oldrev,所以用它分辨。Draft 標成 Ready 也是
+                # 沒有 oldrev 的 update,由 changes 認出來另外審。
+                # 不分辨的後果:每個 MR 至少多跑一次完整審查(自己的 set_label 觸發
+                # 的),而且兩次決策不同時 label 又變、再觸發一次。
+                return f"ignored (update 沒有新 commit)"
+            return _trigger(int(iid), head_sha=attrs.get("last_commit", {}).get("id"))
+        return f"ignored (action={action})"
+    if kind == "note":                      # 討論串留言:只有開頭的 /review 才重審(Draft 也審)
+        attrs = payload.get("object_attributes", {})
+        mr = payload.get("merge_request", {})
+        author_bot = payload.get("user", {}).get("username", "").startswith(("ai-", "root"))
+        if (attrs.get("noteable_type") == "MergeRequest" and mr.get("iid")
+                and _review_command(attrs.get("note")) and not author_bot):
+            return _trigger(int(mr["iid"]), head_sha=mr.get("last_commit", {}).get("id"))
+        return "ignored (note)"
+    return f"ignored (kind={kind})"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -215,30 +302,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._send(400, "bad json")
 
-        kind = payload.get("object_kind")
-        if kind == "merge_request":
-            attrs = payload.get("object_attributes", {})
-            action, iid = attrs.get("action"), attrs.get("iid")
-            if action in TRIGGER_ACTIONS and iid is not None:
-                if action == "update" and not attrs.get("oldrev"):
-                    # GitLab 的 action=update 不只代表推了新 commit:改 label、標題、
-                    # 描述、指派人都是 update——**包括審查自己最後 set_label 那一下**。
-                    # 只有推了新 commit 時才會帶 oldrev,所以用它分辨。
-                    # 不分辨的後果:每個 MR 至少多跑一次完整審查(自己的 set_label 觸發
-                    # 的),而且兩次決策不同時 label 又變、再觸發一次。
-                    return self._send(200, f"ignored (update 沒有新 commit)")
-                return self._send(200, _trigger(int(iid), head_sha=attrs.get("last_commit", {}).get("id")))
-            return self._send(200, f"ignored (action={action})")
-        if kind == "note":                      # 討論串留言:只有明確 /review 才重審(避免迴圈)
-            attrs = payload.get("object_attributes", {})
-            mr = payload.get("merge_request", {})
-            author_bot = payload.get("user", {}).get("username", "").startswith(("ai-", "root"))
-            if (attrs.get("noteable_type") == "MergeRequest" and mr.get("iid")
-                    and "/review" in (attrs.get("note") or "") and not author_bot):
-                return self._send(200, _trigger(int(mr["iid"]),
-                                                 head_sha=mr.get("last_commit", {}).get("id")))
-            return self._send(200, "ignored (note)")
-        return self._send(200, f"ignored (kind={kind})")
+        return self._send(200, _handle(payload))
 
     def log_message(self, *a):    # 靜音預設 access log,只留自己的 print
         pass

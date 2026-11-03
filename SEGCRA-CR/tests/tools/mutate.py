@@ -4376,6 +4376,70 @@ MUTANTS.update({
 })
 
 
+# webhook 每份審查的事件迴圈:關掉前取消並等完還沒結束的工作(跟 asyncio.run 收尾一樣,等待有上限)
+W = "../scripts/webhook_server.py"
+MUTANTS.update({
+    "迴圈收尾:直接關迴圈": (W, "        _close_loop(loop, mr_iid)", "        loop.close()"),
+    "迴圈收尾:不取消剩下的工作": (W,
+        "        for t in pending:" + NL + "            t.cancel()",
+        "        for t in pending:" + NL + "            pass"),
+    "迴圈收尾:不等取消的工作收完": (W,
+        "            _, still = loop.run_until_complete(asyncio.wait(pending, timeout=_LOOP_CLEANUP_SECONDS))",
+        "            _, still = set(), set(pending)"),
+    "迴圈收尾:等待沒有上限": (W,
+        "asyncio.wait(pending, timeout=_LOOP_CLEANUP_SECONDS)", "asyncio.wait(pending, timeout=None)"),
+    "迴圈收尾:等不完也不說": (W,
+        "            if still:", "            if False:"),
+    "迴圈收尾:例外連訊息一起記": (W,
+        "收尾時有工作丟出 {type(t.exception()).__name__}", "收尾時有工作丟出 {t.exception()!r}"),
+    "迴圈收尾:收尾出錯往外丟": (W,
+        "        except Exception as e:" + NL + '            print(f"[webhook] MR !{mr_iid} 收尾({step})出錯',
+        "        except ZeroDivisionError as e:" + NL + '            print(f"[webhook] MR !{mr_iid} 收尾({step})出錯'),
+    "迴圈收尾:不收 async generator 與執行緒池": (W,
+        '    for step in ("shutdown_asyncgens", "shutdown_default_executor"):',
+        "    for step in ():"),
+    "迴圈收尾:關掉的迴圈還掛在執行緒上": (W, "    asyncio.set_event_loop(None)", "    pass"),
+})
+
+# webhook 什麼時候觸發審查:留言開頭的 /review、Draft 不審、標成 Ready 時審、連續觸發只審最後一次
+MUTANTS.update({
+    "觸發:內文或網址裡的 /review 也算": (W,
+        r'_REVIEW_COMMAND = re.compile(r"\A\s*/review(?:\s|\Z)")',
+        r'_REVIEW_COMMAND = re.compile(r".*/review(?:\s|\Z)")'),
+    "觸發:/reviews 也算": (W,
+        r'_REVIEW_COMMAND = re.compile(r"\A\s*/review(?:\s|\Z)")',
+        r'_REVIEW_COMMAND = re.compile(r"\A\s*/review")'),
+    "觸發:留言不看是不是 /review 指令": (W,
+        '                and _review_command(attrs.get("note")) and not author_bot):',
+        "                and not author_bot):"),
+    "觸發:Draft 也審": (W,
+        "        if _is_draft(attrs):", "        if False:"),
+    "觸發:較早版本的欄位 work_in_progress 不認": (W,
+        '    return attrs.get("draft") is True or attrs.get("work_in_progress") is True',
+        '    return attrs.get("draft") is True'),
+    "觸發:標成 Ready 不審": (W,
+        '        if isinstance(change, dict) and change.get("previous") is True and change.get("current") is False:'
+        + NL + "            return True",
+        '        if isinstance(change, dict) and change.get("previous") is True and change.get("current") is False:'
+        + NL + "            return False"),
+    "觸發:標回 Draft 也當成 Ready": (W,
+        'change.get("previous") is True and change.get("current") is False:',
+        'change.get("previous") is not None:'),
+    "觸發:changes 形狀不對也照讀": (W,
+        "    if not isinstance(changes, dict):" + NL + "        return False",
+        "    if False:" + NL + "        return False"),
+    "觸發:不等安靜期": (W,
+        "    timer = threading.Timer(DEBOUNCE_SECONDS, _start, args=(mr_iid, head_sha))",
+        "    timer = threading.Timer(0, _start, args=(mr_iid, head_sha))"),
+    "觸發:被換掉的計時器照樣開始": (W,
+        "        if _pending.get(mr_iid) is not threading.current_thread():" + NL + "            return",
+        "        if False:" + NL + "            return"),
+    "觸發:開始後不清掉等待中的紀錄": (W,
+        "        _pending.pop(mr_iid)", "        pass"),
+    "觸發:開始時不取消進行中的審查": (W,
+        "    if _cancel(mr_iid):", "    if False:"),
+})
+
 # ---- 主審查的輸出被截斷
 # 失效是靜默的:被切斷的 JSON 會被修補成合法物件,報告只是比較短。
 P = "pipeline.py"
@@ -4941,31 +5005,6 @@ MUTANTS.update({
      "                               (\"completion_tokens_total\", None)):"),
 })
 
-
-# webhook 每份審查的事件迴圈:關掉前取消並等完還沒結束的工作(跟 asyncio.run 收尾一樣,等待有上限)
-W = "../scripts/webhook_server.py"
-MUTANTS.update({
-    "迴圈收尾:直接關迴圈": (W, "        _close_loop(loop, mr_iid)", "        loop.close()"),
-    "迴圈收尾:不取消剩下的工作": (W,
-        "        for t in pending:" + NL + "            t.cancel()",
-        "        for t in pending:" + NL + "            pass"),
-    "迴圈收尾:不等取消的工作收完": (W,
-        "            _, still = loop.run_until_complete(asyncio.wait(pending, timeout=_LOOP_CLEANUP_SECONDS))",
-        "            _, still = set(), set(pending)"),
-    "迴圈收尾:等待沒有上限": (W,
-        "asyncio.wait(pending, timeout=_LOOP_CLEANUP_SECONDS)", "asyncio.wait(pending, timeout=None)"),
-    "迴圈收尾:等不完也不說": (W,
-        "            if still:", "            if False:"),
-    "迴圈收尾:例外連訊息一起記": (W,
-        "收尾時有工作丟出 {type(t.exception()).__name__}", "收尾時有工作丟出 {t.exception()!r}"),
-    "迴圈收尾:收尾出錯往外丟": (W,
-        "        except Exception as e:" + NL + '            print(f"[webhook] MR !{mr_iid} 收尾({step})出錯',
-        "        except ZeroDivisionError as e:" + NL + '            print(f"[webhook] MR !{mr_iid} 收尾({step})出錯'),
-    "迴圈收尾:不收 async generator 與執行緒池": (W,
-        '    for step in ("shutdown_asyncgens", "shutdown_default_executor"):',
-        "    for step in ():"),
-    "迴圈收尾:關掉的迴圈還掛在執行緒上": (W, "    asyncio.set_event_loop(None)", "    pass"),
-})
 
 if __name__ == "__main__":
     sys.exit(main())
