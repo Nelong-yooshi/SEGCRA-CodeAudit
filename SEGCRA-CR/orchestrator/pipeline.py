@@ -40,6 +40,8 @@ from .dbt_project import DbtProjectError, check_project_dir
 from .dbt_render import (MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, MACRO_SYNTAX,
                          check_macro_files_isolated)
 from .security import scan_mr
+from toolbox.gitlab import (WRITE_FAILED, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UNCERTAIN,
+                            write_failure)
 from .skills_loader import always_skills, load_skills, skills_index
 from .spec_exec import SpecLookup, find_spec, run_spec_exec
 from .tool_hub import ToolHub
@@ -357,32 +359,67 @@ def _superseded(now: dict, reviewed_sha: str | None) -> bool:
     return bool(current) and current != reviewed_sha
 
 
-# 總結裡最多列幾條沒有確定貼上的 finding(其餘只寫條數)
+# 總結裡沒有確定貼上的 finding:前幾條連標題一起列,其餘只列檔名與行號(一行一條)
 _UNPOSTED_LISTED = 20
 
 
 def _posted(result: str) -> bool:
     """`post_inline_comment` 有沒有確定貼上。回 `ok: false`(送出後不知道 GitLab 有沒有建立),
     或工具本身丟例外(ToolHub 回的是錯誤字串),都算沒有確定貼上。"""
-    try:
-        return json.loads(result).get("ok") is True
-    except (ValueError, TypeError, AttributeError):
-        return False
+    return write_failure(result) is None
+
+
+def _place(fd: dict) -> str:
+    return f"`{fd.get('file', '')}:{fd.get('line') or 0}`"
 
 
 def _unposted_section(unposted: list[dict]) -> str:
     """總結裡列出沒有確定貼上的 finding(行內討論送出後連線中斷、逾時或 5xx)。
 
     這些不改貼一般留言:GitLab 可能已經建立了討論、只是回應沒送到,改貼的話同一條會出現
-    兩次。列在總結裡,看的人才知道可能少了哪幾條。"""
+    兩次。列在總結裡,看的人才知道可能少了哪幾條。**每一條都列出來**:看 MR 的人拿不到
+    伺服器上的報告檔,沒列的就等於在 MR 上消失了;超過 _UNPOSTED_LISTED 條的部分只列檔名
+    與行號,總結不會因此變得太長。"""
     if not unposted:
         return ""
-    shown = unposted[:_UNPOSTED_LISTED]
-    lines = [f"- `{fd.get('file', '')}:{fd.get('line') or 0}` {fd.get('title', '')}" for fd in shown]
-    if len(unposted) > len(shown):
-        lines.append(f"- 其餘 {len(unposted) - len(shown)} 條見完整的審查報告")
+    lines = [f"- {_place(fd)} {fd.get('title', '')}" for fd in unposted[:_UNPOSTED_LISTED]]
+    lines += [f"- {_place(fd)}" for fd in unposted[_UNPOSTED_LISTED:]]
     return (f"\n\n**有 {len(unposted)} 條意見沒有確定貼上**(送出後連線中斷、逾時或 GitLab "
             f"回應錯誤;為了不重複貼,沒有改貼成一般留言):\n" + "\n".join(lines))
+
+
+# 回寫的步驟(寫進 report["_writeback"] 的鍵 → 報告與 log 上的名稱)與失敗的種類
+_WRITEBACK_STEPS = {"commit_status": "merge 閘門(commit status)", "label": "標籤",
+                    "summary": "總結留言"}
+_WRITE_FAILURE_TEXT = {
+    WRITE_REJECTED: "GitLab 拒絕了這個請求",
+    WRITE_UNCERTAIN: "連線中斷、逾時或 GitLab 回應錯誤,不確定有沒有寫上",
+    WRITE_NO_SHA: "沒有 commit 的 sha",
+    WRITE_FAILED: "寫入工具出錯",
+}
+
+
+def _record_writeback(writeback: dict, mr_id: str, step: str, result: str) -> str | None:
+    """記下一步回寫有沒有寫上:沒寫上的記進 writeback、印一行 log(只寫步驟與種類,不寫
+    例外訊息)。回傳失敗的種類,寫上了回 None。"""
+    failure = write_failure(result)
+    if failure is not None:
+        writeback[step] = failure
+        print(f"[pipeline] MR !{mr_id} 回寫沒有完成:{_WRITEBACK_STEPS[step]}"
+              f"({_WRITE_FAILURE_TEXT[failure]})", flush=True)
+    return failure
+
+
+def _writeback_section(writeback: dict, label: str) -> str:
+    """總結裡寫明 commit status 或標籤沒有寫上(總結在這兩步之後才貼,見 review_mr)。"""
+    lines = []
+    if writeback.get("commit_status"):
+        lines.append(f"- ⚠️ **merge 閘門沒有寫上**(commit status `segcra/review`:"
+                     f"{_WRITE_FAILURE_TEXT[writeback['commit_status']]})。合併閘門上可能沒有這次"
+                     "審查的結果,請人工確認後再合併。")
+    if writeback.get("label"):
+        lines.append(f"- 標籤 `{label}` 沒有設上({_WRITE_FAILURE_TEXT[writeback['label']]})。")
+    return "\n\n**回寫沒有完成的部分**:\n" + "\n".join(lines) if lines else ""
 
 
 def _spec_exec_stage(progress: dict) -> str:
@@ -2046,26 +2083,32 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             })
             if not _posted(result):
                 unposted.append(fd)
-        report["_writeback"] = {"unposted": len(unposted)}
+        writeback = {"unposted": len(unposted)}
+        report["_writeback"] = writeback
+        if unposted:
+            print(f"[pipeline] MR !{mr_id} 有 {len(unposted)} 條意見沒有確定貼上", flush=True)
         decision = report.get("decision", "needs_human")
+        label = f"ai-review::{decision}"
+        # commit status 與標籤先設、總結最後貼:這兩步沒寫上時要在總結寫明(看 MR 的人看得到)。
+        # commit status 回寫:CE 的 merge 閘門靠它(Pipelines must succeed)
+        _record_writeback(writeback, mr_id, "commit_status", await hub.call(
+            "gitlab__set_commit_status", {
+                "mr_id": mr_id, "sha": mr.get("sha", ""),
+                "state": "success" if decision == "auto_approved" else "failed",
+                "name": "segcra/review",
+                "description": f"{decision}:{report.get('summary', '')[:180]}",
+            }))
+        _record_writeback(writeback, mr_id, "label", await hub.call(
+            "gitlab__set_label", {"mr_id": mr_id, "label": label}))
         decision_text = {"auto_approved": "✅ 小幅變更且無實質問題,自動放行",
                          "needs_human": "👤 請人工確認後裁決",
                          "blocked": "⛔ 有 blocker 級問題,修正前不得合入"}[decision]
-        await hub.call("gitlab__post_summary", {
+        _record_writeback(writeback, mr_id, "summary", await hub.call("gitlab__post_summary", {
             "mr_id": mr_id,
             "body": f"**決策:{decision_text}**\n\n{report.get('summary', '')}"
-                    + _unposted_section(unposted),
+                    + _unposted_section(unposted) + _writeback_section(writeback, label),
             "score": int(report.get("score", 0)), "verdict": report.get("verdict", "needs_changes"),
-        })
-        await hub.call("gitlab__set_label",
-                       {"mr_id": mr_id, "label": f"ai-review::{decision}"})
-        # commit status 回寫:CE 的 merge 閘門靠它(Pipelines must succeed)
-        await hub.call("gitlab__set_commit_status", {
-            "mr_id": mr_id, "sha": mr.get("sha", ""),
-            "state": "success" if decision == "auto_approved" else "failed",
-            "name": "segcra/review",
-            "description": f"{decision}:{report.get('summary', '')[:180]}",
-        })
+        }))
         clock.finish()
         if capture is not None:
             capture["report"] = report
@@ -3942,13 +3985,16 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
     report = enforce_dbt_impact(report, affected, dbt_ctx)
     report = enforce_dbt_hidden_writes(report, pre)
     report = enforce_spec_change(report, mr)
+    writeback = {"unposted": 0}
     for fd in report["findings"]:
-        await hub.call("gitlab__post_inline_comment",
-                       {"mr_id": mr_id, "file": fd["file"], "line": 0,
-                        "severity": fd["severity"], "body": fd["title"]})
-    await hub.call("gitlab__post_summary",
-                   {"mr_id": mr_id, "body": report["summary"],
-                    "score": report["score"], "verdict": "dry_run"})
+        result = await hub.call("gitlab__post_inline_comment",
+                                {"mr_id": mr_id, "file": fd["file"], "line": 0,
+                                 "severity": fd["severity"], "body": fd["title"]})
+        writeback["unposted"] += not _posted(result)
+    _record_writeback(writeback, mr_id, "summary", await hub.call(
+        "gitlab__post_summary", {"mr_id": mr_id, "body": report["summary"],
+                                 "score": report["score"], "verdict": "dry_run"}))
+    report["_writeback"] = writeback
     return report
 
 

@@ -525,6 +525,62 @@ def _rejected_by_gitlab(e: Exception) -> bool:
     return isinstance(e, httpx.HTTPStatusError) and 400 <= e.response.status_code < 500
 
 
+# 寫入 GitLab 失敗的種類。寫回的函式不丟例外,失敗時回 {"ok": false, "failure": 種類}:
+# 呼叫端(pipeline 的回寫、webhook 的通知)要知道有沒有寫上,而例外訊息可能帶主機位址,
+# 不能原樣寫進報告或 log。
+WRITE_REJECTED = "rejected"      # GitLab 明確拒絕(4xx):一定沒有寫上
+WRITE_UNCERTAIN = "uncertain"    # 連線中斷、逾時、5xx:不知道有沒有寫上
+WRITE_NO_SHA = "no_sha"          # 沒有 commit 的 sha,設不了 commit status
+WRITE_FAILED = "failed"          # 其他(寫入工具本身出錯、回傳的形狀不對)
+WRITE_FAILURES = (WRITE_REJECTED, WRITE_UNCERTAIN, WRITE_NO_SHA, WRITE_FAILED)
+
+# 重送不會重複的寫入(設 label、設 commit status)失敗時的重送:總共送幾次、每次之間等幾秒
+LABEL_ATTEMPTS = 2
+STATUS_ATTEMPTS = 3
+RETRY_DELAY_SECONDS = 1.0
+
+
+def _write_failed(kind: str) -> str:
+    return json.dumps({"ok": False, "failure": kind}, ensure_ascii=False)
+
+
+def _failure_kind(e: Exception) -> str:
+    return WRITE_REJECTED if _rejected_by_gitlab(e) else WRITE_UNCERTAIN
+
+
+def write_failure(result) -> str | None:
+    """寫回函式的結果有沒有寫上:寫上回 None,沒有回失敗的種類(WRITE_FAILURES 之一)。
+
+    不是這幾個函式回的 JSON(例如 ToolHub 把例外轉成的錯誤字串)算 WRITE_FAILED;
+    `failure` 不是已知的種類時也是,不把任意字串帶進報告。"""
+    try:
+        got = json.loads(result)
+    except (ValueError, TypeError):
+        return WRITE_FAILED
+    if not isinstance(got, dict):
+        return WRITE_FAILED
+    if got.get("ok") is True:
+        return None
+    return got.get("failure") if got.get("failure") in WRITE_FAILURES else WRITE_FAILED
+
+
+def _send_with_retry(send, attempts: int) -> str | None:
+    """重送不會重複的寫入:失敗就再送,最多 attempts 次。成功回 None,失敗回種類。
+
+    GitLab 明確拒絕(4xx)不重送:再送一樣被拒絕。"""
+    attempt = 1
+    while True:
+        try:
+            send()
+            return None
+        except Exception as e:               # noqa: BLE001 — 種類記下來,例外訊息不往外帶
+            kind = _failure_kind(e)
+            if kind == WRITE_REJECTED or attempt >= attempts:
+                return kind
+        attempt += 1
+        time.sleep(RETRY_DELAY_SECONDS)
+
+
 def post_inline_comment(mr_id: str, file: str, line: int, body: str,
                         severity: str = "info", base_sha: str = "", head_sha: str = "",
                         start_sha: str = "") -> str:
@@ -535,7 +591,7 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
 
     行內討論被 GitLab 拒絕(4xx)時退成一般留言。連線中斷、逾時、5xx 時**不退**:GitLab 可能
     已經建立了討論、只是回應沒送到,再貼一般留言同一條就出現兩次。這時回傳
-    `{"ok": false, "uncertain": true}`,由呼叫端記下來。"""
+    `{"ok": false, "failure": "uncertain"}`,由呼叫端記下來。"""
     if REAL_MODE:
         text = f"**[{severity}]** {body}"
         if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
@@ -562,7 +618,7 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
                                                    "new_line": line, **refs}})
         except Exception as e:
             if not _rejected_by_gitlab(e):
-                return json.dumps({"ok": False, "uncertain": True}, ensure_ascii=False)
+                return _write_failed(WRITE_UNCERTAIN)
             # 行號對不上 diff 時退成一般留言,不讓單一 finding 卡住整份審查
             _api("POST", f"/merge_requests/{mr_id}/notes", json=note)
     else:
@@ -572,10 +628,16 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
 
 
 def post_summary(mr_id: str, body: str, score: int, verdict: str) -> str:
-    """發布審查總結留言(總評 + 分數 + 結論)。"""
+    """發布審查總結留言(總評 + 分數 + 結論)。
+
+    失敗時回 `{"ok": false, "failure": 種類}`(見 WRITE_FAILURES),**不重送**:逾時、5xx 時
+    GitLab 可能已經建立了留言、只是回應沒送到,再送同一份總結就出現兩次。"""
     text = f"## 🤖 AI 審查報告\n\n**評分:{score}/100 — {verdict}**\n\n{body}"
     if REAL_MODE:
-        _api("POST", f"/merge_requests/{mr_id}/notes", json={"body": text})
+        try:
+            _api("POST", f"/merge_requests/{mr_id}/notes", json={"body": text})
+        except Exception as e:               # noqa: BLE001 — 種類記下來,例外訊息不往外帶
+            return _write_failed(_failure_kind(e))
     else:
         _mock_output(mr_id, "summary", {"score": score, "verdict": verdict, "body": body})
     return json.dumps({"ok": True}, ensure_ascii=False)
@@ -585,14 +647,22 @@ def set_commit_status(sha: str, state: str, name: str = "segcra/review",
                       description: str = "", mr_id: str = "") -> str:
     """回寫 commit status(external pipeline)。state: success | failed | pending。
     CE 的 merge 閘門靠它:專案設定「Pipelines must succeed」後,
-    failed 的 commit 無法 merge。"""
+    failed 的 commit 無法 merge。
+
+    失敗時重送(同一個 sha 與 name 重送只會更新同一個 status,不會重複),最多
+    STATUS_ATTEMPTS 次;最後還是失敗時回 `{"ok": false, "failure": 種類}`。"""
     if state not in ("success", "failed", "pending"):
         return json.dumps({"error": "state 必須是 success/failed/pending"}, ensure_ascii=False)
     if REAL_MODE:
         if not sha:
-            return json.dumps({"error": "缺 sha,無法回寫 commit status"}, ensure_ascii=False)
-        _api("POST", f"/statuses/{sha}",
-             json={"state": state, "name": name, "description": description[:250]})
+            return json.dumps({"ok": False, "failure": WRITE_NO_SHA,
+                               "error": "缺 sha,無法回寫 commit status"}, ensure_ascii=False)
+        failure = _send_with_retry(lambda: _api(
+            "POST", f"/statuses/{sha}",
+            json={"state": state, "name": name, "description": description[:250]}),
+            STATUS_ATTEMPTS)
+        if failure is not None:
+            return _write_failed(failure)
     else:
         _mock_output(mr_id or "unknown", "commit_status",
                      {"sha": sha, "state": state, "name": name,
@@ -627,9 +697,15 @@ def create_rule_mr(file_path: str, content: str, title: str, description: str) -
 
 
 def set_label(mr_id: str, label: str) -> str:
-    """為 MR 加上標籤(如 ai-review::needs-changes)。"""
+    """為 MR 加上標籤(如 ai-review::needs-changes)。
+
+    失敗時重送一次(加上已經有的標籤不會重複),最後還是失敗時回 `{"ok": false, "failure": 種類}`。"""
     if REAL_MODE:
-        _api("PUT", f"/merge_requests/{mr_id}", json={"add_labels": label})
+        failure = _send_with_retry(
+            lambda: _api("PUT", f"/merge_requests/{mr_id}", json={"add_labels": label}),
+            LABEL_ATTEMPTS)
+        if failure is not None:
+            return _write_failed(failure)
     else:
         _mock_output(mr_id, "label", {"label": label})
     return json.dumps({"ok": True}, ensure_ascii=False)
