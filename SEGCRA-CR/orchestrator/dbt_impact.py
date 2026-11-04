@@ -795,6 +795,44 @@ def _walk(callers_of: dict, start, label, snapshot_hits=None):
     return model_hits, yml_hits, referenced
 
 
+def macros_referenced(source: str, macro_files: dict) -> tuple[set, bool] | None:
+    """這段樣板(遞迴)用到哪些 macro:({macro 名稱}, 有沒有動態呼叫)。
+
+    解析不了時回 `None`,讓呼叫端自己決定要不要退回別的做法。
+
+    **跟 `analyze_macro_impact` 共用同一個掃描器**:那一套照語法樹走,`adapter.dispatch('x')`
+    會展開成所有 `<前綴>__x` 實作。另外用正規式做一份呼叫圖的話,dispatch 這類間接呼叫
+    抓不到 —— 被 dispatch 呼叫到的 macro 裡如果有 `DB_NAME()`,就整個掃不到。
+    """
+    scanner = _Scanner()
+    try:
+        by_name, defined = {}, {}
+        for rel, text in (macro_files or {}).items():
+            scan = scanner.scan(str(text or ""))
+            for name, refs in scan.macros.items():
+                defined[name] = rel
+                by_name[name] = refs
+        top = scanner.scan(str(source or ""))
+    except Exception:            # noqa: BLE001 — 解析不了由呼叫端決定怎麼辦
+        return None
+    dynamic = top.top.dynamic or any(r.dynamic for r in top.macros.values())
+    used, queue = set(), list(top.top.names | {n for r in top.macros.values() for n in r.names})
+    while queue:
+        name = queue.pop()
+        # `adapter.dispatch('x')` 被掃成名稱 `x`,實際會呼叫到所有 `<前綴>__x` 的實作
+        # (dbt 依 adapter 挑一個)。哪一個會被選中是執行期才知道的,所以全部都算 ——
+        # 少算一個就等於那支 macro 裡的 DB_NAME() 掃不到。
+        for candidate in (n for n in by_name
+                          if n == name or n.endswith(f"__{name}")):
+            if candidate in used:
+                continue
+            used.add(candidate)
+            refs = by_name[candidate]
+            dynamic = dynamic or refs.dynamic
+            queue.extend(refs.names)
+    return used, dynamic
+
+
 def analyze_macro_impact(files, changed_paths, *, base_files=None, added_paths=(),
                          model_dirs=DEFAULT_MODEL_DIRS,
                          macro_dirs=DEFAULT_MACRO_DIRS, snapshot_dirs=(),

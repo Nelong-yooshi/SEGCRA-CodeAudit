@@ -488,3 +488,38 @@ def test_prescan對展開成功的樣板也掃原文():
     entry = next(e for e in pre if e["path"] == "models/mrt_big.sql")
     assert "dbt_render_error" not in entry, "這個樣板要展開得成功,情境才成立"
     assert "H008" in [h["rule"] for h in entry["rules"]], entry["rules"]
+
+
+# ─────────────────── macro 呼叫圖只留一套(#103)───────────────────
+#
+# 正規式那份看不懂 `adapter.dispatch('x')`:被它呼叫到的 macro 裡如果有 DB_NAME(),
+# 就整個掃不到。改成先用語法樹(跟 macro 反查同一套),解析不了才退回正規式。
+
+_DISPATCH_MACROS = {
+    "macros/env.sql": "{% macro helper() %}DB_NAME(){% endmacro %}",
+    "macros/impl.sql": "{% macro default__pick() %}{{ helper() }}{% endmacro %}\n"
+                       "{% macro sqlserver__pick() %}@@SERVERNAME{% endmacro %}",
+    "macros/other.sql": "{% macro never_called() %}{{ env_var('X') }}{% endmacro %}",
+}
+
+
+def test_dispatch_呼叫到的macro也掃得到():
+    """`adapter.dispatch('pick')` 會呼叫到 `<前綴>__pick`。哪一個被選中是執行期才知道的,
+    所以全部都算 —— 少算一個就等於那支 macro 裡的 DB_NAME() 掃不到。"""
+    used = _macros_used("SELECT {{ adapter.dispatch('pick')() }}",
+                        _macro_index(_DISPATCH_MACROS))
+    assert sorted(used) == ["macros/env.sql", "macros/impl.sql"]
+
+
+def test_dispatch_沒呼叫到的照舊不掃():
+    used = _macros_used("SELECT {{ adapter.dispatch('pick')() }}",
+                        _macro_index(_DISPATCH_MACROS))
+    assert "macros/other.sql" not in used
+
+
+def test_樣板解析不了時退回正規式():
+    """展開失敗的 model 也要能掃 —— 那正是最該看的情況之一。退回去的代價只是
+    dispatch 這類間接呼叫看不到,總比整個不掃好。"""
+    broken = "{% macro %}\nSELECT {{ db() }}"          # 壞掉的 Jinja,語法樹走不了
+    used = _macros_used(broken, _macro_index(MACROS))
+    assert sorted(used) == ["macros/readenv.sql"]

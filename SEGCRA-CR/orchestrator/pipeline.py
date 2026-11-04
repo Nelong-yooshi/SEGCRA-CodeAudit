@@ -28,6 +28,7 @@ from .dbt_affected import (
 from .change_view import build_full_text_section
 from .cold_read import (UNREAD_NEAR_LIMIT, UNREAD_NO_USAGE, UNREAD_TOO_FEW, ColdRead,
                         cold_read as _cold_read, record as _cold_read_record)
+from .dbt_impact import macros_referenced
 from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_hidden_writes import IN_TAGS, UNREACHED, UNVERIFIED, WRITE_KEYWORDS, find_hidden_writes
 from .dbt_render import is_dbt_template, render_model_isolated
@@ -941,7 +942,21 @@ def _macro_index(macro_files: dict) -> dict:
 
 
 def _macros_used(src: str, index: dict) -> dict:
-    """這段樣板用到的 macro(含 macro 再呼叫 macro),{專案內路徑: 內容}。"""
+    """這段樣板用到的 macro(含 macro 再呼叫 macro),{專案內路徑: 內容}。
+
+    **先用語法樹**(`dbt_impact.macros_referenced`,跟 macro 反查同一套):正規式看不懂
+    `adapter.dispatch('x')`,被它呼叫到的 macro 裡如果有 `DB_NAME()` 就整個掃不到。
+
+    **樣板解析不了才退回正規式**:展開失敗的 model 也要能掃,而那正是最該看的情況
+    之一 —— 退回去的代價只是 dispatch 這類間接呼叫看不到,總比整個不掃好。
+    """
+    # macro 的原文從 index 還原({名稱: (路徑, 內容)}):呼叫端只傳 index,
+    # 兩份資料就不會走鐘。
+    macro_files = {rel: body for rel, body in index.values()}
+    by_tree = macros_referenced(str(src or ""), macro_files)
+    if by_tree is not None:
+        names, _dynamic = by_tree
+        return {index[n][0]: index[n][1] for n in names if n in index}
     out, seen, queue = {}, set(), [str(src or "")]
     while queue:
         text = queue.pop()
