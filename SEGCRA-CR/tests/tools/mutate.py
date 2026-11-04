@@ -2472,16 +2472,6 @@ MUTANTS.update({
  "R004:訊息回顯比對到的原文": ("../toolbox/sqltools.py",
      'f"疑似硬編碼憑證/密碼/金鑰於 SQL:{_secret_kind(m)}——"',
      'f"疑似硬編碼憑證/密碼/金鑰於 SQL:「{m.group(0)[:40]}」——"'),
- # macro 呼叫圖只留一套(#103)
- '呼叫圖:不用語法樹,只用正規式(dispatch 抓不到)': ('pipeline.py',
-     '    by_tree = macros_referenced(str(src or ""), macro_files)',
-     '    by_tree = None'),
- '呼叫圖:解析不了時不退回正規式(展開失敗的 model 整個不掃)': ('pipeline.py',
-     '    if by_tree is not None:',
-     '    if True:'),
- '呼叫圖:dispatch 只認同名的(<前綴>__x 的實作漏掉)': ('dbt_impact.py',
-     '        for candidate in (n for n in by_name\n                          if n == name or n.endswith(f"__{name}")):',
-     '        for candidate in (n for n in by_name if n == name):'),
  "R004:回顯鍵名原文(大小寫與寫法是作者的文字)": ("../toolbox/sqltools.py",
      '    key = re.sub(r"[_-]", "", m.group("key") or "").lower()' + NL
      + "    return f\"{_SECRET_KINDS.get(key, '憑證')}類的鍵指定了字串常值\"",
@@ -2536,6 +2526,16 @@ MUTANTS.update({
 
 # ---- 注入掃描的總量上限:放得下一份展開結果
 MUTANTS.update({
+ # macro 呼叫圖只留一套(#103)
+ '呼叫圖:不用語法樹,只用正規式(dispatch 抓不到)': ('pipeline.py',
+     '    by_tree = macros_referenced(str(src or ""), macro_files)',
+     '    by_tree = None'),
+ '呼叫圖:解析不了時不退回正規式(展開失敗的 model 整個不掃)': ('pipeline.py',
+     '    if by_tree is not None:',
+     '    if True:'),
+ '呼叫圖:dispatch 只認同名的(<前綴>__x 的實作漏掉)': ('dbt_impact.py',
+     '        for candidate in (n for n in by_name\n                          if n == name or n.endswith(f"__{name}")):',
+     '        for candidate in (n for n in by_name if n == name):'),
     "掃描上限:改回放不下一份展開結果": ("pipeline.py",
         "MAX_EXTRA_SCAN_CHARS = 5_000_000",
         "MAX_EXTRA_SCAN_CHARS = 200_000"),
