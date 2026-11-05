@@ -4652,6 +4652,19 @@ MUTANTS.update({
 })
 
 
+# ---- isolation.py 能用的 asyncio 功能(import 白名單的理由)
+MUTANTS.update({
+ "背景執行緒:多用 asyncio 的連線能力": ("isolation.py",
+     "    loop = asyncio.get_running_loop()",
+     "    loop = asyncio.get_running_loop()" + NL + "    _ = asyncio.open_connection"),
+ "背景執行緒:迴圈多用起子行程的能力": ("isolation.py",
+     "    fut = loop.create_future()",
+     "    fut = loop.create_future()" + NL + "    _ = loop.subprocess_exec"),
+ "背景執行緒:迴圈換個名字存": ("isolation.py",
+     "    loop = asyncio.get_running_loop()",
+     "    loop = ev = asyncio.get_running_loop()"),
+})
+
 # ---- 背景執行緒的收尾(isolation.run_in_thread)
 MUTANTS.update({
  "收尾:例外不先綁到自己的變數(lambda 跑的時候 e 已經被刪掉 → 永遠掛著)": ("isolation.py",
