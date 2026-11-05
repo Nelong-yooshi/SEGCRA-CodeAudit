@@ -986,7 +986,8 @@ class _LintBudget:
 
 async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
                   dbt_ctx: DbtContext | None = None, rendered: list | None = None,
-                  line_maps: dict | None = None, out: list | None = None) -> list[dict]:
+                  line_maps: dict | None = None, out: list | None = None,
+                  progress: dict | None = None) -> list[dict]:
     """對每個變更檔跑 rule-base + lint(不經 LLM)。
 
     dbt_cfg 給定且 enabled 時,含 dbt 樣板標記的檔案先展開成純 SQL 再交給規則層
@@ -1003,8 +1004,10 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
     line_maps 給定時,記下展開後的行對回原始檔的對應表(見 _keep_line_maps),給程式補的
     finding 寫行號用(_attach_statement_lines)。不放進預掃結果:預掃結果整份會進 prompt。
 
-    out 給定時,每做完一個檔案就把結果加進這個清單(回傳的也是它):預掃中途被時間上限
-    中止時,做完的檔案仍拿得到(見 _run_prescan)。
+    out 給定時,每做完一個檔案(以及之後每掃完一個呼叫到的 macro)就把結果加進這個清單
+    (回傳的也是它):預掃中途被時間上限中止時,做完的部分仍拿得到(見 _run_prescan)。
+    progress 給定時,開始掃呼叫到的 macro 時記下 `phase = "called_macros"`,逾時的說明據此
+    分得出卡在哪一段。
 
     lint 有整份 MR 的總預算(見 _LintBudget)。
     """
@@ -1094,7 +1097,9 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
             used_macros[f.get("path")] = sql          # 改到的 macro 自己也會呼叫別的
         elif in_project:
             used_macros[f.get("path")] = sql
-    results += await _macro_scan(hub, used_macros, dbt_ctx, {e["path"] for e in results})
+    if progress is not None:
+        progress["phase"] = _PHASE_CALLED_MACROS
+    await _macro_scan(hub, used_macros, dbt_ctx, {e["path"] for e in results}, results)
     return results
 
 
@@ -1110,20 +1115,23 @@ def _merge_env_hits(hits: list, raw) -> list:
     return hits
 
 
-async def _macro_scan(hub: ToolHub, sources: dict, dbt_ctx, already: set) -> list[dict]:
+async def _macro_scan(hub: ToolHub, sources: dict, dbt_ctx, already: set,
+                      out: list | None = None) -> list[dict]:
     """改到的 model/macro 所呼叫的 macro,掃一次讀取環境的寫法。
 
     已經在變更清單裡的檔案不重複掃(它自己那一輪就掃過,而且掃的是全部規則)。
+    有命中的每掃完一個就加進 out(給定時;回傳的也是它):預掃在這一段被時間上限中止時,
+    已經掃完的 macro 的命中仍拿得到。
     """
+    out = [] if out is None else out
     if not sources or dbt_ctx is None or getattr(dbt_ctx, "project", None) is None:
-        return []
+        return out
     index = _macro_index(getattr(dbt_ctx, "macro_files", None) or {})
     if not index:
-        return []
+        return out
     bodies = {}
     for src in sources.values():
         bodies.update(_macros_used(src, index))
-    out = []
     prefix = (getattr(dbt_ctx, "prefix", "") or "").strip("/")
     for rel, body in sorted(bodies.items()):
         path = f"{prefix}/{rel}" if prefix else rel
@@ -1139,6 +1147,7 @@ async def _macro_scan(hub: ToolHub, sources: dict, dbt_ctx, already: set) -> lis
 
 
 _PRESCAN_STAGE = "預掃(規則層/dbt 展開)"
+_PHASE_CALLED_MACROS = "called_macros"      # 預掃正在掃變更檔呼叫到的 macro(見 prescan 的 progress)
 
 
 async def _run_prescan(report: dict, hub: ToolHub, files: list[dict], dbt_cfg: dict | None,
@@ -1156,24 +1165,30 @@ async def _run_prescan(report: dict, hub: ToolHub, files: list[dict], dbt_cfg: d
     """
     limit = min(PRESCAN_TIMEOUT_SECONDS, max(deadline - time.monotonic(), MIN_STAGE_SECONDS))
     done: list[dict] = []
+    progress: dict = {}
     try:
         await asyncio.wait_for(
-            prescan(hub, files, dbt_cfg, dbt_ctx, rendered, line_maps, out=done), limit)
+            prescan(hub, files, dbt_cfg, dbt_ctx, rendered, line_maps, out=done,
+                    progress=progress), limit)
     except asyncio.TimeoutError:
-        report.setdefault("findings", []).append(
-            _prescan_timeout_finding(limit, len(done), len(files)))
+        report.setdefault("findings", []).append(_prescan_timeout_finding(
+            limit, len(done), len(files), progress.get("phase") == _PHASE_CALLED_MACROS))
     except Exception as e:                   # noqa: BLE001 — 任何例外都不得往外丟
         report.setdefault("findings", []).append(_incomplete_finding(_PRESCAN_STAGE, e))
         return []
     return done
 
 
-def _prescan_timeout_finding(limit: float, done: int, total: int) -> dict:
-    """預掃逾時的未完整 finding:寫明做完的檔案結果仍在報告內。"""
+def _prescan_timeout_finding(limit: float, done: int, total: int, in_called_macros: bool) -> dict:
+    """預掃逾時的未完整 finding:寫明做完的部分仍在報告內,卡在哪一段。"""
     finding = _timeout_finding(_PRESCAN_STAGE, limit, PRESCAN_TIMEOUT_SECONDS)
-    finding["detail"] = finding["detail"].replace(
-        "這一環節的結果不在本報告內。",
-        f"逾時前做完規則層的 {done} 個檔案(共 {total} 個)結果仍在報告內,沒做完的部分沒有規則層與 lint 的結果。")
+    if in_called_macros:
+        note = (f"變更的 {total} 個檔案都做完了,結果仍在報告內;卡在掃它們呼叫到的 macro(讀取環境的"
+                "寫法),已經掃完的 macro 的命中也在報告內,沒掃到的沒有這項檢查。")
+    else:
+        note = (f"逾時前做完規則層的 {done} 個檔案(共 {total} 個)結果仍在報告內,沒做完的部分沒有"
+                "規則層與 lint 的結果。")
+    finding["detail"] = finding["detail"].replace("這一環節的結果不在本報告內。", note)
     return finding
 
 

@@ -333,3 +333,62 @@ def test_review_mr_預掃卡住時照常產出報告並交人工(monkeypatch, tm
     assert any(f.get("file") == "sql/a.sql" and f.get("severity") == "blocker"
                for f in report["findings"]), report["findings"]
     assert report["decision"] != "auto_approved", report["decision"]
+
+
+# ─────────────────── 卡在呼叫到的 macro ───────────────────
+
+def test_卡在呼叫到的_macro_時_掃完的那個命中還在_說明寫對(monkeypatch):
+    """變更的 model 呼叫兩個 macro:第一個掃完(讀取環境的寫法,H008),第二個卡住。
+    掃完的那個命中要在結果裡;說明要寫「變更的檔案都做完了,卡在呼叫到的 macro」。
+
+    卡住的記號寫在 Jinja 註解裡:只出現在 macro 的原文(預掃掃的是原文),不出現在展開結果,
+    model 自己那一輪的規則層不會跟著卡住。"""
+    from orchestrator import dbt_context, dbt_project
+    from orchestrator.dbt_render import render_model
+    from tests import test_dbt_context as DBT
+
+    dbt_project.clear_cache()
+    monkeypatch.setattr(dbt_context, "_summarize_isolated", dbt_context._summarize)
+    monkeypatch.setattr(pipeline, "render_model_isolated",
+                        lambda path, *, timeout_s=None, **kw: render_model(path, **kw))
+    project = {**DBT.PROJECT,
+               "macros/a_env.sql": ("{% macro a_env() %}{% if target.name == 'prod' %}1"
+                                    "{% else %}2{% endif %}{% endmacro %}"),
+               "macros/b_slow.sql": "{% macro b_slow() %}{# SLOW_MACRO #}3{% endmacro %}",
+               "models/mrt_big.sql": "SELECT {{ a_env() }} AS a, {{ b_slow() }} AS b FROM t\n"}
+    mr = DBT._mr([DBT._f("models/mrt_big.sql")])
+    ctx = DBT._ctx(files=project, mr=mr)
+
+    def run_rules(sql):
+        if "SLOW_MACRO" in sql:
+            time.sleep(5)
+        return sqltools.run_rules(sql)
+    hub = ToolHub()
+    hub._functions["sqltools__run_rules"] = run_rules
+    hub._functions["sqltools__lint"] = lambda sql: "[]"
+    monkeypatch.setattr(pipeline, "PRESCAN_TIMEOUT_SECONDS", 3)
+    try:
+        report = {"findings": []}
+        pre = _run(pipeline._run_prescan(report, hub, mr["files"], DBT.CFG, ctx, [], {},
+                                         time.monotonic() + 1000))
+    finally:
+        dbt_project.clear_cache()
+    called = {e["path"]: e for e in pre if e.get("called_macro")}
+    assert [h["rule"] for h in called["macros/a_env.sql"]["rules"]] == ["H008"], called
+    assert "macros/b_slow.sql" not in called
+    assert [e["path"] for e in pre if not e.get("called_macro")] == ["models/mrt_big.sql"]
+    [fd] = report["findings"]
+    assert "變更的 1 個檔案都做完了" in fd["detail"] and "卡在掃它們呼叫到的 macro" in fd["detail"]
+    assert "逾時前做完規則層" not in fd["detail"]
+
+
+def test_最後一個檔的_lint_卡住時_說明不寫成卡在_macro(monkeypatch):
+    """變更檔都已經放進結果(規則層做完、lint 還在跑),但還沒進到呼叫到的 macro 那一段。"""
+    monkeypatch.setattr(pipeline, "PRESCAN_TIMEOUT_SECONDS", 0.5)
+    files = [{"path": "sql/a.sql", "full_content": "DELETE FROM slow\n"}]
+    report, pre = _prescan_with_limit(_hub_with_lint(_slow_second_file(3)), files,
+                                      time.monotonic() + 1000)
+    assert [e["path"] for e in pre] == ["sql/a.sql"]
+    [fd] = report["findings"]
+    assert "逾時前做完規則層的 1 個檔案(共 1 個)" in fd["detail"]
+    assert "卡在掃它們呼叫到的 macro" not in fd["detail"]
