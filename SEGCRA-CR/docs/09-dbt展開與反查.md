@@ -101,7 +101,7 @@
    - **自訂 schema 要不要串接**(dbt-sqlserver 的 `sqlserver__generate_schema_name`):
      `dbt_project.yml` 的 `flags.dbt_sqlserver_use_default_schema_concat` 或同名 `vars` 任一個是
      true 就串接(`<target schema>_<自訂>`),否則自訂值原樣用。**兩個都沒寫時看轉接器的預設值,
-     而這個預設在不同版本相反**(1.9.2 是 false、1.12 的預覽版是 true),所以由部署端在設定檔填
+     而這個預設在不同版本相反**(1.9.2 是 false,1.12 起預設 true),所以由部署端在設定檔填
      `dbt.sqlserver_schema_concat`(見 10 篇);沒填就記成無法確定。值不是布林、或 var 寫在專案
      層級的子區塊裡時也是無法確定,部署端的預設不蓋過
    - **只偵測、不模擬**:snapshot 的 `target_schema` / `target_database`

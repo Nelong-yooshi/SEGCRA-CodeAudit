@@ -7,7 +7,7 @@
     target.schema;有的話預設是 `<target.schema>_<自訂去掉頭尾空白>`
   * dbt-sqlserver 的 sqlserver__generate_schema_name(`macros/adapters/schema.sql`):旗標
     dbt_sqlserver_use_default_schema_concat 或同名 var 任一個是 true 才串接,否則自訂值原樣用;
-    旗標沒寫時的預設值依版本不同(1.9.2 是 false、1.12 的預覽版是 true),所以由部署端設定補
+    旗標沒寫時的預設值依版本不同(1.9.2 是 false,1.12 起預設 true),所以由部署端設定補
   * 合併順序(dbt 文件 "Define configs"):dbt_project.yml(資料夾越深越優先)→ 屬性檔的
     config: → model 檔的 config()
 有 dbt 的環境可以用 tests/dbt_reference/relation_names.py 拿 dbt parse 的 manifest 對照。

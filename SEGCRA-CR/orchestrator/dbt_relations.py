@@ -310,7 +310,7 @@ def _schema_concat(raw: dict) -> tuple[bool | None, bool]:
     照 dbt-sqlserver 的 sqlserver__generate_schema_name:旗標(flags 的
     dbt_sqlserver_use_default_schema_concat)或舊寫法的同名 var 任一個是 true 就串接
     (`<target.schema>_<自訂>`),否則自訂值原樣用。旗標沒寫時用轉接器的預設值,而這個預設在
-    不同版本相反(1.9.2 是 false、1.12 的預覽版是 true),所以**專案沒寫時回 (None, True)**,由呼叫端
+    不同版本相反(1.9.2 是 false,1.12 起預設 true),所以**專案沒寫時回 (None, True)**,由呼叫端
     用部署端設定的預設補上。值不是布林、或 var 寫在專案層級的子區塊裡時無法確定(None, False)。"""
     flags, variables = raw.get("flags", {}), raw.get("vars", {})
     if not isinstance(flags, (dict, type(None))) or not isinstance(variables, (dict, type(None))):
