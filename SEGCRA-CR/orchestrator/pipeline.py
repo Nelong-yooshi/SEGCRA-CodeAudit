@@ -3402,16 +3402,29 @@ def enforce_claim_evidence(report: dict) -> dict:
     return report
 
 
+# 檢核點裡跟規則層一樣寫死、不看模型有沒有回應的(見 _rule_hit_codes)。其他檢核點照
+# enforce_hints 看同一個檔的 finding 有沒有回應,以及設定的 forbid_pending_hints。
+_HARD_HINT_CODES = frozenset({
+    "H004",   # 撈憑證/密碼類欄位、明碼比對密碼:資安類
+    "H006",   # 以下四項是環境相依的寫法:沙盒與正式環境會走不同分支,執行驗證驗不到
+    "H007",   # 讀連線的語系/日期設定
+    "H008",   # dbt 編譯期的環境資訊
+    "H009",   # 現在時間與寫死的日期比較
+})
+
+
 def _rule_hit_codes(pre: list[dict]) -> list[str]:
-    """預掃裡規則層(R 系列)命中的代號,排序、不重複。決策閘門的硬條件用(見 apply_policy)。
+    """預掃裡規則層(R 系列)與 _HARD_HINT_CODES 列的檢核點命中的代號,排序、不重複。
+    決策閘門的硬條件用(見 apply_policy)。
 
     從預掃結果算,不從 finding 認:模型可以自己寫一條同標題的 finding,也可以把命中的那條
-    寫成 info。檢核點(H 系列)與學到的風格(S 系列)不算。"""
+    寫成 info;檢核點「有沒有回應」看的是同一個檔的 finding 有沒有含關鍵詞,一條提到「密碼」
+    的 info 就算回應過。其他檢核點與學到的風格(S 系列)不算。"""
     codes = set()
     for entry in pre if isinstance(pre, list) else []:
         for hit in entry.get("rules", []) if isinstance(entry, dict) else []:
             code = hit.get("rule") if isinstance(hit, dict) else None
-            if isinstance(code, str) and code.startswith("R"):
+            if isinstance(code, str) and (code.startswith("R") or code in _HARD_HINT_CODES):
                 codes.add(code)
     return sorted(codes)
 
@@ -3463,7 +3476,8 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     incomplete = review_incomplete(report)
     # 規則層有命中、冷讀命中或沒看完 → 不得自動放行,也**寫死在程式裡**。只靠設定檔的
     # allowed_severities 只許 info 擋著的話(命中至少是 minor、冷讀那條是 major),設定一放寬,
-    # 規則層驗到差異、或有文字在對審查者說話的 MR 就會被自動放行。兩個訊號都是程式寫的
+    # 規則層驗到差異、或有文字在對審查者說話的 MR 就會被自動放行。資安與環境相依的檢核點
+    # (_HARD_HINT_CODES)也算在 rule_hits 裡:不看模型有沒有回應。兩個訊號都是程式寫的
     # (`_rule_hits` 從預掃結果算、`_cold_read` 由冷讀那一道寫),不看 finding 的標題或嚴重度。
     rule_hits = [str(code) for code in (report.get("_rule_hits") or [])]
     cold = report.get("_cold_read")

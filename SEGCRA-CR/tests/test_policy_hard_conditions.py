@@ -1,7 +1,8 @@
 """決策閘門的硬條件:規則層有命中、冷讀命中或沒看完,不得自動放行,不可由設定關閉。
 
 預設設定只許 info 自動放行,規則命中(至少 minor)與冷讀那條 finding(major)本來就擋得住;
-這裡驗的是設定放寬之後也一樣擋得住。兩個訊號都由程式寫:規則命中從預掃結果算
+這裡驗的是設定放寬之後也一樣擋得住。資安與環境相依的檢核點(H004、H006–H009)跟規則層
+一樣算,在預設設定下也要擋:檢核點「有沒有回應」看的是 finding 有沒有含關鍵詞。兩個訊號都由程式寫:規則命中從預掃結果算
 (`_rule_hits`),冷讀的紀錄由冷讀那一道寫(`_cold_read`),模型輸出的同名欄位會被蓋掉。
 """
 import asyncio
@@ -37,9 +38,60 @@ def test_收集規則層的命中代號_排序不重複():
     assert pipeline._rule_hit_codes(pre) == ["R001", "R002", "R005"]
 
 
-def test_檢核點與風格不算():
-    pre = [{"path": "a.sql", "rules": [{"rule": "H003"}, {"rule": "S-naming"}]}]
+def test_其他檢核點與風格不算():
+    pre = [{"path": "a.sql", "rules": [{"rule": "H001"}, {"rule": "H002"}, {"rule": "H003"},
+                                       {"rule": "H005"}, {"rule": "S-naming"}]}]
     assert pipeline._rule_hit_codes(pre) == []
+
+
+@pytest.mark.parametrize("code", ["H004", "H006", "H007", "H008", "H009"])
+def test_資安與環境相依的檢核點也算(code):
+    pre = [{"path": "a.sql", "rules": [{"rule": code}, {"rule": "H003"}]}]
+    assert pipeline._rule_hit_codes(pre) == [code]
+
+
+def test_呼叫到的_macro_的命中也算():
+    """預掃對呼叫到的 macro 只掃讀取環境的寫法(R005、H006–H009),命中一樣進來。"""
+    pre = [{"path": "models/m.sql", "rules": []},
+           {"path": "macros/env.sql", "called_macro": True, "rules": [{"rule": "H008"}]}]
+    assert pipeline._rule_hit_codes(pre) == ["H008"]
+
+
+# ─────────────────── 檢核點被一條 info 放過的情況 ───────────────────
+
+_PW_SQL = "SELECT password FROM users WHERE id = @id;"
+_PW_MR = {"files": [{"path": "sql/x.sql", "diff": "@@ -1 +1 @@\n+" + _PW_SQL,
+                     "full_content": _PW_SQL}]}
+
+
+def _pw_decision(model_findings, *, count_hard_hints=True):
+    """規則層實際掃 _PW_SQL → 檢核點那一關(enforce_hints)→ 規則命中彙整 → 預設設定的決策閘門。
+    執行驗證當作通過、分數 100:只留檢核點與硬條件會影響決策。"""
+    from orchestrator.config import load_config
+    from toolbox import sqltools
+    pre = [{"path": "sql/x.sql", "rules": json.loads(sqltools.run_rules(_PW_SQL))}]
+    report = _report(findings=list(model_findings))
+    report = pipeline.enforce_hints(report, pre)
+    report["_rule_hits"] = pipeline._rule_hit_codes(pre) if count_hard_hints else []
+    return pipeline.apply_policy(report, _PW_MR, load_config().policy)
+
+
+_PW_INFO = {"file": "sql/x.sql", "line": 1, "severity": "info",
+            "title": "密碼欄位存的是雜湊值,沒有問題", "detail": "x", "suggestion": "x"}
+
+
+def test_撈密碼欄位_模型一條提到密碼的_info_也不能讓它自動放行():
+    out = _pw_decision([_PW_INFO])
+    assert out["_rule_hits"] == ["H004"]
+    assert out["_policy_signals"]["pending_hints"] is False   # 檢核點那一關已被這條 info 放過
+    assert out["decision"] == "needs_human"
+
+
+def test_撈密碼欄位_對照_不算進硬條件時那條_info_會讓它自動放行():
+    """對照組:確認上一條擋下的是硬條件,不是別的訊號。"""
+    assert _pw_decision([_PW_INFO], count_hard_hints=False)["decision"] == "auto_approved"
+    # 模型沒回應時檢核點那一關本來就擋
+    assert _pw_decision([], count_hard_hints=False)["decision"] == "needs_human"
 
 
 @pytest.mark.parametrize("pre", [
