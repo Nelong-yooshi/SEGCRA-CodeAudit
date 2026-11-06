@@ -795,42 +795,93 @@ def _walk(callers_of: dict, start, label, snapshot_hits=None):
     return model_hits, yml_hits, referenced
 
 
-def macros_referenced(source: str, macro_files: dict) -> tuple[set, bool] | None:
-    """這段樣板(遞迴)用到哪些 macro:({macro 名稱}, 有沒有動態呼叫)。
+def _suffix_index(names) -> dict:
+    """`{x: {<前綴>__x 的實作…}}`。`adapter.dispatch('x')` 會呼叫到其中一支,
+    哪一支是執行期才知道的(dbt 依 adapter 挑),所以全部都算。"""
+    index: dict[str, set] = {}
+    for name in names:
+        for cut in {name.find("__"), name.rfind("__")}:
+            if cut > 0 and cut + 2 < len(name):
+                index.setdefault(name[cut + 2:], set()).add(name)
+    return index
 
-    解析不了時回 `None`,讓呼叫端自己決定要不要退回別的做法。
 
-    **跟 `analyze_macro_impact` 共用同一個掃描器**:那一套照語法樹走,`adapter.dispatch('x')`
-    會展開成所有 `<前綴>__x` 實作。另外用正規式做一份呼叫圖的話,dispatch 這類間接呼叫
-    抓不到 —— 被 dispatch 呼叫到的 macro 裡如果有 `DB_NAME()`,就整個掃不到。
+def _resolve_refs(ref_names, known: set, suffix_index: dict) -> set:
+    found = set()
+    for ref in ref_names:
+        if ref in known:
+            found.add(ref)
+        found |= suffix_index.get(ref, set())
+    return found
+
+
+def _refs_is_dynamic(refs: "_Refs", callables: set) -> bool:
+    """這一段樣板有沒有「名稱在執行期才決定」的呼叫。
+
+    **反查與預掃的 macro 掃描共用這一份**:各寫各的話,一邊補了 `context.items()`
+    另一邊沒補,就會有一種寫法在某一條路上被當成沒有動態呼叫。
+    """
+    # context.get(...)、context.items() 等:取用的不是 macro,可能藉此取到任意 macro
+    if refs.dynamic or refs.root_names - callables:
+        return True
+    # 以執行期名稱對 macro(或其別名)取項目 / 屬性:flag[k]、{% set m = flag %}{{ m[k] }}
+    probed, grew = set(refs.probed), True
+    while grew:
+        grew = False
+        for alias, source in refs.aliases:
+            if alias in probed and source not in probed:
+                probed.add(source)
+                grew = True
+    return bool(probed & callables)
+
+def macros_referenced(sources: dict, macro_files: dict) -> dict | None:
+    """每個來源(遞迴)用到哪些 macro:`{來源的鍵: {macro 名稱…}}`;解析不了回 `None`。
+
+    **一次處理全部來源**:macro 檔只解析一次。一個檔呼叫一次的話,300 個 macro 檔、
+    改到 20 個 model 要把全部 macro 重新解析 20 遍(實測 30 秒)。
+
+    **跟 `analyze_macro_impact` 共用同一個掃描器與同一份判斷**:那一套照語法樹走,
+    `adapter.dispatch('x')` 會展開成所有 `<前綴>__x` 實作;動態呼叫(名稱在執行期才
+    組出來)的判斷也用同一個 `_refs_is_dynamic`。
+
+    **動態呼叫時回傳專案裡全部的 macro**:名稱執行期才決定,掃不出是哪幾支。多掃到
+    沒被呼叫的只是多一條提醒,漏掉才是問題 —— 反查遇到動態呼叫也是保守地全部列出來。
+
+    **這個函式會解析 MR 帶進來的內容**,呼叫端請放進子行程跑(見
+    `pipeline._macro_scan`);`analyze_macro_impact_isolated` 的理由相同。
     """
     scanner = _Scanner()
     try:
-        by_name, defined = {}, {}
-        for rel, text in (macro_files or {}).items():
-            scan = scanner.scan(str(text or ""))
-            for name, refs in scan.macros.items():
-                defined[name] = rel
-                by_name[name] = refs
-        top = scanner.scan(str(source or ""))
+        by_name = {}
+        for text in (macro_files or {}).values():
+            for name, refs in scanner.scan(str(text or "")).macros.items():
+                by_name.setdefault(name, refs)
+        scans = {key: scanner.scan(str(src or "")) for key, src in (sources or {}).items()}
     except Exception:            # noqa: BLE001 — 解析不了由呼叫端決定怎麼辦
         return None
-    dynamic = top.top.dynamic or any(r.dynamic for r in top.macros.values())
-    used, queue = set(), list(top.top.names | {n for r in top.macros.values() for n in r.names})
-    while queue:
-        name = queue.pop()
-        # `adapter.dispatch('x')` 被掃成名稱 `x`,實際會呼叫到所有 `<前綴>__x` 的實作
-        # (dbt 依 adapter 挑一個)。哪一個會被選中是執行期才知道的,所以全部都算 ——
-        # 少算一個就等於那支 macro 裡的 DB_NAME() 掃不到。
-        for candidate in (n for n in by_name
-                          if n == name or n.endswith(f"__{name}")):
-            if candidate in used:
-                continue
-            used.add(candidate)
-            refs = by_name[candidate]
-            dynamic = dynamic or refs.dynamic
-            queue.extend(refs.names)
-    return used, dynamic
+    known = set(by_name)
+    callables = known | BUILTIN_MACROS | _CONTEXT_OVERRIDES
+    suffix = _suffix_index(known)
+    out = {}
+    for key, scan in scans.items():
+        refs = [scan.top] + list(scan.macros.values())
+        if any(_refs_is_dynamic(r, callables) for r in refs):
+            out[key] = set(known)
+            continue
+        used, queue = set(), [n for r in refs for n in r.names]
+        while queue:
+            for name in _resolve_refs([queue.pop()], known, suffix):
+                if name in used:
+                    continue
+                used.add(name)
+                inner = by_name[name]
+                if _refs_is_dynamic(inner, callables):
+                    used = set(known)
+                    queue = []
+                    break
+                queue.extend(inner.names)
+        out[key] = used
+    return out
 
 
 def analyze_macro_impact(files, changed_paths, *, base_files=None, added_paths=(),

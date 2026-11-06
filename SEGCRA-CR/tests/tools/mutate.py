@@ -2528,14 +2528,26 @@ MUTANTS.update({
 MUTANTS.update({
  # macro 呼叫圖只留一套(#103)
  '呼叫圖:不用語法樹,只用正規式(dispatch 抓不到)': ('pipeline.py',
-     '    by_tree = macros_referenced(str(src or ""), macro_files)',
+     '    by_tree = _macros_used_by_tree(sources, macro_files)',
      '    by_tree = None'),
- '呼叫圖:解析不了時不退回正規式(展開失敗的 model 整個不掃)': ('pipeline.py',
-     '    if by_tree is not None:',
-     '    if True:'),
- '呼叫圖:dispatch 只認同名的(<前綴>__x 的實作漏掉)': ('dbt_impact.py',
-     '        for candidate in (n for n in by_name\n                          if n == name or n.endswith(f"__{name}")):',
-     '        for candidate in (n for n in by_name if n == name):'),
+ '呼叫圖:子行程失敗時不退回正規式(整個不掃)': ('pipeline.py',
+     '    if by_tree is None:',
+     '    if False:'),
+ '呼叫圖:在主行程直接解析(沒有時間與記憶體上限)': ('pipeline.py',
+     '    return run_isolated(macros_referenced, (dict(sources), dict(macro_files or {})),' + NL
+     + '                        timeout_s=DEFAULT_ISOLATED_TIMEOUT_S,' + NL
+     + '                        max_memory_mb=DEFAULT_ISOLATED_MEMORY_MB,' + NL
+     + '                        on_failure=lambda _message: None)',
+     '    return macros_referenced(dict(sources), dict(macro_files or {}))'),
+ '呼叫圖:dispatch 只認 default__ 的實作': ('dbt_impact.py',
+     '                index.setdefault(name[cut + 2:], set()).add(name)',
+     '                index.setdefault(name[cut + 2:], set()).add(name) if name.startswith("default__") else None'),
+ '呼叫圖:動態呼叫時不把全部 macro 算進來': ('dbt_impact.py',
+     '            out[key] = set(known)\n            continue',
+     '            out[key] = set()\n            continue'),
+ '呼叫圖:macro 內的動態呼叫不算': ('dbt_impact.py',
+     '                if _refs_is_dynamic(inner, callables):',
+     '                if False:'),
     "掃描上限:改回放不下一份展開結果": ("pipeline.py",
         "MAX_EXTRA_SCAN_CHARS = 5_000_000",
         "MAX_EXTRA_SCAN_CHARS = 200_000"),
@@ -4751,9 +4763,9 @@ MUTANTS.update({
      "            out[rel] = body" + NL + "            queue.append(body)",
      "            out[rel] = body"),
  "macro 掃描:專案裡的 macro 全掃(不看有沒有被呼叫)": (P,
-     "    for src in sources.values():" + NL
-     + "        bodies.update(_macros_used(src, index))",
-     "    bodies.update(getattr(dbt_ctx, \"macro_files\", None) or {})"),
+     "        for names in by_tree.values():" + NL
+     + "            bodies.update({index[n][0]: index[n][1] for n in names if n in index})",
+     "        bodies.update(macro_files)"),
  # 特製內容不得讓規則層變成平方時間(內容由 MR 決定)
  "上限:函式名與括號之間的空白/註解不設上限": (T,
      r'_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/)){0,500}\*/|--[^\n]*\n){0,30}"',

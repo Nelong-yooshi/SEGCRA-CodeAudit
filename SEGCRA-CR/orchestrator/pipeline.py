@@ -28,7 +28,8 @@ from .dbt_affected import (
 from .change_view import build_full_text_section
 from .cold_read import (UNREAD_NEAR_LIMIT, UNREAD_NO_USAGE, UNREAD_TOO_FEW, ColdRead,
                         cold_read as _cold_read, record as _cold_read_record)
-from .dbt_impact import macros_referenced
+from .isolation import run_isolated
+from .dbt_impact import DEFAULT_ISOLATED_MEMORY_MB, DEFAULT_ISOLATED_TIMEOUT_S, macros_referenced
 from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_hidden_writes import IN_TAGS, UNREACHED, UNVERIFIED, WRITE_KEYWORDS, find_hidden_writes
 from .dbt_render import is_dbt_template, render_model_isolated
@@ -923,8 +924,12 @@ async def _non_sql_entry(hub: ToolHub, text: str, kind: str, path: str) -> dict:
 # 就掃得到;但**編譯期**的寫法(`{% if target.name == 'prod' %}`、`env_var()`)決定的是
 # 「展開出哪一段 SQL」,它們自己不會出現在展開結果裡 —— 展開完就看不見了。
 #
-# 用文字層的呼叫圖而不是展開器的追蹤:展開失敗的 model 也要能掃(展開失敗正是最該看的
-# 情況之一),而且不必動展開器。多掃到沒被呼叫的 macro 只是多一條提醒,漏掉才是問題。
+# 呼叫圖**先走語法樹**(`_macros_used_by_tree` → `dbt_impact.macros_referenced`,跟 macro
+# 反查同一套、在子行程裡跑):正規式看不懂 `adapter.dispatch('x')` 這類間接呼叫。樣板解析
+# 不了、子行程逾時或失敗時,才退回下面的正規式 —— 展開失敗的 model 也要能掃(展開失敗
+# 正是最該看的情況之一),而且不必動展開器。
+# 多掃到沒被呼叫的 macro 只是多一條提醒,漏掉才是問題:名稱在執行期才決定的動態呼叫,
+# 語法樹那條會把專案裡全部的 macro 都算進來,跟反查的做法一致。
 _MACRO_DEF_RE = re.compile(r"\{%-?\s*macro\s+(\w+)\s*\(")
 _MACRO_CALL_RE = re.compile(r"(?<![\w.])(\w+)\s*\(")
 # 只留讀取環境那一家族:macro 裡的 SELECT * 之類由 model 展開後的結果負責,
@@ -941,22 +946,27 @@ def _macro_index(macro_files: dict) -> dict:
     return index
 
 
+def _macros_used_by_tree(sources: dict, macro_files: dict) -> dict | None:
+    """語法樹版的呼叫圖,**在子行程裡跑**:`{來源的鍵: {macro 名稱…}}`;失敗回 None。
+
+    要放子行程的理由跟 macro 反查一樣:解析的是 MR 帶進來的內容,在主行程直接跑
+    沒有時間與記憶體上限,而預掃是同步呼叫 —— 卡住就是整份審查卡住(實測一個 3 MB
+    的 model 要 6 秒、多用 73 MB)。逾時或失敗就回 None,呼叫端退回正規式。
+    """
+    if not sources:
+        return {}
+    return run_isolated(macros_referenced, (dict(sources), dict(macro_files or {})),
+                        timeout_s=DEFAULT_ISOLATED_TIMEOUT_S,
+                        max_memory_mb=DEFAULT_ISOLATED_MEMORY_MB,
+                        on_failure=lambda _message: None)
+
 def _macros_used(src: str, index: dict) -> dict:
     """這段樣板用到的 macro(含 macro 再呼叫 macro),{專案內路徑: 內容}。
 
-    **先用語法樹**(`dbt_impact.macros_referenced`,跟 macro 反查同一套):正規式看不懂
-    `adapter.dispatch('x')`,被它呼叫到的 macro 裡如果有 `DB_NAME()` 就整個掃不到。
-
-    **樣板解析不了才退回正規式**:展開失敗的 model 也要能掃,而那正是最該看的情況
-    之一 —— 退回去的代價只是 dispatch 這類間接呼叫看不到,總比整個不掃好。
+    **正規式版,只在語法樹那條走不通時用**(樣板解析不了、子行程失敗或逾時):
+    看不懂 `adapter.dispatch('x')` 這類間接呼叫,但展開失敗的 model 也要能掃,
+    而那正是最該看的情況之一 —— 退回去的代價只是間接呼叫看不到,總比整個不掃好。
     """
-    # macro 的原文從 index 還原({名稱: (路徑, 內容)}):呼叫端只傳 index,
-    # 兩份資料就不會走鐘。
-    macro_files = {rel: body for rel, body in index.values()}
-    by_tree = macros_referenced(str(src or ""), macro_files)
-    if by_tree is not None:
-        names, _dynamic = by_tree
-        return {index[n][0]: index[n][1] for n in names if n in index}
     out, seen, queue = {}, set(), [str(src or "")]
     while queue:
         text = queue.pop()
@@ -1096,12 +1106,20 @@ async def _macro_scan(hub: ToolHub, sources: dict, dbt_ctx, already: set) -> lis
     """
     if not sources or dbt_ctx is None or getattr(dbt_ctx, "project", None) is None:
         return []
-    index = _macro_index(getattr(dbt_ctx, "macro_files", None) or {})
+    macro_files = getattr(dbt_ctx, "macro_files", None) or {}
+    index = _macro_index(macro_files)
     if not index:
         return []
+    # 語法樹那條一次處理全部來源(macro 檔只解析一次,而且在子行程裡跑);
+    # 回 None 代表樣板解析不了或子行程失敗 —— 逐檔退回正規式。
+    by_tree = _macros_used_by_tree(sources, macro_files)
     bodies = {}
-    for src in sources.values():
-        bodies.update(_macros_used(src, index))
+    if by_tree is None:
+        for src in sources.values():
+            bodies.update(_macros_used(src, index))
+    else:
+        for names in by_tree.values():
+            bodies.update({index[n][0]: index[n][1] for n in names if n in index})
     out = []
     prefix = (getattr(dbt_ctx, "prefix", "") or "").strip("/")
     for rel, body in sorted(bodies.items()):
