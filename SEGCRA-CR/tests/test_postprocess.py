@@ -104,7 +104,11 @@ def test_去重會忽略規則碼前綴與排版符號():
 #
 # **一律補報**(#104):規則命中是程式判定的事實,不看模型有沒有提到。原本用關鍵詞猜
 # 「模型已經講過同一件事」,而那會誤中——模型在別的 finding 裡提到 GRANT,R008 就整條
-# 不補,代價是安靜地漏報。重複由 sanitize_findings 的同檔近似標題去重處理。
+# 不補,代價是安靜地漏報。
+#
+# **補上的不會跟模型的去重**:正式路徑上 sanitize_findings 排在 enforce_rules 之前,
+# 所以模型講過同一件事時報告上一律是兩條。也不該在補報之後再去重一次——去重留下的是
+# 建議較長的那條、不看嚴重度,程式補的 blocker 會被模型的 info 換掉。
 
 def test_模型漏報的_R_規則命中要補回():
     """大型多問題 SQL 裡,模型會挑語意問題報而漏掉機械性規則命中。
@@ -154,34 +158,39 @@ def test_確定性的_blocker_一定擋得下來():
     assert apply_policy(report, mr, _POLICY)["decision"] == "blocked"
 
 
-def test_說法夠接近時由近似標題去重():
-    """一律補報的代價是模型講過的事會多一條。那一層由 sanitize_findings 處理 ——
-    它比的是同檔的近似標題,不是猜語意。"""
+def test_模型講過同一件事時報告上是兩條():
+    """**照正式路徑的順序**:review_mr 裡先 sanitize_findings、再 enforce_rules,
+    所以補上的 R 命中從來不會跟模型的 finding 去重 —— 兩條都會在。
+
+    先 enforce_rules 再手動去重的寫法驗不到正式路徑(那是上一版這條測試的錯)。
+    """
     from orchestrator.pipeline import sanitize_findings
 
     model = [{"severity": "blocker", "file": FILE,
               "title": "DELETE 沒有 WHERE 條件,將影響全表", "detail": "",
               "suggestion": "加上 WHERE", "citations": ["R-100"]}]
-    report = enforce_rules({"findings": list(model)},
+    report = enforce_rules(sanitize_findings({"findings": list(model)}),
                            _pre([{"rule": "R001", "severity": "blocker",
                                   "message": "DELETE 沒有 WHERE 條件,將影響全表"}]))
-    assert len(report["findings"]) == 2, "補報這一層不做語意判斷"
-    kept = sanitize_findings(report)["findings"]
-    assert len(kept) == 1 and kept[0]["suggestion"] == "加上 WHERE", "保留資訊較完整的那條"
+    assert len(report["findings"]) == 2, "說法再接近也是兩條"
 
 
-def test_說法差得多時兩條都留著():
-    """**已知限制**:去重比的是字面,模型用自己的話講同一件事(「資料異動沒有條件」)
-    時相似度不到門檻,兩條都會留在報告上。
+def test_模型的近似info不會換掉程式補的blocker():
+    """不能為了少一條而在 enforce_rules 之後再去重:去重留下的是建議較長、引用較多
+    的那條,不看嚴重度 —— 模型寫一條標題近似的 info 附一段建議,程式補的 blocker
+    就會被換掉(#16 的那個洞)。"""
+    from orchestrator.pipeline import apply_policy, sanitize_findings
 
-    這是一律補報換來的代價,方向是對的 —— 多一條的代價是有人多看一眼,漏一條的代價
-    是帶著問題上線。要收斂得靠模型標出它對到哪一條規則(#104 第 2 點)。"""
-    from orchestrator.pipeline import sanitize_findings
-
-    model = [{"severity": "blocker", "file": FILE, "title": "資料異動沒有條件",
-              "detail": "", "suggestion": ""}]
-    report = enforce_rules({"findings": list(model)}, _pre([_R001]))
-    assert len(sanitize_findings(report)["findings"]) == 2
+    model = [{"severity": "info", "file": FILE,
+              "title": "DELETE 沒有 WHERE 條件,將影響全表", "detail": "已確認沒問題",
+              "suggestion": "這段是一次性清理,已與需求確認過,不需要 WHERE" * 3,
+              "citations": ["R-100", "R-101"]}]
+    report = enforce_rules(sanitize_findings(
+        {"score": 100, "_spec_exec": {"passed": True}, "findings": list(model)}), _pre([_R001]))
+    blockers = [f for f in report["findings"] if f["severity"] == "blocker"]
+    assert len(blockers) == 1 and blockers[0]["title"].startswith("[R001]")
+    mr = {"files": [{"path": "sql/maintenance/x.sql", "diff": "@@\n+DELETE FROM t;"}]}
+    assert apply_policy(report, mr, _POLICY)["decision"] == "blocked"
 
 
 def test_不認得的嚴重度照樣補():

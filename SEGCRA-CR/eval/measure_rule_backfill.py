@@ -4,7 +4,8 @@
   python eval/measure_rule_backfill.py                 # 用 eval/_reports_* 裡存下來的報告
 
 **為什麼要量**:一律補報把判斷從「猜模型講過沒有」換成「照實說」,代價是報告會變長。
-要知道長多少、以及近似標題去重接得住多少,不能只看單元測試。
+要知道長多少,不能只看單元測試。**不量去重**:正式路徑上 sanitize_findings 排在
+enforce_rules 之前,補上的 R 命中從來不會跟模型的 finding 去重(見 docs/04 第 3 道)。
 
 怎麼量:報告檔裡沒有存預掃結果,所以拿 golden case 的檔案內容重跑一次規則層,得到
 那次審查真正的命中;模型那一側用報告裡存下來的 findings。兩種做法各跑一次 enforce_rules:
@@ -12,7 +13,11 @@
   舊:_coverage(模型報告, 關鍵詞表) → 只補「沒對應到」的那幾處
   新:全部補
 
-輸出三個數字:補報數、去重後的報告長度、以及被去重併掉的條數。
+輸出三個數字:模型自己報了幾條、舊做法補幾條、新做法補幾條。
+
+**模型那一側要先濾掉程式補的**:存下來的報告是整份審查跑完的結果,findings 裡已經
+有程式補的(`_source` 是 `program`,含舊做法補的 R 命中)。不濾掉的話,舊做法會把
+自己補的那一條當成「模型講過了」而不再補,兩種做法的差異就量不出來。
 
 **樣本很小**(只有存下來的那幾份報告)。完整的數字要等評測跑一輪;這支程式就是
 那時候拿來對照的工具。
@@ -80,26 +85,27 @@ def main(dirs) -> int:
             golden = ROOT / "eval" / "golden" / f.name
             if not golden.exists() or "findings" not in report:
                 continue
+            # 模型自己報的 = 報告裡 _source 不是 program 的那些
+            model_only = [f for f in report.get("findings", [])
+                          if isinstance(f, dict) and f.get("_source") != "program"]
+            report = {**report, "findings": model_only}
             pre = _prescan(json.loads(golden.read_text(encoding="utf-8")))
             hits = sum(len([h for h in e["rules"] if str(h.get("rule", "")).startswith("R")])
                        for e in pre)
             old = _old_backfill(report, pre)
             new_report = pipeline.enforce_rules(json.loads(json.dumps(report)), pre)
             new = len(new_report["findings"]) - len(report.get("findings", []))
-            kept = len(pipeline.sanitize_findings(
-                json.loads(json.dumps(new_report)))["findings"])
-            rows.append((f.name, len(report.get("findings", [])), hits, old, new,
-                         len(new_report["findings"]), kept))
+            rows.append((f.name, len(model_only), hits, old, new,
+                         len(new_report["findings"])))
     if not rows:
         print("找不到可以對照的報告(需要 eval/golden 裡有同名的 case)")
         return 1
-    head = ("case", "模型報的", "R 命中", "舊補報", "新補報", "合計", "去重後")
+    head = ("case", "模型報的", "R 命中", "舊補報", "新補報", "合計")
     print("  ".join(f"{h:>8}" for h in head))
     for r in rows:
         print("  ".join(f"{str(v):>8}" for v in r))
-    print("\n小計:舊補報 {} 條、新補報 {} 條;去重併掉 {} 條".format(
-        sum(r[3] for r in rows), sum(r[4] for r in rows),
-        sum(r[5] - r[6] for r in rows)))
+    print("\n小計:舊補報 {} 條、新補報 {} 條".format(
+        sum(r[3] for r in rows), sum(r[4] for r in rows)))
     return 0
 
 
