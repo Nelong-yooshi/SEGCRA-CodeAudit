@@ -4698,7 +4698,8 @@ MUTANTS.update({
         "    for model in list(models)[:max_models]:",
         "    for model in list(models):"),
     "隱藏寫入macro:全部展開到也不停": ("dbt_hidden_writes.py",
-        "        if len(reached) == len(literal):\n            break",
+        "        if len(reached) == len(literal) and len(probe.outputs_reached) == len(outputs):\n"
+        "            break",
         "        if False:\n            break"),
     "隱藏寫入macro:不以增量模式展開": ("dbt_hidden_writes.py",
         '        if getattr(clean, "incremental_checked", False):',
@@ -4733,6 +4734,70 @@ MUTANTS.update({
     "隱藏寫入macro:展開數是 True 也照用": ("pipeline.py",
         "    if unreached and isinstance(models, int) and not isinstance(models, bool):",
         "    if unreached and isinstance(models, int):"),
+})
+
+# ---- 沒有展開到的分支裡有輸出(dbt_hidden_writes 的 UNREACHED_OUTPUT)
+MUTANTS.update({
+    "分支輸出:不插記號": ("dbt_hidden_writes.py",
+        "        self.marked = mark(source, literal, token, self.outputs)",
+        "        self.marked = mark(source, literal, token)"),
+    "分支輸出:記號出現也不算產生過": ("dbt_hidden_writes.py",
+        "                    self.outputs_reached.add(n)", "                    pass"),
+    "分支輸出:記號種類不分": ("dbt_hidden_writes.py",
+        '            if m.group(1).upper() == "O":', "            if False:"),
+    "分支輸出:分支外的固定文字也算": ("dbt_hidden_writes.py",
+        "            if depth and lead < len(body):", "            if lead < len(body):"),
+    "分支輸出:空白也算輸出": ("dbt_hidden_writes.py",
+        "            if depth and lead < len(body):", "            if depth:"),
+    "分支輸出:分支外的運算式也算": ("dbt_hidden_writes.py",
+        "            if depth and inner is not None:", "            if inner is not None:"),
+    "分支輸出:分支結尾不減層": ("dbt_hidden_writes.py",
+        "            depth = max(0, depth - 1)", "            pass"),
+    "分支輸出:運算式記號不避開開頭的修空白": ("dbt_hidden_writes.py",
+        '    a = s + 2 + (text[s + 2] in "-+")', "    a = s + 2"),
+    "分支輸出:運算式記號不避開結尾的修空白": ("dbt_hidden_writes.py",
+        '    b = e - 2 - (text[e - 3] in "-+")', "    b = e - 2"),
+    "分支輸出:沒有走到的不報(model)": ("dbt_hidden_writes.py",
+        "    if missed:" + NL + "        out[UNREACHED_OUTPUT] = missed" + NL + "    return out",
+        "    return out"),
+    "分支輸出:沒有走到的不報(macro)": ("dbt_hidden_writes.py",
+        "    if missed:" + NL + "        out[UNREACHED_OUTPUT] = missed" + NL + "    if unreached or missed:",
+        "    if unreached or missed:"),
+    "分支輸出:macro 只有分支輸出時不寫展開數": ("dbt_hidden_writes.py",
+        "    if unreached or missed:", "    if unreached:"),
+    "分支輸出:macro 沒有關鍵字時不檢查": ("dbt_hidden_writes.py",
+        "        return out" + NL + "    if not literal and not outputs:" + NL + "        return out" + NL
+        + "    reason = _too_many(literal, outputs)" + NL + "    if reason:" + NL
+        + "        out[UNVERIFIED] = reason" + NL + "        return out" + NL
+        + "    probe = _Probe(source, literal, token or secrets.token_hex(8), outputs)" + NL
+        + "    reached: set[int] = set()" + NL + "    checked = 0",
+        "        return out" + NL + "    if not literal:" + NL + "        return out" + NL
+        + "    reason = _too_many(literal, outputs)" + NL + "    if reason:" + NL
+        + "        out[UNVERIFIED] = reason" + NL + "        return out" + NL
+        + "    probe = _Probe(source, literal, token or secrets.token_hex(8), outputs)" + NL
+        + "    reached: set[int] = set()" + NL + "    checked = 0"),
+    "分支輸出:model 沒有關鍵字時不檢查": ("dbt_hidden_writes.py",
+        "    outputs = output_points(source)" + NL + "    if not literal and not outputs:",
+        "    outputs = output_points(source)" + NL + "    if not literal:"),
+    "分支輸出:還沒全部產生過就不再換 model": ("dbt_hidden_writes.py",
+        "        if len(reached) == len(literal) and len(probe.outputs_reached) == len(outputs):",
+        "        if len(reached) == len(literal):"),
+    "分支輸出:不設上限": ("dbt_hidden_writes.py",
+        "    if len(outputs) > MAX_BRANCH_OUTPUTS:", "    if False:"),
+    "分支輸出:return() 的 macro 不另外看": ("dbt_hidden_writes.py",
+        "    if returning:" + NL + "        out[UNVERIFIED] = _return_macro_reason(source, returning)",
+        "    if False:" + NL + "        out[UNVERIFIED] = _return_macro_reason(source, returning)"),
+    "分支輸出:沒有 finding": ("pipeline.py",
+        "        for added in (_hidden_write_finding(entry), _unreached_branch_finding(entry)):",
+        "        for added in (_hidden_write_finding(entry),):"),
+    "分支輸出:寫入語句那條列過的行再列一次": ("pipeline.py",
+        "        if isinstance(line, int) and not isinstance(line, bool) and line not in listed \\",
+        "        if isinstance(line, int) and not isinstance(line, bool) \\"),
+    "分支輸出:同一行列兩次": ("pipeline.py",
+        "                and line not in lines:", "                and True:"),
+    "分支輸出:macro 的說明不寫展開數": ("pipeline.py",
+        "        when = (f\"從呼叫這個 macro 檔的 model 展開時都沒有產生過(展開了 {models} 個 model;\"",
+        "        when = (f\"從呼叫這個 macro 檔的 model 展開時都沒有產生過(\""),
 })
 
 # ---- 危險 SQL 原語(#41 第 1 點)。每一條問的都是同一件事:放寬之後有沒有測試會紅。

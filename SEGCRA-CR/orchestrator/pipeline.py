@@ -37,7 +37,7 @@ from .dbt_asset_names import (ASSET as _ASSET_RULE, CHECK as _CHECK_RULE, GROUP 
                               versioned_models as _versioned_models)
 from .dbt_config_change import HIGH_RISK_NEW, config_changes, default_relative, is_dbt_yaml
 from .dbt_project import DbtProjectError, check_project_dir
-from .dbt_hidden_writes import MODELS_CHECKED, find_hidden_writes_in_macro
+from .dbt_hidden_writes import MODELS_CHECKED, UNREACHED_OUTPUT, find_hidden_writes_in_macro
 from .dbt_render import (MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, MACRO_SYNTAX,
                          check_macro_files_isolated)
 from .security import scan_mr
@@ -2522,14 +2522,51 @@ def _hidden_write_finding(entry: dict) -> dict | None:
             "citations": []}
 
 
+_UNREACHED_BRANCH_TITLE = "dbt 樣板有沒有展開到的分支,裡面的輸出沒有經過規則檢查"
+
+
+def _unreached_branch_finding(entry: dict) -> dict | None:
+    """分支裡的輸出哪一次展開都沒有產生過(dbt_hidden_writes 的 UNREACHED_OUTPUT)。
+    已經列在寫入語句那條的行不重複列;全部都列過了就不補。"""
+    hidden = entry.get("dbt_hidden_writes")
+    if not isinstance(hidden, dict) or not isinstance(hidden.get(UNREACHED_OUTPUT), list):
+        return None
+    _, listed = _hidden_write_list(hidden.get(UNREACHED))
+    lines = []
+    for it in hidden[UNREACHED_OUTPUT]:
+        line = it.get("line") if isinstance(it, dict) else None
+        if isinstance(line, int) and not isinstance(line, bool) and line not in listed \
+                and line not in lines:
+            lines.append(line)
+    if not lines:
+        return None
+    shown = "、".join(str(n) for n in lines[:_HIDDEN_WRITE_LIST_MAX])
+    where = f"第 {shown} 行" + (f" 等 {len(lines)} 處" if len(lines) > _HIDDEN_WRITE_LIST_MAX else "")
+    models = hidden.get(MODELS_CHECKED)
+    if isinstance(models, int) and not isinstance(models, bool):
+        when = (f"從呼叫這個 macro 檔的 model 展開時都沒有產生過(展開了 {models} 個 model;"
+                "有呼叫 is_incremental() 的也以增量模式展開過)")
+    else:
+        when = "在這次審查的展開結果裡沒有產生過(一般模式、增量模式都沒有)"
+    return {"file": entry["path"], "line": min(lines), "severity": "major",
+            "title": _UNREACHED_BRANCH_TITLE,
+            "detail": f"這些分支裡的輸出{when},可能只有真正執行時才會進:{where}。"
+                      "分支裡的內容可以用樣板組出寫入語句(例如把關鍵字拆成兩個字串接起來),"
+                      "規則層只檢查展開後的 SQL,這些內容沒有經過規則檢查,無法確認,不得自動放行。",
+            "suggestion": "人工確認這些分支在什麼情況下會進、會產生什麼 SQL;以 dbt compile 取得實際會"
+                          "執行的 SQL 再檢查。",
+            "citations": []}
+
+
 @_isolated_stage("寫入語句沒有展開到")
 def enforce_dbt_hidden_writes(report: dict, pre: list[dict]) -> dict:
     """樣板原文有寫入語句、規則層卻看不到時補 major(預掃記下的 dbt_hidden_writes,見
-    dbt_hidden_writes 模組)。確定性補報,不看模型有沒有提到;標題只能由程式產生。"""
+    dbt_hidden_writes 模組);沒有展開到的分支裡有輸出時另補一條 major。確定性補報,
+    不看模型有沒有提到;標題只能由程式產生。"""
     for entry in pre:
-        hidden = _hidden_write_finding(entry)
-        if hidden is not None:
-            _put_program_finding(report, hidden)
+        for added in (_hidden_write_finding(entry), _unreached_branch_finding(entry)):
+            if added is not None:
+                _put_program_finding(report, added)
     return report
 
 
