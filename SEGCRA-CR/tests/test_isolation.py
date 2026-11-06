@@ -13,10 +13,10 @@ import time
 
 import pytest
 
-from orchestrator import env_registry, isolation
+from orchestrator import env_registry, isolation, isolation_child
 from orchestrator.dbt_render import DbtProjectInfo, RenderResult
-from orchestrator.isolation import (CHILD_ENV_NAMES, CodecError, _decode, _encode, child_env,
-                                    run_isolated)
+from orchestrator.isolation import CHILD_ENV_NAMES, child_env, run_isolated
+from orchestrator.isolation_child import CodecError, _decode, _encode
 
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SECRETS = ("GITLAB_TOKEN", "GITLAB_READ_TOKEN", "GITLAB_URL", "SANDBOX_MSSQL_PASSWORD",
@@ -131,7 +131,7 @@ def test_子行程會用到的模組讀的環境變數都有決定():
     變數的地方而沒有決定,這裡會擋下:漏給的話子行程悄悄用預設值,多給的可能是秘密。"""
     files = _run(project_modules, ["orchestrator.dbt_render", "orchestrator.dbt_impact",
                                    "orchestrator.dbt_context", "toolbox.sqltools"])
-    assert isinstance(files, list) and "orchestrator/isolation.py" in files, files
+    assert isinstance(files, list) and "orchestrator/isolation_child.py" in files, files
     names = {read.name for rel in files for read in env_registry.scan_file(PKG_ROOT / rel, rel)}
     undecided = names - CHILD_ENV_NAMES - MAIN_PROCESS_ONLY
     assert undecided == set(), sorted(undecided)
@@ -165,7 +165,7 @@ def _same(a, b):
 
 
 def test_型別原樣來回():
-    _same(_decode(_encode(COMPLEX), {isolation._type_name(Point): Point}), COMPLEX)
+    _same(_decode(_encode(COMPLEX), {isolation_child._type_name(Point): Point}), COMPLEX)
 
 
 def test_經過子行程也一樣():
@@ -196,24 +196,24 @@ def test_不能傳遞的值(value):
 
 def test_巢狀太深():
     deep = []
-    for _ in range(isolation.MAX_DEPTH + 5):
+    for _ in range(isolation_child.MAX_DEPTH + 5):
         deep = [deep]
     with pytest.raises(CodecError):
         _encode(deep)
     encoded = {"$list": []}
-    for _ in range(isolation.MAX_DEPTH + 5):
+    for _ in range(isolation_child.MAX_DEPTH + 5):
         encoded = {"$list": [encoded]}
     with pytest.raises(CodecError):
         _decode(encoded, {})
 
 
-POINT = isolation._type_name(Point)
+POINT = isolation_child._type_name(Point)
 
 
 @pytest.mark.parametrize("obj", [
     {"$dc": POINT, "f": {"x": 1}},                                  # 少了欄位(有預設值也不行)
     {"$dc": POINT, "f": {"x": 1, "y": {"$tuple": []}, "z": 2}},     # 多了欄位
-    {"$dc": isolation._type_name(NotListed), "f": {"a": 1}},        # 不在清單
+    {"$dc": isolation_child._type_name(NotListed), "f": {"a": 1}},        # 不在清單
     {"$dc": "os:system", "f": {}},                                  # 不在清單的任何東西
     {"$dc": POINT, "f": {"x": 1, "y": {"$tuple": []}}, "extra": 1},
     {"$what": []}, {"$list": "x"}, {"$list": [], "$tuple": []}, {}, [1, 2],
@@ -310,3 +310,46 @@ def test_正常的結果照常收得到(evil):
     """前提:替身子行程送回合格的資料時是收得到的(不然上面那些失敗不代表什麼)。"""
     evil(b'{"status": "ok", "value": {"$tuple": [1, "a"]}}')
     assert _run(len, "x") == (1, "a")
+
+
+# ─────────────────── 主行程那一側能做的事 ───────────────────
+# isolation.py 不在 tests/test_dbt_render.py 的 import 白名單裡(它要啟動子行程)。
+# 它用 subprocess 與 os 做的事由這裡鎖住:多做一件就失敗。
+
+def _parent_tree():
+    import ast
+    return ast.parse((PKG_ROOT / "orchestrator" / "isolation.py").read_text(encoding="utf-8"))
+
+
+def _attrs_of(tree, name):
+    import ast
+    return {n.attr for n in ast.walk(tree)
+            if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == name}
+
+
+def test_主行程那一側只用_subprocess_起固定的子行程():
+    """只呼叫一次 Popen,指令是 [sys.executable, "-I", "-c", _BOOTSTRAP],不經 shell;
+    subprocess 其他用到的只有常數與逾時例外。"""
+    import ast
+    tree = _parent_tree()
+    assert _attrs_of(tree, "subprocess") == {"Popen", "PIPE", "DEVNULL", "TimeoutExpired"}
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and isinstance(n.func.value, ast.Name) and n.func.value.id == "subprocess"]
+    assert [c.func.attr for c in calls] == ["Popen"]
+    (popen,) = calls
+    cmd = popen.args[0]
+    assert isinstance(cmd, ast.List) and ast.unparse(cmd) == "[sys.executable, '-I', '-c', _BOOTSTRAP]"
+    keywords = {k.arg: ast.unparse(k.value) for k in popen.keywords}
+    assert "shell" not in keywords and keywords.get("env") == "child_env()"
+    assert not [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+                and (n.module or "") in ("subprocess", "os")]
+
+
+def test_主行程那一側只用_os_讀環境變數():
+    assert _attrs_of(_parent_tree(), "os") == {"environ"}
+
+
+def test_子行程的進入點在子行程那一側():
+    """_BOOTSTRAP 匯入的是 isolation_child 的進入點;isolation_child 不匯入主行程那一側。"""
+    assert "from orchestrator.isolation_child import _child_main" in isolation._BOOTSTRAP
+    assert not hasattr(isolation_child, "run_isolated") and not hasattr(isolation_child, "subprocess")

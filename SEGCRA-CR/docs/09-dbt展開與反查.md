@@ -13,7 +13,8 @@
 - **`orchestrator/dbt_impact.py`**:MR 只改 macro 或 config 註冊表時,反查出呼叫它的
   model(diff 裡看不到那些檔案),並依 model 檔名對應到核定規格。
 
-兩者共用 **`orchestrator/isolation.py`**(子行程隔離:逾時、記憶體上限、拿不到 token 與密碼、結果只用 JSON 傳回)。
+兩者共用 **`orchestrator/isolation.py`**(子行程隔離:逾時、記憶體上限、拿不到 token 與密碼、結果只用 JSON 傳回;
+子行程裡實際跑的那一側在 `orchestrator/isolation_child.py`)。
 
 對應 Issue #7 的四點。接進審查管線的部分以 `config/models.yaml` 的 `dbt.enabled`
 控制,**預設關閉**:目前已接上「預掃前展開」與「依檔名對應規格」;macro 反查尚未
@@ -220,6 +221,12 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
   - 參數與結果都用 JSON 傳遞,不用 pickle:主行程只建出基本型別、容器與呼叫端列出的 dataclass
     (欄位名稱要完全一致);不是 JSON、形狀不對、超過 256 MB、巢狀超過 64 層都算失敗,錯誤訊息去掉
     控制字元並截短
+  - 拆成兩支:`isolation.py` 是主行程那一側(啟動子行程、只給列出的環境變數、限時、讀回結果),
+    `isolation_child.py` 是子行程裡實際跑的那一側(進入點、JSON 編解碼)。`tests/test_dbt_render.py`
+    的 import 白名單管後者:子行程處理不可信的內容,不能有網路、指令執行、寫檔的能力。前者要啟動
+    子行程,需要 `subprocess` 與 `os`,不在白名單裡——它不讀、不展開不可信的內容(只當成參數編碼後
+    交給子行程),指令固定(`sys.executable -I` 加固定的進入點,不經 shell);它用到的 `subprocess`、
+    `os`、`asyncio` 由 `tests/test_isolation.py` 與 `tests/test_dbt_render.py` 的語法樹檢查鎖住
   - 限制:子行程讀得到磁碟上的檔案(跟主行程同一個帳號)
 - dbt 內建 macro 名稱清單由 `dbt parse` 產生,**只收錄名稱,不含任何程式碼**;來源套件
   版本與授權取自套件中繼資料(dbt-core、dbt-adapters 為 Apache-2.0,dbt-sqlserver 為 MIT)
