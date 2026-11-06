@@ -111,3 +111,27 @@ def test_值不像狀態碼就不降級(sql, label):
     """狀態碼是 'ACTIVE'、'N' 這種純字母的短字串。有數字或符號的一律當成憑證 ——
     降錯的代價是寫死的金鑰不再擋下 MR。"""
     assert "R004" in _codes(sql), label
+
+
+# ─────────────────── 5. 不可以比改之前還鬆(#67 review)───────────────────
+
+@pytest.mark.parametrize("sql,label", [
+    ("SELECT 1 FROM t WHERE token = 'ACTIVE';\nSET @password = 'hunter2';",
+     "前面有一處被降級成比較"),
+    ("SET @password = 'hunter2'; -- 見 {{ doc }}", "同一行後面的註解有佔位符"),
+    ("SET @password = 'hunter2'; PRINT '${x}';", "同一行後面另一個字串有佔位符"),
+    ("password: \"{{ env_var('A') }}\"\npassword: S3cr3tPass", "第一處是佔位符,第二處是寫死的"),
+])
+def test_一處被排除不影響其他處(sql, label):
+    """只看第一個比對到的話,第一處被降級或排除就整份不報 —— 後面真的寫死的密碼
+    跟著消失,比不改還鬆。每一處要各自判斷。"""
+    assert "R004" in _codes(sql), label
+
+
+@pytest.mark.parametrize("sql,label", [
+    ("password: S3cr3tPass  # 之後改 env_var('P')", "YAML 的值後面有註解提到 env_var"),
+    ("SET @api_key = 'sk-live-1'; -- TODO 改成 ${API_KEY}", "註解裡的佔位符"),
+])
+def test_佔位符只看值本身(sql, label):
+    """要判斷的是那個**值**是不是佔位符,不是「附近有沒有佔位符」。"""
+    assert "R004" in _codes(sql), label

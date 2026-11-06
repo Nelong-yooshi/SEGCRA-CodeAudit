@@ -247,30 +247,44 @@ RULES = [
 # 鍵名(像憑證的那些)。三處共用:鍵=值、位置參數的前後文、欄位比較的降級判斷。
 _CRED_KEY = (r"password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token"
              r"|token|credential|conn(?:ection)?[_-]?string")
-# 寫死的值。涵蓋三種寫法,**都要排除佔位符**(`{{ }}`、`${}`、`env_var(...)`):
-# 那些是「去別的地方拿」,不是寫死;R004 是 blocker,誤報會直接把 MR 擋下來。
+# 寫死的值。涵蓋三種寫法:
 #   1. 引號包起來的值,前面可以有 T-SQL 的 N 前綴:`PASSWORD = N'6789'`
 #   2. 沒加引號的值。**冒號與等號要分開**:
 #      YAML 的 `password: 6789`、`password: S3cr3tPass` —— 冒號後面什麼都算;
 #      SQL 的 `SET @pwd = 6789` —— 等號後面只認數字開頭的,不然 `password = other_column`
 #      這種拿欄位比較的寫法會被當成寫死的值
 #   3. 連線字串裡的 `帳號:密碼@主機`
-# 佔位符不是寫死的值:`{{ }}`、`${}`、`env_var(...)` 都是「去別的地方拿」。往後看一行
-# 之內,引號裡面也要看得到(值本身就包在引號裡)。R004 是 blocker,誤報會直接擋下 MR。
-_NOT_HARDCODED = r"(?![^\n]{0,60}(?:\{\{|\$\{|env_var\s*\())"
-_QUOTED = r'''N?'[^'\n]{1,}'|N?"[^"\n]{1,}"'''
+#
+# **值本身抓成群組**:要判斷的是那個值是不是佔位符,不是「附近有沒有佔位符」。
+# 往後看一行之內的話,`SET @password = 'hunter2'; PRINT '${x}'` 會因為後面那個 `${}`
+# 整條不報 —— 比改之前還鬆。
+_QUOTED = r"""N?'[^'\n]{1,}'|N?\"[^\"\n]{1,}\""""
 _SECRET_RE = re.compile(
     r"""(?ix)
     (?P<key>""" + _CRED_KEY + r""")\s*(?:
-        :\s*""" + _NOT_HARDCODED + r"""(?:""" + _QUOTED + r"""|[^\s#,;)\n]{1,})
-      | =\s*""" + _NOT_HARDCODED + r"""(?:""" + _QUOTED + r"""|[0-9][\w.$-]{0,})
+        :\s*(?P<colon>""" + _QUOTED + r"""|[^\s#,;)\n]{1,})
+      | =\s*(?P<equals>""" + _QUOTED + r"""|[0-9][\w.$-]{0,})
     )
-    | (?P<url>://[^:/\s'"]+:[^@/\s'"]+@)          # user:pass@host 連線字串
+    | (?P<url>://[^:/\s'\"]+:[^@/\s'\"]+@)          # user:pass@host 連線字串
     """)
+# 佔位符不是寫死的值:`{{ }}`、`${}`、`env_var(...)` 都是「去別的地方拿」。
+_PLACEHOLDER_RE = re.compile(r"(?i)\{\{|\$\{|env_var\s*\(")
+
+
+def _hardcoded_value(m: "re.Match") -> bool:
+    """這一處比對到的**值**是不是寫死的(不是佔位符)。"""
+    groups = m.groupdict()
+    if groups.get("url"):
+        return True
+    value = groups.get("colon") or groups.get("equals") or groups.get("secret") or ""
+    return not _PLACEHOLDER_RE.search(value)
+
+
+
 _SECRET_PROC_RE = re.compile(
     r"""(?ix)(?<![\w.@\[])(?P<proc>sp_addlogin|sp_adduser|sp_password
         |sp_addlinkedsrvlogin|sp_setapprole|sp_addapprole)\b
-        [^\n;]{0,200}?,\s*""" + _NOT_HARDCODED + r"""N?'[^'\n]{1,}'""")
+        [^\n;]{0,200}?,\s*(?P<secret>N?'[^'\n]{1,}')""")
 # 命中的鍵名 → **我們自己的**分類標籤。連鍵名都不原樣回顯:大小寫與 `api-key`/`api_key`
 # 這些寫法也是作者的文字,而分類標籤是固定字串,說明的資訊量一樣夠。
 _SECRET_KINDS = {
@@ -594,12 +608,21 @@ def _env_hints(sql: str) -> list[tuple[str, str, str]]:
     return hits
 
 
+def _secret_matches(sql: str):
+    """所有「疑似寫死憑證」的比對位置,依出現順序。"""
+    found = list(_SECRET_RE.finditer(sql)) + list(_SECRET_PROC_RE.finditer(sql))
+    return sorted(found, key=lambda m: m.start())
+
+
 def _text_rules(sql: str):
     hits = []
-    m = _SECRET_RE.search(sql) or _SECRET_PROC_RE.search(sql)
-    if m and not _is_comparison(sql, m):
+    # **每一處各自判斷**:只看第一個比對到的話,第一處剛好是「欄位 = 狀態碼」的比較
+    # 而被降級時,整份就不報了 —— 後面真的寫死的密碼跟著消失,比不改還鬆。
+    secret = next((m for m in _secret_matches(sql)
+                   if _hardcoded_value(m) and not _is_comparison(sql, m)), None)
+    if secret is not None:
         hits.append(("R004", "blocker",
-                     f"疑似硬編碼憑證/密碼/金鑰於 SQL:{_secret_kind(m)}——"
+                     f"疑似硬編碼憑證/密碼/金鑰於 SQL:{_secret_kind(secret)}——"
                      f"一律禁止,應改用參數/密鑰管理服務"))
     if _PW_COMPARE_RE.search(sql):
         hits.append(("H004", "hint",
