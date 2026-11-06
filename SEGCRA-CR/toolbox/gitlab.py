@@ -592,3 +592,50 @@ def set_label(mr_id: str, label: str) -> str:
         _mock_output(mr_id, "label", {"label": label})
     return json.dumps({"ok": True}, ensure_ascii=False)
 
+
+# --- CI 閘門用(不在模型的工具清單裡) -------------------------------------
+# 審查做成部署端 CI 的一個 job 時(見 orchestrator/ci_gate.py),審查服務要確認呼叫它的是
+# 這個專案、這個 MR 的 pipeline 裡正在跑的 job。
+
+def job_from_token(job_token: str) -> dict | None:
+    """用 CI job 的 CI_JOB_TOKEN 向 GitLab 查它是哪一個 job(GET /job,帶 JOB-TOKEN)。
+
+    token 無效、job 已經結束、或 GitLab 回錯誤時回 None。只在 real 模式有意義;mock 模式回 None。
+    token 是呼叫端送來的(不可信),只放在 header,不記 log。"""
+    if not REAL_MODE or not isinstance(job_token, str) or not job_token or len(job_token) > 512:
+        return None
+    import httpx
+    try:
+        r = httpx.get(f"{GITLAB_URL}/api/v4/job", headers={"JOB-TOKEN": job_token}, timeout=30)
+        if r.status_code != 200:
+            return None
+        job = r.json()
+    except Exception:                        # noqa: BLE001 — 查不到就是驗證失敗
+        return None
+    return job if isinstance(job, dict) else None
+
+
+def pipeline_info(pipeline_id: int) -> dict | None:
+    """這個專案的某條 pipeline(GET /projects/:id/pipelines/:pipeline_id);取不到回 None。"""
+    if not REAL_MODE or not isinstance(pipeline_id, int) or isinstance(pipeline_id, bool):
+        return None
+    try:
+        info = _api("GET", f"/pipelines/{pipeline_id}")
+    except Exception:                        # noqa: BLE001
+        return None
+    return info if isinstance(info, dict) else None
+
+
+def mr_head(mr_id: str) -> dict | None:
+    """MR 目前的 head commit 與狀態(GET /merge_requests/:iid):{sha, state, source_project_id};
+    取不到回 None。"""
+    mr_id = _check_mr_id(mr_id)
+    if not REAL_MODE:
+        mr = _mock_mr(mr_id)
+        return {"sha": mr.get("sha", f"mock-{mr_id}"), "state": "opened", "source_project_id": None}
+    try:
+        mr = _api("GET", f"/merge_requests/{mr_id}")
+    except Exception:                        # noqa: BLE001
+        return None
+    return {"sha": mr.get("sha") or "", "state": mr.get("state") or "",
+            "source_project_id": mr.get("source_project_id")}

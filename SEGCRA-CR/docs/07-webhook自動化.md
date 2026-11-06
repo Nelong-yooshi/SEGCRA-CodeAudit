@@ -43,6 +43,24 @@
 2. 專案 → Settings → Webhooks → Add new webhook:URL 填 `http://172.17.0.1:8000/gitlab-webhook`(容器打回宿主機走 docker bridge gateway;容器內打 `localhost` 是打容器自己)、Secret token 填與 `GITLAB_WEBHOOK_SECRET` 相同的值、勾 **Merge request events** 與 **Comments**(後者供 `/review` 重審)。
 3. 建好後用該 webhook 的 Test → Merge request events 驗證,server stdout 應出現觸發紀錄。
 
+### CI 的 job 呼叫的那條路(`/ci/review`,部署端用這一條)
+
+部署端不設 webhook:審查做成 MR pipeline 最後一個 stage 的 job,job 呼叫同一支服務的
+`POST /ci/review` 與 `GET /ci/review/<編號>`(設定步驟與 job 的 YAML 見 06 篇第 4 節)。跟 webhook
+那條路的差別:
+
+| | webhook(`/gitlab-webhook`) | CI(`/ci/review`) |
+|---|---|---|
+| 怎麼確認呼叫者 | `X-Gitlab-Token` 跟 `GITLAB_WEBHOOK_SECRET` 相同 | job 的 `JOB-TOKEN` 向 GitLab 查是哪個 job,再確認專案、MR pipeline、ref、sha 與 MR 目前的 head(`orchestrator/ci_gate.py:check_request`) |
+| Draft | 不審 | 審(Draft 標成 Ready 不會重跑 pipeline) |
+| 安靜期 | 等 `WEBHOOK_DEBOUNCE_SECONDS` | 不等,每個 job 都要自己的結果;webhook 那條路還在等的同一個 MR 不再審 |
+| 結果 | commit status `segcra/review` | job 的結束碼(`ci_gate.exit_code`),不寫 commit status |
+| 沒跑完 | 留言 + commit status 設成失敗 | 留言,job 拿到 5 |
+
+兩條路共用 `_run_review`(同一個 MR 有進行中的審查就取消、改審新的)與 `REVIEW_TIMEOUT_SECONDS`。
+進行中的 CI 審查記在記憶體(`_ci_reviews`,最多 `MAX_CI_REVIEWS` 份,超過時丟掉最舊的、已經結束的),
+服務重新啟動就沒了:job 查不到狀態,連續 10 次後以 5 結束,retry job 重審。
+
 ## 對決策的影響
 
 webhook server 本身不產生 finding、不動 severity、不參與三態決策的任何條件——它是觸發器與回寫通道。決策(`auto_approved` / `needs_human` / `blocked`)完全由管線的 `apply_policy`(`orchestrator/pipeline.py`)確定性計算。webhook 的貢獻在**決策的落地**:把決策轉成 commit status(只有 `auto_approved` 是 success),配合「Pipelines must succeed」讓 `needs_human` 與 `blocked` 的 MR 在 GitLab 上實際按不下 merge。換句話說,它讓三態決策從「一段報告文字」變成「merge 按鈕的狀態」。
