@@ -237,10 +237,13 @@ def test_審查未完成要把commit_status設成失敗(ws, monkeypatch):
     只留言不設狀態,等於審查沒跑完卻沒有東西擋著合併。"""
     calls = {}
     import types
+    from toolbox import gitlab
+    ok = '{"ok": true}'
     fake = types.SimpleNamespace(
-        post_summary=lambda *a, **k: calls.setdefault("summary", a),
-        set_commit_status=lambda *a, **k: calls.setdefault("status", a),
-        get_mr_diff=lambda mr_id: '{"head_sha": "deadbeef"}')
+        post_summary=lambda *a, **k: calls.setdefault("summary", a) and ok,
+        set_commit_status=lambda *a, **k: calls.setdefault("status", a) and ok,
+        get_mr_refs=lambda mr_id: '{"head_sha": "deadbeef"}',
+        write_failure=gitlab.write_failure)
     import toolbox
     monkeypatch.setattr(toolbox, "gitlab", fake, raising=False)
     ws._notify_incomplete(11, "超過上限")
@@ -258,10 +261,12 @@ def test_留言失敗不影響commit_status(ws, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("留言壞了")
 
+    from toolbox import gitlab
     fake = types.SimpleNamespace(
         post_summary=boom,
-        set_commit_status=lambda *a, **k: calls.setdefault("status", a),
-        get_mr_diff=lambda mr_id: '{"head_sha": "abc"}')
+        set_commit_status=lambda *a, **k: calls.setdefault("status", a) and '{"ok": true}',
+        get_mr_refs=lambda mr_id: '{"head_sha": "abc"}',
+        write_failure=gitlab.write_failure)
     import toolbox
     monkeypatch.setattr(toolbox, "gitlab", fake, raising=False)
     ws._notify_incomplete(12, "程式發生 RuntimeError", "abc")

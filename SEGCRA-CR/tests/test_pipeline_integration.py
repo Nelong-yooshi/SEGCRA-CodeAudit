@@ -520,7 +520,7 @@ def _writeback_calls(output, mr_id):
 def test_已有更新的commit時不回寫(run, monkeypatch):
     seen = {}
 
-    async def newer(hub, mr_id, reviewed_sha):
+    def newer(now, reviewed_sha):
         seen["asked"] = reviewed_sha
         return True                     # 假裝 MR 目前的 head 已經換了
 
@@ -547,21 +547,17 @@ def test_問不出目前的sha就照常回寫(run, monkeypatch):
         async def call_json(self, *a, **k):
             raise RuntimeError("API 掛了")
 
-    assert asyncio.run(pipeline._superseded(Hub(), "900", "abc")) is False
+    now = asyncio.run(pipeline._current_mr(Hub(), "900"))
+    assert now == {}
+    assert pipeline._superseded(now, "abc") is False
     # 沒有 sha 可比(mock 模式常見)也一樣不擋
-    assert asyncio.run(pipeline._superseded(Hub(), "900", None)) is False
+    assert pipeline._superseded({"head_sha": "new"}, None) is False
 
 
 def test_head_sha_換掉就算被取代():
-    class Hub:
-        def __init__(self, sha):
-            self.sha = sha
-
-        async def call_json(self, *a, **k):
-            return {"head_sha": self.sha}
-
-    assert asyncio.run(pipeline._superseded(Hub("new"), "900", "old")) is True
-    assert asyncio.run(pipeline._superseded(Hub("same"), "900", "same")) is False
+    assert pipeline._superseded({"head_sha": "new"}, "old") is True
+    assert pipeline._superseded({"head_sha": "same"}, "same") is False
+    assert pipeline._superseded({"sha": "new"}, "old") is True          # mock 模式只有 sha
 
 
 def test_注入掃描丟例外時交人工_而不是當成沒有注入(run, monkeypatch):

@@ -80,28 +80,37 @@ def _notify_incomplete(mr_iid: int, reason: str, head_sha: str | None = None,
     「Pipelines must succeed」)。只留言不設狀態,等於審查沒跑完卻沒有東西擋著合併
     ——那正是 #45 要消滅的「沒擋、沒放、也沒人知道」。
 
-    兩個動作各自 try:留言失敗不該讓狀態也設不上,反之亦然。
+    兩個動作各自 try:留言失敗不該讓狀態也設不上,反之亦然。兩個都看回傳的結果
+    (`gitlab.write_failure`):沒寫上時不能印成已經寫上。log 只寫哪一步與問題的種類,
+    不印例外訊息(可能帶主機位址)。
     """
     body = (f"審查未完成({reason}),請人工處理。\n\n"
             f"這不是「沒問題」——是這次審查沒有跑完,沒有結論。")
     from toolbox import gitlab
     try:
-        gitlab.post_summary(str(mr_iid), body, 0, "審查未完成")
+        failure = gitlab.write_failure(gitlab.post_summary(str(mr_iid), body, 0, "審查未完成"))
+    except Exception as e:                   # noqa: BLE001 — 只記種類
+        failure = type(e).__name__
+    if failure is None:
         print(f"[webhook] MR !{mr_iid} 已留言告知審查未完成({reason})", flush=True)
-    except Exception as e:
-        print(f"[webhook] MR !{mr_iid} 連留言都失敗了:{type(e).__name__}: {e}", flush=True)
+    else:
+        print(f"[webhook] MR !{mr_iid} 審查未完成的留言沒有貼上({failure})", flush=True)
     if not commit_status:
         return
     try:
         sha = head_sha or ""
         if not sha:
-            info = json.loads(gitlab.get_mr_diff(str(mr_iid)))
-            sha = info.get("head_sha") or info.get("sha") or ""
-        gitlab.set_commit_status(sha, "failed", "segcra/review",
-                                 f"審查未完成:{reason}"[:200], str(mr_iid))
+            # 只要 head 的 sha:取 MR 的位置就好,不用 get_mr_diff 把每個檔案都取一遍
+            refs = json.loads(gitlab.get_mr_refs(str(mr_iid)))
+            sha = refs.get("head_sha") or refs.get("sha") or ""
+        failure = gitlab.write_failure(gitlab.set_commit_status(
+            sha, "failed", "segcra/review", f"審查未完成:{reason}"[:200], str(mr_iid)))
+    except Exception as e:                   # noqa: BLE001 — 只記種類
+        failure = type(e).__name__
+    if failure is None:
         print(f"[webhook] MR !{mr_iid} commit status 設為失敗(審查未完成)", flush=True)
-    except Exception as e:
-        print(f"[webhook] MR !{mr_iid} commit status 設定失敗:{type(e).__name__}: {e}",
+    else:
+        print(f"[webhook] MR !{mr_iid} commit status 沒有設上({failure}):merge 閘門上沒有這次的結果",
               flush=True)
 
 
