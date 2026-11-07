@@ -141,23 +141,23 @@ def measure(files: int, model_findings: int, latency: float) -> dict:
     async def spec_exec(cfg, hub, mr, *a, **kw):
         return {"passed": True, "findings": []}
 
-    superseded = pipeline._superseded
+    current_mr = pipeline._current_mr
     before_finish: Counter = Counter()
 
-    async def mark_then_check(*a, **kw):     # 收尾的第一個 GitLab 請求在這裡:先記下之前打了幾次
+    async def mark_then_fetch(*a, **kw):     # 收尾的第一個 GitLab 請求在這裡:先記下之前打了幾次
         before_finish.update(_FakeGitLab.counts)
-        return await superseded(*a, **kw)
+        return await current_mr(*a, **kw)
 
     originals = (pipeline.run_agent, pipeline._cold_read, pipeline.run_spec_exec)
     pipeline.run_agent, pipeline._cold_read, pipeline.run_spec_exec = run_agent, cold, spec_exec
-    pipeline._superseded = mark_then_check
+    pipeline._current_mr = mark_then_fetch
     try:
         cfg = load_config()
         cfg.dbt["enabled"] = False          # 量的是收尾,不展開 dbt
         report = asyncio.run(pipeline.review_mr(cfg, "1"))
     finally:
         pipeline.run_agent, pipeline._cold_read, pipeline.run_spec_exec = originals
-        pipeline._superseded = superseded
+        pipeline._current_mr = current_mr
         for k, v in saved.items():
             setattr(gitlab, k, v)
         server.shutdown()

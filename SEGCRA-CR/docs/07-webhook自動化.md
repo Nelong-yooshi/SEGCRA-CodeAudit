@@ -106,48 +106,33 @@ finding 貼回 MR、設 label 與 commit status;收尾保留 `FINISH_RESERVE_SEC
 `postprocess` 後處理,`spec_exec`,`finish` 收尾含回寫,`total`)與這輪的截止時間(`_review_deadline_seconds`)。
 各步的上限與收尾保留照這些數字調。
 
-### 收尾保留怎麼訂(量過)
+### 收尾保留怎麼訂
 
-收尾 = 執行驗證結束之後到回傳:校準、評分、決策、比對 MR 的 head(重新取一次 MR 與每個檔案)、
-逐條貼回(每條 2 個請求:取 MR 的 `diff_refs`、開行內討論;沒有行號的貼一般留言)、總結、label、commit status。
-跟模型無關,時間幾乎都花在 GitLab 的請求上。
+收尾 = 執行驗證結束之後到回傳:校準、評分、決策、取一次 MR(`get_mr_refs`:只取 head 與 `diff_refs`,
+用來比對 head,也拿來開行內討論)、逐條貼回(每條 1 個請求;沒有行號的貼一般留言)、commit status、label、
+總結。跟模型無關,時間幾乎都花在 GitLab 的請求上。
 
-量法:`eval/measure_finish.py` 跑真的 `review_mr` 與真的 `toolbox/gitlab.py`(real 模式),GitLab 換成本機的
-假伺服器、每個請求固定延遲;模型的三步換成立刻回傳的替身。finding 數用檔案數控制(每個檔案一句沒有 WHERE 的
-DELETE,另外主審查回 20 條)。
+- **請求數 ≈ finding 數 + 4**(取一次 MR、commit status、label、總結),跟檔案數無關。commit status 或
+  label 寫入失敗時會重送(各最多再送 2、1 次,每次之間等 1 秒)
+- **收尾 ≈ 請求數 × 單次延遲**
+- **部署端怎麼量**:先量一次 GitLab API 的延遲(例如 `GET /projects/:id/merge_requests/:iid` 的回應時間),
+  帶進 `eval/measure_finish.py` 跑(真的 `review_mr` 與真的 `toolbox/gitlab.py`,GitLab 換成本機的假伺服器、
+  每個請求固定延遲;finding 數用檔案數控制):
 
-```bash
-python eval/measure_finish.py --files 10 50 100 200 --latency 0 0.1 0.3
-```
+  ```bash
+  python eval/measure_finish.py --files 10 50 100 200 --latency <部署端量到的延遲>
+  ```
 
-開發機(Windows)2026-10-25 量到的收尾秒數:
+  量到的收尾超過 `FINISH_RESERVE_SECONDS`(預設 300 秒)時調大它。
 
-| finding 數 | 收尾的 GitLab 請求數 | 延遲 0 | 每個請求 0.1 秒 | 每個請求 0.3 秒 |
-|---|---|---|---|---|
-| 29 | 73 | 1.0 | 8.5 | 23.1 |
-| 69 | 193 | 2.8 | 22.2 | 61.0 |
-| 119 | 343 | 4.4 | 39.5 | 108.4 |
-| 219 | 643 | 9.5 | 74.1 | 202.8 |
-
-請求數是延遲 0.1、0.3 秒那兩輪的;延遲 0 那一輪有幾條行內討論在用戶端失敗、退成一般留言,多出 1–12 個請求。
-收尾 ≈ 請求數 × 單次延遲 + 每條 finding 約 0.04 秒;請求數 ≈ 2 × finding 數 + 檔案數 + 5。
-**預設 300 秒**:照上表的比例(檔案數與 finding 數相當),單次延遲 0.3 秒時約 310 條 finding 以內收得完,
-0.1 秒時約 880 條;檔案數較少時能收的條數更多。
-部署端先量一次 GitLab API 的延遲(例如 `GET /projects/:id/merge_requests/:iid` 的回應時間),用
-`--latency` 帶進去重跑,或直接照上面的式子算;超過就調大 `FINISH_RESERVE_SECONDS`。
-
-另外量到的一件事:**收尾目前打不斷**。回寫是同步的工具呼叫(`ToolHub.call` 直接呼叫同步函式),中間沒有
-讓出事件迴圈,外層 `asyncio.wait_for` 的時限在回寫途中到了也插不進去,回寫會做完、結果照常回傳,只是整份
-超過 `REVIEW_TIMEOUT_SECONDS` 才結束(Python 3.11、3.13 實測:外層 1 秒、回寫 10 次各 0.2 秒,10 次都貼了,
-2.5 秒後正常回傳)。所以收尾超過保留時不會讓結果消失。**數字不靠這個性質訂**:回寫日後改成非同步(例如
-丟到執行緒)時就打得斷了,保留要照真的會花的時間留。
+回寫(貼留言、設 label、設 commit status)是在事件迴圈裡直接呼叫的同步請求,外層的時間上限在回寫途中到了
+也插不進去:回寫會做完,整份超過 `REVIEW_TIMEOUT_SECONDS` 才結束。
 
 ### 每一步的上限與最少秒數
 
-`MIN_STAGE_SECONDS`(30 秒)是「剩這麼少就不開始」:冷讀關掉思考後,開發環境量到的每份時間中位數是
-12 到 29 秒(兩組題目,見 `config/models.yaml` 的 `cold_read` profile 註解),剩不到 30 秒開始多半跑不完。主審查 1800、冷讀 600、執行驗證 1200 與這個值都跟模型主機的速度
-有關,開發環境量到的只能當參考,**部署端用正式的上限跑一輪評測題、看 `stage_time_summary.py` 的各階段
-P90 與最大值再調**(見下一節)。
+`MIN_STAGE_SECONDS`(30 秒)是「剩這麼少就不開始」:剩的時間太少時開始的模型步驟多半跑不完。主審查 1800、
+冷讀 600、執行驗證 1200 與這個值都跟模型主機的速度有關,**部署端用正式的上限跑一輪評測題、看
+`stage_time_summary.py` 的各階段 P90 與最大值再調**(見下一節)。
 
 ### 評測的截止時間
 
