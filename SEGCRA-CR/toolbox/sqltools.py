@@ -159,6 +159,8 @@ _STMT_KEYWORDS = (
 # `.match(sql, i)` 本身就從 i 開始比,不要加 `^`:沒有 MULTILINE 時 `^` 只在整份的
 # 開頭才成立,加了就等於永遠不切。
 _KEYWORD_LINE_RE = re.compile(r"(?i)[ \t]*(?:" + "|".join(_STMT_KEYWORDS) + r")\b")
+# 同一份關鍵字,但比對任意位置(剝掉 `IF 條件` 之後找語句從哪裡開始)
+_KEYWORD_ANY_RE = re.compile(r"(?i)(?<![\w.@\[])(?:" + "|".join(_STMT_KEYWORDS) + r")\b")
 
 
 def _keyword_cuts(sql: str) -> list[int]:
@@ -199,6 +201,87 @@ def _split_by_keyword(text: str, line_offset: int) -> list[Chunk] | None:
     return out
 
 
+# 程序性的區塊。T-SQL 的 `BEGIN … END`、`BEGIN TRY … END TRY`、`IF 條件 <一句>`
+# 這些,sqlglot 不是整段退回 `Command`(只剩原文、沒有語法樹),就是解析成別的東西
+# (`IF @x = 1` 換行接 `DELETE FROM t` 會被讀成條件 `@x = 1 AS DELETE`,刪除變成讀取)。
+# 兩種都讓裡面的寫入語句對規則層消失,而且報告長得跟掃過了沒問題一樣。
+_BLOCK_EDGE_RE = re.compile(
+    r"(?i)^\s*(?:BEGIN\s+TRY|BEGIN\s+CATCH|END\s+TRY|END\s+CATCH"
+    r"|BEGIN(?!\s+TRAN)|END|GO)\b")
+_COND_HEAD_RE = re.compile(r"(?i)^\s*(?:IF|WHILE|ELSE)\b")
+# 區塊的結尾。`BEGIN TRY … END TRY` 的 END 在最後面,只剝開頭的話,剝完仍然解析不了。
+_BLOCK_TAIL_RE = re.compile(r"(?i)(?:END\s+TRY|END\s+CATCH|END|GO)\s*;?\s*$")
+# 程序、函式、觸發程序的標頭。`CREATE PROCEDURE` 解析得出 `Create`(裡面的寫入語句
+# 走語法樹找得到),但 `ALTER PROCEDURE`、`CREATE TRIGGER` 會整段退回 `Command` ——
+# 標頭剝到 `AS` 為止,剩下的本體照常逐句解析。
+_PROC_HEAD_RE = re.compile(
+    r"(?i)^\s*(?:CREATE|ALTER)\s+(?:OR\s+ALTER\s+)?"
+    r"(?:PROC|PROCEDURE|FUNCTION|TRIGGER)\b[\s\S]{0,2000}?\bAS\b")
+# 原文裡出現、但語法樹裡找不到的寫入語句 = 解析把它吃掉了
+_WRITE_WORD_RE = re.compile(r"(?i)(?<![\w.@\[])(DELETE|UPDATE|INSERT|MERGE|DROP|TRUNCATE)\b")
+_WRITE_NODES = (exp.Delete, exp.Update, exp.Insert, exp.Merge, exp.Drop, exp.TruncateTable)
+
+
+class _BlockNotParsed(Exception):
+    """程序性區塊剝不開。自己的型別,不是解析器丟的 —— 訊息是我們寫的固定字串,
+    不含 MR 的原文(解析失敗的說明會貼回 MR 留言,見 parse_error_text)。"""
+
+
+def _writes_seen(statements) -> int:
+    return sum(len(list(st.find_all(*_WRITE_NODES))) + isinstance(st, _WRITE_NODES)
+               for st in statements if st is not None)
+
+
+def _code_text(sql: str) -> str:
+    """把字串常值與註解挖掉、只留程式碼本身(長度不變,挖掉的位置填空白)。
+
+    判斷「原文寫著 DELETE 卻不在語法樹裡」時要用它:`-- DELETE FROM t` 只是註解,
+    算進去的話,一個純註解的段落會被判成「寫入語句消失了」而報成無法解析。
+    """
+    keep = bytearray(b" ") * len(sql)
+    for i, ch in _scan_code(sql):
+        keep[i] = ord(ch) if ch.isascii() else ord("x")
+    return keep.decode("ascii")
+
+
+def _block_unclear(text: str, statements) -> bool:
+    """這一段是不是「裡面的寫入語句對規則層消失了」。
+
+    兩種都算:解析退回 `Command`(只剩原文),或原文寫著 `DELETE`/`UPDATE`… 而語法樹裡
+    一個都找不到。只有註解或 `END` 這種沒有寫入字樣的段落不算 —— 它們本來就沒東西可驗。
+    """
+    if not _WRITE_WORD_RE.search(_code_text(text)):
+        return False
+    if _writes_seen(statements) == 0:
+        return True
+    return any(isinstance(st, exp.Command) or st.find(exp.Command) is not None
+               for st in statements if st is not None)
+
+
+def _strip_block_heads(text: str) -> str:
+    """把區塊的外框剝掉:`BEGIN TRY`、`END CATCH`、`IF 條件`、`WHILE 條件` 這些。
+
+    條件剝到第一個語句關鍵字為止。剝錯了不會有事:呼叫端只在「剝完解析得過、而且原文
+    寫著的寫入語句都在語法樹裡」時才採用,否則照舊記成解析失敗。
+    """
+    prev = None
+    while prev != text:
+        prev = text
+        m = _BLOCK_EDGE_RE.match(text) or _PROC_HEAD_RE.match(text)
+        if m:
+            text = text[m.end():]
+            continue
+        tail = _BLOCK_TAIL_RE.search(text)
+        if tail:
+            text = text[:tail.start()]
+            continue
+        if _COND_HEAD_RE.match(text):
+            after = _KEYWORD_ANY_RE.search(text, _COND_HEAD_RE.match(text).end())
+            if after:
+                text = text[after.start():]
+    return text
+
+
 def parsed_chunks(sql: str, catch=(SqlglotError, RecursionError)
                   ) -> list[tuple[Chunk, list, Exception | None]]:
     """切句 + 逐句解析,一次做完:[(這一句, 解析出來的語句, 解析失敗的例外或 None)]。
@@ -224,10 +307,27 @@ def parsed_chunks(sql: str, catch=(SqlglotError, RecursionError)
     out = []
     for chunk in chunks:
         try:
-            out.append((chunk, parse_statements(chunk.text), None))
-            continue
+            parsed = parse_statements(chunk.text)
         except catch as e:
             err = e
+        else:
+            if not _block_unclear(chunk.text, parsed):
+                out.append((chunk, parsed, None))
+                continue
+            # 程序性的區塊:裡面的寫入語句對規則層消失了。剝掉外框再解析一次。
+            inner = _strip_block_heads(chunk.text)
+            try:
+                retry = parse_statements(inner) if inner.strip() else []
+            except catch:
+                retry = None
+            if retry is not None and not _block_unclear(inner, retry):
+                out.append((Chunk(inner, chunk.line_offset, chunk.start), retry, None))
+            else:
+                # 剝不開、或剝完還是看不到那些寫入語句:**不可以回報成沒有命中**。
+                # 記成解析失敗,由 enforce_parse 補一條「預掃無法解析」交人工。
+                out.append((chunk, [], _BlockNotParsed(
+                    "程序性區塊(BEGIN…END / IF / WHILE / TRY…CATCH)裡的語句無法解析")))
+            continue
         pieces = _split_by_keyword(chunk.text, chunk.line_offset)
         if pieces is None:
             out.append((chunk, [], err))
@@ -309,10 +409,32 @@ def _lint_in_child(sql: str) -> str:
 # --- rule-base 掛載點 ---------------------------------------------------
 # 每條規則:(規則碼, severity, 檢查函式) — 檢查函式吃 AST statement,回傳違規訊息或 None
 
+def _inside_merge(node) -> bool:
+    """這個寫入語句是不是 `MERGE … WHEN MATCHED THEN UPDATE/DELETE` 的一部分。
+
+    那種寫法在語法樹裡也是一個沒有 WHERE 的 `Update`/`Delete`,但條件寫在 `WHEN` 上,
+    不是全表操作 —— 改成整棵樹找寫入語句之後,不排除的話每個 MERGE 都會被報成 blocker。
+    """
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, exp.Merge):
+            return True
+        parent = parent.parent
+    return False
+
+
 def _r001_dml_without_where(st):
-    if isinstance(st, (exp.Update, exp.Delete)) and st.find(exp.Where) is None:
-        return f"{st.key.upper()} 沒有 WHERE 條件,將影響全表"
-    return None
+    """**整棵樹都找**,不是只看最外層。
+
+    最外層是 `CREATE PROCEDURE`、`IF`、`WHILE` 時,裡面那句 `DELETE FROM t` 原本一條都
+    不報,而且報告長得跟掃過了沒問題一樣 —— 預存程序、hook、腳本裡的 T-SQL 常這樣寫。
+    """
+    bad = [node.key.upper() for node in st.find_all(exp.Update, exp.Delete)
+           if node.find(exp.Where) is None and not _inside_merge(node)]
+    if not bad:
+        return None
+    where = "" if len(bad) == 1 else f"(這一句裡有 {len(bad)} 處)"
+    return f"{bad[0]} 沒有 WHERE 條件,將影響全表{where}"
 
 
 def _r002_select_star(st):
@@ -453,6 +575,9 @@ def parse_error_text(e: Exception, line_offset: int = 0) -> str:
             # 逐句解析時,行號是**那一句之內**的;加上這一句在檔案裡的起始行,
             # 看留言的人才對得回原檔(#90 第 1 點)
             spots.append(f"第 {d['line'] + line_offset} 行第 {d.get('col', '?')} 欄")
+    if isinstance(e, _BlockNotParsed):
+        # 我們自己丟的,訊息是固定字串、不含 MR 的原文,可以照原樣說明
+        return f"parse failed: {e}"
     where = "、".join(dict.fromkeys(spots))[:120] if spots else type(e).__name__
     return f"parse failed: 語法無法解析({where})"
 
