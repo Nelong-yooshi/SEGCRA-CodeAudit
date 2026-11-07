@@ -15,12 +15,19 @@ schema 生成:從函式簽名 + docstring 自動產生——docstring 是給 LLM
 可以夾帶給模型的指令。寫判例、學風格、開 MR、留言、設 label、設 commit status 只由管線
 自己用 call() 執行;模型那一端看到的工具清單(openai_tools)與執行入口
 (call_from_model)都只認白名單。
+
+**唯讀的工具在背景執行緒跑**(_invoke):工具都是同步函式,直接在事件迴圈裡呼叫時,外層的
+`asyncio.wait_for`(預掃、主審查、整份審查的上限)要等它跑完才插得進來。寫入類留在事件迴圈裡,
+見 _invoke 的說明。
 """
+import functools
 import inspect
 import json
 import typing
 
 from toolbox import gitlab, memory, sqltools
+
+from .isolation import run_in_thread
 
 # 工具組:group 名 → 該組要暴露的函式(全名 = f"{group}__{fn.__name__}")
 TOOL_GROUPS = {
@@ -125,12 +132,25 @@ class ToolHub:
             return MODEL_REFUSAL
         return await self.call(full_name, args)
 
+    @staticmethod
+    async def _invoke(full_name: str, fn, args: dict):
+        """執行一個工具。唯讀的(MODEL_TOOLS)丟到背景執行緒,外層的時間上限插得進來;
+        逾時時那條執行緒自己跑完自己結束,結果不用(見 isolation.run_in_thread)。
+
+        寫入類(貼留言、設 label、設 commit status、寫判例)**留在事件迴圈裡直接呼叫**:
+        丟到背景執行緒的話,外層逾時後它仍會做完,而 webhook 在逾時時會把 commit status 設成
+        失敗——還在跑的「設成成功」可能在那之後才送到,把失敗蓋掉,合併閘門就放行了。
+        留在事件迴圈裡,寫入一旦開始就做完,外層等它結束才處理逾時。"""
+        if full_name in MODEL_TOOLS:
+            return await run_in_thread(functools.partial(fn, **args), name="segcra-tool")
+        return fn(**args)
+
     async def call(self, full_name: str, args: dict, truncate: bool = True) -> str:
         if full_name in self.local_tools:
-            result = self.local_tools[full_name][0](**args)
+            result = await self._invoke(full_name, self.local_tools[full_name][0], args)
         elif full_name in self._functions:
             try:
-                result = self._functions[full_name](**args)
+                result = await self._invoke(full_name, self._functions[full_name], args)
             except Exception as e:   # 與舊版(MCP server 端吞錯)一致:回錯誤字串不炸管線
                 result = f"Error executing tool {full_name}: {e}"
         elif "__" in full_name:

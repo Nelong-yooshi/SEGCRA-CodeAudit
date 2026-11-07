@@ -362,8 +362,9 @@ def parse_ast(sql: str) -> str:
 
 
 # lint 的耗時隨內容超線性成長,特製的內容(例如反覆的 `/*,`)幾千字元就可能要數十秒。
-# 預掃與模型的工具呼叫都在審查的同一條執行緒上同步呼叫,卡住就是整份審查卡住,外層的
-# asyncio 時間上限也插不進來。所以放進子行程跑,超過時間強制終止(見 orchestrator.isolation)。
+# 唯讀的工具(含 lint)在背景執行緒跑,外層的時間上限插得進來;但卡住的那條執行緒不會因此
+# 結束,子行程的時間上限仍然是真正讓它停下來的那一道。所以放進子行程跑,超過時間強制終止
+# (見 orchestrator.isolation)。
 # 超過字數上限的不跑:幾乎一定逾時,先擋下省掉等待。
 LINT_TIMEOUT_SECONDS = env_seconds("LINT_TIMEOUT_SECONDS", 60)
 LINT_MAX_CHARS = 100_000

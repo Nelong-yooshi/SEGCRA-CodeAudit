@@ -199,6 +199,9 @@ INCOMPLETE_TITLE_PREFIX = "審查未完整"
 SPEC_EXEC_TIMEOUT_SECONDS = env_seconds("SPEC_EXEC_TIMEOUT_SECONDS", 1200)
 # 冷讀的時間上限(主審查之後依序跑,從冷讀開始算;見 _run_cold_read)
 COLD_READ_TIMEOUT_SECONDS = env_seconds("COLD_READ_TIMEOUT_SECONDS", 600)
+# 預掃整段的上限(見 _run_prescan),與其中 lint 的總預算(見 _LintBudget)
+PRESCAN_TIMEOUT_SECONDS = env_seconds("PRESCAN_TIMEOUT_SECONDS", 600)
+LINT_TOTAL_SECONDS = env_seconds("LINT_TOTAL_SECONDS", 300)
 # 主審查(模型呼叫)的時間上限。單次請求的逾時(LLM_TIMEOUT,預設 3600 秒)比整份審查的上限
 # (webhook 的 REVIEW_TIMEOUT_SECONDS,預設 2400 秒)還長:端點收了連線卻一直不回時,外層會先把
 # 整份審查取消,確定性的結果跟著消失。所以主審查有自己的上限,而且比整份短,留時間給後面的步驟
@@ -478,15 +481,6 @@ def _step(report: dict, stage: str, fn, default, *args, **kwargs):
     try:
         return fn(*args, **kwargs)
     except Exception as e:                  # noqa: BLE001 — 任何例外都不得往外丟
-        report.setdefault("findings", []).append(_incomplete_finding(stage, e))
-        return default
-
-
-async def _astep(report: dict, stage: str, coro, default):
-    """`_step` 的非同步版。失敗就記一條並回傳 default,讓後面的環節照跑。"""
-    try:
-        return await coro
-    except Exception as e:
         report.setdefault("findings", []).append(_incomplete_finding(stage, e))
         return default
 
@@ -1137,9 +1131,44 @@ def _macros_used(src: str, index: dict) -> dict:
     return out
 
 
+def _lint_not_done(reason: str) -> list[dict]:
+    """lint 沒跑完時預掃結果裡的那一筆(LINT_INCOMPLETE_CODE,由 enforce_lint_incomplete 交人工)。"""
+    return [{"line": 0, "code": LINT_INCOMPLETE_CODE,
+             "description": f"{reason},這份內容沒有 lint 結果"}]
+
+
+class _LintBudget:
+    """整份 MR 的 lint 總預算(LINT_TOTAL_SECONDS)。
+
+    每次 lint 各有上限(LINT_TIMEOUT_SECONDS),但檔案一多,加起來沒有上限:20 個特製內容的
+    檔案就是 20 分鐘。每次 lint 花的時間從這裡扣;用完後剩下的檔案不跑,跑到一半的那一次也
+    不等,都記成沒跑完(LINT_INCOMPLETE_CODE,由 enforce_lint_incomplete 交人工)。
+    不等的那一次在背景執行緒裡自己跑到它的上限(見 ToolHub._invoke)。"""
+
+    def __init__(self, seconds: float) -> None:
+        self.total = seconds
+        self.left = seconds
+
+    def _incomplete(self) -> list[dict]:
+        return _lint_not_done(f"整份 MR 的 lint 總時間({self.total} 秒)用完了")
+
+    async def lint(self, hub: ToolHub, sql: str) -> list:
+        if self.left <= 0:
+            return self._incomplete()
+        start = time.monotonic()
+        try:
+            lint = await asyncio.wait_for(hub.call_json("sqltools__lint", {"sql": sql}), self.left)
+        except asyncio.TimeoutError:
+            self.left = 0
+            return self._incomplete()
+        self.left -= time.monotonic() - start
+        return lint[:15] if isinstance(lint, list) else []
+
+
 async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
                   dbt_ctx: DbtContext | None = None, rendered: list | None = None,
-                  line_maps: dict | None = None) -> list[dict]:
+                  line_maps: dict | None = None, out: list | None = None,
+                  progress: dict | None = None) -> list[dict]:
     """對每個變更檔跑 rule-base + lint(不經 LLM)。
 
     dbt_cfg 給定且 enabled 時,含 dbt 樣板標記的檔案先展開成純 SQL 再交給規則層
@@ -1155,9 +1184,17 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
 
     line_maps 給定時,記下展開後的行對回原始檔的對應表(見 _keep_line_maps),給程式補的
     finding 寫行號用(_attach_statement_lines)。不放進預掃結果:預掃結果整份會進 prompt。
+
+    out 給定時,每做完一個檔案(以及之後每掃完一個呼叫到的 macro)就把結果加進這個清單
+    (回傳的也是它):預掃中途被時間上限中止時,做完的部分仍拿得到(見 _run_prescan)。
+    progress 給定時,開始掃呼叫到的 macro 時記下 `phase = "called_macros"`,逾時的說明據此
+    分得出卡在哪一段。
+
+    lint 有整份 MR 的總預算(見 _LintBudget)。
     """
     dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True
-    results = []
+    results = [] if out is None else out
+    lint_budget = _LintBudget(LINT_TOTAL_SECONDS)
     used_macros: dict = {}          # 改到的 model/macro 的原始碼,用來找它呼叫了哪些 macro
     for f in files:
         if _is_spec_path(f.get("path")):
@@ -1237,14 +1274,18 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
         # lint 用**原始**文字,不用展開後的 rule_sql:lint 管的是開發者寫的程式長什麼樣子,
         # 展開後的 SQL 不是他們寫、也不會看到的東西,本來就不該對它做 lint。行號也因此跟
         # LLM 看到的 diff(原始行號)一致。
-        lint = await hub.call_json("sqltools__lint", {"sql": sql})
-        entry["lint"] = lint[:15] if isinstance(lint, list) else []
+        # 規則層的結果先放進去:lint 跑到一半遇到預掃整段的上限時,這個檔的規則命中仍然要在
+        # (見 _run_prescan);lint 那一欄先記成沒跑完,跑完再換成結果。
+        entry["lint"] = _lint_not_done("預掃整段的時間上限到了")
+        results.append(entry)
+        entry["lint"] = await lint_budget.lint(hub, sql)
         if is_macro:
             used_macros[f.get("path")] = sql          # 改到的 macro 自己也會呼叫別的
         elif in_project:
             used_macros[f.get("path")] = sql
-        results.append(entry)
-    results += await _macro_scan(hub, used_macros, dbt_ctx, {e["path"] for e in results})
+    if progress is not None:
+        progress["phase"] = _PHASE_CALLED_MACROS
+    await _macro_scan(hub, used_macros, dbt_ctx, {e["path"] for e in results}, results)
     return results
 
 
@@ -1260,17 +1301,21 @@ def _merge_env_hits(hits: list, raw) -> list:
     return hits
 
 
-async def _macro_scan(hub: ToolHub, sources: dict, dbt_ctx, already: set) -> list[dict]:
+async def _macro_scan(hub: ToolHub, sources: dict, dbt_ctx, already: set,
+                      out: list | None = None) -> list[dict]:
     """改到的 model/macro 所呼叫的 macro,掃一次讀取環境的寫法。
 
     已經在變更清單裡的檔案不重複掃(它自己那一輪就掃過,而且掃的是全部規則)。
+    有命中的每掃完一個就加進 out(給定時;回傳的也是它):預掃在這一段被時間上限中止時,
+    已經掃完的 macro 的命中仍拿得到。
     """
+    out = [] if out is None else out
     if not sources or dbt_ctx is None or getattr(dbt_ctx, "project", None) is None:
-        return []
+        return out
     macro_files = getattr(dbt_ctx, "macro_files", None) or {}
     index = _macro_index(macro_files)
     if not index:
-        return []
+        return out
     # 語法樹那條一次處理全部來源(macro 檔只解析一次,而且在子行程裡跑);
     # 回 None 代表樣板解析不了或子行程失敗 —— 逐檔退回正規式。
     by_tree = _macros_used_by_tree(sources, macro_files)
@@ -1281,7 +1326,6 @@ async def _macro_scan(hub: ToolHub, sources: dict, dbt_ctx, already: set) -> lis
     else:
         for names in by_tree.values():
             bodies.update({index[n][0]: index[n][1] for n in names if n in index})
-    out = []
     prefix = (getattr(dbt_ctx, "prefix", "") or "").strip("/")
     for rel, body in sorted(bodies.items()):
         path = f"{prefix}/{rel}" if prefix else rel
@@ -1294,6 +1338,52 @@ async def _macro_scan(hub: ToolHub, sources: dict, dbt_ctx, already: set) -> lis
         if keep:
             out.append({"path": path, "rules": keep, "lint": [], "called_macro": True})
     return out
+
+
+_PRESCAN_STAGE = "預掃(規則層/dbt 展開)"
+_PHASE_CALLED_MACROS = "called_macros"      # 預掃正在掃變更檔呼叫到的 macro(見 prescan 的 progress)
+
+
+async def _run_prescan(report: dict, hub: ToolHub, files: list[dict], dbt_cfg: dict | None,
+                       dbt_ctx: DbtContext | None, rendered: list, line_maps: dict,
+                       deadline: float) -> list[dict]:
+    """預掃,有自己的時間上限(PRESCAN_TIMEOUT_SECONDS),也不超過離整份截止還剩的時間,
+    但**至少 MIN_STAGE_SECONDS**:預掃是確定性的結果,剩的時間再少也要跑(模型的步驟則是不開始)。
+
+    出錯不該讓整份審查消失:規則層與 dbt 展開都在裡面,壞了就記一條、用空的預掃往下走
+    (模型仍然看得到 diff 與規格)。**逾時時保留做完的檔案**:它們的規則命中(例如 DELETE
+    沒有 WHERE)是確定的結果;沒做完的部分由那條未完整的 finding 交人工。
+
+    上限插得進來,是因為預掃的工具呼叫(規則層、lint)在背景執行緒跑(見 ToolHub._invoke)。
+    沒經過工具呼叫的同步工作(dbt 展開)要等它自己的上限到了,外層的上限才插得進來。
+    """
+    limit = min(PRESCAN_TIMEOUT_SECONDS, max(deadline - time.monotonic(), MIN_STAGE_SECONDS))
+    done: list[dict] = []
+    progress: dict = {}
+    try:
+        await asyncio.wait_for(
+            prescan(hub, files, dbt_cfg, dbt_ctx, rendered, line_maps, out=done,
+                    progress=progress), limit)
+    except asyncio.TimeoutError:
+        report.setdefault("findings", []).append(_prescan_timeout_finding(
+            limit, len(done), len(files), progress.get("phase") == _PHASE_CALLED_MACROS))
+    except Exception as e:                   # noqa: BLE001 — 任何例外都不得往外丟
+        report.setdefault("findings", []).append(_incomplete_finding(_PRESCAN_STAGE, e))
+        return []
+    return done
+
+
+def _prescan_timeout_finding(limit: float, done: int, total: int, in_called_macros: bool) -> dict:
+    """預掃逾時的未完整 finding:寫明做完的部分仍在報告內,卡在哪一段。"""
+    finding = _timeout_finding(_PRESCAN_STAGE, limit, PRESCAN_TIMEOUT_SECONDS)
+    if in_called_macros:
+        note = (f"變更的 {total} 個檔案都做完了,結果仍在報告內;卡在掃它們呼叫到的 macro(讀取環境的"
+                "寫法),已經掃完的 macro 的命中也在報告內,沒掃到的沒有這項檢查。")
+    else:
+        note = (f"逾時前做完規則層的 {done} 個檔案(共 {total} 個)結果仍在報告內,沒做完的部分沒有"
+                "規則層與 lint 的結果。")
+    finding["detail"] = finding["detail"].replace("這一環節的結果不在本報告內。", note)
+    return finding
 
 
 def build_diff_section(files: list[dict], budget_tokens: int) -> str:
@@ -1913,10 +2003,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                         mr, cfg.dbt)
         rendered: list[dict] = []          # 展開後的 SQL,給注入掃描用
         line_maps: dict = {}               # 展開後的行對回原始檔,給程式補的 finding 寫行號用
-        # 預掃失敗不該讓整份審查消失:規則層與 dbt 展開都在裡面,壞了就記一條、
-        # 用空的預掃往下走(模型仍然看得到 diff 與規格)。
-        pre = await _astep(report_stub, "預掃(規則層/dbt 展開)",
-                           prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered, line_maps), [])
+        # 預掃失敗或逾時不該讓整份審查消失(見 _run_prescan)
+        pre = await _run_prescan(report_stub, hub, mr["files"], cfg.dbt, dbt_ctx, rendered,
+                                 line_maps, review_deadline)
         if capture is not None:
             capture["mr"] = mr
             capture["prescan_raw"] = copy.deepcopy(pre)
@@ -2403,8 +2492,9 @@ def enforce_lint_incomplete(report: dict, pre: list[dict]) -> dict:
         report.setdefault("findings", []).append({
             "file": entry["path"], "line": 0, "severity": "major",
             "title": f"[lint] {INCOMPLETE_TITLE_PREFIX}",
-            "detail": (f"lint 沒有跑完(超過時間上限 {LINT_TIMEOUT_SECONDS} 秒、內容超過 "
-                       f"{LINT_MAX_CHARS} 字元或執行失敗),這個檔案沒有風格與反模式檢查的結果。"
+            "detail": (f"lint 沒有跑完(超過時間上限 {LINT_TIMEOUT_SECONDS} 秒、整份 MR 的 lint 總時間 "
+                       f"{LINT_TOTAL_SECONDS} 秒用完、內容超過 {LINT_MAX_CHARS} 字元或執行失敗),"
+                       "這個檔案沒有風格與反模式檢查的結果。"
                        "規則層的檢查不受影響。"),
             "stage": "lint",
             "suggestion": "請人工確認這個檔案的內容;一般的 SQL 在時間上限內跑得完。",
