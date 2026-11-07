@@ -96,6 +96,36 @@ def _dump_response(path: str, content: str, finish_reason: str,
 async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
                     hub: ToolHub, verbose: bool = True, use_tools: bool = True,
                     trace: list | None = None, meta: dict | None = None) -> str:
+    """建立用戶端、跑完、**保證關掉**。實際的迴圈在 `_run_agent`。
+
+    不關的話,底層的 httpx 連線池會留到物件被回收才收尾,而那通常發生在事件迴圈
+    已經關掉之後 —— 於是每次 `asyncio.run` 結束都印一行
+    `RuntimeError: Event loop is closed`(冷讀評測實測)。正式的 webhook 每份審查
+    也是一個迴圈,同樣會留下沒收尾的連線。
+
+    包成薄薄一層而不是在迴圈裡 try/finally:那個函式有七個 return,包起來要整段
+    重排縮排,改動大、也更容易改錯。
+    """
+    client = AsyncOpenAI(base_url=cfg.endpoint, api_key=cfg.api_key,
+                         timeout=REQUEST_TIMEOUT, max_retries=0)
+    try:
+        return await _run_agent(client, cfg, profile, system, user, hub,
+                                verbose=verbose, use_tools=use_tools,
+                                trace=trace, meta=meta)
+    finally:
+        # 測試與評測會換上自己的假用戶端,不一定有 close();收尾失敗也不該讓一份
+        # 跑完的審查變成例外。
+        closer = getattr(client, "close", None)
+        if closer is not None:
+            try:
+                await closer()
+            except Exception:        # noqa: BLE001 — 收尾不成功不影響審查結果
+                pass
+
+
+async def _run_agent(client, cfg: Config, profile: ModelProfile, system: str, user: str,
+                     hub: ToolHub, verbose: bool = True, use_tools: bool = True,
+                     trace: list | None = None, meta: dict | None = None) -> str:
     """trace 給定時,把每次工具呼叫記錄下來(供產生逐字對話 transcript)。
 
     meta 給定時,填入最後一次回應的 `finish_reason` 與 `completion_tokens`。
@@ -114,8 +144,6 @@ async def run_agent(cfg: Config, profile: ModelProfile, system: str, user: str,
     已對真實端點驗證過兩個方向(不只單元測試的 mock):`max_tokens=16` 時
     回 `finish_reason='length'`、`completion_tokens=16`;`max_tokens=512`
     的短回覆回 `'stop'`、`completion_tokens=67`。"""
-    client = AsyncOpenAI(base_url=cfg.endpoint, api_key=cfg.api_key,
-                         timeout=REQUEST_TIMEOUT, max_retries=0)
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": user}]
     if verbose:

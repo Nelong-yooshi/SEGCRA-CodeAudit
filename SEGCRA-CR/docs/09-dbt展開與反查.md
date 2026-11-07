@@ -13,7 +13,8 @@
 - **`orchestrator/dbt_impact.py`**:MR 只改 macro 或 config 註冊表時,反查出呼叫它的
   model(diff 裡看不到那些檔案),並依 model 檔名對應到核定規格。
 
-兩者共用 **`orchestrator/isolation.py`**(子行程隔離:逾時、記憶體上限)。
+兩者共用 **`orchestrator/isolation.py`**(子行程隔離:逾時、記憶體上限、拿不到 token 與密碼、結果只用 JSON 傳回;
+子行程裡實際跑的那一側在 `orchestrator/isolation_child.py`)。
 
 對應 Issue #7 的四點。接進審查管線的部分以 `config/models.yaml` 的 `dbt.enabled`
 控制,**預設關閉**:目前已接上「預掃前展開」與「依檔名對應規格」;macro 反查尚未
@@ -87,21 +88,41 @@
      檔名清單取得,snapshot 的名稱寫在 `{% snapshot %}` 區塊上)、所有屬性檔都解析得了、呼叫端
      以 `root_files_checked=True` 明確確認已檢查專案根目錄的 `packages.yml` /
      `dependencies.yml`(沒傳進來不等於沒有)
-   - **只偵測、不模擬**:alias、自訂 schema、snapshot 的 `target_schema` / `target_database`
+   - **表名照 dbt 的規則算**(model 的 alias / schema;`model_identity`):
+     - 字串常值的設定照 dbt 的合併順序取值:`dbt_project.yml`(`models:` 底下照資料夾由淺到深,
+       指名 model 的最優先;`+alias` 與不加前綴的 `alias` 都算)→ 屬性檔的 `config:` →
+       model 檔的 `config()`(同一個檔有好幾個,後面的蓋過前面的)。每個設定各自覆蓋
+     - alias:有值(非空字串)用它去掉頭尾空白,否則用 model 名稱(dbt 的 `generate_alias_name`)
+     - schema:沒有自訂值是 target 的 schema(`dbo`);有自訂值時看要不要串接(下一點)
+     - database:一律用約定的假名(見下面「資料庫名」那點),model 設的不採用
+     - 算出來表名相同的 model(例如資料夾層級設了同一個 alias)dbt 會編譯失敗,記成無法確定;
+       算出來的名稱不是英數與底線時也記成無法確定(照 model 名稱展開,不讓展開失敗)
+     - 對照:`tests/dbt_reference/relation_names.py` 的合成小專案與預期表名照 dbt 的原始碼推出;
+       有 dbt-sqlserver 的環境可以用它的 `write` / `check` 拿 `dbt parse` 的 manifest 驗證
+   - **自訂 schema 要不要串接**(dbt-sqlserver 的 `sqlserver__generate_schema_name`):
+     `dbt_project.yml` 的 `flags.dbt_sqlserver_use_default_schema_concat` 或同名 `vars` 任一個是
+     true 就串接(`<target schema>_<自訂>`),否則自訂值原樣用。**兩個都沒寫時看轉接器的預設值,
+     而這個預設在不同版本相反**(1.9.2 是 false,1.12 起預設 true),所以由部署端在設定檔填
+     `dbt.sqlserver_schema_concat`(見 10 篇);沒填就記成無法確定。值不是布林、或 var 寫在專案
+     層級的子區塊裡時也是無法確定,部署端的預設不蓋過
+   - **只偵測、不模擬**:snapshot 的 `target_schema` / `target_database`
      (dbt 用它們覆蓋 schema / database;只看屬性檔與 `config()` 的參數。`dbt_project.yml` 的
      `+target_schema` 不讓整個專案無法確定:snapshot 本來就一律無法確定,見下一點)、
-     `generate_*_name`、樣板值、ephemeral
+     `generate_*_name`、樣板值或不是字串的 alias / schema / database、屬性檔裡寫在 `config:`
+     外面或加了 `+` 的 alias / schema / database、ephemeral
      (被引用時展開成 CTE,不是表名)、停用(`enabled` 不是 true,被引用時 dbt 編譯失敗)、
-     model 版本、同名的 model(dbt 編譯失敗;model 與 seed / snapshot 同名也算)、
-     Python model(內容不讀)、macro 裡呼叫的 `config()`(作用在呼叫它的 model 上,
-     看不出是哪些,整個專案都無法確定);屬性檔的 `seeds:` / `snapshots:` 區段同樣檢查。
-     有這類設定就保留提醒;規則層檢查語法結構、不看表名,模擬的成本高、價值低
+     model 版本、同名的 model(dbt 編譯失敗;model 與 seed / snapshot 同名也算)、同一個 model
+     在屬性檔出現兩次、明寫 null / None 想蓋掉上層設的值(dbt 是清掉還是保留沒有逐一查證)、
+     Python model(內容不讀)、macro 裡呼叫的 `config()`(作用在呼叫它的
+     model 上,看不出是哪些,整個專案都無法確定)、看不懂的屬性檔(裡面可能就有某個 model 的
+     alias,整個專案都無法確定);屬性檔與 `dbt_project.yml` 的 `seeds:` / `snapshots:` 區段
+     有表名設定時同樣無法確定。有這類設定就保留提醒
    - **呼叫端提供的名稱(seed / snapshot / Python model)只代表存在,表名一律無法確定**
      (#19 review):只有名稱、看不到內容,而 snapshot 的 `target_schema`、Python model 的
      `dbt.config()` 都寫在內容裡。`ref()` 得到名單上沒有的名稱時照樣判成不存在
    - **model 檔內 `config()` 的偵測用白名單**:每個參數都必須是「名稱 = 常值」(字串、數字、
-     布林、字串清單),名稱不是 alias / schema / database,`materialized` 也不是 ephemeral,
-     才算確定。字典寫法、`**` 展開、變數、`var()`、樣板運算、沒有右括號,一律算可能改名——
+     布林、字串清單),alias / schema / database 要是字串或 `None`(名稱分大小寫),不能有
+     `target_schema` / `target_database`,`materialized` 也不是 ephemeral,才算確定。字典寫法、`**` 展開、變數、`var()`、樣板運算、沒有右括號,一律算可能改名——
      看不懂的寫法會自動往「無法確定」靠,不會漏判。屬性檔與 `dbt_project.yml` 的
      `materialized` 為 ephemeral 或樣板值時同樣無法確定
    - **`config.set()` 一律算可能改名**(#19 review):dbt 的 `config.set(name, value)` 等同
@@ -211,7 +232,22 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 ### 共用與供應鏈
 
 - **子行程隔離**(`isolation.py`):逾時強制終止;Linux 上限制記憶體;子行程異常結束、
-  被系統終止、拋例外、**啟動失敗**一律收斂成失敗結果,訊息不帶輸入內容
+  被系統終止、拋例外、**啟動失敗**一律收斂成失敗結果,訊息不帶輸入內容。它也是安全邊界的一層
+  (Jinja 沙箱萬一有逃逸漏洞時):
+  - 以 subprocess 啟動,只給 `CHILD_ENV_NAMES` 列的環境變數(系統執行需要的、子行程裡的模組匯入時讀的
+    `SQL_DIALECT`、`LINT_TIMEOUT_SECONDS`);`GITLAB_*`、`SANDBOX_*`、模型端點的通行碼一開始就不給。
+    在子行程裡才刪掉不夠(Linux 的 `/proc/self/environ` 仍留著啟動時的那一份)。子行程用到的模組
+    新增讀環境變數的地方時,`tests/test_isolation.py` 會要求決定給不給
+  - 參數與結果都用 JSON 傳遞,不用 pickle:主行程只建出基本型別、容器與呼叫端列出的 dataclass
+    (欄位名稱要完全一致);不是 JSON、形狀不對、超過 256 MB、巢狀超過 64 層都算失敗,錯誤訊息去掉
+    控制字元並截短
+  - 拆成兩支:`isolation.py` 是主行程那一側(啟動子行程、只給列出的環境變數、限時、讀回結果),
+    `isolation_child.py` 是子行程裡實際跑的那一側(進入點、JSON 編解碼)。`tests/test_dbt_render.py`
+    的 import 白名單管後者:子行程處理不可信的內容,不能有網路、指令執行、寫檔的能力。前者要啟動
+    子行程,需要 `subprocess` 與 `os`,不在白名單裡——它不讀、不展開不可信的內容(只當成參數編碼後
+    交給子行程),指令固定(`sys.executable -I` 加固定的進入點,不經 shell);它用到的 `subprocess`、
+    `os`、`asyncio` 由 `tests/test_isolation.py` 與 `tests/test_dbt_render.py` 的語法樹檢查鎖住
+  - 限制:子行程讀得到磁碟上的檔案(跟主行程同一個帳號)
 - dbt 內建 macro 名稱清單由 `dbt parse` 產生,**只收錄名稱,不含任何程式碼**;來源套件
   版本與授權取自套件中繼資料(dbt-core、dbt-adapters 為 Apache-2.0,dbt-sqlserver 為 MIT)
 - 產生標準答案的腳本只傳白名單內的環境變數給 dbt,並關閉 dbt 的匿名使用統計
@@ -236,7 +272,7 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 | 預掃前展開 | 已接上 | 含樣板的檔案先以 `render_model_isolated()` 展開再交給規則層;展開失敗則原樣退回,由 `enforce_dbt_render_failure()` 一律補 major(見下方)。lint 跑原始文字:lint 管的是開發者寫的程式,展開後的 SQL 不是他們寫、也不會看到的 |
 | 依檔名對應規格 | 已接上 | 完全沒有 R 編號時,先查本機 `specs/`、再逐一探測 GitLab 的候選路徑 |
 | `ref()`/`source()` 精確度提醒 | 已接上 | 預掃結果帶 `dbt_render_notice`,後處理由 `enforce_dbt_notice()` 確定性補成 info finding(正式路徑與 dry-run 皆同) |
-| 執行驗證(沙盒) | **不支援** | SQL 是樣板時不送進沙盒,回報「尚未支援」major、交人工——原樣執行只會得到語法錯誤,會錯誤地指控程式有誤。改到 dbt 而執行驗證卻通過時,`enforce_dbt_unexecuted()` 補 major |
+| 執行驗證(沙盒) | **只支援只引用 `source()` 的 model** | 展開成沙盒用的 SQL 再執行(見「執行驗證」)。其他樣板不送進沙盒,回報「尚未支援」major、交人工——原樣執行只會得到語法錯誤,會錯誤地指控程式有誤。改到 dbt 而執行驗證卻通過時,`enforce_dbt_unexecuted()` 補 major(通過的就是展開執行的那個 model、而且 MR 只改了它時不補) |
 | 專案的 macro 與專案資訊 | 已接上(真實 GitLab 模式) | 依 MR 的 head commit 取回專案;取不回來一律交人工。mock 模式要在 fixture 目錄放專案才有(見「接進審查管線」),沒放時呼叫專案 macro 的 model 展開失敗 |
 | macro 反查 | 已接上(真實 GitLab 模式) | MR 改到 macro、屬性檔或專案設定檔時反查受影響的 model,比較變更前後的規則命中,由 `enforce_dbt_impact()` 補成一條 finding |
 
@@ -251,6 +287,21 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 或引號識別字,之後就是任意 SQL。四種位置都實測過能變成 R001 blocker
 (`test_macro_output_escapes_comments_and_strings`)。展開失敗 = 不知道輸出是什麼,
 無法證明它跳不出去,所以不看標記的位置。
+
+**樣板自己的 Jinja 語法錯誤補 blocker**:model、analysis、singular test 目錄的檔,展開失敗的
+原因是這份樣板自己的 Jinja 語法錯誤時(區塊沒閉合、運算式寫錯、不認得的標籤或濾器、重複
+定義的 block、model 檔裡的 `{% snapshot %}`),改補 blocker「dbt 樣板有 Jinja 語法錯誤,dbt
+整個專案會編譯失敗」,寫出行號、不帶錯誤訊息:dbt 解析專案時一樣失敗,部署端整個載入失敗
+(dbt-core 1.12 的行為)。下面這些不算,照舊是展開失敗的 major:
+
+- 執行時的錯誤、呼叫不存在的 macro(dbt 到 compile 才失敗)、macro 檔的問題、展開器的限制
+- model 檔裡的 `{% test %}`、`{% materialization %}`:dbt 解析得過、編譯出的 SQL 也不含區塊
+  內容,但區塊裡的 SQL 會在別的地方執行,展開器照樣中止展開(丟掉的話那段 SQL 就逃過預掃)
+- snapshot 目錄的檔:展開器把它當 model 展開,`{% snapshot %}` 區塊本身就會失敗,分不出是不是
+  真的語法錯誤
+- 沒有取回專案(不知道目錄設定)、或檔案不在專案裡
+
+model 檔裡的 `{% docs %}` 區塊跟 dbt 一樣丟掉(只是說明文字,不會被執行),不算展開失敗。
 
 資料庫名稱以環境變數提供,**固定使用假名** `SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER`
 (#14 review 同意):它只用來把 `ref()`/`source()` 展開成完整表名給規則層掃描,
@@ -283,7 +334,8 @@ golden set 的標準答案才不會跟著變;約定值寫在 `orchestrator/confi
    `all_models_possibly_affected=True`
 3. 必須傳入 `base_files`(所有被修改檔案的變更前內容)與 `added_paths`(本次新增的檔案)
 4. 檔案內容以字典傳入,不要傳由 MR 資料拼出來的路徑
-5. 呼叫端要有 `if __name__ == "__main__":` 保護(multiprocessing spawn 的要求)
+5. 子行程只拿到 `isolation.CHILD_ENV_NAMES` 列的環境變數(token、密碼不給),參數與結果以 JSON
+   傳遞;dataclass 要由呼叫端列在 `run_isolated(types=...)`
 
 ## 怎麼驗證它在動
 
@@ -410,8 +462,10 @@ review_mr
 
 **寫入語句沒有展開到。** 展開器跟 dbt 真正執行時總有可以分辨的差異,樣板可以拿來當條件,把寫入語句藏在
 審查時不會進的分支。預掃對展開成功的樣板另外看原文:固定文字裡的寫入關鍵字插記號、用同一份專案資訊再展開
-(需要時增量模式也一次),記號後面沒有緊接著那段固定文字就是沒展開到;寫在 Jinja 標記字串裡的,會被執行的位置(hook、`sql_header`、`run_query`)一律算,其他位置像一句寫入語句才算。結果記在
-`dbt_hidden_writes`,由 `enforce_dbt_hidden_writes` 補 major(判定細節與已知限制見 04 篇)。
+(需要時增量模式也一次),記號後面沒有緊接著那段固定文字就是沒展開到;寫在 Jinja 標記字串裡的,會被執行的位置(hook、`sql_header`、`run_query`)一律算,其他位置像一句寫入語句才算。
+分支(`if` / `for`)裡的每一個輸出也插記號,哪一次展開都沒有產生過就記成無法確認(關鍵字用樣板組出來時靠這一點)。結果記在
+`dbt_hidden_writes`,由 `enforce_dbt_hidden_writes` 補 major(判定細節與已知限制見 04 篇)。MR 改到的 macro 檔用
+同樣的方法,從呼叫它的 model 展開來看(macro 反查的結果,最多 3 個)。
 
 **展開用的內容。** 真實 GitLab 模式的 diff 只有新增的行。專案裡的檔案只要 head 的完整內容是樣板,
 就用完整內容展開(改到的那幾行沒有樣板標記,不代表整個檔案沒有)。不是樣板的 SQL 檔維持原本的
@@ -437,13 +491,28 @@ macro 載入一次(隔離子行程),看改到的檔載入得了嗎:
 - 只看改到的檔:專案裡本來就壞的檔不是這個 MR 造成的,用到它的 model 展開失敗時已經會報
 - 只寫種類與行號,不帶 Jinja 的錯誤訊息(裡面有樣板內容)
 
+**改到的 dbt 設定檔本身。** dbt 解析專案時一定失敗的寫法補 **blocker**「dbt 設定檔有 dbt 解析不了的寫法,
+dbt 整個專案會解析失敗」(`enforce_dbt_project_broken`;dbt-core 1.12 的行為):
+
+- `dbt_project.yml` 不是合法的 YAML:取回專案時就會失敗(`DbtProjectSyntaxError`,`DbtContext.broken`);MR 有
+  改到它才補 blocker
+- MR 刪掉或移走了 `dbt_project.yml`:head commit 讀不到它時,看 MR 的變更清單分得出是 MR 刪的(刪除,或改名成
+  別的路徑),原因寫「MR 刪掉或移走了 dbt_project.yml」;其餘照舊寫「專案目錄設定錯誤,或唯讀 token 看不到這個
+  專案」(GitLab 對沒有權限的專案也回「找不到」,這兩個分不出來)
+- MR 改到的屬性檔(dbt 目錄裡的 .yml / .yaml):YAML 語法錯誤(寫出行號)、`models:` 有值但不是清單。屬性檔是
+  待審 repo 的內容,在子行程裡解析(`dbt_project.yaml_file_problems`);沒檢查完補 major「無法確認」
+- 其他結構上的問題不報:dbt 不一定失敗(例如描述不存在的 model 只有警告)
+- 只看改到的檔:專案本來就壞的設定檔不是這個 MR 造成的;那時取不回專案,專案裡改到的檔已經記成展開失敗交人工
+
 **受影響的 model(MR 改到 macro、屬性檔、專案設定檔時)。**
 
 - 不放進預掃、也不放進模型的 prompt:它們不在 diff 裡,放進預掃會讓每個檢核點各補一條
   「模型未回應」,放進 prompt 會佔掉預算並多一個注入的入口
 - 以變更前、變更後的專案各展開一次,**只回報變更後多出來的規則命中**。比較的是**每一句的規則命中數**
   有沒有增加(依語句在檔案裡的順序對應),不比語句的文字:macro 只把一個值從 1 改成 2,同一句原本就有
-  的命中不能因為文字變了就當成新的。兩邊切出來的語句數量不同時,退回比較整個 model 同一條規則的
+  的命中不能因為文字變了就當成新的。切句與逐句解析用 `sqltools.parsed_chunks`(跟預掃同一份):
+  **某一句解析不了時只有那一句比不了**,留一個位置、後面的句子照樣對得齊——整份退回「只比個數」的話,
+  改壞的那一句被搬到別的位置也看不出來。兩邊切出來的語句數量不同時,退回比較整個 model 同一條規則的
   命中數;文字層的規則與對不到語句的命中只比個數。原本就有的命中不重報(否則每個改到 macro 的 MR 都會被既有的寫法擋下)。
   命中寫出在展開後的第幾句
 - **增量分支**:變更後的樣板有呼叫 `is_incremental()` 時,兩邊再以增量模式各展開一次、照同樣的
@@ -491,7 +560,31 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 2. `enforce_dbt_unexecuted`:MR 改到 dbt 的東西(樣板、macro、屬性檔、專案設定檔、或專案取不回來),
    而執行驗證的結果是通過 → 補 major(被執行的是同一個 MR 裡別的內容)。這一層在 mock 模式
    也生效:沒有取回專案時,改看手上的內容有沒有樣板標記(樣板檔與純 SQL 檔混在同一個 MR、
-   通過的是純 SQL 檔)。沒開 dbt 時不介入
+   通過的是純 SQL 檔)。沒開 dbt 時不介入。例外:執行驗證跑的就是展開後送進沙盒的那個 model
+   (見下方「執行驗證」),而且 MR 改到 dbt 的只有它(沒改 macro、屬性檔、設定檔,其他檔案也不是
+   樣板)時,通過的就是這個 model 本身,不補
+
+### 執行驗證
+
+執行驗證要跑的檔案(MR 裡最後一個有內容的檔案)是取回的 dbt 專案裡的 model 時,先另外展開一次
+(`dbt_exec.render_for_exec`,一樣走 `render_model_isolated()`),再把展開後的 SQL 交給執行驗證。
+沙盒每次建一個新的資料庫,依規格「資料表定義」建表,所以展開時:
+
+| 寫法 | 展開成 |
+|---|---|
+| `source()` | sources.yml 有宣告、表名確定(identifier 沒宣告就是 table 名,不是樣板值),而且規格「資料表定義」有同名的表(不分大小寫)→ 規格裡的寫法(`[txn]`、`[stage].[txn]`)。不看來源的 schema:沙盒只有規格建的表 |
+| `ref()` | 不支援(上游 model 要先在沙盒建出來,或由測資代替,還沒做) |
+| `{{ this }}` | 不支援(有定義,用到就失敗) |
+| 表名物件的 `database` / `schema` | 取用就失敗(沙盒的值跟正式環境不同) |
+
+下列情況不展開,執行驗證照舊回「尚未支援」major,另外補一條 info「dbt model 沒有送進沙盒執行」
+寫出原因:上面任一項不成立、規格裡同名的表不只一張、兩個不同的來源對到同一張表、呼叫了
+`is_incremental()`(增量那段要先放一份上一次執行後的目標表,還沒做)、專案有同名的 macro、展開後
+仍有樣板標記、MR 沒有自己的規格而借來的受影響 model 規格不是這個 model 的、資料庫名稱不是約定的假名。
+不猜表名:猜錯的話執行失敗或結果不符,會被說成程式的問題。
+
+要跑的檔案不是 model(純 SQL、macro 檔、seed 等)、不是樣板、沒有取回專案或沒有規格時,照舊交給
+執行驗證,行為不變。紀錄寫在報告的 `_dbt_exec`(`{file, ok, reason}`;不適用時是 null)。
 
 檢查受影響的 model 時若發生非預期的錯誤,審查不中斷:結果收斂成「全部 model 可能受影響」→ major,
 只留錯誤的類型、不回顯內容。
@@ -502,13 +595,13 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 |---|---|
 | `relation_notice` 改成確定性揭露 | 完成(#14):`enforce_dbt_notice` |
 | macro 目錄的取檔方式決定並實作 | 完成:依 commit 打包下載(#20),接進管線(本節) |
-| 進入點有 `if __name__ == "__main__":` 保護 | `demo.py`、`scripts/webhook_server.py`、`tools/prescan.py`、`eval/run_eval.py` 都有;`tests/test_entrypoint_guard.py` 另外自動找出 `scripts/`、`tools/`、`eval/` 底下用到管線的腳本,檢查最外層不直接執行。展開、macro 反查、專案資訊與 lint 都開子行程(spawn);進入點少了保護時,子行程會把整支程式從頭重跑一次。實際踩到時的結果是專案資訊整理失敗 → 當成取不回專案 → 交人工 |
+| 進入點有 `if __name__ == "__main__":` 保護 | `demo.py`、`scripts/webhook_server.py`、`tools/prescan.py`、`eval/run_eval.py` 都有;`tests/test_entrypoint_guard.py` 另外自動找出 `scripts/`、`tools/`、`eval/` 底下用到管線的腳本,檢查最外層不直接執行。進入點在模組最外層開始審查的話,import 它(測試、其他腳本)就會跑一次審查。子行程以 subprocess 啟動,不會重新匯入進入點 |
 | 資料庫假名確定並寫進文件,設錯要擋下 | 完成(#16):固定為 `DBT_PLACEHOLDER`,載入設定與展開前各檢查一次 |
 
 開啟與回復的步驟、以及不接 GitLab 就能跑的範例,見 README「開啟 dbt 接線」與 `examples/dbt_wiring/`。
 mock 模式下,fixture 目錄若放了 MR 那個 commit 的專案(`<FIXTURES_DIR>/dbt_archives/<commit 編號>/`),
 接線會從那裡取得專案——打包成 GitLab 的形狀後交給同一個 `load_dbt_project`,解壓與檢查走同一條路;
-沒有放就不適用。預設的 `fixtures/` 與 golden set 都沒有放,行為不變。
+沒有放就不適用。預設的 `fixtures/` 沒有放,行為不變;golden set 只有 `mr_413`、`mr_862` 放了(哪些 case 會取回專案由 `tests/test_dbt_wiring_example.py` 鎖住)。
 
 **真實 GitLab 實測**(2026-10-12,測試用 GitLab、只含假資料的專案)。只讀取:不呼叫模型、不寫回
 GitLab;執行的是 `review_mr` 在呼叫模型之前的部分(取 MR → 取回專案 → 預掃 → 反查 → 檢查受影響的
@@ -548,7 +641,7 @@ major。加上非 SQL 檔的處理之後,改由非 SQL 檔的分類與設定比�
 
 **已知限制**
 
-- mock 模式而 fixture 沒有放專案時(預設的 `fixtures/`、golden set):macro 檔仍會被當成 model 展開
+- mock 模式而 fixture 沒有放專案時(預設的 `fixtures/`、golden set 裡沒有放專案的 case):macro 檔仍會被當成 model 展開
   (接線前的行為)。要在 mock 模式看到接線的效果,得照 `examples/dbt_wiring/` 的方式放專案
 - 注入掃描涵蓋 MR、取回的完整內容與預掃展開後的 SQL(會以規則命中的語句、解析錯誤的片段進 prompt);
   受影響 model 的展開結果不進 prompt(只有路徑、規則代號、語句序號),不另外掃。取回的完整內容與展開後的
@@ -585,9 +678,9 @@ major。加上非 SQL 檔的處理之後,改由非 SQL 檔的分類與設定比�
 
 ## 後續
 
-- **展開結果尚未在 MS SQL 沙盒實際執行過**(目前只驗證了展開字串與 `dbt compile`
-  逐字一致)。要支援樣板的執行驗證,需把 `ref()`/`source()` 對應到沙盒每次建立的
-  資料庫,且 model 引用的上游表與規格建立的測資表名稱不同,需要處理
+- 執行驗證:只引用 `source()` 的 model 已經會展開後送進沙盒(見「執行驗證」);`ref()` 到其他
+  model(上游 model 要先建出來或由測資代替)與增量 model(一般模式與增量模式各驗一次)還沒做。
+  展開後的 SQL 還沒有在 MS SQL 沙盒上用正式規則實際跑過
 - 真實 GitLab 模式下,dbt 專案以外的 SQL 檔(與專案裡不是樣板的 SQL 檔)仍只有 diff 新增的行,
   完整內容由 #22 以 Files API 依 head sha 取得
 - 不分析第三方套件內的 macro;目錄由呼叫端指定

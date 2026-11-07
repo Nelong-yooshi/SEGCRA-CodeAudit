@@ -795,6 +795,95 @@ def _walk(callers_of: dict, start, label, snapshot_hits=None):
     return model_hits, yml_hits, referenced
 
 
+def _suffix_index(names) -> dict:
+    """`{x: {<前綴>__x 的實作…}}`。`adapter.dispatch('x')` 會呼叫到其中一支,
+    哪一支是執行期才知道的(dbt 依 adapter 挑),所以全部都算。"""
+    index: dict[str, set] = {}
+    for name in names:
+        for cut in {name.find("__"), name.rfind("__")}:
+            if cut > 0 and cut + 2 < len(name):
+                index.setdefault(name[cut + 2:], set()).add(name)
+    return index
+
+
+def _resolve_refs(ref_names, known: set, suffix_index: dict) -> set:
+    found = set()
+    for ref in ref_names:
+        if ref in known:
+            found.add(ref)
+        found |= suffix_index.get(ref, set())
+    return found
+
+
+def _refs_is_dynamic(refs: "_Refs", callables: set) -> bool:
+    """這一段樣板有沒有「名稱在執行期才決定」的呼叫。
+
+    **反查與預掃的 macro 掃描共用這一份**:各寫各的話,一邊補了 `context.items()`
+    另一邊沒補,就會有一種寫法在某一條路上被當成沒有動態呼叫。
+    """
+    # context.get(...)、context.items() 等:取用的不是 macro,可能藉此取到任意 macro
+    if refs.dynamic or refs.root_names - callables:
+        return True
+    # 以執行期名稱對 macro(或其別名)取項目 / 屬性:flag[k]、{% set m = flag %}{{ m[k] }}
+    probed, grew = set(refs.probed), True
+    while grew:
+        grew = False
+        for alias, source in refs.aliases:
+            if alias in probed and source not in probed:
+                probed.add(source)
+                grew = True
+    return bool(probed & callables)
+
+def macros_referenced(sources: dict, macro_files: dict) -> dict | None:
+    """每個來源(遞迴)用到哪些 macro:`{來源的鍵: {macro 名稱…}}`;解析不了回 `None`。
+
+    **一次處理全部來源**:macro 檔只解析一次。一個檔呼叫一次的話,300 個 macro 檔、
+    改到 20 個 model 要把全部 macro 重新解析 20 遍(實測 30 秒)。
+
+    **跟 `analyze_macro_impact` 共用同一個掃描器與同一份判斷**:那一套照語法樹走,
+    `adapter.dispatch('x')` 會展開成所有 `<前綴>__x` 實作;動態呼叫(名稱在執行期才
+    組出來)的判斷也用同一個 `_refs_is_dynamic`。
+
+    **動態呼叫時回傳專案裡全部的 macro**:名稱執行期才決定,掃不出是哪幾支。多掃到
+    沒被呼叫的只是多一條提醒,漏掉才是問題 —— 反查遇到動態呼叫也是保守地全部列出來。
+
+    **這個函式會解析 MR 帶進來的內容**,呼叫端請放進子行程跑(見
+    `pipeline._macro_scan`);`analyze_macro_impact_isolated` 的理由相同。
+    """
+    scanner = _Scanner()
+    try:
+        by_name = {}
+        for text in (macro_files or {}).values():
+            for name, refs in scanner.scan(str(text or "")).macros.items():
+                by_name.setdefault(name, refs)
+        scans = {key: scanner.scan(str(src or "")) for key, src in (sources or {}).items()}
+    except Exception:            # noqa: BLE001 — 解析不了由呼叫端決定怎麼辦
+        return None
+    known = set(by_name)
+    callables = known | BUILTIN_MACROS | _CONTEXT_OVERRIDES
+    suffix = _suffix_index(known)
+    out = {}
+    for key, scan in scans.items():
+        refs = [scan.top] + list(scan.macros.values())
+        if any(_refs_is_dynamic(r, callables) for r in refs):
+            out[key] = set(known)
+            continue
+        used, queue = set(), [n for r in refs for n in r.names]
+        while queue:
+            for name in _resolve_refs([queue.pop()], known, suffix):
+                if name in used:
+                    continue
+                used.add(name)
+                inner = by_name[name]
+                if _refs_is_dynamic(inner, callables):
+                    used = set(known)
+                    queue = []
+                    break
+                queue.extend(inner.names)
+        out[key] = used
+    return out
+
+
 def analyze_macro_impact(files, changed_paths, *, base_files=None, added_paths=(),
                          model_dirs=DEFAULT_MODEL_DIRS,
                          macro_dirs=DEFAULT_MACRO_DIRS, snapshot_dirs=(),
@@ -1243,7 +1332,7 @@ def analyze_macro_impact_isolated(files, changed_paths, *,
     changed = [changed_paths] if isinstance(changed_paths, str) else list(changed_paths)
     result = run_isolated(analyze_macro_impact, (dict(files), changed), kwargs,
                           timeout_s=timeout_s, max_memory_mb=max_memory_mb,
-                          on_failure=_impact_failure)
+                          on_failure=_impact_failure, types=(ImpactReport, AffectedModel))
     if not isinstance(result, ImpactReport):
         return _impact_failure("子行程回傳了非預期的資料")
     return result

@@ -46,6 +46,7 @@ class _Cfg:
 
 def _save(code="R-999", spec="規格內容", plan=None, gaps=(), **kw):
     kw.setdefault("model", MODEL)
+    kw.setdefault("generation", "model_cases")
     testdata_cache.save(code, spec, plan or _plan(), list(gaps), profile="review", **kw)
 
 

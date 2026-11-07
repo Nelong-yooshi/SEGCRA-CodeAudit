@@ -240,7 +240,10 @@ def test_同檔兩處命中模型只報一處時另一處也在報告上(run):
     report, _, _ = run(_mr(sql, path=path), model)
     r001 = [f for f in report["findings"]
             if f["file"] == path and f["severity"] == "blocker" and "WHERE" in f["title"]]
-    assert len(r001) == 2, [f["title"] for f in report["findings"]]
+    # 規則命中一律補報(#104):兩處都補。模型那條跟補的第一條說法夠接近時由
+    # sanitize_findings 併掉,所以是 2 或 3 條 —— 重點是兩句都出現在報告上。
+    assert len(r001) >= 2, [f["title"] for f in report["findings"]]
+    assert sorted(f["line"] for f in r001 if f.get("line")) [-2:] == [2, 3]
     assert report["decision"] == "blocked"
 
 

@@ -24,22 +24,20 @@ macro 反查(dbt_context 準備好的 ImpactReport)只說「哪些 model 受影�
     剩下的時間;時間到了還沒做完的 model 記成沒有檢查、沒查規格
 """
 import asyncio
-import contextvars
 import dataclasses
 import re
-import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
 
-from sqlglot.errors import SqlglotError
 
 from .config import DBT_DATABASE_PLACEHOLDER
 from .dbt_context import DbtContext
 from .dbt_impact import ImpactReport
 from .dbt_render import DEFAULT_ISOLATED_TIMEOUT_S, render_model_isolated
+from .isolation import run_in_thread
 from toolbox.gitlab import UNAVAILABLE_TEXT
-from toolbox.sqltools import DIALECT, _parse
+from toolbox.sqltools import DIALECT, parsed_chunks
 
 MAX_CHECKED_MODELS = 50
 MAX_SPEC_LOOKUPS = 20          # 規格逐一向 GitLab 探測,數量另外設限
@@ -232,34 +230,12 @@ async def _spec_for(hub, ctx: DbtContext, rel: str, find_spec, specs: dict,
 
 
 async def _wait_in_thread(make_coroutine, seconds: float):
-    """在一條背景(daemon)執行緒裡用自己的事件迴圈跑 make_coroutine(),最多等 seconds 秒,
-    逾時丟 asyncio.TimeoutError。
-
-    不用 asyncio.to_thread:那會用預設的執行緒池,審查結束時 asyncio.run 會等池裡卡住的
-    執行緒跑完,時間上限就守不住。逾時後那條執行緒繼續跑到它自己的請求逾時為止,結果丟掉。
-
-    呼叫端的 contextvars 要一起帶過去(asyncio.to_thread 也是這樣做):新開的執行緒不會繼承,
-    而這次審查釘住的 commit(toolbox.gitlab 的 review_ref)就存在 ContextVar 裡,讀不到時
-    get_file 會回「無法取得審查中的版本」,受影響的 model 就全部查不到規格。"""
-    loop = asyncio.get_running_loop()
-    done = loop.create_future()
-
-    def deliver(setter, value):
-        if not done.done():
-            setter(value)
-
-    def work():
-        try:
-            outcome = (done.set_result, asyncio.run(make_coroutine()))
-        except BaseException as e:            # noqa: BLE001 — 交回原本的事件迴圈處理
-            outcome = (done.set_exception, e)
-        try:
-            loop.call_soon_threadsafe(deliver, *outcome)
-        except RuntimeError:
-            pass                               # 原本的事件迴圈已經結束:沒有人在等了
-
-    threading.Thread(target=contextvars.copy_context().run, args=(work,), daemon=True).start()
-    return await asyncio.wait_for(done, seconds)
+    """在一條背景執行緒裡用自己的事件迴圈跑 make_coroutine(),最多等 seconds 秒,逾時丟
+    asyncio.TimeoutError(見 isolation.run_in_thread:daemon 執行緒、帶上 contextvars——審查釘住的
+    commit 讀不到時 get_file 會回「無法取得審查中的版本」,受影響的 model 就全部查不到規格)。
+    逾時後那條執行緒繼續跑到它自己的請求逾時為止,結果丟掉。"""
+    return await asyncio.wait_for(
+        run_in_thread(lambda: asyncio.run(make_coroutine()), name="dbt-affected-spec"), seconds)
 
 
 async def _compare(hub, rel: str, dbt_cfg: dict, ctx: DbtContext, render, deadline, clock):
@@ -382,13 +358,21 @@ async def _hits(hub, rel, text, dbt_cfg, macro_files, macro_dirs, info, render, 
                  bool(getattr(rendered, "incremental_checked", False))), None
 
 
-def _statement_keys(sql: str) -> list[str] | None:
+def _statement_keys(sql: str) -> list[str | None] | None:
     """展開後 SQL 的每一句,文字寫法與規則命中的 statement 相同(規則層同一個函式產生)。
-    切不出來(解析錯誤、巢狀太深)回 None;其他例外是程式的錯,往外丟。"""
-    try:
-        return [st.sql(dialect=DIALECT)[:200] for st in _parse(sql) if st is not None]
-    except (SqlglotError, RecursionError):   # 切不出來就只能整個 model 合計比較
-        return None
+
+    **逐句解析**(切句用 `sqltools.statement_chunks`,跟預掃同一份):整份一次解析的話,
+    其中一句壞掉就整個 model 退回「只比命中的個數」,於是改壞的那一句被搬到別的位置也
+    看不出來。壞掉的那一句用 None 佔位,位置照樣對得齊,其他句照常逐句比。
+
+    一句都切不出來(整份就是一句、而且解析不了)才回 None。"""
+    keys: list[str | None] = []
+    for _chunk, parsed, err in parsed_chunks(sql):
+        if err is not None:
+            keys.append(None)                    # 這一句比不了,但位置要留著
+            continue
+        keys.extend(st.sql(dialect=DIALECT)[:200] for st in parsed if st is not None)
+    return keys or None                          # 一句都切不出來:只能整個 model 合計比較
 
 
 # ------------------------------------------------------------------ 整理成一條 finding

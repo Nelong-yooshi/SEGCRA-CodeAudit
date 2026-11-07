@@ -14,10 +14,6 @@ from typing import NamedTuple
 
 from pathlib import Path
 
-import sqlglot
-from sqlglot import exp
-from sqlglot.errors import SqlglotError
-from sqlglot.tokens import TokenType
 
 from .agent import MAX_ITERATIONS, extract_json, output_truncated, run_agent
 from .config import (DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, env_seconds,
@@ -28,7 +24,11 @@ from .dbt_affected import (
 from .change_view import build_full_text_section
 from .cold_read import (UNREAD_NEAR_LIMIT, UNREAD_NO_USAGE, UNREAD_TOO_FEW, ColdRead,
                         cold_read as _cold_read, record as _cold_read_record)
+from .isolation import run_isolated
+from .dbt_impact import DEFAULT_ISOLATED_MEMORY_MB, DEFAULT_ISOLATED_TIMEOUT_S, macros_referenced
 from .dbt_context import DbtContext, prepare_dbt_context
+from .dbt_exec import render_for_exec
+from .dbt_impact import path_kind
 from .dbt_hidden_writes import IN_TAGS, UNREACHED, UNVERIFIED, WRITE_KEYWORDS, find_hidden_writes
 from .dbt_render import is_dbt_template, render_model_isolated
 from .dbt_asset_names import (ASSET as _ASSET_RULE, CHECK as _CHECK_RULE, GROUP as _GROUP_RULE,
@@ -37,17 +37,20 @@ from .dbt_asset_names import (ASSET as _ASSET_RULE, CHECK as _CHECK_RULE, GROUP 
                               versioned_models as _versioned_models)
 from .dbt_config_change import HIGH_RISK_NEW, config_changes, default_relative, is_dbt_yaml
 from .dbt_project import DbtProjectError, check_project_dir
+from .dbt_hidden_writes import MODELS_CHECKED, UNREACHED_OUTPUT, find_hidden_writes_in_macro
 from .dbt_render import (MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, MACRO_SYNTAX,
                          check_macro_files_isolated)
 from .security import scan_mr
 from toolbox.gitlab import (WRITE_FAILED, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UNCERTAIN,
                             write_failure)
 from .skills_loader import always_skills, load_skills, skills_index
+from .dbt_context import PROJECT_FILE_REMOVED, PROJECT_YAML_INVALID, check_yaml_files_isolated
+from .dbt_project import YAML_MODELS_NOT_LIST, YAML_SYNTAX
 from .spec_exec import SpecLookup, find_spec, run_spec_exec
 from .tool_hub import ToolHub
 from toolbox.sqltools import LINT_INCOMPLETE_CODE, LINT_MAX_CHARS, LINT_TIMEOUT_SECONDS
 from toolbox.sqltools import run_rules
-from toolbox.sqltools import DIALECT, _parse
+from toolbox.sqltools import DIALECT, parse_statements, parsed_chunks
 
 SYSTEM_TEMPLATE = """你是資深資料庫工程主管,負責審查 SQL merge request。\
 你的審查將直接決定 MR 能否合入,必須精準、可回溯、給得出修改建議。
@@ -196,6 +199,9 @@ INCOMPLETE_TITLE_PREFIX = "審查未完整"
 SPEC_EXEC_TIMEOUT_SECONDS = env_seconds("SPEC_EXEC_TIMEOUT_SECONDS", 1200)
 # 冷讀的時間上限(主審查之後依序跑,從冷讀開始算;見 _run_cold_read)
 COLD_READ_TIMEOUT_SECONDS = env_seconds("COLD_READ_TIMEOUT_SECONDS", 600)
+# 預掃整段的上限(見 _run_prescan),與其中 lint 的總預算(見 _LintBudget)
+PRESCAN_TIMEOUT_SECONDS = env_seconds("PRESCAN_TIMEOUT_SECONDS", 600)
+LINT_TOTAL_SECONDS = env_seconds("LINT_TOTAL_SECONDS", 300)
 # 主審查(模型呼叫)的時間上限。單次請求的逾時(LLM_TIMEOUT,預設 3600 秒)比整份審查的上限
 # (webhook 的 REVIEW_TIMEOUT_SECONDS,預設 2400 秒)還長:端點收了連線卻一直不回時,外層會先把
 # 整份審查取消,確定性的結果跟著消失。所以主審查有自己的上限,而且比整份短,留時間給後面的步驟
@@ -479,15 +485,6 @@ def _step(report: dict, stage: str, fn, default, *args, **kwargs):
         return default
 
 
-async def _astep(report: dict, stage: str, coro, default):
-    """`_step` 的非同步版。失敗就記一條並回傳 default,讓後面的環節照跑。"""
-    try:
-        return await coro
-    except Exception as e:
-        report.setdefault("findings", []).append(_incomplete_finding(stage, e))
-        return default
-
-
 def review_incomplete(report: dict) -> list[str]:
     """哪些環節沒完成(供決策與測試判讀)。回傳那幾條 finding 的標題。
 
@@ -703,6 +700,8 @@ class _Expanded(NamedTuple):
     # 展開後的行 → 原始檔的行。只有哨兵法(逐行精確)才給;近似對齊(difflib)與對不上時是 None
     line_map: dict | None = None
     incremental_line_map: dict | None = None
+    # 展開失敗的原因是樣板自己的 Jinja 語法錯誤時,錯誤所在的行;其他失敗是 None
+    syntax_line: int | None = None
 
 
 def _render_project(dbt_ctx: DbtContext | None) -> dict:
@@ -729,6 +728,35 @@ def _hidden_writes(path: str, sql: str, expanded: "_Expanded", dbt_cfg: dict,
     try:
         return find_hidden_writes(sql, clean, render)
     except Exception as e:                   # noqa: BLE001 — 檢查沒做完不能當成沒有
+        return {UNVERIFIED: f"檢查寫入語句時發生非預期錯誤({type(e).__name__})"}
+
+
+def _macro_hidden_writes(path: str, dbt_cfg: dict, dbt_ctx: DbtContext) -> dict:
+    """MR 改到的 macro 檔裡、從呼叫它的 model 展開時沒有出現的寫入語句(見
+    dbt_hidden_writes.find_hidden_writes_in_macro)。呼叫它的 model 取自 macro 反查的結果,呼叫鏈
+    短的先展開;macro 檔換成插了記號的版本,其他照這次審查的專案資訊。被刪掉的檔(沒有 head 的
+    內容)由 find_hidden_writes_in_macro 回空的。
+    檢查本身出錯時記成無法確認(交人工),不當成沒有。"""
+    rel, source = dbt_ctx.relative(path), dbt_ctx.head_text(path)
+    if rel is None:
+        return {}
+    database = dbt_cfg.get("database")
+    if database != DBT_DATABASE_PLACEHOLDER:
+        return {UNVERIFIED: _DBT_DATABASE_MISMATCH}
+    project = _render_project(dbt_ctx)
+    files = dbt_ctx.project.files
+    impact = dbt_ctx.impact
+    ordered = sorted(impact.affected_models if impact is not None else (),
+                     key=lambda m: (len(m.chain), m.path))
+    models = list(dict.fromkeys(m.path for m in ordered if isinstance(files.get(m.path), str)))
+
+    def render(text: str, model: str, incremental: bool):
+        return render_model_isolated(model, source=files[model], database=database,
+                                     **{**project, "macro_files": {**project["macro_files"], rel: text}},
+                                     **({"incremental": True} if incremental else {}))
+    try:
+        return find_hidden_writes_in_macro(source, models, render)
+    except Exception as e:                   # noqa: BLE001 — macro 檔的檢查沒做完也不能當成沒有
         return {UNVERIFIED: f"檢查寫入語句時發生非預期錯誤({type(e).__name__})"}
 
 
@@ -774,7 +802,8 @@ def _dbt_expand_for_prescan(path: str, sql: str, dbt_cfg: dict, dbt_ctx: DbtCont
         return _Expanded(sql, (f"dbt 專案裡有 {len(rendered.macro_conflicts)} 組同名的 macro"
                                "(dbt 會編譯失敗),無法確定展開結果"), None)
     if not rendered.ok:
-        return _Expanded(sql, rendered.error, None)
+        return _Expanded(sql, rendered.error, None,
+                         syntax_line=rendered.error_line if rendered.syntax_error else None)
     if not rendered.incremental_checked:
         return _Expanded(rendered.sql, None, rendered.relation_notice,
                          line_map=_sentinel_map(rendered))
@@ -862,6 +891,55 @@ def _mr_for_spec_exec(mr: dict, dbt_ctx: DbtContext | None) -> dict:
         head = dbt_ctx.head_text(f.get("path")) if isinstance(f, dict) else None
         files.append({**f, "full_content": head} if head is not None and is_dbt_template(head) else f)
     return {**mr, "files": files}
+
+
+def _dbt_exec_mr(exec_mr: dict, exec_text, spec_text, affected_specs: tuple[SpecForModels, ...],
+                 dbt_ctx: DbtContext | None, dbt_cfg: dict | None) -> tuple[dict, dict | None]:
+    """執行驗證要跑的檔案是 dbt model 時,先展開成沙盒用的純 SQL(見 dbt_exec)。
+
+    要跑的是哪個檔案跟 run_spec_exec 一樣:最後一個有內容的檔案。它是取回的 dbt 專案裡的
+    model(.sql、在 model 目錄、內容是樣板),而且有規格時才展開;規格是從受影響 model 借來的
+    (MR 自己沒有規格)時,還要是這個 model 對到的那份。
+    回傳 (交給執行驗證的 MR, 紀錄)。紀錄是 None 表示不適用(照舊交給執行驗證);
+    {"file", "ok", "reason"}:ok 時那個檔案的內容換成展開後的 SQL,不 ok 時 MR 不動
+    (執行驗證照舊回「尚未支援」),reason 是原因。"""
+    if not dbt_cfg or dbt_cfg.get("enabled") is not True:
+        return exec_mr, None
+    if dbt_ctx is None or dbt_ctx.project is None or dbt_ctx.error is not None:
+        return exec_mr, None
+    files = list(exec_mr.get("files", []))
+    last = None
+    for i, f in enumerate(files):
+        got = (f.get("full_content") or _sql_from_diff(f.get("diff", ""))) if isinstance(f, dict) else ""
+        if got:
+            last = (i, f, got)
+    if last is None:
+        return exec_mr, None
+    i, f, source = last
+    path = f.get("path") or ""
+    rel = dbt_ctx.relative(path)
+    project = dbt_ctx.project
+    if (rel is None or not rel.endswith(".sql") or not is_dbt_template(source)
+            or path_kind(rel, project.model_paths, project.macro_paths,
+                         project.resource_paths) != "model"):
+        return exec_mr, None
+    if not exec_text:
+        return exec_mr, None                 # 沒有規格:執行驗證自己會說
+    record = {"file": path, "ok": False, "reason": None}
+    if not spec_text and not (affected_specs and rel in affected_specs[0].models):
+        record["reason"] = "MR 沒有自己的規格,借用的受影響 model 規格不是這個 model 的"
+        return exec_mr, record
+    if DBT_DATABASE_PLACEHOLDER != dbt_cfg.get("database"):
+        record["reason"] = _DBT_DATABASE_MISMATCH
+        return exec_mr, record
+    sql, reason = render_for_exec(path, source, exec_text, dbt_cfg["database"],
+                                  _render_project(dbt_ctx))
+    if sql is None:
+        record["reason"] = reason
+        return exec_mr, record
+    files[i] = {**f, "full_content": sql}
+    record["ok"] = True
+    return {**exec_mr, "files": files}, record
 
 
 # 注入掃描額外加進去的內容(取回的完整內容、展開後的 SQL)合計最多幾個字元。展開可以把很短的
@@ -996,8 +1074,12 @@ async def _non_sql_entry(hub: ToolHub, text: str, kind: str, path: str) -> dict:
 # 就掃得到;但**編譯期**的寫法(`{% if target.name == 'prod' %}`、`env_var()`)決定的是
 # 「展開出哪一段 SQL」,它們自己不會出現在展開結果裡 —— 展開完就看不見了。
 #
-# 用文字層的呼叫圖而不是展開器的追蹤:展開失敗的 model 也要能掃(展開失敗正是最該看的
-# 情況之一),而且不必動展開器。多掃到沒被呼叫的 macro 只是多一條提醒,漏掉才是問題。
+# 呼叫圖**先走語法樹**(`_macros_used_by_tree` → `dbt_impact.macros_referenced`,跟 macro
+# 反查同一套、在子行程裡跑):正規式看不懂 `adapter.dispatch('x')` 這類間接呼叫。樣板解析
+# 不了、子行程逾時或失敗時,才退回下面的正規式 —— 展開失敗的 model 也要能掃(展開失敗
+# 正是最該看的情況之一),而且不必動展開器。
+# 多掃到沒被呼叫的 macro 只是多一條提醒,漏掉才是問題:名稱在執行期才決定的動態呼叫,
+# 語法樹那條會把專案裡全部的 macro 都算進來,跟反查的做法一致。
 _MACRO_DEF_RE = re.compile(r"\{%-?\s*macro\s+(\w+)\s*\(")
 _MACRO_CALL_RE = re.compile(r"(?<![\w.])(\w+)\s*\(")
 # 只留讀取環境那一家族:macro 裡的 SELECT * 之類由 model 展開後的結果負責,
@@ -1014,8 +1096,27 @@ def _macro_index(macro_files: dict) -> dict:
     return index
 
 
+def _macros_used_by_tree(sources: dict, macro_files: dict) -> dict | None:
+    """語法樹版的呼叫圖,**在子行程裡跑**:`{來源的鍵: {macro 名稱…}}`;失敗回 None。
+
+    要放子行程的理由跟 macro 反查一樣:解析的是 MR 帶進來的內容,在主行程直接跑
+    沒有時間與記憶體上限,而預掃是同步呼叫 —— 卡住就是整份審查卡住(實測一個 3 MB
+    的 model 要 6 秒、多用 73 MB)。逾時或失敗就回 None,呼叫端退回正規式。
+    """
+    if not sources:
+        return {}
+    return run_isolated(macros_referenced, (dict(sources), dict(macro_files or {})),
+                        timeout_s=DEFAULT_ISOLATED_TIMEOUT_S,
+                        max_memory_mb=DEFAULT_ISOLATED_MEMORY_MB,
+                        on_failure=lambda _message: None)
+
 def _macros_used(src: str, index: dict) -> dict:
-    """這段樣板用到的 macro(含 macro 再呼叫 macro),{專案內路徑: 內容}。"""
+    """這段樣板用到的 macro(含 macro 再呼叫 macro),{專案內路徑: 內容}。
+
+    **正規式版,只在語法樹那條走不通時用**(樣板解析不了、子行程失敗或逾時):
+    看不懂 `adapter.dispatch('x')` 這類間接呼叫,但展開失敗的 model 也要能掃,
+    而那正是最該看的情況之一 —— 退回去的代價只是間接呼叫看不到,總比整個不掃好。
+    """
     out, seen, queue = {}, set(), [str(src or "")]
     while queue:
         text = queue.pop()
@@ -1030,9 +1131,44 @@ def _macros_used(src: str, index: dict) -> dict:
     return out
 
 
+def _lint_not_done(reason: str) -> list[dict]:
+    """lint 沒跑完時預掃結果裡的那一筆(LINT_INCOMPLETE_CODE,由 enforce_lint_incomplete 交人工)。"""
+    return [{"line": 0, "code": LINT_INCOMPLETE_CODE,
+             "description": f"{reason},這份內容沒有 lint 結果"}]
+
+
+class _LintBudget:
+    """整份 MR 的 lint 總預算(LINT_TOTAL_SECONDS)。
+
+    每次 lint 各有上限(LINT_TIMEOUT_SECONDS),但檔案一多,加起來沒有上限:20 個特製內容的
+    檔案就是 20 分鐘。每次 lint 花的時間從這裡扣;用完後剩下的檔案不跑,跑到一半的那一次也
+    不等,都記成沒跑完(LINT_INCOMPLETE_CODE,由 enforce_lint_incomplete 交人工)。
+    不等的那一次在背景執行緒裡自己跑到它的上限(見 ToolHub._invoke)。"""
+
+    def __init__(self, seconds: float) -> None:
+        self.total = seconds
+        self.left = seconds
+
+    def _incomplete(self) -> list[dict]:
+        return _lint_not_done(f"整份 MR 的 lint 總時間({self.total} 秒)用完了")
+
+    async def lint(self, hub: ToolHub, sql: str) -> list:
+        if self.left <= 0:
+            return self._incomplete()
+        start = time.monotonic()
+        try:
+            lint = await asyncio.wait_for(hub.call_json("sqltools__lint", {"sql": sql}), self.left)
+        except asyncio.TimeoutError:
+            self.left = 0
+            return self._incomplete()
+        self.left -= time.monotonic() - start
+        return lint[:15] if isinstance(lint, list) else []
+
+
 async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
                   dbt_ctx: DbtContext | None = None, rendered: list | None = None,
-                  line_maps: dict | None = None) -> list[dict]:
+                  line_maps: dict | None = None, out: list | None = None,
+                  progress: dict | None = None) -> list[dict]:
     """對每個變更檔跑 rule-base + lint(不經 LLM)。
 
     dbt_cfg 給定且 enabled 時,含 dbt 樣板標記的檔案先展開成純 SQL 再交給規則層
@@ -1048,9 +1184,17 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
 
     line_maps 給定時,記下展開後的行對回原始檔的對應表(見 _keep_line_maps),給程式補的
     finding 寫行號用(_attach_statement_lines)。不放進預掃結果:預掃結果整份會進 prompt。
+
+    out 給定時,每做完一個檔案(以及之後每掃完一個呼叫到的 macro)就把結果加進這個清單
+    (回傳的也是它):預掃中途被時間上限中止時,做完的部分仍拿得到(見 _run_prescan)。
+    progress 給定時,開始掃呼叫到的 macro 時記下 `phase = "called_macros"`,逾時的說明據此
+    分得出卡在哪一段。
+
+    lint 有整份 MR 的總預算(見 _LintBudget)。
     """
     dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True
-    results = []
+    results = [] if out is None else out
+    lint_budget = _LintBudget(LINT_TOTAL_SECONDS)
     used_macros: dict = {}          # 改到的 model/macro 的原始碼,用來找它呼叫了哪些 macro
     for f in files:
         if _is_spec_path(f.get("path")):
@@ -1076,12 +1220,17 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
         incremental_sql = None
         if is_macro:
             entry["dbt_macro"] = True
+            hidden = _macro_hidden_writes(f.get("path", ""), dbt_cfg, dbt_ctx)
+            if hidden:
+                entry["dbt_hidden_writes"] = hidden
         elif dbt_error is not None:
             entry["dbt_render_error"] = dbt_error
         elif dbt_enabled and sql and is_dbt_template(sql):
             render_ctx = dbt_ctx if in_project else None      # 專案外的檔案不給專案的 macro
             expanded = _dbt_expand_for_prescan(f.get("path", ""), sql, dbt_cfg, render_ctx)
             rule_sql, dbt_error, dbt_notice, incremental_sql = expanded[:4]
+            if expanded.syntax_line is not None and _parsed_whole_by_dbt(f.get("path"), render_ctx):
+                entry["dbt_syntax_line"] = expanded.syntax_line
             if dbt_error is None and line_maps is not None and _is_full_text(f, sql, dbt_ctx):
                 _keep_line_maps(line_maps, f.get("path"), sql, expanded)
             if dbt_error is None:
@@ -1125,14 +1274,18 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
         # lint 用**原始**文字,不用展開後的 rule_sql:lint 管的是開發者寫的程式長什麼樣子,
         # 展開後的 SQL 不是他們寫、也不會看到的東西,本來就不該對它做 lint。行號也因此跟
         # LLM 看到的 diff(原始行號)一致。
-        lint = await hub.call_json("sqltools__lint", {"sql": sql})
-        entry["lint"] = lint[:15] if isinstance(lint, list) else []
+        # 規則層的結果先放進去:lint 跑到一半遇到預掃整段的上限時,這個檔的規則命中仍然要在
+        # (見 _run_prescan);lint 那一欄先記成沒跑完,跑完再換成結果。
+        entry["lint"] = _lint_not_done("預掃整段的時間上限到了")
+        results.append(entry)
+        entry["lint"] = await lint_budget.lint(hub, sql)
         if is_macro:
             used_macros[f.get("path")] = sql          # 改到的 macro 自己也會呼叫別的
         elif in_project:
             used_macros[f.get("path")] = sql
-        results.append(entry)
-    results += await _macro_scan(hub, used_macros, dbt_ctx, {e["path"] for e in results})
+    if progress is not None:
+        progress["phase"] = _PHASE_CALLED_MACROS
+    await _macro_scan(hub, used_macros, dbt_ctx, {e["path"] for e in results}, results)
     return results
 
 
@@ -1148,20 +1301,31 @@ def _merge_env_hits(hits: list, raw) -> list:
     return hits
 
 
-async def _macro_scan(hub: ToolHub, sources: dict, dbt_ctx, already: set) -> list[dict]:
+async def _macro_scan(hub: ToolHub, sources: dict, dbt_ctx, already: set,
+                      out: list | None = None) -> list[dict]:
     """改到的 model/macro 所呼叫的 macro,掃一次讀取環境的寫法。
 
     已經在變更清單裡的檔案不重複掃(它自己那一輪就掃過,而且掃的是全部規則)。
+    有命中的每掃完一個就加進 out(給定時;回傳的也是它):預掃在這一段被時間上限中止時,
+    已經掃完的 macro 的命中仍拿得到。
     """
+    out = [] if out is None else out
     if not sources or dbt_ctx is None or getattr(dbt_ctx, "project", None) is None:
-        return []
-    index = _macro_index(getattr(dbt_ctx, "macro_files", None) or {})
+        return out
+    macro_files = getattr(dbt_ctx, "macro_files", None) or {}
+    index = _macro_index(macro_files)
     if not index:
-        return []
+        return out
+    # 語法樹那條一次處理全部來源(macro 檔只解析一次,而且在子行程裡跑);
+    # 回 None 代表樣板解析不了或子行程失敗 —— 逐檔退回正規式。
+    by_tree = _macros_used_by_tree(sources, macro_files)
     bodies = {}
-    for src in sources.values():
-        bodies.update(_macros_used(src, index))
-    out = []
+    if by_tree is None:
+        for src in sources.values():
+            bodies.update(_macros_used(src, index))
+    else:
+        for names in by_tree.values():
+            bodies.update({index[n][0]: index[n][1] for n in names if n in index})
     prefix = (getattr(dbt_ctx, "prefix", "") or "").strip("/")
     for rel, body in sorted(bodies.items()):
         path = f"{prefix}/{rel}" if prefix else rel
@@ -1174,6 +1338,52 @@ async def _macro_scan(hub: ToolHub, sources: dict, dbt_ctx, already: set) -> lis
         if keep:
             out.append({"path": path, "rules": keep, "lint": [], "called_macro": True})
     return out
+
+
+_PRESCAN_STAGE = "預掃(規則層/dbt 展開)"
+_PHASE_CALLED_MACROS = "called_macros"      # 預掃正在掃變更檔呼叫到的 macro(見 prescan 的 progress)
+
+
+async def _run_prescan(report: dict, hub: ToolHub, files: list[dict], dbt_cfg: dict | None,
+                       dbt_ctx: DbtContext | None, rendered: list, line_maps: dict,
+                       deadline: float) -> list[dict]:
+    """預掃,有自己的時間上限(PRESCAN_TIMEOUT_SECONDS),也不超過離整份截止還剩的時間,
+    但**至少 MIN_STAGE_SECONDS**:預掃是確定性的結果,剩的時間再少也要跑(模型的步驟則是不開始)。
+
+    出錯不該讓整份審查消失:規則層與 dbt 展開都在裡面,壞了就記一條、用空的預掃往下走
+    (模型仍然看得到 diff 與規格)。**逾時時保留做完的檔案**:它們的規則命中(例如 DELETE
+    沒有 WHERE)是確定的結果;沒做完的部分由那條未完整的 finding 交人工。
+
+    上限插得進來,是因為預掃的工具呼叫(規則層、lint)在背景執行緒跑(見 ToolHub._invoke)。
+    沒經過工具呼叫的同步工作(dbt 展開)要等它自己的上限到了,外層的上限才插得進來。
+    """
+    limit = min(PRESCAN_TIMEOUT_SECONDS, max(deadline - time.monotonic(), MIN_STAGE_SECONDS))
+    done: list[dict] = []
+    progress: dict = {}
+    try:
+        await asyncio.wait_for(
+            prescan(hub, files, dbt_cfg, dbt_ctx, rendered, line_maps, out=done,
+                    progress=progress), limit)
+    except asyncio.TimeoutError:
+        report.setdefault("findings", []).append(_prescan_timeout_finding(
+            limit, len(done), len(files), progress.get("phase") == _PHASE_CALLED_MACROS))
+    except Exception as e:                   # noqa: BLE001 — 任何例外都不得往外丟
+        report.setdefault("findings", []).append(_incomplete_finding(_PRESCAN_STAGE, e))
+        return []
+    return done
+
+
+def _prescan_timeout_finding(limit: float, done: int, total: int, in_called_macros: bool) -> dict:
+    """預掃逾時的未完整 finding:寫明做完的部分仍在報告內,卡在哪一段。"""
+    finding = _timeout_finding(_PRESCAN_STAGE, limit, PRESCAN_TIMEOUT_SECONDS)
+    if in_called_macros:
+        note = (f"變更的 {total} 個檔案都做完了,結果仍在報告內;卡在掃它們呼叫到的 macro(讀取環境的"
+                "寫法),已經掃完的 macro 的命中也在報告內,沒掃到的沒有這項檢查。")
+    else:
+        note = (f"逾時前做完規則層的 {done} 個檔案(共 {total} 個)結果仍在報告內,沒做完的部分沒有"
+                "規則層與 lint 的結果。")
+    finding["detail"] = finding["detail"].replace("這一環節的結果不在本報告內。", note)
+    return finding
 
 
 def build_diff_section(files: list[dict], budget_tokens: int) -> str:
@@ -1732,11 +1942,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
     """capture 給定時,記錄各階段中間產物(預掃前後、檢索到的知識、模型原始輸出、
     agent 工具對話、最終報告),供產生逐字 transcript。
 
-    cfg.dbt["enabled"] 為 True 時,prescan() 會呼叫 render_model_isolated()
-    (multiprocessing 的 spawn context)。**呼叫端的進入點程式必須有
-    `if __name__ == "__main__":` 保護**,否則 Windows 上 spawn 會重新匯入整個
-    頂層模組,連帶把呼叫 review_mr() 的那段程式碼也重跑一次——demo.py 與
-    scripts/webhook_server.py 都已經這樣寫,寫新的進入點時比照辦理。
+    cfg.dbt["enabled"] 為 True 時,prescan() 會呼叫 render_model_isolated()(在子行程展開,
+    見 isolation)。
     """
     import copy
     from .dbt_render import start_review_invocation
@@ -1796,10 +2003,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                         mr, cfg.dbt)
         rendered: list[dict] = []          # 展開後的 SQL,給注入掃描用
         line_maps: dict = {}               # 展開後的行對回原始檔,給程式補的 finding 寫行號用
-        # 預掃失敗不該讓整份審查消失:規則層與 dbt 展開都在裡面,壞了就記一條、
-        # 用空的預掃往下走(模型仍然看得到 diff 與規格)。
-        pre = await _astep(report_stub, "預掃(規則層/dbt 展開)",
-                           prescan(hub, mr["files"], cfg.dbt, dbt_ctx, rendered, line_maps), [])
+        # 預掃失敗或逾時不該讓整份審查消失(見 _run_prescan)
+        pre = await _run_prescan(report_stub, hub, mr["files"], cfg.dbt, dbt_ctx, rendered,
+                                 line_maps, review_deadline)
         if capture is not None:
             capture["mr"] = mr
             capture["prescan_raw"] = copy.deepcopy(pre)
@@ -1822,6 +2028,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # MR 改到的 macro 檔載入得了嗎:Jinja 語法錯誤時 dbt 整個專案都編譯不了
         macro_issues = _step(report_stub, "macro 檔檢查", _macro_file_issues, [],
                              mr, dbt_ctx, cfg.dbt)
+        # MR 改到的 dbt 設定檔(dbt_project.yml、屬性檔):dbt 解析專案時一定失敗的寫法
+        yaml_issues = _step(report_stub, "dbt 設定檔檢查", _dbt_yaml_issues, [], mr, dbt_ctx)
         if spec_code is None and spec_text is None and affected is not None and affected.spec:
             # MR 本身對不到規格(只改了 macro),而受影響的 model 都對到同一份:用它來審
             spec_code, spec_text = affected.spec
@@ -1875,7 +2083,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                                          affected, dbt_ctx, cfg.dbt,
                                          incomplete=report_stub["findings"],
                                          affected_specs=affected_specs,
-                                         macro_issues=macro_issues)
+                                         macro_issues=macro_issues, yaml_issues=yaml_issues)
 
         # 路徑觸發的 skill 自動注入:異常交易規則檔一律載入領域知識,不賭模型主動載
         always_block = always_skills(skills)
@@ -1970,6 +2178,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_scan_skipped(report, scan_target.get("_scan_skipped", 0))  # 內容太多沒掃完
         report = enforce_dbt_impact(report, affected, dbt_ctx)  # macro 等變更影響的其他 model
         report = enforce_dbt_macro_problems(report, macro_issues)  # macro 檔語法錯誤、載入失敗
+        report = enforce_dbt_project_broken(report, yaml_issues)   # 設定檔讓 dbt 整個專案失敗
         report = enforce_non_sql(report, pre)  # 非 SQL 檔沒跑 SQL 規則:說明文件 info,其他 major
         report = enforce_dbt_config_change(report, mr, dbt_ctx, cfg.dbt)  # 只改設定時展開結果不變
         report = enforce_dbt_asset_names(report, mr, dbt_ctx, cfg.dbt)  # 名稱不合 Dagster 規則:部署失敗
@@ -1993,12 +2202,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         #
         # 失敗或逾時要看得出是哪一個階段:run_spec_exec 把現在在跑哪一段寫進 progress,
         # 逾時是外層丟的、它看不到裡面,所以只能這樣問。沙盒階段另外收一個截止時間——
-        # 它是同步呼叫,wait_for 插不進去(見 spec_exec._in_thread)。
+        # 它是同步呼叫,wait_for 插不進去(見 isolation.run_in_thread)。
         clock.lap("postprocess")
         progress: dict = {}
         # 上限不超過整份的截止時間(見 _stage_limit);沙盒階段的截止時間跟著縮
         spec_limit = _stage_limit(SPEC_EXEC_TIMEOUT_SECONDS, review_deadline)
         deadline = time.monotonic() + (spec_limit or 0)
+        dbt_exec = None
         try:
             # 端點無法使用時整段不跑:測資生成要呼叫模型。找不到規格等不用模型的結果這次不會出現,
             # 但它們本來就是交人工,決策不受影響;端點恢復後重新審查就看得到
@@ -2009,6 +2219,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             # 交給執行驗證的 MR 與規格也在 try 裡:組不出來同樣記成執行驗證未完成
             exec_mr = _mr_for_spec_exec(mr, dbt_ctx)
             exec_code, exec_text = _spec_for_exec(spec_code, spec_text, affected_specs, exec_mr)
+            exec_mr, dbt_exec = _dbt_exec_mr(exec_mr, exec_text, spec_text, affected_specs,
+                                             dbt_ctx, cfg.dbt)
             spec_result = await asyncio.wait_for(
                 run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text,
                               progress=progress, deadline=deadline),
@@ -2038,7 +2250,12 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 模型自己輸出的同名欄位在這裡被蓋掉
         report["_stage_seconds"] = clock.seconds
         report["_review_deadline_seconds"] = REVIEW_BUDGET_SECONDS   # 評測看得出這輪用的是哪一種截止時間
-        report = enforce_dbt_unexecuted(report, mr, dbt_ctx, cfg.dbt)  # dbt 的變更沒被執行驗證到
+        # 報告裡同名的欄位(模型可能自己輸出)一律蓋掉
+        report["_dbt_exec"] = dbt_exec
+        executed_dbt = (dbt_exec["file"] if dbt_exec and dbt_exec["ok"] and spec_result is not None
+                        and spec_result.get("executed_file") == dbt_exec["file"] else None)
+        report = enforce_dbt_exec_note(report, dbt_exec)  # dbt model 沒有送進沙盒的原因
+        report = enforce_dbt_unexecuted(report, mr, dbt_ctx, cfg.dbt, executed_dbt)  # dbt 的變更沒被執行驗證到
         report = enforce_spec_change(report, mr)  # MR 改到規格檔:改了什麼、前後是否一致
 
         # 判斷校準:嚴重度交給能確定性驗證的證據決定,不是模型的語氣,也不是
@@ -2049,6 +2266,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_claim_evidence(report)
 
         report = apply_rubric(report)
+        # 規則層命中的代號由程式從預掃結果寫進報告(模型輸出的同名欄位在這裡被蓋掉),
+        # 決策閘門據此判斷;這一步出錯時記成環節未完整,一樣不得自動放行
+        report["_rule_hits"] = _step(report, "規則命中彙整", _rule_hit_codes, None, pre)
         report = apply_policy(report, mr, cfg.policy)
         if not report.get("decision"):
             # 決策閘門自己壞掉時沒有決策可用——不能留空(呼叫端會以為沒問題)。
@@ -2231,25 +2451,6 @@ def _needs_secure_sql(pre: list[dict]) -> bool:
     return any(h.get("rule") in _SECURE_SQL_RULES for e in pre for h in e.get("rules", []))
 
 
-# rule 命中 → 判定「模型已涵蓋」的關鍵詞(報告全文含任一即視為已報,避免重複)
-_RULE_KEYWORDS = {
-    "R001": ["WHERE", "全表", "整表", "整張表", "purge"],
-    "R002": ["SELECT *", "明列欄位", "star"],
-    "R003": ["NOT IN", "NULL 陷阱", "NOT EXISTS"],
-    "R004": ["憑證", "密碼", "金鑰", "硬編碼", "hardcode", "credential", "secret"],
-    # 「沙盒」刻意不列(#27 review 的建議):它的範圍太廣,同一個檔案裡模型的其他
-    # major 只要提到沙盒,R005 就會被當成已經報過而不補報。
-    "R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys."],
-    # 危險 SQL 原語:關鍵詞要用那一類**特有**的字。原本這幾種會被報成「語法錯誤」
-    # 「效能問題」,所以泛用的字眼(「外部」「權限」)不能用——模型用它講別的事情時,
-    # 這一條就會被當成已經報過而不補報。
-    "R006": ["OPENROWSET", "OPENDATASOURCE", "OPENQUERY", "BULK INSERT", "linked server",
-             "四段式"],
-    "R007": ["xp_cmdshell", "作業系統指令", "作業系統命令"],
-    "R008": ["GRANT", "REVOKE", "EXECUTE AS", "ALTER ROLE", "授權", "權限授予"],
-    "R009": ["動態 SQL", "sp_executesql", "字串串接", "組出來再執行"],
-    "R010": ["run_query", "編譯期", "compile"],
-}
 
 
 _PARSE_FAIL_TITLE = "預掃無法解析此檔的 SQL,rule-base 規則未執行"
@@ -2294,8 +2495,9 @@ def enforce_lint_incomplete(report: dict, pre: list[dict]) -> dict:
         report.setdefault("findings", []).append({
             "file": entry["path"], "line": 0, "severity": "major",
             "title": f"[lint] {INCOMPLETE_TITLE_PREFIX}",
-            "detail": (f"lint 沒有跑完(超過時間上限 {LINT_TIMEOUT_SECONDS} 秒、內容超過 "
-                       f"{LINT_MAX_CHARS} 字元或執行失敗),這個檔案沒有風格與反模式檢查的結果。"
+            "detail": (f"lint 沒有跑完(超過時間上限 {LINT_TIMEOUT_SECONDS} 秒、整份 MR 的 lint 總時間 "
+                       f"{LINT_TOTAL_SECONDS} 秒用完、內容超過 {LINT_MAX_CHARS} 字元或執行失敗),"
+                       "這個檔案沒有風格與反模式檢查的結果。"
                        "規則層的檢查不受影響。"),
             "stage": "lint",
             "suggestion": "請人工確認這個檔案的內容;一般的 SQL 在時間上限內跑得完。",
@@ -2490,7 +2692,36 @@ def enforce_dbt_asset_names(report: dict, mr: dict, dbt_ctx: DbtContext | None =
 _RENDER_FAIL_TITLE = "dbt 樣板展開失敗,rule-base 規則掃的是未展開的原文"
 
 
+def _in_dirs(rel: str, dirs) -> bool:
+    return any(rel == d or rel.startswith(d.rstrip("/") + "/") for d in dirs)
+
+
+def _parsed_whole_by_dbt(path, dbt_ctx: DbtContext | None) -> bool:
+    """dbt 解析專案時,會把這個檔整份當成 Jinja 樣板解析嗎(model、analysis、singular test 的
+    目錄)?這種檔有 Jinja 語法錯誤時,dbt 整個專案解析失敗(dbt-core 1.12 實測)。
+
+    snapshot 目錄的檔不算:展開器把它當 model 展開,`{% snapshot %}` 區塊本身就是不認得的標籤,
+    分不出是不是真的語法錯誤。沒有取回專案時也不算(不知道目錄設定)。"""
+    project = dbt_ctx.project if dbt_ctx is not None else None
+    rel = dbt_ctx.relative(path) if project is not None else None
+    return rel is not None and _in_dirs(
+        rel, project.model_paths + project.analysis_paths + project.test_paths)
+
+
+_TEMPLATE_SYNTAX_TITLE = "dbt 樣板有 Jinja 語法錯誤,dbt 整個專案會編譯失敗"
+
+
 def _render_fail_finding(entry: dict) -> dict:
+    line = entry.get("dbt_syntax_line")
+    if isinstance(line, int) and not isinstance(line, bool):
+        where = _code_span(entry["path"]) + (f" 第 {line} 行附近" if line else "")
+        return {"file": entry["path"], "line": line, "severity": "blocker",
+                "title": _TEMPLATE_SYNTAX_TITLE,
+                "detail": (f"{where}有 Jinja 語法錯誤(區塊沒有閉合、運算式寫錯、不認得的標籤或濾器、"
+                           "重複定義的 block 等)。dbt 解析專案時會失敗,部署端也會整個載入失敗,"
+                           "影響的不只這個檔案。這個檔案沒有展開,規則層掃的是未展開的原文。"),
+                "suggestion": "修正語法後,用 dbt parse 確認整個專案解析得過。",
+                "citations": [], "_source": PROGRAM_SOURCE}
     parse_note = ("未展開的原文也無法解析,語法樹規則整組沒有執行。" if entry.get("parse_error")
                   else "未展開的原文雖然解析得過,但那不是實際會執行的 SQL,"
                        "規則沒有命中不代表展開後沒有問題。")
@@ -2551,7 +2782,13 @@ def _hidden_write_finding(entry: dict) -> dict | None:
         return None
     parts, lines = [], []
     unreached, at = _hidden_write_list(hidden.get(UNREACHED))
-    if unreached:
+    models = hidden.get(MODELS_CHECKED)
+    if unreached and isinstance(models, int) and not isinstance(models, bool):
+        lines += at
+        parts.append(f"這些寫入語句從呼叫這個 macro 檔的 model 展開時都沒有出現(展開了 {models} 個 model;"
+                     f"有呼叫 is_incremental() 的也以增量模式展開過),可能寫在只有真正執行時才會進的分支,"
+                     f"或只在別處被執行:{unreached}。")
+    elif unreached:
         lines += at
         parts.append("這些寫入語句在這次審查的展開結果裡沒有出現(一般模式、增量模式都沒有),"
                      f"可能寫在只有真正執行時才會進的分支:{unreached}。")
@@ -2574,14 +2811,51 @@ def _hidden_write_finding(entry: dict) -> dict | None:
             "citations": []}
 
 
+_UNREACHED_BRANCH_TITLE = "dbt 樣板有沒有展開到的分支,裡面的輸出沒有經過規則檢查"
+
+
+def _unreached_branch_finding(entry: dict) -> dict | None:
+    """分支裡的輸出哪一次展開都沒有產生過(dbt_hidden_writes 的 UNREACHED_OUTPUT)。
+    已經列在寫入語句那條的行不重複列;全部都列過了就不補。"""
+    hidden = entry.get("dbt_hidden_writes")
+    if not isinstance(hidden, dict) or not isinstance(hidden.get(UNREACHED_OUTPUT), list):
+        return None
+    _, listed = _hidden_write_list(hidden.get(UNREACHED))
+    lines = []
+    for it in hidden[UNREACHED_OUTPUT]:
+        line = it.get("line") if isinstance(it, dict) else None
+        if isinstance(line, int) and not isinstance(line, bool) and line not in listed \
+                and line not in lines:
+            lines.append(line)
+    if not lines:
+        return None
+    shown = "、".join(str(n) for n in lines[:_HIDDEN_WRITE_LIST_MAX])
+    where = f"第 {shown} 行" + (f" 等 {len(lines)} 處" if len(lines) > _HIDDEN_WRITE_LIST_MAX else "")
+    models = hidden.get(MODELS_CHECKED)
+    if isinstance(models, int) and not isinstance(models, bool):
+        when = (f"從呼叫這個 macro 檔的 model 展開時都沒有產生過(展開了 {models} 個 model;"
+                "有呼叫 is_incremental() 的也以增量模式展開過)")
+    else:
+        when = "在這次審查的展開結果裡沒有產生過(一般模式、增量模式都沒有)"
+    return {"file": entry["path"], "line": min(lines), "severity": "major",
+            "title": _UNREACHED_BRANCH_TITLE,
+            "detail": f"這些分支裡的輸出{when},可能只有真正執行時才會進:{where}。"
+                      "分支裡的內容可以用樣板組出寫入語句(例如把關鍵字拆成兩個字串接起來),"
+                      "規則層只檢查展開後的 SQL,這些內容沒有經過規則檢查,無法確認,不得自動放行。",
+            "suggestion": "人工確認這些分支在什麼情況下會進、會產生什麼 SQL;以 dbt compile 取得實際會"
+                          "執行的 SQL 再檢查。",
+            "citations": []}
+
+
 @_isolated_stage("寫入語句沒有展開到")
 def enforce_dbt_hidden_writes(report: dict, pre: list[dict]) -> dict:
     """樣板原文有寫入語句、規則層卻看不到時補 major(預掃記下的 dbt_hidden_writes,見
-    dbt_hidden_writes 模組)。確定性補報,不看模型有沒有提到;標題只能由程式產生。"""
+    dbt_hidden_writes 模組);沒有展開到的分支裡有輸出時另補一條 major。確定性補報,
+    不看模型有沒有提到;標題只能由程式產生。"""
     for entry in pre:
-        hidden = _hidden_write_finding(entry)
-        if hidden is not None:
-            _put_program_finding(report, hidden)
+        for added in (_hidden_write_finding(entry), _unreached_branch_finding(entry)):
+            if added is not None:
+                _put_program_finding(report, added)
     return report
 
 
@@ -2684,6 +2958,90 @@ def enforce_dbt_macro_problems(report: dict, issues) -> dict:
     return report
 
 
+_PROJECT_BROKEN_TITLE = "dbt 設定檔有 dbt 解析不了的寫法,dbt 整個專案會解析失敗"
+_YAML_UNCHECKED_TITLE = "無法確認 dbt 屬性檔 dbt 解析得過"
+_YAML_CHECK_FAILED = "check_failed"       # 檢查本身沒做完(逾時、資源上限)
+_YAML_PROBLEM_TEXT = {
+    PROJECT_YAML_INVALID: "dbt_project.yml 不是合法的 YAML",
+    PROJECT_FILE_REMOVED: "這個 MR 刪掉或移走了 dbt_project.yml,dbt 找不到專案設定",
+    YAML_SYNTAX: "不是合法的 YAML",
+    YAML_MODELS_NOT_LIST: "`models:` 不是清單",
+}
+
+
+def _dbt_yaml_issues(mr: dict, dbt_ctx: DbtContext | None) -> list[dict]:
+    """MR 改到的 dbt 設定檔有沒有 dbt 解析專案時一定失敗的寫法:[{path(MR 裡的路徑), kind, line}]。
+
+    - dbt_project.yml 不是合法的 YAML(取回專案時發現,DbtContext.broken),或 MR 刪掉、移走了它
+    - 改到的屬性檔:YAML 語法錯誤、`models:` 不是清單(dbt_project.yaml_file_problems,在子行程裡
+      檢查;沒檢查完記成無法確認,不當成沒有問題)
+
+    只看 MR 改到的檔:專案裡本來就壞的檔不是這個 MR 造成的;那時取不回專案,專案裡改到的檔
+    已經記成展開失敗交人工(見 _dbt_head_source)。"""
+    if dbt_ctx is None:
+        return []
+    files = [f for f in mr.get("files", []) if isinstance(f, dict)] if isinstance(mr, dict) else []
+    project_file = f"{dbt_ctx.prefix}/dbt_project.yml" if dbt_ctx.prefix else "dbt_project.yml"
+    if dbt_ctx.broken == PROJECT_FILE_REMOVED:
+        return [{"path": project_file, "kind": PROJECT_FILE_REMOVED, "line": 0}]
+    if dbt_ctx.broken == PROJECT_YAML_INVALID:
+        changed = any(f.get("path") == project_file for f in files)
+        return [{"path": project_file, "kind": PROJECT_YAML_INVALID, "line": 0}] if changed else []
+    if dbt_ctx.project is None:
+        return []
+    texts = {}
+    for f in files:
+        path = f.get("path")
+        rel = dbt_ctx.relative(path) if isinstance(path, str) else None
+        # dbt_project.yml 不送去檢查:它的 models: 是設定(物件),不是屬性檔的 models 清單,當成屬性檔
+        # 檢查會誤報(它本身的 YAML 語法錯誤在取回專案時就分出來了,見上面)
+        if rel is None or rel == "dbt_project.yml" or f.get("deleted") or not is_dbt_yaml(rel):
+            continue
+        text = dbt_ctx.head_text(path)
+        if isinstance(text, str):
+            texts[path] = text
+    if not texts:
+        return []
+    found = check_yaml_files_isolated(texts)
+    if found is None:
+        return [{"path": path, "kind": _YAML_CHECK_FAILED, "line": 0} for path in sorted(texts)]
+    return found
+
+
+def _dbt_yaml_finding(issue) -> dict | None:
+    if not isinstance(issue, dict) or not isinstance(issue.get("path"), str):
+        return None
+    kind, line = issue.get("kind"), issue.get("line")
+    line = line if type(line) is int and line > 0 else 0          # bool 不算行號
+    where = _code_span(issue["path"]) + (f" 第 {line} 行附近" if line else "")
+    if kind in _YAML_PROBLEM_TEXT:
+        return {"file": issue["path"], "line": line, "title": _PROJECT_BROKEN_TITLE,
+                "severity": "blocker",
+                "detail": (f"{where}:{_YAML_PROBLEM_TEXT[kind]}。dbt 解析專案時會失敗,部署端也會整個"
+                           "載入失敗,影響的不只這個檔案。"),
+                "suggestion": "修正後用 dbt parse 確認整個專案解析得過。",
+                "citations": []}
+    if kind == _YAML_CHECK_FAILED:
+        return {"file": issue["path"], "line": 0, "severity": "major",
+                "title": _YAML_UNCHECKED_TITLE,
+                "detail": (f"{where}:檢查沒有做完(逾時或超過資源上限)。屬性檔有 YAML 語法錯誤時,"
+                           "dbt 整個專案解析失敗,不得自動放行。"),
+                "suggestion": "用 dbt parse 確認整個專案解析得過。",
+                "citations": []}
+    return None
+
+
+@_isolated_stage("dbt 設定檔問題揭露")
+def enforce_dbt_project_broken(report: dict, issues) -> dict:
+    """MR 改到的 dbt 設定檔讓 dbt 整個專案解析失敗時補 blocker(見 _dbt_yaml_issues);沒檢查完補 major。
+    確定性補報;標題只能由程式產生;只寫種類與行號,不帶檔案內容。"""
+    for issue in issues if isinstance(issues, list) else []:
+        problem = _dbt_yaml_finding(issue)
+        if problem is not None:
+            _put_program_finding(report, problem)
+    return report
+
+
 _DBT_UNEXECUTED_TITLE = "dbt 的變更沒有經過執行驗證"
 
 
@@ -2702,7 +3060,7 @@ def _mr_touches_dbt(mr: dict, dbt_ctx: DbtContext | None, dbt_cfg: dict | None) 
 
 @_isolated_stage("dbt 未經執行驗證揭露")
 def enforce_dbt_unexecuted(report: dict, mr: dict, dbt_ctx: DbtContext | None,
-                           dbt_cfg: dict | None = None) -> dict:
+                           dbt_cfg: dict | None = None, executed_dbt: str | None = None) -> dict:
     """MR 改到 dbt 的東西(樣板、macro、屬性檔、專案設定檔),而執行驗證卻「通過」時,補一條 major。
 
     dbt 樣板目前不送沙盒(展開後的表名對不到沙盒的測資表),所以這種 MR 的執行驗證結果
@@ -2711,8 +3069,13 @@ def enforce_dbt_unexecuted(report: dict, mr: dict, dbt_ctx: DbtContext | None,
     「執行驗證通過」在這裡不成立。確定性補報,標題只能由程式產生。
 
     要排在執行驗證之後(看的是它的結果)。沒開 dbt 不受影響。mock 模式沒有取回專案,
-    一樣適用:樣板檔與純 SQL 檔混在同一個 MR 時,通過的是純 SQL 檔。"""
+    一樣適用:樣板檔與純 SQL 檔混在同一個 MR 時,通過的是純 SQL 檔。
+
+    executed_dbt 是展開後真的送進沙盒、而且就是執行驗證跑的那個 model(見 _dbt_exec_mr)。
+    它是這個 MR 唯一改到 dbt 的檔案時,通過的就是這個 model 本身,不補(_only_dbt_file)。"""
     if not _mr_touches_dbt(mr, dbt_ctx, dbt_cfg):
+        return report
+    if executed_dbt is not None and _only_dbt_file(mr, dbt_ctx, executed_dbt):
         return report
     if (report.get("_spec_exec") or {}).get("passed") is not True:
         return report            # 執行驗證自己已經說了沒通過 / 沒執行,不重複
@@ -2722,6 +3085,40 @@ def enforce_dbt_unexecuted(report: dict, mr: dict, dbt_ctx: DbtContext | None,
                   "dbt 樣板目前不會送進沙盒執行,這些變更沒有經過執行驗證,不得自動放行。",
         "suggestion": "以 dbt compile 取得展開後的 SQL,人工依核定規格核對。",
         "citations": []})
+    return report
+
+
+def _only_dbt_file(mr: dict, dbt_ctx: DbtContext | None, path: str) -> bool:
+    """MR 改到 dbt 的只有 path 這個檔案:其他檔案都不是 dbt 的東西。逐一問 dbt_context(有反查
+    結果時,也就是改到 macro、屬性檔、設定檔時,每個檔案都算),判斷跟 _mr_touches_dbt 一樣
+    寧可多算。"""
+    if dbt_ctx is None or dbt_ctx.error is not None:
+        return False
+    for f in mr.get("files", []):
+        if not isinstance(f, dict):
+            return False
+        if f.get("path") == path:
+            continue
+        if dbt_ctx.touches_dbt([f]) or is_dbt_template(f.get("full_content") or f.get("diff") or ""):
+            return False
+    return True
+
+
+_DBT_EXEC_NOTE_TITLE = "dbt model 沒有送進沙盒執行"
+
+
+@_isolated_stage("dbt 執行驗證說明")
+def enforce_dbt_exec_note(report: dict, dbt_exec: dict | None) -> dict:
+    """執行驗證要跑的 dbt model 沒能展開成沙盒用的 SQL 時,補一條 info 寫出原因。
+    決策不受影響(執行驗證自己已經回了「尚未支援」的 major),只讓審查者知道差在哪裡。"""
+    if not dbt_exec or dbt_exec.get("ok") or not dbt_exec.get("reason"):
+        return report
+    _put_program_finding(report, {
+        "file": dbt_exec["file"] or "(MR 內容)", "line": 0, "severity": "info",
+        "title": _DBT_EXEC_NOTE_TITLE,
+        "detail": f"執行驗證只支援只引用 source() 的 model;這個 model 沒有展開:{dbt_exec['reason']}。",
+        "suggestion": "以 dbt compile 取得展開後的 SQL,人工依核定規格核對。",
+        "citations": [], "_source": PROGRAM_SOURCE})
     return report
 
 
@@ -2759,10 +3156,16 @@ def _hit_line(hit: dict, exact: bool) -> int:
 
 
 def _count_note(code: str, total: int, missing: int, n: int) -> str:
-    """同一個檔案同一個代碼有多處命中時,附在補的說明後面的數量(只有一處時不加)。"""
+    """同一個檔案同一個代碼有多處命中時,附在補的說明後面的數量(只有一處時不加)。
+
+    檢核點(`enforce_hints`)仍然要判斷模型回應了幾處,所以保留 `missing`;規則
+    (`enforce_rules`)一律補報,兩個數字相同,說明就只寫「共幾處、這是第幾條」。
+    """
     if total <= 1:
         return ""
-    return (f"(這個檔案共有 {total} 處命中 {code},模型的 finding 只對應到 {total - missing} 處;"
+    answered = ("" if missing == total
+                else f",模型的 finding 只對應到 {total - missing} 處")
+    return (f"(這個檔案共有 {total} 處命中 {code}{answered};"
             f"這是程式補上的第 {n} 條,共 {missing} 條。請逐一檢查每一處。)")
 
 
@@ -2888,33 +3291,27 @@ def _rendered_starts(sql: str) -> dict | None:
     空白(空白控制 `{%- -%}` 會把幾個原始行接成同一個展開後的行,第二句的起始行對不回它真正的那一行),
     以及它是第幾句(對不回行號時寫在說明裡,分得出是哪一句)。
 
-    只有「切不出語句」(解析錯誤、tokenizer 錯誤、巢狀太深)回 None、不寫行號;其他例外是程式的錯,
+    **逐句切、逐句解析**(切句用 `sqltools.statement_chunks`,跟預掃同一份):整份一次解析
+    的話,其中一句壞掉就**整個檔案都不寫行號**,連好的那幾句也沒有 —— 而解析不了的那一句
+    正是最值得標出位置的。現在壞掉的那一句跳過,其他句照寫。
+
+    一句都切不出來(整份就是一句、而且解析不了)回 None、不寫行號;其他例外是程式的錯,
     往外丟,由呼叫端的環節隔離記成未完整,不默默變成 0。"""
-    try:
-        tokens = sqlglot.tokenize(sql, read=DIALECT)
-        statements = [st for st in _parse(sql) if st is not None
-                      and not isinstance(st, exp.Semicolon)]
-    except (SqlglotError, RecursionError):   # 切不出來就不寫行號
-        return None
-    firsts, first = [], None
-    for tok in tokens:
-        if tok.token_type == TokenType.SEMICOLON:
-            if first is not None:
-                firsts.append(first)
-            first = None
-        elif first is None:
-            first = tok
-    if first is not None:
-        firsts.append(first)
-    if len(firsts) != len(statements):
-        return None
     by_text: dict[str, list] = {}
-    for n, (tok, st) in enumerate(zip(firsts, statements), 1):
-        line_start = sql.rfind("\n", 0, tok.start) + 1
-        alone = not sql[line_start:tok.start].strip()
-        full = st.sql(dialect=DIALECT)
-        by_text.setdefault(full[:200], []).append((tok.line, full, alone, n))
-    return by_text
+    for n, (chunk, parsed, err) in enumerate(parsed_chunks(sql), 1):
+        if err is not None:                  # 這一句不寫行號,其他句照寫
+            continue
+        # 只有註解的那一段,逐句解析的結果是 [None],`st is not None` 就濾掉了 ——
+        # 不必再排除分號節點(整份一次解析的時代才需要)。
+        statements = [st for st in parsed if st is not None]
+        if len(statements) != 1:   # 一段切出兩句以上:對不準是哪一句,寧可不寫
+            continue
+        full = statements[0].sql(dialect=DIALECT)
+        line_start = sql.rfind("\n", 0, chunk.start) + 1
+        alone = not sql[line_start:chunk.start].strip()
+        by_text.setdefault(full[:200], []).append(
+            (sql.count("\n", 0, chunk.start) + 1, full, alone, n))
+    return by_text or None
 
 
 _TAG_OPENERS = ("{{", "{%", "{#")
@@ -3006,8 +3403,17 @@ def enforce_rules(report: dict, pre: list[dict]) -> dict:
             if code.startswith("R"):       # hint(H 系列)由 enforce_hints 處理
                 by_code.setdefault(code, []).append(h)
         for code, hits in by_code.items():
-            missing, exact = _coverage(before, entry["path"], _RULE_KEYWORDS.get(code, [code]),
-                                       hits)
+            # **一律補報,不看模型有沒有提到**(#104)。規則命中是程式判定的事實,
+            # 不需要靠猜來決定要不要說。原本用關鍵詞猜「模型已經講過同一件事」,而那
+            # 會誤中:模型在別的 finding 裡提到 `GRANT`,R008 就整條不補 —— 代價是
+            # 安靜地漏報,要到稽核才會發現。
+            #
+            # **補上的不會跟模型的去重**:`sanitize_findings` 排在這之前(見 review_mr),
+            # 所以模型講過同一件事時,報告上一律是兩條。不要為了少一條而在這之後再去重:
+            # 去重留下的是建議較長、引用較多的那條、不看嚴重度,模型寫一條標題近似的
+            # info 附一段建議,這裡補的 blocker 就會被換掉(#16 的那個洞)。
+            # 多一條的代價是有人多看一眼,漏一條的代價是帶著問題上線。
+            missing, exact = hits, True
             for n, h in enumerate(missing, 1):
                 detail = h.get("message", "") + (
                     "(這個命中在 is_incremental() 為 True 的增量分支裡)"
@@ -3490,6 +3896,33 @@ def enforce_claim_evidence(report: dict) -> dict:
     return report
 
 
+# 檢核點裡跟規則層一樣寫死、不看模型有沒有回應的(見 _rule_hit_codes)。其他檢核點照
+# enforce_hints 看同一個檔的 finding 有沒有回應,以及設定的 forbid_pending_hints。
+_HARD_HINT_CODES = frozenset({
+    "H004",   # 撈憑證/密碼類欄位、明碼比對密碼:資安類
+    "H006",   # 以下四項是環境相依的寫法:沙盒與正式環境會走不同分支,執行驗證驗不到
+    "H007",   # 讀連線的語系/日期設定
+    "H008",   # dbt 編譯期的環境資訊
+    "H009",   # 現在時間與寫死的日期比較
+})
+
+
+def _rule_hit_codes(pre: list[dict]) -> list[str]:
+    """預掃裡規則層(R 系列)與 _HARD_HINT_CODES 列的檢核點命中的代號,排序、不重複。
+    決策閘門的硬條件用(見 apply_policy)。
+
+    從預掃結果算,不從 finding 認:模型可以自己寫一條同標題的 finding,也可以把命中的那條
+    寫成 info;檢核點「有沒有回應」看的是同一個檔的 finding 有沒有含關鍵詞,一條提到「密碼」
+    的 info 就算回應過。其他檢核點與學到的風格(S 系列)不算。"""
+    codes = set()
+    for entry in pre if isinstance(pre, list) else []:
+        for hit in entry.get("rules", []) if isinstance(entry, dict) else []:
+            code = hit.get("rule") if isinstance(hit, dict) else None
+            if isinstance(code, str) and (code.startswith("R") or code in _HARD_HINT_CODES):
+                codes.add(code)
+    return sorted(codes)
+
+
 @_isolated_stage("決策閘門")
 def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     """決策閘門(確定性):auto_approved / needs_human / blocked。
@@ -3535,6 +3968,14 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     # allowed_severities 只許 info 擋著(未完成的那條是 major),設定一放寬,
     # 沒跑完的審查就會被當成「沒問題」自動放行。跟執行驗證一樣不可由設定關閉。
     incomplete = review_incomplete(report)
+    # 規則層有命中、冷讀命中或沒看完 → 不得自動放行,也**寫死在程式裡**。只靠設定檔的
+    # allowed_severities 只許 info 擋著的話(命中至少是 minor、冷讀那條是 major),設定一放寬,
+    # 規則層驗到差異、或有文字在對審查者說話的 MR 就會被自動放行。資安與環境相依的檢核點
+    # (_HARD_HINT_CODES)也算在 rule_hits 裡:不看模型有沒有回應。兩個訊號都是程式寫的
+    # (`_rule_hits` 從預掃結果算、`_cold_read` 由冷讀那一道寫),不看 finding 的標題或嚴重度。
+    rule_hits = [str(code) for code in (report.get("_rule_hits") or [])]
+    cold = report.get("_cold_read")
+    cold_read = isinstance(cold, dict) and (cold.get("flagged") is True or cold.get("truncated") is True)
 
     blk = policy.get("block", {})
     if sum(s == "blocker" for s in
@@ -3549,6 +3990,8 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
           and not needs_human
           and not spec_changed
           and not incomplete
+          and not rule_hits
+          and not cold_read
           and report.get("score", 0) >= aa.get("min_score", 101)
           and severities <= set(aa.get("allowed_severities", []))
           and not (aa.get("forbid_pending_hints", True) and pending_hints))
@@ -3559,7 +4002,9 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
                                  "spec_exec_passed": spec_exec_ok,
                                  "needs_human": needs_human,
                                  "spec_changed": spec_changed,
-                                 "incomplete": incomplete}
+                                 "incomplete": incomplete,
+                                 "rule_hits": rule_hits,
+                                 "cold_read": cold_read}
     return report
 
 
@@ -3949,7 +4394,8 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                           spec_code, spec_text, affected: AffectedCheck | None = None,
                           dbt_ctx: DbtContext | None = None, dbt_cfg: dict | None = None,
                           incomplete: list[dict] | None = None,
-                          affected_specs: tuple = (), macro_issues: list | None = None) -> dict:
+                          affected_specs: tuple = (), macro_issues: list | None = None,
+                          yaml_issues: list | None = None) -> dict:
     """不經 LLM 的管線煙霧測試:預掃結果直接轉 findings,並驗證 memory/spec 可用。
     (執行驗證需要 LLM 生成測資,dry-run 不跑;只回報 spec 是否找得到。)
 
@@ -3982,6 +4428,7 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
     report = enforce_non_sql(report, pre)      # 與正式路徑一致
     report = enforce_lint_incomplete(report, pre)
     report = enforce_dbt_macro_problems(report, macro_issues or [])  # 與正式路徑一致
+    report = enforce_dbt_project_broken(report, yaml_issues or [])
     report = enforce_dbt_config_change(report, mr, dbt_ctx, dbt_cfg)
     report = enforce_dbt_notice(report, pre)   # 與正式路徑一致:表名未驗證的提醒不可少
     report = enforce_dbt_asset_names(report, mr, dbt_ctx, dbt_cfg)

@@ -26,8 +26,17 @@ def _render(source, incremental=False):
                         **({"incremental": True} if incremental else {}))
 
 
-def _check(source, *, incremental=None, calls=None):
-    """跟預掃一樣:先正常展開(需要時增量也一次),再交給 find_hidden_writes。"""
+def _writes_only(out: dict) -> dict:
+    """只留寫入語句那幾項:這一段的測試對準寫入關鍵字;分支裡的輸出另有一段測試。"""
+    out = {k: v for k, v in out.items() if k != hw.UNREACHED_OUTPUT}
+    if hw.UNREACHED not in out:
+        out.pop(hw.MODELS_CHECKED, None)
+    return out
+
+
+def _check(source, *, incremental=None, calls=None, outputs=False):
+    """跟預掃一樣:先正常展開(需要時增量也一次),再交給 find_hidden_writes。
+    outputs=False 時拿掉分支輸出那一項(見 _writes_only)。"""
     clean = {False: _render(source)}
     if incremental if incremental is not None else clean[False].incremental_checked:
         clean[True] = _render(source, True)
@@ -37,7 +46,8 @@ def _check(source, *, incremental=None, calls=None):
         if calls is not None:
             calls.append(inc)
         return _render(marked, inc)
-    return hw.find_hidden_writes(source, {k: v.sql for k, v in clean.items()}, render)
+    out = hw.find_hidden_writes(source, {k: v.sql for k, v in clean.items()}, render)
+    return out if outputs else _writes_only(out)
 
 
 # ─────────────────── 藏在沒有展開到的分支 ───────────────────
@@ -73,8 +83,16 @@ def test_正常的增量model不報_也不多展開():
            "SELECT id, amount FROM {{ source('raw', 'txn') }}\n"
            "{% if is_incremental() %}\nWHERE id > (SELECT MAX(id) FROM {{ this }})\n{% endif %}")
     calls = []
-    assert _check(src, calls=calls) == {}
-    assert calls == []                      # 原文沒有寫入關鍵字:不用插記號再展開
+    assert _check(src, calls=calls, outputs=True) == {}
+    assert calls == [False, True]           # 分支裡有輸出:兩種模式各插記號再展開一次
+
+
+def test_沒有寫入關鍵字也沒有分支的樣板不多展開():
+    src = ("{{ config(materialized='table') }}\n"
+           "SELECT id, amount FROM {{ source('raw', 'txn') }}")
+    calls = []
+    assert _check(src, calls=calls, outputs=True) == {}
+    assert calls == []
 
 
 @pytest.mark.parametrize("cond", [
@@ -384,7 +402,8 @@ HIDDEN = "SELECT 1 AS a\n{% if invocation_id == 'never' %}\n;DELETE FROM t\n{% e
 
 def test_預掃記下沒有展開到的寫入語句(_in_process):
     entry = _prescan(HIDDEN)
-    assert entry["dbt_hidden_writes"] == {hw.UNREACHED: [{"line": 3, "keyword": "DELETE"}]}
+    assert entry["dbt_hidden_writes"] == {hw.UNREACHED: [{"line": 3, "keyword": "DELETE"}],
+                                          hw.UNREACHED_OUTPUT: [{"line": 3}]}
     assert _in_process == [False, False]
 
 
@@ -527,3 +546,135 @@ def test_整條review_mr_沒有藏東西時不補(monkeypatch, tmp_path, _in_pro
 def test_dry_run_也補(monkeypatch, tmp_path, _in_process):
     report = _review(monkeypatch, tmp_path, HIDDEN, dry_run=True)
     assert len(_finding(report)) == 1
+
+
+# ─────────────────── 沒展開到的分支裡有輸出 ───────────────────
+# 關鍵字用樣板組出來時,固定文字裡找不到;對準的是「分支裡的輸出審查時沒有產生過」。
+
+@pytest.mark.parametrize("src, lines", [
+    # 運算式組出關鍵字
+    ("SELECT 1 AS a\n{% if invocation_id == 'never' %}\n;{{ 'DEL' ~ 'ETE' }} FROM t\n{% endif %}", [3]),
+    # 先 set 再輸出
+    ("SELECT 1 AS a\n{% if invocation_id == 'never' %}{% set k = 'DEL' + 'ETE' %}\n{{ k }} FROM t\n"
+     "{% endif %}", [3]),
+    # 只有運算式、沒有固定文字
+    ("SELECT 1 AS a\n{% if invocation_id == 'never' %}{{ k }}{% endif %}", [2]),
+    # 迴圈一次都沒跑
+    ("SELECT 1 AS a\n{% for x in [] %}\n{{ x }}\n{% endfor %}", [3]),
+    # 巢狀:外層有走到、內層沒有
+    ("{% if true %}SELECT 1 AS a\n{% if invocation_id == 'never' %}\n, 2 AS b\n{% endif %}{% endif %}", [3]),
+])
+def test_沒展開到的分支有輸出時記成無法確認(src, lines):
+    out = _check(src, outputs=True)
+    assert out == {hw.UNREACHED_OUTPUT: [{"line": n} for n in lines]}, out
+
+
+def test_樣板組出來的關鍵字_一般的寫入語句那一項照樣是空的():
+    """組出來的關鍵字靜態看不到:只有分支輸出那一項標得出來。"""
+    src = "SELECT 1 AS a\n{% if invocation_id == 'never' %}{{ 'DEL' ~ 'ETE' }} FROM t{% endif %}"
+    assert _check(src) == {}
+    assert _check(src, outputs=True) == {hw.UNREACHED_OUTPUT: [{"line": 2}]}
+
+
+@pytest.mark.parametrize("src", [
+    "SELECT 1 AS a\n{% if true %}\n, 2 AS b\n{% endif %}",
+    "SELECT 1 AS a\n{% if invocation_id != 'never' %}{{ ', 2 AS b' }}{% endif %}",
+    "SELECT {% for c in ['a', 'b'] %}{{ c }}{% if not loop.last %}, {% endif %}{% endfor %} FROM t",
+    # 分支裡只有空白、或沒有輸出的標記
+    "SELECT 1 AS a\n{% if invocation_id == 'never' %}\n   \n{% set x = 1 %}{# 註解 #}{% endif %}",
+    # 分支外面的輸出不看
+    "{{ config(materialized='table') }}\nSELECT {{ 1 + 1 }} AS a",
+])
+def test_分支的輸出有產生過_或分支裡沒有輸出時不報(src):
+    assert _check(src, outputs=True) == {}
+
+
+def test_增量分支的輸出在增量模式產生過_不報():
+    src = ("SELECT id FROM {{ source('raw', 'txn') }}\n"
+           "{% if is_incremental() %}\nWHERE id > (SELECT MAX(id) FROM {{ this }})\n{% endif %}")
+    assert _check(src, outputs=True) == {}
+    assert _check(src, incremental=False, outputs=True) == {hw.UNREACHED_OUTPUT: [{"line": 3}]}
+
+
+def test_修空白的寫法不讓輸出不同():
+    """`{{- … -}}`、`{%- … -%}` 會修掉前後的空白:記號插在運算式裡、固定文字的第一個非空白字元前,
+    去掉記號後要跟沒插時一模一樣(不同就會記成無法確認)。"""
+    src = ("SELECT 1 AS a\n{%- if true -%}\n  , {{- ' 2' -}}  AS b\n{%- endif -%}\n"
+           "{%- for c in ['x'] %}  , {{ c }}  {% endfor -%}")
+    assert _check(src, outputs=True) == {}
+
+
+def test_分支輸出太多時不逐一確認(monkeypatch):
+    monkeypatch.setattr(hw, "MAX_BRANCH_OUTPUTS", 2)
+    src = "SELECT 1 AS a {% if true %}, 2 AS b {{ 3 }} , 4 AS d{% endif %}"
+    out = _check(src, outputs=True)
+    assert set(out) == {hw.UNVERIFIED} and "分支裡的輸出超過 2 處" in out[hw.UNVERIFIED]
+
+
+def test_分支輸出的結果不帶原文_也不帶記號():
+    src = "SELECT 1 AS a\n{% if invocation_id == 'never' %}{{ 'SECRET_TEXT' }}{% endif %}"
+    out = json.dumps(_check(src, outputs=True), ensure_ascii=False)
+    assert "SECRET_TEXT" not in out and "SEGCRA" not in out
+
+
+def _branch_finding(report):
+    return [f for f in report["findings"] if f["title"] == pipeline._UNREACHED_BRANCH_TITLE]
+
+
+def test_分支輸出補一條major_寫出行號():
+    pre = [{"path": "models/m.sql", "dbt_hidden_writes": {
+        hw.UNREACHED_OUTPUT: [{"line": 5}, {"line": 2}, {"line": 5}]}}]
+    report = pipeline.enforce_dbt_hidden_writes({"findings": []}, pre)
+    [f] = _branch_finding(report)
+    assert (f["file"], f["line"], f["severity"]) == ("models/m.sql", 2, "major")
+    assert "第 5、2 行" in f["detail"] and "不得自動放行" in f["detail"]
+    assert "一般模式、增量模式都沒有" in f["detail"]
+    assert _finding(report) == []           # 沒有寫入語句那條
+
+
+def test_分支輸出的行已經列在寫入語句那條時不重複列():
+    hidden = {hw.UNREACHED: [{"line": 3, "keyword": "DELETE"}],
+              hw.UNREACHED_OUTPUT: [{"line": 3}, {"line": 7}]}
+    report = pipeline.enforce_dbt_hidden_writes(
+        {"findings": []}, [{"path": "models/m.sql", "dbt_hidden_writes": hidden}])
+    [f] = _branch_finding(report)
+    assert "第 7 行" in f["detail"] and "3" not in f["detail"].split("可能只有")[1].split("。")[0]
+    hidden[hw.UNREACHED_OUTPUT] = [{"line": 3}]
+    report = pipeline.enforce_dbt_hidden_writes(
+        {"findings": []}, [{"path": "models/m.sql", "dbt_hidden_writes": hidden}])
+    assert _branch_finding(report) == [] and len(_finding(report)) == 1
+
+
+def test_分支輸出列太多時只寫前幾個與總數():
+    pre = [{"path": "models/m.sql", "dbt_hidden_writes": {
+        hw.UNREACHED_OUTPUT: [{"line": n} for n in range(1, 16)]}}]
+    [f] = _branch_finding(pipeline.enforce_dbt_hidden_writes({"findings": []}, pre))
+    assert "第 1、2、3、4、5、6、7、8、9、10 行 等 15 處" in f["detail"]
+
+
+@pytest.mark.parametrize("items", ["x", None, [{"line": True}], [{"line": "3"}], ["3"], []])
+def test_分支輸出形狀不對的內容不補也不出錯(items):
+    pre = [{"path": "models/m.sql", "dbt_hidden_writes": {hw.UNREACHED_OUTPUT: items}}]
+    assert _branch_finding(pipeline.enforce_dbt_hidden_writes({"findings": []}, pre)) == []
+
+
+def test_模型自己輸出同標題的info_分支那條也會被取代():
+    pre = [{"path": "models/m.sql", "dbt_hidden_writes": {hw.UNREACHED_OUTPUT: [{"line": 2}]}}]
+    fake = {"file": "models/m.sql", "line": 2, "severity": "info",
+            "title": pipeline._UNREACHED_BRANCH_TITLE, "detail": "沒事", "suggestion": "",
+            "citations": []}
+    [f] = _branch_finding(pipeline.enforce_dbt_hidden_writes({"findings": [fake]}, pre))
+    assert f["severity"] == "major" and f["detail"] != "沒事"
+
+
+@pytest.mark.parametrize("src", [
+    "SELECT 1 AS a\n{% if invocation_id == 'never' %};{{ 'DEL' ~ 'ETE' }} FROM t{% endif %}",
+    "SELECT 1 AS a\n{% if invocation_id == 'never' %}{% set k = 'DEL' + 'ETE' %};{{ k }} FROM t"
+    "{% endif %}",
+])
+def test_整條review_mr_樣板組出關鍵字藏起來的不得自動放行(monkeypatch, tmp_path, _in_process, src):
+    report = _review(monkeypatch, tmp_path, src)
+    assert _finding(report) == []           # 寫入關鍵字那條看不到
+    [f] = _branch_finding(report)
+    assert (f["file"], f["line"], f["severity"]) == ("models/m.sql", 2, "major")
+    assert report["decision"] != "auto_approved"

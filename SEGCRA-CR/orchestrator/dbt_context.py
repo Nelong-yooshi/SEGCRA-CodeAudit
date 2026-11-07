@@ -36,13 +36,18 @@ from dataclasses import dataclass, field
 from .dbt_impact import ImpactReport, normalize_path, path_kind
 from .dbt_mr_impact import analyze_mr_macro_impact
 from .dbt_project import (DbtLayout, DbtProject, DbtProjectError, check_project_dir,
-                          extra_ref_names, load_dbt_project, read_layout)
+                          extra_ref_names, load_dbt_project, read_layout, yaml_file_problems)
 from .dbt_relations import project_info_from_files
 from .dbt_render import (DEFAULT_ISOLATED_MEMORY_MB, DEFAULT_ISOLATED_TIMEOUT_S, DbtProjectInfo,
                          is_dbt_template)
 from .isolation import run_isolated
 
 _SHA = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+# 取不回專案的原因裡,dbt 解析專案時一樣會整個失敗的(DbtContext.broken):跟「下載失敗、權限、
+# 設定錯誤」分開,報告才寫得出「這份內容會讓 dbt 整個專案失敗」
+PROJECT_YAML_INVALID = "project_yaml_invalid"      # dbt_project.yml 不是合法的 YAML
+PROJECT_FILE_REMOVED = "project_file_removed"      # MR 刪掉或移走了 dbt_project.yml
 
 
 @dataclass(frozen=True)
@@ -61,6 +66,9 @@ class DbtContext:
     base_macro_files: dict = field(default_factory=dict)
     # dbt 會讀的目錄(dbt_project.yml 的設定);None = 不知道,專案目錄裡的檔案都算
     layout: DbtLayout | None = None
+    # 取不回專案(error 有值)而且原因是 dbt 解析專案時一樣會整個失敗的:PROJECT_YAML_INVALID /
+    # PROJECT_FILE_REMOVED;其他原因是 None
+    broken: str | None = None
 
     def __post_init__(self):
         # 沒有內容、也沒有失敗原因的狀態不應該出現;萬一出現,當成取不回來(交人工),
@@ -236,24 +244,39 @@ def prepare_dbt_context(mr: dict, dbt_cfg: dict | None, *, real_mode: bool | Non
         # 跟以前一樣要讓人看到「取不回來」,不可以靜靜變成不適用(只是不必再下載整個專案)
         if not _needs_project(files, prefix):
             return None
+        if _removed_project_file(files, prefix):
+            return _failed(prefix, "MR 刪掉或移走了 dbt_project.yml", broken=PROJECT_FILE_REMOVED)
         return _failed(prefix, "head commit 讀不到 dbt_project.yml(專案目錄設定錯誤,或唯讀 token 看不到這個專案)")
     if not _needs_project(files, prefix, layout):
         return None
+    concat = dbt_cfg.get("sqlserver_schema_concat")
+    concat = concat if isinstance(concat, bool) else None
     try:
-        return _prepare(mr, prefix, load, summarize or _summarize_isolated, layout)
+        return _prepare(mr, prefix, load, summarize or _summarize_isolated, layout, concat)
     except Exception as e:                  # noqa: BLE001 — 一律收斂成取回失敗
         return _failed(prefix, f"準備 dbt 專案時發生非預期錯誤({type(e).__name__})", layout)
 
 
-def _failed(prefix: str, reason: str, layout: DbtLayout | None = None) -> DbtContext:
+def _failed(prefix: str, reason: str, layout: DbtLayout | None = None,
+            broken: str | None = None) -> DbtContext:
     """專案取不回來:專案裡的檔案交人工(見模組說明),macro 反查也當成做不了——
     不知道 MR 有沒有改到 macro,不可以回報「沒有影響」。"""
-    return DbtContext(prefix=prefix, error=reason, layout=layout, impact=ImpactReport(
+    return DbtContext(prefix=prefix, error=reason, layout=layout, broken=broken, impact=ImpactReport(
         uncertain=(f"無法取回 dbt 專案({reason}),macro 反查未執行,保守視為全部 model 可能受影響",),
         all_models_possibly_affected=True))
 
 
-def _prepare(mr: dict, prefix: str, load, summarize, layout: DbtLayout | None = None) -> DbtContext:
+def _with_concat_default(info: DbtProjectInfo, concat: bool | None) -> DbtProjectInfo:
+    """專案自己沒決定自訂 schema 要不要串接時,補上部署端設定的預設值(設定檔
+    dbt.sqlserver_schema_concat;沒設就維持無法確定)。在主行程補,不讓整理專案資訊的子行程
+    去讀設定。"""
+    if info.schema_concat_unset and concat is not None:
+        return dataclasses.replace(info, schema_concat=concat)
+    return info
+
+
+def _prepare(mr: dict, prefix: str, load, summarize, layout: DbtLayout | None = None,
+             concat: bool | None = None) -> DbtContext:
     sha, head_sha = mr.get("sha"), mr.get("head_sha")
     if not isinstance(sha, str) or not _SHA.fullmatch(sha):
         return _failed(prefix, "MR 沒有可用的 head commit 編號", layout)
@@ -267,11 +290,14 @@ def _prepare(mr: dict, prefix: str, load, summarize, layout: DbtLayout | None = 
     project = load(sha, prefix)
     if not isinstance(project, DbtProject) or not project.ok:
         reason = project.error if isinstance(project, DbtProject) and project.error else "原因不明"
-        return _failed(prefix, reason, layout)
+        broken = (PROJECT_YAML_INVALID if isinstance(project, DbtProject) and project.yaml_syntax_error
+                  else None)
+        return _failed(prefix, reason, layout, broken)
     summary = summarize(project)
     if summary is None:
         return _failed(prefix, "dbt 專案的屬性檔解析逾時或失敗", project.layout)
     info, macro_files = summary
+    info = _with_concat_default(info, concat)
     ctx = DbtContext(prefix=prefix, project=project, info=info, macro_files=macro_files,
                      layout=project.layout)
     # MR 在專案裡只改到 model:沒有 macro 反查要做,也就不需要變更前的專案(少一次下載、
@@ -286,7 +312,8 @@ def _prepare(mr: dict, prefix: str, load, summarize, layout: DbtLayout | None = 
     base_summary = summarize(base) if isinstance(base, DbtProject) and base.ok else None
     if base_summary is not None:           # 變更前的專案整理不出來:當成沒有可以比較的基準
         return dataclasses.replace(ctx, impact=impact, base_project=base,
-                                   base_info=base_summary[0], base_macro_files=base_summary[1])
+                                   base_info=_with_concat_default(base_summary[0], concat),
+                                   base_macro_files=base_summary[1])
     return dataclasses.replace(ctx, impact=impact)
 
 
@@ -305,10 +332,34 @@ def _summarize(project: DbtProject) -> tuple[DbtProjectInfo, dict]:
     return info, macro_files
 
 
+def _removed_project_file(files, prefix: str) -> bool:
+    """MR 刪掉或移走了專案的 dbt_project.yml(刪除,或改名成別的路徑)。"""
+    target = f"{prefix}/dbt_project.yml" if prefix else "dbt_project.yml"
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        if f.get("path") == target and f.get("deleted") is True:
+            return True
+        if f.get("old_path") == target and f.get("path") != target:
+            return True
+    return False
+
+
+def check_yaml_files_isolated(texts: dict) -> list[dict] | None:
+    """在子行程裡做 dbt_project.yaml_file_problems(會解析待審 repo 的 yml)。逾時、記憶體超限、
+    異常或回傳的形狀不對都回 None:沒檢查完,不可以當成沒有問題。"""
+    result = run_isolated(yaml_file_problems, (texts,), timeout_s=DEFAULT_ISOLATED_TIMEOUT_S,
+                          max_memory_mb=DEFAULT_ISOLATED_MEMORY_MB, on_failure=lambda _message: None)
+    if isinstance(result, list) and all(isinstance(item, dict) for item in result):
+        return result
+    return None
+
+
 def _summarize_isolated(project: DbtProject) -> tuple[DbtProjectInfo, dict] | None:
     """在子行程裡整理專案資訊;逾時、記憶體超限、異常或回傳的形狀不對都回 None。"""
     result = run_isolated(_summarize, (project,), timeout_s=DEFAULT_ISOLATED_TIMEOUT_S,
-                          max_memory_mb=DEFAULT_ISOLATED_MEMORY_MB, on_failure=lambda _message: None)
+                          max_memory_mb=DEFAULT_ISOLATED_MEMORY_MB, on_failure=lambda _message: None,
+                          types=(DbtProject, DbtProjectInfo))
     if (isinstance(result, tuple) and len(result) == 2
             and isinstance(result[0], DbtProjectInfo) and isinstance(result[1], dict)):
         return result

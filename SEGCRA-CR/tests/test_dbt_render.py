@@ -329,14 +329,14 @@ def test_dbt_only_block_does_not_hide_macros_in_the_same_file(tmp_path):
     "{% materialization m, default %}SELECT secret{% endmaterialization %}\nSELECT 1",
 ])
 def test_dbt_only_block_in_model_is_a_hard_failure(tmp_path, source):
-    """model 檔裡用這些標籤不是合法的 dbt 寫法。
+    """model 檔裡的 generic test 與自訂實體化:dbt 解析得過,但區塊裡的 SQL 會在別的地方執行。
 
-    默默把那段丟掉,我們會產出「比 dbt 少一段」的 SQL 卻回報展開成功——
-    整段 SQL 就這樣逃過預掃。寧可硬失敗。
+    默默把那段丟掉,那段 SQL 就逃過預掃,還回報展開成功。寧可硬失敗——但不算語法錯誤
+    (dbt 不會因此整個專案失敗)。
     """
     r = _render(code_root=tmp_path, source=source)
-    assert not r.ok
-    assert "unknown tag" in r.error
+    assert not r.ok and not r.syntax_error
+    assert r.error.startswith("DbtBlockInModel:")
     assert "secret" not in r.sql
 
 
@@ -352,7 +352,7 @@ def test_dbt_only_block_in_model_still_fails_after_macros_are_loaded(tmp_path):
     r = _render(code_root=tmp_path,
                 source="{% test z(model) %}SELECT secret{% endtest %}SELECT {{ amt() }}")
     assert not r.ok
-    assert "unknown tag" in r.error
+    assert r.error.startswith("DbtBlockInModel:")
     assert "secret" not in r.sql
 
 
@@ -1000,8 +1000,16 @@ def _imports_of(path: pathlib.Path) -> set[str]:
     # contextvars:一份審查共用一個 invocation_id(每條執行緒各自一個值),不帶來任何對外能力
     ("dbt_render.py", {"contextvars", "copy", "dataclasses", "difflib", "jinja2", "pathlib", "re",
                        "secrets", "types", ".isolation"}),
-    ("isolation.py", {"multiprocessing", "resource"}),
+    # 隔離子行程裡實際跑的那一側(進入點、JSON 編解碼):json、dataclasses、math、pathlib 做編解碼,
+    # importlib 照主行程指定的「模組:名稱」找回函式,sys 讀 stdin、寫 stdout,resource 設記憶體上限
+    ("isolation_child.py", {"dataclasses", "importlib", "json", "math", "pathlib", "resource", "sys"}),
+    # isolation.py(主行程那一側)不在這裡:它要啟動子行程,本來就需要 subprocess 與 os(只給列出的
+    # 環境變數),asyncio 也開得了連線與子行程。它可以有這些,因為它不讀、不展開不可信的內容——
+    # MR 的內容只當成參數編碼後交給子行程,子行程的指令固定(sys.executable -I 加固定的進入點,
+    # 不經 shell)。它實際用到哪些由語法樹檢查鎖住:asyncio 見下面的
+    # test_isolation_uses_only_loop_calls_for_threads,subprocess 與 os 見 tests/test_isolation.py。
     ("dbt_relations.py", {"re", "yaml", ".dbt_render"}),
+    ("dbt_exec.py", {"__future__", "re", "sqlglot", ".dbt_render", "toolbox"}),
 ])
 def test_module_imports_are_allowlisted(module, allowed):
     """處理不可信內容的模組不得悄悄獲得網路、指令執行、檔案寫入等能力。
@@ -1009,7 +1017,7 @@ def test_module_imports_are_allowlisted(module, allowed):
     assert _imports_of(PKG_ROOT / "orchestrator" / module) == allowed
 
 
-@pytest.mark.parametrize("module", ["dbt_render.py", "isolation.py", "dbt_relations.py"])
+@pytest.mark.parametrize("module", ["dbt_render.py", "isolation.py", "dbt_relations.py", "dbt_exec.py"])
 def test_modules_never_write_files_or_exec(module):
     """以語法樹檢查(不用子字串比對,避免誤判或換個寫法就漏判):不寫檔、不執行程式碼。"""
     tree = ast.parse((PKG_ROOT / "orchestrator" / module).read_text(encoding="utf-8"))
@@ -1018,6 +1026,33 @@ def test_modules_never_write_files_or_exec(module):
     assert not names & {"open", "eval", "exec", "compile", "__import__", "input", "breakpoint"}
     assert not attrs & {"write_text", "write_bytes", "open", "unlink", "mkdir", "rmdir", "rmtree",
                         "system", "popen", "chmod", "rename", "replace_file", "symlink_to"}
+
+
+def test_isolation_uses_only_loop_calls_for_threads():
+    """isolation.py 用 asyncio 只為了等背景執行緒的結果:asyncio 只用 get_running_loop,
+    拿到的迴圈只用 create_future、call_soon_threadsafe。開連線、起子行程(open_connection、
+    create_subprocess_exec、loop.create_connection、loop.subprocess_exec……)都不在其中。"""
+    tree = ast.parse((PKG_ROOT / "orchestrator" / "isolation.py").read_text(encoding="utf-8"))
+    from_asyncio = [n for n in ast.walk(tree)
+                    if isinstance(n, ast.ImportFrom) and (n.module or "").startswith("asyncio")]
+    assert not from_asyncio
+    used = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name):
+            used.setdefault(n.value.id, set()).add(n.attr)
+    assert used.get("asyncio") == {"get_running_loop"}
+    assert used.get("loop") == {"create_future", "call_soon_threadsafe"}
+    # 迴圈只存在 loop 這個名字裡:換個名字就繞過上面的檢查
+    holders = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign)
+               and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Attribute)
+               and n.value.func.attr == "get_running_loop" for t in n.targets
+               if isinstance(t, ast.Name)}
+    assert holders == {"loop"}
+
+
+def test_isolation_child_never_writes_files_or_exec():
+    """隔離子行程裡實際跑的那一側,同上一條的語法樹檢查。"""
+    test_modules_never_write_files_or_exec("isolation_child.py")
 
 
 # ---------------------------------------------------------------- 隔離展開
@@ -1058,8 +1093,8 @@ def test_isolation_returns_result_and_fails_closed_on_crash_or_exception():
 
 
 def test_isolation_start_failure_is_closed():
-    """子行程啟動失敗(例如參數不能 pickle)也要收斂成失敗,不可把例外丟給呼叫端。"""
-    result = _isolated(len, lambda x: x)      # lambda 不能 pickle
+    """子行程啟動失敗(例如參數不能傳遞)也要收斂成失敗,不可把例外丟給呼叫端。"""
+    result = _isolated(len, lambda x: x)      # lambda 不能經 JSON 傳遞
     assert result[0] == "失敗"
     assert "子行程" in result[1]
 

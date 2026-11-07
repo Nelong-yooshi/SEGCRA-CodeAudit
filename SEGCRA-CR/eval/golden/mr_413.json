@@ -1,0 +1,31 @@
+{
+  "title": "R-140 現金大額入帳監控:改寫成 dbt model",
+  "description": "依核定規格 specs/R-140.md 以 dbt model 實作;交易資料用 source('raw', 'txn_log') 引用,三項排除條件(沖銷、小額、行銷撥入)均已納入。",
+  "sha": "c413000000000000000000000000000000000413",
+  "diff_refs": {
+    "base_sha": "a413000000000000000000000000000000000413",
+    "head_sha": "c413000000000000000000000000000000000413",
+    "start_sha": "a413000000000000000000000000000000000413"
+  },
+  "files": [
+    {
+      "path": "models/mrt_cash_inbound.sql",
+      "diff": "@@ -0,0 +1,13 @@\n+-- R-140: 當日現金入帳累計達 500000(含)通報\n+SELECT\n+    t.account_id,\n+    SUM(t.amount) AS total_amount\n+FROM {{ source('raw', 'txn_log') }} t\n+WHERE t.op_code IN ('OP01','OP02','OP03')\n+  AND t.cash_flag = 'Y'\n+  AND COALESCE(t.rev_flag, 'N') <> 'Y'\n+  AND t.amount > 1000\n+  AND COALESCE(t.channel_name, '') <> 'PROMO'\n+  AND t.tx_time >= @start_date AND t.tx_time < @end_date\n+GROUP BY t.account_id\n+HAVING SUM(t.amount) >= 500000;"
+    }
+  ],
+  "expected": [],
+  "_golden": {
+    "layer": "spec_exec",
+    "dbt_enabled": true,
+    "intent": "dbt model 的執行驗證(#76 第 1 步):跟 mr_406 是同一份正確的 R-140 SQL,只把表名換成 {{ source('raw', 'txn_log') }}。只引用 source() 的 model 展開時,source() 換成規格「資料表定義」的表名([txn_log])再送進沙盒,用同一份規格與凍結測資,結果應跟 mr_406 一樣通過。dbt 專案放在 eval/golden/dbt_archives/ 底下(base 與 head 各一份;base 沒有這個 model、head 有),MR 只有 diff,跟真實 GitLab 模式一樣。",
+    "expect_signals": {
+      "spec_found": true,
+      "spec_exec_passed": true
+    },
+    "forbid_findings": [
+      {
+        "severity": "blocker"
+      }
+    ]
+  }
+}

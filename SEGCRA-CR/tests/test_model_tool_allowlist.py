@@ -244,10 +244,42 @@ def test_管線在決策前補這條_並讀的是同一個_hub():
 
 
 def test_審查迴圈走白名單入口():
-    """run_agent 執行模型要求的工具時,必須走 call_from_model,不能直接 call()。"""
-    src = inspect.getsource(agent.run_agent)
+    """執行模型要求的工具時,必須走 call_from_model,不能直接 call()。
+
+    掃的是**迴圈本身**(`_run_agent`):`run_agent` 現在是建立用戶端、跑完、保證
+    關掉的薄包裝,迴圈在裡面那一層。"""
+    src = inspect.getsource(agent._run_agent)
     assert "hub.call_from_model(tc.function.name, args)" in src
     assert "hub.call(" not in src
+
+
+def test_用戶端一定會被關掉():
+    """不關的話,httpx 的連線池會留到物件被回收才收尾,而那通常在事件迴圈關掉
+    之後 —— 每次 asyncio.run 結束都印一行 RuntimeError: Event loop is closed。"""
+    closed = []
+
+    class _Client:
+        def __init__(self, **_):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        async def _create(self, **_kw):
+            raise RuntimeError("端點掛了")
+
+        async def close(self):
+            closed.append(True)
+
+    import orchestrator.agent as agent_mod
+    original = agent_mod.AsyncOpenAI
+    agent_mod.AsyncOpenAI = _Client
+    try:
+        cfg = SimpleNamespace(endpoint="http://x/v1", api_key="k")
+        profile = SimpleNamespace(model="m", temperature=0, max_output_tokens=100,
+                                  seed=None, reasoning_effort=None)
+        with pytest.raises(RuntimeError, match="端點掛了"):
+            asyncio.run(agent.run_agent(cfg, profile, "sys", "user", _hub(), verbose=False))
+    finally:
+        agent_mod.AsyncOpenAI = original
+    assert closed == [True], "丟例外的時候也要關"
 
 
 BAD_MR_IDS = ["1/../../issues/5", "x/../../config/x", "1?private_token=x", "1#x", "", "-1",

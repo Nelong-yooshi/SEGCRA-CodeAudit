@@ -35,6 +35,7 @@ from decimal import Decimal
 from toolbox.gitlab import UNAVAILABLE_TEXT, fetch_file
 from .agent import extract_json, output_truncated, run_agent
 from .config import Config, PKG_ROOT
+from .isolation import run_in_thread
 
 SPECS_DIR = PKG_ROOT / "specs"
 
@@ -95,7 +96,7 @@ class SpecLookup(tuple):
     def __getnewargs__(self):
         """複製與 pickle 都靠它。沒有的話 tuple 子類別會把 (code, text) 整個當成
         第一個參數傳回 __new__,三種都丟 TypeError —— 管線有 deepcopy(capture),
-        隔離子行程用 pickle 傳結果,踩到只是時間問題。"""
+        踩到只是時間問題。"""
         return (self[0], self[1], self.unavailable)
 
 
@@ -1837,57 +1838,6 @@ STAGE_SANDBOX = "沙盒執行"
 STAGE_ARBITRATE = "仲裁"
 
 
-async def _in_thread(fn, *args):
-    """把同步函式丟到背景執行緒跑,讓外層的 await 能準時回來。
-
-    為什麼需要(#53 review 第 1 點):`execute_cases` 是同步的 pymssql 呼叫,它在跑的
-    時候事件迴圈整個卡住,外面的 `asyncio.wait_for` **插不進去**。實測:上限設 1 秒、
-    沙盒卡 6 秒,結果跑了 6 秒、沒有逾時、結果照常回傳——時間上限對沙盒階段等於不存在。
-
-    不用 `asyncio.to_thread`(預設執行緒池):`asyncio.run` 結束時會等池子裡的工作做完,
-    等於逾時又被拖回去(跟 #33 的 `_wait_in_thread` 同一個理由)。自己開 daemon 執行緒,
-    逾時就讓它自己跑完自己結束,外層不等它。
-
-    `contextvars` 要帶進去:審查用的 ref 釘在 ContextVar 裡(#31),不帶進去的話背景
-    執行緒讀到的是預設值。
-    """
-    import contextvars
-    import threading
-    loop = asyncio.get_running_loop()
-    fut: asyncio.Future = loop.create_future()
-    ctx = contextvars.copy_context()
-
-    def settle(apply):
-        """把結果交回事件迴圈。迴圈已經關掉就安靜放掉。
-
-        逾時之後外層不等這個執行緒,它可能在迴圈收掉之後才跑完 —— 那時
-        `call_soon_threadsafe` 會丟 `RuntimeError: Event loop is closed`,而這個例外
-        發生在 daemon 執行緒裡,沒有人接:正式環境的 log 每逾時一次就多一段看起來很
-        嚴重的 traceback,排查的人會先去追它;測試套件則是長期掛著警告。
-        逾時的結果本來就不要了,放掉是對的,但要**安靜地**放掉。
-        """
-        try:
-            loop.call_soon_threadsafe(apply)
-        except RuntimeError:                  # 迴圈已經關了
-            pass
-
-    def runner():
-        try:
-            out = ctx.run(fn, *args)
-        except BaseException as e:            # noqa: BLE001 — 原樣交回給 await 端
-            # **要先綁到自己的變數**:`except ... as e` 的 e 在區塊結束時就被刪掉,
-            # 而這個 lambda 是丟給事件迴圈稍後才跑的。直接捕捉 e 的話,跑的時候會丟
-            # NameError,fut 永遠不會有結果,await 就**永遠掛著** —— 沙盒丟例外時
-            # 整個執行驗證卡住,要等外層的時間上限才被砍掉。
-            exc = e
-            settle(lambda: fut.cancelled() or fut.set_exception(exc))
-        else:
-            settle(lambda: fut.cancelled() or fut.set_result(out))
-
-    threading.Thread(target=runner, name="spec-exec-sandbox", daemon=True).start()
-    return await fut
-
-
 def _execute(sql: str, plan: dict, deadline: float | None):
     """呼叫 execute_cases,吃不吃 deadline 由它的簽名決定。
 
@@ -2018,9 +1968,9 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
     # 角色二:確定性執行
     _t = _enter(STAGE_SANDBOX)
     try:
-        # 同步的 pymssql 呼叫丟到背景執行緒,外層的時間上限才插得進來(見 _in_thread);
+        # 同步的 pymssql 呼叫丟到背景執行緒,外層的時間上限才插得進來(見 isolation.run_in_thread);
         # deadline 讓它自己也會在上限前停下來,不要留一個還在灌資料的執行緒。
-        ex = await _in_thread(_execute, sql, plan, deadline)
+        ex = await run_in_thread(_execute, sql, plan, deadline, name="spec-exec-sandbox")
     finally:
         _leave(STAGE_SANDBOX, _t)
     if ex["sandbox_error"]:

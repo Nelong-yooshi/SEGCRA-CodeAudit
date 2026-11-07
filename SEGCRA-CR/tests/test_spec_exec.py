@@ -2076,7 +2076,7 @@ def test_沙盒逾時中止要在缺口裡說是逾時(monkeypatch):
 def test_run_spec_exec_的沙盒同步卡住時外層逾時得了(monkeypatch):
     """走真路徑:`run_spec_exec` 裡的沙盒換成同步卡 5 秒,外層上限 1 秒。
 
-    直接測 `_in_thread` 不夠——呼叫處改回直接呼叫(不丟執行緒)時,那條測試照樣綠,
+    直接測 `isolation.run_in_thread` 不夠——呼叫處改回直接呼叫(不丟執行緒)時,那條測試照樣綠,
     而這正是老闆實測到的壞法:上限 1 秒、沙盒卡 6 秒,跑了 6 秒還不逾時。
     """
     import time as _t
