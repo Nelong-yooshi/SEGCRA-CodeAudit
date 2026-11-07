@@ -6,7 +6,9 @@
 工具壞掉時沒人會發現,所以它的關鍵行為也要有測試守著。
 """
 import importlib.util
+import os
 import pathlib
+import sys
 
 import pytest
 
@@ -115,15 +117,44 @@ def test_收集錯誤不算抓到(code, out, verdict):
     assert mutate._verdict(code, out)[0] == verdict
 
 
+def test_匯入時才壞的突變算設定錯誤(tmp_path):
+    """語法過得去、**匯入時才壞**的突變(典型是正規式寫壞):模組一匯入就炸,
+    每個測試檔都收集失敗、每條都紅,看起來像被抓到,其實沒有一條測試驗到那個行為。
+    跟語法錯誤同一類,由工具自己擋掉,不要靠人發現。"""
+    (tmp_path / "orchestrator").mkdir()
+    (tmp_path / "orchestrator" / "m.py").write_text(
+        'import re\nRX = re.compile(r"(a)")\n', encoding="utf-8")
+    verdict, why = mutate._run_mutant(
+        tmp_path, ("m.py", 'RX = re.compile(r"(a)")', 'RX = re.compile(r"(a")'),
+        sys.executable, 60, dict(os.environ))
+    assert verdict == "config", why
+    assert "匯入" in why, why
+
+
+def test_匯入得起來的突變照常判定(tmp_path, monkeypatch):
+    """反面:匯入沒問題時不要被這道檢查擋下來。"""
+    (tmp_path / "orchestrator").mkdir()
+    (tmp_path / "orchestrator" / "m.py").write_text("X = 1\n", encoding="utf-8")
+    monkeypatch.setattr(mutate, "_verdict", lambda *a: ("caught", "假的"))
+    verdict, _ = mutate._run_mutant(tmp_path, ("m.py", "X = 1", "X = 2"),
+                                    sys.executable, 60, dict(os.environ))
+    assert verdict == "caught"
+
+
 def test_逾時不算抓到(tmp_path, monkeypatch):
     (tmp_path / "orchestrator").mkdir()
     (tmp_path / "orchestrator" / "m.py").write_text("X = 1\n", encoding="utf-8")
 
-    def stuck(*a, **kw):
-        raise mutate.subprocess.TimeoutExpired("pytest", 1)
+    real = mutate.subprocess.run
+
+    def stuck(args, **kw):
+        if "pytest" in args:            # 只卡住測試套件那一次,匯入檢查照常跑
+            raise mutate.subprocess.TimeoutExpired("pytest", 1)
+        return real(args, **kw)
 
     monkeypatch.setattr(mutate.subprocess, "run", stuck)
-    verdict, _ = mutate._run_mutant(tmp_path, ("m.py", "X = 1", "X = 2"), "python", 1, {})
+    verdict, _ = mutate._run_mutant(tmp_path, ("m.py", "X = 1", "X = 2"),
+                                    sys.executable, 1, dict(os.environ))
     assert verdict == "timeout"
 
 
