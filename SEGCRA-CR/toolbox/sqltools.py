@@ -7,9 +7,11 @@ import json
 import logging
 import os
 import re
+from typing import NamedTuple
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.errors import SqlglotError
 
 from orchestrator.config import env_seconds
 from orchestrator.isolation import run_isolated
@@ -31,26 +33,36 @@ def parse_statements(sql: str):
 
 # 舊名字:等 pipeline 與 dbt_affected 的呼叫端換過去之後移除。先留著是因為那兩個
 # 檔案現在有在途的改動,一起改會撞在一起。
-_parse = parse_statements
 
 
-def _semicolon_cuts(sql: str) -> list[int]:
-    """分號的位置(切在分號**後面**)。字串、識別字、註解裡的分號不算。
+def _skip_block_comment(sql: str, i: int, end: int) -> int:
+    """跳過從 i 開始的區塊註解,回傳註解後的位置。
 
-    **自己掃而不是用 sqlglot 的 tokenizer**:斷詞對沒收尾的引號或區塊註解會整個
-    失敗,而那正是這道要擋的手法 —— 在檔尾加一個 `'` 或 `/*`,整份就退回一次解析,
-    前面那句 `DELETE FROM t;` 的 blocker 又不見了,比巢狀運算式更容易做出來。
-
-    沒收尾的就吃到檔尾:那一段變成最後一「句」,解析失敗記成錯誤,**前面的句子照樣
-    逐句解析**。切錯的代價也只是那一段解析不了,不會吃掉別句。
+    **T-SQL 的區塊註解可以巢狀**:`/* a /* b */ 還在註解裡 */`。只找第一個 `*/` 的話,
+    內層一閉合就以為註解結束了,夾在中間的分號會被當成切點。沒收尾的吃到結尾。
     """
-    cuts, i, n = [], 0, len(sql)
+    depth, i = 1, i + 2
+    while i < end and depth:
+        if sql.startswith("/*", i):
+            depth, i = depth + 1, i + 2
+        elif sql.startswith("*/", i):
+            depth, i = depth - 1, i + 2
+        else:
+            i += 1
+    return i
+
+
+def _scan_code(sql: str):
+    """逐一吐出「不在字串、識別字、註解裡」的位置與字元:`(位置, 字元)`。
+
+    切句的兩個掃描器(分號、行首關鍵字)共用這一份:字串常值、`[...]`/`"..."` 識別字、
+    行註解與可巢狀的區塊註解整段跳過,沒收尾的就吃到檔尾。各寫一份的話,補了一邊的
+    跳脫規則就會漏掉另一邊。
+    """
+    i, n = 0, len(sql)
     while i < n:
         ch = sql[i]
-        if ch == ";":
-            cuts.append(i + 1)
-            i += 1
-        elif ch == "'":                      # 字串('' 是跳脫,不是結束)
+        if ch == "'":                        # 字串('' 是跳脫,不是結束)
             i += 1
             while i < n:
                 if sql[i] == "'":
@@ -63,28 +75,65 @@ def _semicolon_cuts(sql: str) -> list[int]:
         elif ch in '"[':                     # 以引號或方括號包起來的識別字
             j = sql.find('"' if ch == '"' else "]", i + 1)
             i = n if j < 0 else j + 1
-        elif sql.startswith("--", i):        # 行註解
+        elif sql.startswith("--", i):        # 行註解:停在換行上,換行本身還要看得到
             j = sql.find("\n", i)
-            i = n if j < 0 else j + 1
+            i = n if j < 0 else j
         elif sql.startswith("/*", i):        # 區塊註解(T-SQL 可以巢狀)
-            depth, i = 1, i + 2
-            while i < n and depth:
-                if sql.startswith("/*", i):
-                    depth, i = depth + 1, i + 2
-                elif sql.startswith("*/", i):
-                    depth, i = depth - 1, i + 2
-                else:
-                    i += 1
+            i = _skip_block_comment(sql, i, n)
         else:
+            yield i, ch
             i += 1
-    return cuts
 
 
-def _statement_chunks(sql: str) -> list[tuple[str, int]]:
-    """依分號切成一句一句,回傳 [(這一句的原文, 它在檔案裡的起始行 - 1)]。
+def _semicolon_cuts(sql: str) -> list[int]:
+    """分號的位置(切在分號**後面**)。字串、識別字、註解裡的分號不算。
+
+    **自己掃而不是用 sqlglot 的 tokenizer**:斷詞對沒收尾的引號或區塊註解會整個
+    失敗,而那正是這道要擋的手法 —— 在檔尾加一個 `'` 或 `/*`,整份就退回一次解析,
+    前面那句 `DELETE FROM t;` 的 blocker 又不見了,比巢狀運算式更容易做出來。
+
+    沒收尾的就吃到檔尾:那一段變成最後一「句」,解析失敗記成錯誤,**前面的句子照樣
+    逐句解析**。切錯的代價也只是那一段解析不了,不會吃掉別句。
+    """
+    return [i + 1 for i, ch in _scan_code(sql) if ch == ";"]
+
+
+class Chunk(NamedTuple):
+    """切出來的一句。
+
+    text         這一句的原文(含前面的註解與空白)
+    line_offset  它在檔案裡的起始行 - 1(解析錯誤的行號要加上它才對得回原檔)
+    start        **第一個有意義的字元**在整份 SQL 裡的位置(跳過前面的空白與註解)
+                 —— 要寫出「這一句在第幾行」「它是不是那一行的第一段內容」時用它
+    """
+    text: str
+    line_offset: int
+    start: int
+
+
+def _first_token(sql: str, i: int, end: int) -> int:
+    """從 i 往後找第一個不是空白、也不在註解裡的位置;整段都是空白與註解時回 end。"""
+    while i < end:
+        if sql[i].isspace() or sql[i] == ";":
+            i += 1
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = end if j < 0 else j + 1
+        elif sql.startswith("/*", i):
+            i = _skip_block_comment(sql, i, end)
+        else:
+            return i
+    return end
+
+
+def statement_chunks(sql: str) -> list[Chunk]:
+    """依分號切成一句一句。
 
     切句用自己的掃描器(見 `_semicolon_cuts`):字串常值與註解裡的分號不算,
     沒收尾的引號或註解也不會讓整份退回一次解析。
+
+    **切句的邏輯只留這一份**:預掃逐句解析、展開後的行號對回原始檔、受影響 model 的
+    逐句比較,三處都用它。各寫各的時候,補了一處就會漏掉另外兩處。
     """
     cuts = _semicolon_cuts(sql)
     if not cuts:
@@ -93,8 +142,199 @@ def _statement_chunks(sql: str) -> list[tuple[str, int]]:
     for cut in cuts + ([len(sql)] if cuts[-1] < len(sql) else []):
         chunk = sql[start:cut]
         if chunk.strip(" \t\r\n;"):
-            out.append((chunk, sql.count("\n", 0, start)))
+            out.append(Chunk(chunk, sql.count("\n", 0, start),
+                             _first_token(sql, start, cut)))
         start = cut
+    return out
+
+
+# 語句開頭的關鍵字。**沒有分號的多句**要靠它們切:`DELETE FROM t` 換行接
+# `SELECT 1 AS x`,兩句都正確但沒有分號,整份當成一句就解析不了 —— 於是一條 AST 規則
+# 都不跑,那句 `DELETE` 沒有 WHERE 的 blocker 也跟著不見。T-SQL 不寫分號很常見。
+_STMT_KEYWORDS = (
+    "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "WITH", "TRUNCATE",
+    "CREATE", "ALTER", "DROP", "GRANT", "REVOKE", "DENY", "BACKUP", "RESTORE",
+    "EXEC", "EXECUTE", "DECLARE", "SET", "PRINT", "USE", "IF", "WHILE", "BEGIN",
+)
+# `.match(sql, i)` 本身就從 i 開始比,不要加 `^`:沒有 MULTILINE 時 `^` 只在整份的
+# 開頭才成立,加了就等於永遠不切。
+_KEYWORD_LINE_RE = re.compile(r"(?i)[ \t]*(?:" + "|".join(_STMT_KEYWORDS) + r")\b")
+# 同一份關鍵字,但比對任意位置(剝掉 `IF 條件` 之後找語句從哪裡開始)
+_KEYWORD_ANY_RE = re.compile(r"(?i)(?<![\w.@\[])(?:" + "|".join(_STMT_KEYWORDS) + r")\b")
+
+
+def _keyword_cuts(sql: str) -> list[int]:
+    """每一行的開頭位置,**而且那一行以語句關鍵字開頭、又不在字串或註解裡**。
+
+    只認「行首」而不是任何位置:在行中認關鍵字會把 `WHERE x IN (SELECT …)` 切斷。
+    """
+    return [i + 1 for i, ch in _scan_code(sql)
+            if ch == "\n" and _KEYWORD_LINE_RE.match(sql, i + 1)]
+
+
+def _split_by_keyword(text: str, line_offset: int) -> list[Chunk] | None:
+    """解析不了的一段,改以行首的語句關鍵字再切一次;**每一段都解析得過才算數**。
+
+    **只在解析失敗時才試**,而且全部解析得過才採用:正常寫法(`INSERT INTO t` 換行接
+    `SELECT …`、`UNION ALL`、CTE、`MERGE … WHEN MATCHED THEN UPDATE`)本來就解析得過,
+    根本不會走到這裡 —— 所以切錯把它們拆散的風險不存在。切完還是有一段解析不了的,
+    就當作沒切過,照舊回報那一段解析失敗,不會把「一句壞掉」變成「好幾句壞掉」。
+    """
+    cuts = _keyword_cuts(text)
+    if not cuts:
+        return None
+    out, start = [], 0
+    for cut in list(cuts) + [len(text)]:
+        piece = text[start:cut]
+        if piece.strip(" \t\r\n;"):
+            out.append(Chunk(piece, line_offset + text.count("\n", 0, start),
+                             _first_token(text, start, cut)))
+        start = cut
+    if len(out) < 2:
+        return None
+    for chunk in out:
+        try:
+            if not [st for st in parse_statements(chunk.text) if st is not None]:
+                return None
+        except (SqlglotError, RecursionError):   # 有一段解析不了就當作沒切過
+            return None
+    return out
+
+
+# 程序性的區塊。T-SQL 的 `BEGIN … END`、`BEGIN TRY … END TRY`、`IF 條件 <一句>`
+# 這些,sqlglot 不是整段退回 `Command`(只剩原文、沒有語法樹),就是解析成別的東西
+# (`IF @x = 1` 換行接 `DELETE FROM t` 會被讀成條件 `@x = 1 AS DELETE`,刪除變成讀取)。
+# 兩種都讓裡面的寫入語句對規則層消失,而且報告長得跟掃過了沒問題一樣。
+_BLOCK_EDGE_RE = re.compile(
+    r"(?i)^\s*(?:BEGIN\s+TRY|BEGIN\s+CATCH|END\s+TRY|END\s+CATCH"
+    r"|BEGIN(?!\s+TRAN)|END|GO)\b")
+_COND_HEAD_RE = re.compile(r"(?i)^\s*(?:IF|WHILE|ELSE)\b")
+# 區塊的結尾。`BEGIN TRY … END TRY` 的 END 在最後面,只剝開頭的話,剝完仍然解析不了。
+_BLOCK_TAIL_RE = re.compile(r"(?i)(?:END\s+TRY|END\s+CATCH|END|GO)\s*;?\s*$")
+# 程序、函式、觸發程序的標頭。`CREATE PROCEDURE` 解析得出 `Create`(裡面的寫入語句
+# 走語法樹找得到),但 `ALTER PROCEDURE`、`CREATE TRIGGER` 會整段退回 `Command` ——
+# 標頭剝到 `AS` 為止,剩下的本體照常逐句解析。
+_PROC_HEAD_RE = re.compile(
+    r"(?i)^\s*(?:CREATE|ALTER)\s+(?:OR\s+ALTER\s+)?"
+    r"(?:PROC|PROCEDURE|FUNCTION|TRIGGER)\b[\s\S]{0,2000}?\bAS\b")
+# 原文裡出現、但語法樹裡找不到的寫入語句 = 解析把它吃掉了
+_WRITE_WORD_RE = re.compile(r"(?i)(?<![\w.@\[])(DELETE|UPDATE|INSERT|MERGE|DROP|TRUNCATE)\b")
+_WRITE_NODES = (exp.Delete, exp.Update, exp.Insert, exp.Merge, exp.Drop, exp.TruncateTable)
+
+
+class _BlockNotParsed(Exception):
+    """程序性區塊剝不開。自己的型別,不是解析器丟的 —— 訊息是我們寫的固定字串,
+    不含 MR 的原文(解析失敗的說明會貼回 MR 留言,見 parse_error_text)。"""
+
+
+def _writes_seen(statements) -> int:
+    return sum(len(list(st.find_all(*_WRITE_NODES))) + isinstance(st, _WRITE_NODES)
+               for st in statements if st is not None)
+
+
+def _code_text(sql: str) -> str:
+    """把字串常值與註解挖掉、只留程式碼本身(長度不變,挖掉的位置填空白)。
+
+    判斷「原文寫著 DELETE 卻不在語法樹裡」時要用它:`-- DELETE FROM t` 只是註解,
+    算進去的話,一個純註解的段落會被判成「寫入語句消失了」而報成無法解析。
+    """
+    keep = bytearray(b" ") * len(sql)
+    for i, ch in _scan_code(sql):
+        keep[i] = ord(ch) if ch.isascii() else ord("x")
+    return keep.decode("ascii")
+
+
+def _block_unclear(text: str, statements) -> bool:
+    """這一段是不是「裡面的寫入語句對規則層消失了」。
+
+    兩種都算:解析退回 `Command`(只剩原文),或原文寫著 `DELETE`/`UPDATE`… 而語法樹裡
+    一個都找不到。只有註解或 `END` 這種沒有寫入字樣的段落不算 —— 它們本來就沒東西可驗。
+    """
+    if not _WRITE_WORD_RE.search(_code_text(text)):
+        return False
+    if _writes_seen(statements) == 0:
+        return True
+    return any(isinstance(st, exp.Command) or st.find(exp.Command) is not None
+               for st in statements if st is not None)
+
+
+def _strip_block_heads(text: str) -> str:
+    """把區塊的外框剝掉:`BEGIN TRY`、`END CATCH`、`IF 條件`、`WHILE 條件` 這些。
+
+    條件剝到第一個語句關鍵字為止。剝錯了不會有事:呼叫端只在「剝完解析得過、而且原文
+    寫著的寫入語句都在語法樹裡」時才採用,否則照舊記成解析失敗。
+    """
+    prev = None
+    while prev != text:
+        prev = text
+        m = _BLOCK_EDGE_RE.match(text) or _PROC_HEAD_RE.match(text)
+        if m:
+            text = text[m.end():]
+            continue
+        tail = _BLOCK_TAIL_RE.search(text)
+        if tail:
+            text = text[:tail.start()]
+            continue
+        if _COND_HEAD_RE.match(text):
+            after = _KEYWORD_ANY_RE.search(text, _COND_HEAD_RE.match(text).end())
+            if after:
+                text = text[after.start():]
+    return text
+
+
+def parsed_chunks(sql: str, catch=(SqlglotError, RecursionError)
+                  ) -> list[tuple[Chunk, list, Exception | None]]:
+    """切句 + 逐句解析,一次做完:[(這一句, 解析出來的語句, 解析失敗的例外或 None)]。
+
+    **三處共用這一個進入點**(預掃的規則層、展開後行號對回原始檔、受影響 model 的
+    比較):切句與「解析不了時怎麼辦」只留一份,補一處不會漏掉另外兩處。
+
+    兩層:先依分號切;某一段解析不了,再試著以行首的語句關鍵字切開(沒有分號的多句
+    T-SQL),每一段都解析得過才採用。兩層都不行,那一段就記成解析失敗 —— 失敗只影響
+    那一段,其他句照常。
+
+    整份連一個分號都沒有時也走同一條路:整份當成一段,解析不了就試關鍵字切。
+
+    `catch` 是「算是解析不了」的例外種類,預設只收解析器自己的錯與遞迴太深 ——
+    **程式自己的錯(AttributeError 之類)要往外丟**,由呼叫端的環節隔離記成未完整,
+    不默默變成「這一句沒有命中」。預掃那一層放寬成 `Exception`:它不能因為一句壞掉
+    就中斷整份審查。
+    """
+    chunks = statement_chunks(sql)
+    if not chunks:
+        chunks = ([Chunk(sql, 0, _first_token(sql, 0, len(sql)))]
+                  if sql.strip(" \t\r\n;") else [])
+    out = []
+    for chunk in chunks:
+        try:
+            parsed = parse_statements(chunk.text)
+        except catch as e:
+            err = e
+        else:
+            if not _block_unclear(chunk.text, parsed):
+                out.append((chunk, parsed, None))
+                continue
+            # 程序性的區塊:裡面的寫入語句對規則層消失了。剝掉外框再解析一次。
+            inner = _strip_block_heads(chunk.text)
+            try:
+                retry = parse_statements(inner) if inner.strip() else []
+            except catch:
+                retry = None
+            if retry is not None and not _block_unclear(inner, retry):
+                out.append((Chunk(inner, chunk.line_offset, chunk.start), retry, None))
+            else:
+                # 剝不開、或剝完還是看不到那些寫入語句:**不可以回報成沒有命中**。
+                # 記成解析失敗,由 enforce_parse 補一條「預掃無法解析」交人工。
+                out.append((chunk, [], _BlockNotParsed(
+                    "程序性區塊(BEGIN…END / IF / WHILE / TRY…CATCH)裡的語句無法解析")))
+            continue
+        pieces = _split_by_keyword(chunk.text, chunk.line_offset)
+        if pieces is None:
+            out.append((chunk, [], err))
+            continue
+        for piece in pieces:                        # 上面已經確認每一段都解析得過
+            out.append((Chunk(piece.text, piece.line_offset, chunk.start + piece.start),
+                        parse_statements(piece.text), None))
     return out
 
 
@@ -170,10 +410,32 @@ def _lint_in_child(sql: str) -> str:
 # --- rule-base 掛載點 ---------------------------------------------------
 # 每條規則:(規則碼, severity, 檢查函式) — 檢查函式吃 AST statement,回傳違規訊息或 None
 
+def _inside_merge(node) -> bool:
+    """這個寫入語句是不是 `MERGE … WHEN MATCHED THEN UPDATE/DELETE` 的一部分。
+
+    那種寫法在語法樹裡也是一個沒有 WHERE 的 `Update`/`Delete`,但條件寫在 `WHEN` 上,
+    不是全表操作 —— 改成整棵樹找寫入語句之後,不排除的話每個 MERGE 都會被報成 blocker。
+    """
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, exp.Merge):
+            return True
+        parent = parent.parent
+    return False
+
+
 def _r001_dml_without_where(st):
-    if isinstance(st, (exp.Update, exp.Delete)) and st.find(exp.Where) is None:
-        return f"{st.key.upper()} 沒有 WHERE 條件,將影響全表"
-    return None
+    """**整棵樹都找**,不是只看最外層。
+
+    最外層是 `CREATE PROCEDURE`、`IF`、`WHILE` 時,裡面那句 `DELETE FROM t` 原本一條都
+    不報,而且報告長得跟掃過了沒問題一樣 —— 預存程序、hook、腳本裡的 T-SQL 常這樣寫。
+    """
+    bad = [node.key.upper() for node in st.find_all(exp.Update, exp.Delete)
+           if node.find(exp.Where) is None and not _inside_merge(node)]
+    if not bad:
+        return None
+    where = "" if len(bad) == 1 else f"(這一句裡有 {len(bad)} 處)"
+    return f"{bad[0]} 沒有 WHERE 條件,將影響全表{where}"
 
 
 def _r002_select_star(st):
@@ -314,6 +576,9 @@ def parse_error_text(e: Exception, line_offset: int = 0) -> str:
             # 逐句解析時,行號是**那一句之內**的;加上這一句在檔案裡的起始行,
             # 看留言的人才對得回原檔(#90 第 1 點)
             spots.append(f"第 {d['line'] + line_offset} 行第 {d.get('col', '?')} 欄")
+    if isinstance(e, _BlockNotParsed):
+        # 我們自己丟的,訊息是固定字串、不含 MR 的原文,可以照原樣說明
+        return f"parse failed: {e}"
     where = "、".join(dict.fromkeys(spots))[:120] if spots else type(e).__name__
     return f"parse failed: 語法無法解析({where})"
 
@@ -427,8 +692,31 @@ _ENV_VAR_RE = re.compile(r"(?i)@@(SERVERNAME|SERVICENAME|VERSION|SPID)\b"
 # 不完全貼切,但報得出來比一條都不報好。
 _SYS = _named("sys")
 _OBJ = _named(r"\w+")
+# 回傳執行環境的系統預存程序:`sp_who` 給每個連線的主機名稱、登入帳號與資料庫,
+# `sp_helpserver` 給伺服器名稱,`xp_msver` 給版本與主機資訊 —— 跟 `HOST_NAME()`、
+# `@@SERVERNAME` 是同一類資訊,所以歸 R005。
+_ENV_PROCS = ("sp_who", "sp_who2", "sp_helpserver", "sp_server_info", "sp_helpdb",
+              "xp_msver")
+
+
+def _procs(names) -> str:
+    """這幾支預存程序的比對,**前面接什麼都算**。
+
+    `sys.`、`master.dbo.`、`master..`、方括號、雙引號都是同一支 —— 跟 `sp_executesql`
+    同一種比法。只認沒有限定名稱的那一種,等於加三個字就繞過去。
+    """
+    return r'(?<![\w@])[\["]?(?:' + "|".join(names) + r')[\]"]?(?!\w)'
+
+
+# `sys.<物件>` 那一條不要跟別的分支重複命中:同一句出現兩條說法不同的 finding,
+# 看的人會以為是兩件事。`sp_executesql` 由 R009 報;上面那幾支由下面自己的分支報
+# (前綴不限)。沒列到的 `sys.sp_*` 照樣由 `sys.<物件>` 那條接住。
+_SP_ELSEWHERE = ("sp_executesql",) + _ENV_PROCS
 _ENV_CATALOG_RE = re.compile(
-    r"(?i)(?<!\w)" + _SYS + _GAP + r"\." + _GAP + r'(?![\["]?sp_executesql\b)' + _OBJ
+    r"(?i)(?<!\w)" + _SYS + _GAP + r"\." + _GAP
+    + r'(?![\["]?(?:' + "|".join(_SP_ELSEWHERE) + r')\b)' + _OBJ
+    # 回傳執行環境的系統預存程序(前面有沒有 sys. 都算)
+    + r"|" + _procs(_ENV_PROCS)
     # 舊式的系統表名(master..sysdatabases、master.dbo.sysobjects),沒有 sys. 前綴
     + r"|(?<!\w)[\[\"]?sys(databases|objects|columns|users|logins|processes|servers|indexes)[\]\"]?(?!\w)"
     r"|(?<!\w)[\[\"]?INFORMATION_SCHEMA[\]\"]?" + _GAP + r"\.")
@@ -663,18 +951,12 @@ def _parse_each_statement(sql: str):
 
     說明只留位置:它會變成 finding 的內文、貼回 MR 留言(見 parse_error_text)。
     """
-    chunks = _statement_chunks(sql)
-    if not chunks:                       # 只有一句、或斷詞失敗 → 照舊整份解析
-        try:
-            return parse_statements(sql), None
-        except Exception as e:           # noqa: BLE001 — 解析失敗不中斷預掃
-            return [], parse_error_text(e)
     statements, errors = [], []
-    for chunk, line_offset in chunks:
-        try:
-            statements.extend(parse_statements(chunk))
-        except Exception as e:           # noqa: BLE001
-            errors.append(parse_error_text(e, line_offset))
+    for chunk, parsed, err in parsed_chunks(sql, catch=Exception):
+        if err is None:
+            statements.extend(parsed)
+        else:                            # noqa: BLE001 — 解析失敗不中斷預掃
+            errors.append(parse_error_text(err, chunk.line_offset))
     if not errors:
         return statements, None
     shown = list(dict.fromkeys(errors))[:_MAX_PARSE_ERRORS]

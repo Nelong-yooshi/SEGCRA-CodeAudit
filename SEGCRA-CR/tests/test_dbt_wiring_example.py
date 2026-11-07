@@ -131,7 +131,7 @@ def test_預設的fixtures沒有dbt專案_既有的MR都不取回():
 
 
 # golden set 裡放了 dbt 專案(eval/golden/dbt_archives/<commit>/)的 case
-GOLDEN_WITH_DBT_PROJECT = ["mr_862"]
+GOLDEN_WITH_DBT_PROJECT = ["mr_413", "mr_862"]
 
 
 def test_golden_set只有放了專案的case會取回(monkeypatch):

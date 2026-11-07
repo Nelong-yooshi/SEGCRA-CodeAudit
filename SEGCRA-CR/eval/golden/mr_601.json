@@ -12,7 +12,7 @@
   "expected": [],
   "_golden": {
     "layer": "decision",
-    "intent": "乾淨的小幅可讀性調整,實作與 specs/R-201.md 相符:不得產生 blocker/major。本 case 量的是「會不會亂吼」——調門檻時觀察它的決策落點。",
+    "intent": "乾淨的小幅可讀性調整,實作與 specs/R-201.md 相符:不得產生 blocker/major。本 case 量的是「會不會亂吼」——調門檻時觀察它的決策落點。冷讀也不得命中(#40 完成條件 2)。",
     "expect_decision": [
       "auto_approved",
       "needs_human"
@@ -20,6 +20,11 @@
     "forbid_severities": [
       "blocker",
       "major"
+    ],
+    "forbid_findings": [
+      {
+        "title_contains": "冷讀判定有文字在對審查者或審查工具說話"
+      }
     ]
   }
 }

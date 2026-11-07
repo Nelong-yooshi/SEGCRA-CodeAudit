@@ -118,6 +118,8 @@ CREATE TABLE retail_m1_earlyjob(account_id NVARCHAR(20), table_date DATE);
 - **EarlyJob 排除的比對日**:規格只說排除 EarlyJob 已出過的帳戶,未載是比對
   前一日還是同日。(現行實作比對前一日。)
 - **金額欄位的幣別/單位**:規格未載是否需限制單一幣別;資料表亦無幣別欄位。
+- **金額與餘額是否先取整**:規格未載金額(`amount`)與餘額(`balance_after`)在計算前是否取整。
+  (現行實作先轉成整數 `CAST(... AS BIGINT)` 再計算;金額帶小數時,照規格與照程式可能得到不同結論。)
 
 ## 補充
 

@@ -1332,7 +1332,7 @@ def analyze_macro_impact_isolated(files, changed_paths, *,
     changed = [changed_paths] if isinstance(changed_paths, str) else list(changed_paths)
     result = run_isolated(analyze_macro_impact, (dict(files), changed), kwargs,
                           timeout_s=timeout_s, max_memory_mb=max_memory_mb,
-                          on_failure=_impact_failure)
+                          on_failure=_impact_failure, types=(ImpactReport, AffectedModel))
     if not isinstance(result, ImpactReport):
         return _impact_failure("子行程回傳了非預期的資料")
     return result

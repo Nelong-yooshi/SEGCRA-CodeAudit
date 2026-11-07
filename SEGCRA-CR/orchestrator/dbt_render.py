@@ -225,10 +225,17 @@ class DbtProjectInfo:
     uncertain_models   被引用時表名無法確定的 model / seed / snapshot(alias / schema / database、
                        ephemeral、停用、同名、版本、Python model 等;見 dbt_relations)
     uncertain_sources  schema / identifier 是樣板值、無法確定的來源表
-    global_uncertain   整個專案層級的不確定(自訂 generate_*_name、dbt_project.yml 的
-                       +schema / +alias 等);非 None 時所有 ref() 都視為無法確定
+    global_uncertain   整個專案層級的不確定(自訂 generate_*_name、macro 裡的 config() 等);
+                       非 None 時所有 ref() 都視為無法確定
     refs_complete      ref() 找不到就一定不存在(已知 seed/snapshot、沒用套件、屬性檔都解析得了)
     sources_complete   source() 找不到就一定沒宣告(沒用套件、屬性檔都解析得了)
+    naming             {model 名稱: {"alias", "schema", "database": 字串或 None}}:表名確定的 model
+                       設的自訂值(None = 沒設)。合併順序照 dbt:dbt_project.yml(資料夾由淺到深)
+                       → 屬性檔的 config: → model 檔的 config();見 dbt_relations
+    schema_concat      自訂 schema 要不要接在 target 的 schema 後面(dbt-sqlserver 的
+                       dbt_sqlserver_use_default_schema_concat):True / False;None = 無法確定
+    schema_concat_unset  專案自己沒有決定(flags 與 vars 都沒寫):由部署端設定的預設值補上
+                       (設定檔 dbt.sqlserver_schema_concat,見 dbt_context)
     """
     project_name: str | None = None
     ref_names: frozenset = frozenset()
@@ -238,6 +245,9 @@ class DbtProjectInfo:
     global_uncertain: str | None = None
     refs_complete: bool = False
     sources_complete: bool = False
+    naming: dict = field(default_factory=dict)
+    schema_concat: bool | None = None
+    schema_concat_unset: bool = False
 
 
 class DbtRenderError(Exception):
@@ -309,6 +319,13 @@ def _too_big(value) -> bool:
     return isinstance(value, (str, list, tuple)) and len(value) > MAX_OUTPUT_CHARS
 
 
+class DbtBlockInModel(jinja2.TemplateSyntaxError):
+    """model 檔裡的 `{% test %}` / `{% materialization %}` 區塊:dbt 解析得過,展開器不展開。
+
+    是 TemplateSyntaxError 的子類別(Jinja 解析到一半只能這樣中止),但**不是**語法錯誤:
+    呼叫端不可以把它當成「dbt 整個專案會失敗」。"""
+
+
 class _DbtBlocks(Extension):
     """dbt 自己加上去的區塊標籤,解析掉但不輸出任何內容。
 
@@ -320,18 +337,27 @@ class _DbtBlocks(Extension):
     dbt 自己也是以擴充處理這幾個標籤,而且同樣不會把內容編進 model 的 SQL,
     所以「解析掉並丟棄」與 dbt 的輸出一致。
 
-    **只在載入 macro 檔時生效**:model 檔裡出現這些標籤並不是合法的 dbt 寫法,
-    默默把那段丟掉會讓我們產出「比 dbt 少一段」的 SQL,還回報展開成功。
-    所以 model 階段一律照 Jinja 原本的行為當成未知標籤,硬失敗。
+    model 檔裡(dbt-core 1.12 實測:parse 與 compile 的結果):
+    - `{% docs %}`:dbt 解析得過、編譯出的 SQL 不含區塊內容。內容只是說明文字,不會被執行,
+      照樣丟棄
+    - `{% test %}`、`{% materialization %}`:dbt 一樣解析得過、編譯出的 SQL 不含區塊內容,但
+      區塊裡的 SQL 是 generic test 或自訂實體化,會在別的地方執行。默默丟掉的話,那段 SQL
+      就逃過預掃,還回報展開成功——所以照樣中止展開(DbtBlockInModel,不算語法錯誤)
+    - `{% snapshot %}`:dbt 也不認得(不認得的標籤,整個專案解析失敗),照 Jinja 的預設行為
+      當成未知標籤
     """
 
     tags = {"materialization", "test", "docs", "snapshot"}
 
     def parse(self, parser):
         tag = parser.stream.current.value
-        if not getattr(self.environment, "segcra_macro_phase", False):
-            raise jinja2.TemplateSyntaxError(
-                f"Encountered unknown tag '{tag}'.", parser.stream.current.lineno)
+        if not getattr(self.environment, "segcra_macro_phase", False) and tag != "docs":
+            lineno = parser.stream.current.lineno
+            if tag == "snapshot":
+                raise jinja2.TemplateSyntaxError(f"Encountered unknown tag '{tag}'.", lineno)
+            raise DbtBlockInModel(
+                f"model 檔裡的 {{% {tag} %}} 區塊:dbt 解析得過,但區塊裡的 SQL 會在別的地方執行,"
+                "展開器不展開這種區塊", lineno)
         next(parser.stream)
         while parser.stream.current.type != "block_end":   # 標籤上的參數一律略過
             next(parser.stream)
@@ -448,8 +474,37 @@ def _check_ident(kind: str, value) -> str:
     return value
 
 
+def model_identity(project: "DbtProjectInfo | None", name: str, schema: str) -> tuple[str, str, bool]:
+    """model 被引用時的 (表名, 綱要, 確不確定),照 dbt 的預設規則:
+
+      * 表名:alias 有值(非空字串)就用它去掉頭尾空白,否則用 model 名稱(generate_alias_name)
+      * 綱要:自訂 schema 沒設就是 target 的 schema(呼叫端給的 schema);設了就看要不要串接
+        (generate_schema_name;dbt-sqlserver 的旗標見 DbtProjectInfo.schema_concat):要串接是
+        `<schema>_<自訂>`,不串接是自訂值去掉頭尾空白
+      * 不確定:沒有專案資訊、專案層級無法確定、這個 model 無法確定、不知道要不要串接,
+        或算出來的表名 / 綱要不是英數與底線(會被拼進 SQL 識別字,不接受)。不確定時一律照
+        model 名稱與 target 的 schema 展開,只是記成不確定、不讓展開失敗
+
+    資料庫名不在這裡:一律用呼叫端給的 database(約定的假名,見 DbtProjectInfo)。"""
+    if project is None or project.global_uncertain or name in project.uncertain_models:
+        return name, schema, False
+    naming = project.naming.get(name)
+    if naming is None:
+        return name, schema, False
+    alias = naming["alias"].strip() if naming.get("alias") else name
+    custom = naming.get("schema")
+    if custom is None:
+        return (alias, schema, True) if _IDENT.fullmatch(alias) else (name, schema, False)
+    if project.schema_concat is None:
+        return name, schema, False
+    rel_schema = f"{schema}_{custom.strip()}" if project.schema_concat else custom.strip()
+    if not (_IDENT.fullmatch(alias) and _IDENT.fullmatch(rel_schema)):
+        return name, schema, False
+    return alias, rel_schema, True
+
+
 def _make_relations(database: str | None, schema: str, usage: dict,
-                    project: "DbtProjectInfo | None" = None):
+                    project: "DbtProjectInfo | None" = None, sandbox_tables: dict | None = None):
     """dbt 的 ref() / source(),比照正式環境展開成 "<database>"."<schema>"."<表>"。
 
     usage 是呼叫端給的共用字典:呼叫到 ref()/source() 記 used;有專案資訊但這次
@@ -462,7 +517,13 @@ def _make_relations(database: str | None, schema: str, usage: dict,
         dbt compile 一樣會失敗,這種 MR 合進去會讓排程壞掉
       * 找不到但無法確定(專案用了套件等),或有會改變表名的設定 → 記 uncertain,
         仍以慣例展開(規則層不看表名,不影響判斷)
+      * 找得到的 model 照 dbt 的規則套用 alias 與自訂 schema(model_identity)
+
+    sandbox_tables 給定時是執行驗證用的展開(見 _sandbox_relations):source() 指向規格建的
+    測資表,ref() 與 {{ this }} 不支援。
     """
+    if sandbox_tables is not None:
+        return _sandbox_relations(usage, project, sandbox_tables)
 
     def relation(name, rel_schema=schema) -> str:
         usage["used"] = True
@@ -488,7 +549,7 @@ def _make_relations(database: str | None, schema: str, usage: dict,
             missing(project.refs_complete,
                     f"ref() 指向不存在的套件 {package}(dbt 會編譯失敗)")
         elif name in project.ref_names:
-            if project.global_uncertain or name in project.uncertain_models:
+            if not model_identity(project, name, schema)[2]:
                 usage["uncertain"] = True
         else:
             missing(project.refs_complete,
@@ -509,6 +570,9 @@ def _make_relations(database: str | None, schema: str, usage: dict,
         name = _check_ident("表", args[-1])      # 先過白名單,錯誤訊息才可以帶名稱
         if project is not None:
             check_ref(args[0] if len(args) == 2 else None, name)
+            if len(args) == 1 or args[0] == project.project_name:
+                alias, rel_schema, _ = model_identity(project, name, schema)
+                return relation(alias, rel_schema)
         return relation(name)
 
     def source(source_name, table_name):
@@ -537,8 +601,62 @@ def _make_relations(database: str | None, schema: str, usage: dict,
             return _UnavailableRelation("model 名稱不合法(只接受英數與底線),無法提供 {{ this }}")
         if database is None:
             return _UnavailableRelation("未設定 database,無法提供 {{ this }}")
-        text = f'"{database}"."{_check_ident("綱要", schema)}"."{name}"'
-        return _Relation(text, database, schema, name)
+        alias, rel_schema, _ = model_identity(project, name, schema)
+        text = f'"{database}"."{_check_ident("綱要", rel_schema)}"."{alias}"'
+        return _Relation(text, database, rel_schema, alias)
+
+    return ref, source, this
+
+
+_EXEC_NO_REF = ("執行驗證尚未支援 ref():被引用的 model 要先在沙盒建出來,"
+                "或由測資代替,目前都還沒有做")
+_EXEC_NO_THIS = "執行驗證尚未支援 {{ this }}(這個 model 自己的表不在沙盒裡)"
+_EXEC_LOADING = "載入 macro 時不提供表名"
+
+
+def _sandbox_relations(usage: dict, project: "DbtProjectInfo | None", sandbox_tables: dict):
+    """執行驗證用的 ref() / source() / this。sandbox_tables 是規格「資料表定義」建的表
+    {表名(小寫): 沙盒裡的寫法(每段加上方括號);同名的表不只一張時是 None}。
+
+    source() 只在表名確定時對到測資表:有專案資訊、sources.yml 有宣告、schema / identifier 不是
+    樣板值,而且規格裡有同名(不分大小寫)的表。表名用 identifier(沒宣告就是 table 名),不看
+    來源的 schema:沙盒只有規格建的那幾張表。兩個不同的來源對到同一張測資表時無法分辨,展開失敗。
+    任何一項不成立就展開失敗(錯誤訊息是原因),不猜表名:猜錯的話執行結果會被當成程式的問題。
+
+    ref() 與 {{ this }} 不支援(上游 model 與增量的目標表都不在沙盒裡)。
+    表名物件只提供 identifier / name / table;database 與 schema 在沙盒裡跟正式環境不同,取用就失敗。"""
+    seen: dict = usage.setdefault("sandbox_sources", {})
+
+    def ref(*args, **kwargs):
+        if usage.get("loading_macros"):
+            return _UnavailableRelation(_EXEC_LOADING)
+        raise DbtRenderError(_EXEC_NO_REF)
+
+    def source(source_name, table_name):
+        _check_ident("來源", source_name)
+        _check_ident("表", table_name)
+        if usage.get("loading_macros"):
+            return _UnavailableRelation(_EXEC_LOADING)
+        usage["used"] = True
+        key = (source_name, table_name)
+        if project is None:
+            raise DbtRenderError("沒有 dbt 專案資訊,無法確定 source() 指向的表")
+        if key not in project.sources:
+            raise DbtRenderError(f"source() 未在 sources.yml 宣告:{source_name}.{table_name}")
+        elif key in project.uncertain_sources:
+            raise DbtRenderError(f"source() 的表名無法確定(樣板值等):{source_name}.{table_name}")
+        identifier = _check_ident("表", project.sources[key][1] or table_name)
+        folded = identifier.lower()
+        if folded not in sandbox_tables:
+            raise DbtRenderError(f"規格的資料表定義沒有 source() 指向的表:{identifier}")
+        if sandbox_tables[folded] is None:
+            raise DbtRenderError(f"規格的資料表定義有不只一張叫這個名稱的表:{identifier}")
+        if seen.setdefault(folded, key) != key:
+            raise DbtRenderError(f"兩個不同的 source() 都對到規格的同一張表:{identifier}")
+        return _SandboxRelation(sandbox_tables[folded], identifier)
+
+    def this(name: str):
+        return _UnavailableRelation(_EXEC_NO_THIS)
 
     return ref, source, this
 
@@ -547,7 +665,7 @@ def _mark_this_used(usage: dict, project: "DbtProjectInfo | None", name: str) ->
     """記下用到這個 model 的表名(比照 ref(自己)):表名會改變的設定記 uncertain。
     什麼時候算用到見 render_model;多記只會多帶一句提醒,不影響判斷。"""
     usage["used"] = True
-    if project is not None and (project.global_uncertain or name in project.uncertain_models):
+    if project is not None and not model_identity(project, name, DEFAULT_SCHEMA)[2]:
         usage["uncertain"] = True
 
 
@@ -702,6 +820,24 @@ class _Relation(str):
         return obj
 
 
+class _SandboxRelation(_Relation):
+    """執行驗證時 source() 的結果:字串內容是沙盒裡的表名。database / schema 跟正式環境不同,
+    取用就失敗(不給一個看起來像真的值)。"""
+
+    def __new__(cls, text: str, name: str):
+        obj = str.__new__(cls, text)
+        obj.identifier = obj.name = obj.table = name
+        return obj
+
+    @property
+    def database(self):
+        raise UndefinedError("執行驗證時表名物件沒有 database")
+
+    @property
+    def schema(self):
+        raise UndefinedError("執行驗證時表名物件沒有 schema")
+
+
 class _Adapter:
     """只提供 dispatch 的 adapter 樁。
 
@@ -756,10 +892,20 @@ class RenderResult:
     relation_notice: str | None = None
     # 樣板(含它呼叫的 macro)有沒有呼叫 is_incremental();沒有就不必以增量模式再展開一次
     incremental_checked: bool = False
+    # ok=False 且失敗的原因是這份樣板**自己**的 Jinja 語法錯誤(含不認得的濾器、重複定義的
+    # block):dbt 解析這個檔時一樣失敗(dbt-core 1.12 實測)。error_line 是錯誤所在的行(1 起算)。
+    # 執行時的錯誤、macro 的問題、展開器的限制都不算
+    syntax_error: bool = False
+    error_line: int = 0
 
     def src_line(self, rendered_line: int) -> int:
         """渲染行(1-based)→ 原始行(1-based)。對應不到回 0 = 檔案層留言。"""
         return self.line_map.get(rendered_line, 0)
+
+
+def _error_line(e: jinja2.TemplateSyntaxError, source: str) -> int:
+    """語法錯誤所在的行,對回原始檔(展開前去掉的開頭空行加回來)。"""
+    return e.lineno + source[:len(source) - len(source.lstrip())].count("\n")
 
 
 def _safe_error(e: BaseException) -> str:
@@ -853,7 +999,7 @@ def build_env(code_root=None, variables: dict | None = None,
               macro_dirs=DEFAULT_MACRO_DIRS, adapter: str = DEFAULT_ADAPTER,
               project: DbtProjectInfo | None = None, macro_files: dict | None = None,
               model_name: str | None = None, incremental: bool = False,
-              invocation_id: str | None = None):
+              invocation_id: str | None = None, sandbox_tables: dict | None = None):
     """建好含 dbt 樁與 macro 的 Environment。code_root 與 macro_files 都沒給時不載入任何 macro。
 
     macro_files 專案的檔案 {相對專案根的路徑: 內容}(從 GitLab 取回、不在磁碟上的專案用)。
@@ -865,6 +1011,7 @@ def build_env(code_root=None, variables: dict | None = None,
     incremental `is_incremental()` 的回傳值;True 時需要 model_name
     model_name  這次展開的 model 名稱({{ this }} 的表名;沒給時不提供 {{ this }})
     invocation_id 這次展開的 invocation_id(uuid4 的寫法);沒給時產生新的
+    sandbox_tables 執行驗證用:source() 指向規格建的測資表(見 _sandbox_relations)
 
     回傳 (env, macro 名稱清單, 同名衝突清單)。
     """
@@ -894,7 +1041,8 @@ def build_env(code_root=None, variables: dict | None = None,
     if project is not None and not isinstance(project, DbtProjectInfo):
         raise DbtRenderError("project 必須是 DbtProjectInfo")
     env.segcra_relation_usage = {"used": False, "uncertain": False}
-    ref, source, this = _make_relations(database, schema, env.segcra_relation_usage, project)
+    ref, source, this = _make_relations(database, schema, env.segcra_relation_usage, project,
+                                        sandbox_tables)
     env.globals["ref"] = ref
     env.globals["source"] = source
     if incremental and model_name is None:
@@ -1192,7 +1340,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
                  adapter: str = DEFAULT_ADAPTER,
                  project: DbtProjectInfo | None = None,
                  macro_files: dict | None = None, incremental: bool = False,
-                 invocation_id: str | None = None) -> RenderResult:
+                 invocation_id: str | None = None,
+                 sandbox_tables: dict | None = None) -> RenderResult:
     """在同一行程內展開一份 dbt model。**待審的 MR 內容請改用 render_model_isolated()。**
 
     model_path  model 檔路徑(相對 code_root 或絕對路徑皆可)
@@ -1211,6 +1360,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
     incremental 以 `is_incremental()` 為 True 展開(增量分支);`{{ this }}`(這個 model
                 自己的表名,檔名去掉副檔名)。預設 False,與 dbt compile 相同
     invocation_id 這次展開的 invocation_id(uuid4 的寫法);沒給時產生新的
+    sandbox_tables 執行驗證用的展開:{表名(小寫): 沙盒裡的寫法};source() 指向規格建的測資表,
+                ref() 與 {{ this }} 不支援(見 _sandbox_relations)
 
     任何失敗都收斂成 ok=False 而不丟例外。
     """
@@ -1230,11 +1381,19 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
         env, macros, conflicts, problems = build_env(root, variables, database, schema,
                                                      macro_dirs, adapter, project, macro_files,
                                                      model_path.stem, incremental,
-                                                     invocation_id=invocation_id)
+                                                     invocation_id=invocation_id,
+                                                     sandbox_tables=sandbox_tables)
         # dbt 讀檔時會去掉頭尾空白再渲染(開頭空行不會出現在編譯結果裡)
         body = source.strip()
-        tree = env.parse(body)
-        clean = _render_capped(env.from_string(tree), MAX_OUTPUT_CHARS)
+        try:
+            tree = env.parse(body)
+            template = env.from_string(tree)
+        except DbtBlockInModel:
+            raise
+        except jinja2.TemplateSyntaxError as e:
+            return RenderResult(ok=False, error=_safe_error(e), syntax_error=True,
+                                error_line=_error_line(e, source))
+        clean = _render_capped(template, MAX_OUTPUT_CHARS)
         # 哨兵渲染會再呼叫一次;只算乾淨的那一次
         incremental_checked = env.segcra_incremental["called"]
         # 用到這個 model 的表名:增量模式一律算;一般模式看 model 本身有沒有寫到 this(只看
@@ -1349,7 +1508,8 @@ def check_macro_files_isolated(*, timeout_s: float = DEFAULT_ISOLATED_TIMEOUT_S,
                                **kwargs) -> MacroCheck:
     """在獨立子行程中做 check_macro_files(理由同 render_model_isolated)。不丟例外。"""
     result = run_isolated(check_macro_files, (), kwargs, timeout_s=timeout_s,
-                          max_memory_mb=max_memory_mb, on_failure=_macro_check_failure)
+                          max_memory_mb=max_memory_mb, on_failure=_macro_check_failure,
+                          types=(MacroCheck, DbtProjectInfo))
     return result if isinstance(result, MacroCheck) else MacroCheck(ok=False)
 
 
@@ -1365,16 +1525,15 @@ def render_model_isolated(model_path, *, timeout_s: float = DEFAULT_ISOLATED_TIM
 
     Jinja 沙箱防得了任意程式執行,防不了「一個跑不完的迴圈」或「一個吃光記憶體的
     字串」。這裡用行程邊界兜底(見 isolation.run_isolated):超過 timeout_s 秒強制
-    終止;Linux 上另以 RLIMIT_AS 限制記憶體。任何異常一律收斂成 ok=False。
-
-    呼叫端程式的進入點需有 `if __name__ == "__main__":` 保護(multiprocessing spawn 的要求)。
+    終止;Linux 上另以 RLIMIT_AS 限制記憶體;子行程拿不到 token 與密碼。任何異常一律收斂成 ok=False。
     """
     # 一份審查裡的展開共用一個 invocation_id(見 _REVIEW_INVOCATION_ID);呼叫端指定時照用
     review_id = _REVIEW_INVOCATION_ID.get()
     if review_id is not None:
         kwargs.setdefault("invocation_id", review_id)
     result = run_isolated(render_model, (model_path,), kwargs, timeout_s=timeout_s,
-                          max_memory_mb=max_memory_mb, on_failure=_render_failure)
+                          max_memory_mb=max_memory_mb, on_failure=_render_failure,
+                          types=(RenderResult, DbtProjectInfo))
     if not isinstance(result, RenderResult):
         return _render_failure("DbtRenderError: 展開子行程回傳了非預期的資料")
     return result

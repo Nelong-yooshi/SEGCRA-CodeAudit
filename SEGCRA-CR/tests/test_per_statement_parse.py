@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-from toolbox.sqltools import _statement_chunks, run_rules
+from toolbox.sqltools import run_rules, statement_chunks
 
 DEEP = "SELECT " + "(1+" * 50 + "1" + ")" * 50 + ";"      # sqlglot 遞迴太深
 PURGE = "DELETE FROM t;"
@@ -51,7 +51,7 @@ def test_只有一句而且壞掉時照舊回解析錯誤():
     ("SELECT 1", 0),                                # 只有一句 → 照舊整份解析
 ])
 def test_依分號切句(sql, count):
-    assert len(_statement_chunks(sql)) == count
+    assert len(statement_chunks(sql)) == count
 
 
 def test_字串裡的分號不會把一句切成兩半():
@@ -96,12 +96,13 @@ def test_文字層規則不受影響():
     assert "R004" in [h["rule"] for h in hits]
 
 
-def test_解析進入點有公開的名字():
-    """`pipeline` 與 `dbt_affected` 都在用它(#82 review)。舊名字先留著當別名:
-    那兩個檔案現在有在途的改動,一起改會撞在一起。"""
+def test_解析與切句的進入點都是公開的名字():
+    """`pipeline` 與 `dbt_affected` 都在用它們。舊的 `_parse` 別名已經拿掉——
+    底線開頭的名字被別的模組 import,看起來像內部實作卻是介面。"""
     from toolbox import sqltools
     assert sqltools.parse_statements("SELECT 1")
-    assert sqltools._parse is sqltools.parse_statements
+    assert sqltools.statement_chunks("SELECT 1; SELECT 2")
+    assert not hasattr(sqltools, "_parse"), "別名應該已經拿掉"
 
 
 # ─────────── 斷詞失敗不可以讓整份退回一次解析(#99 review 第 1 點)───────────
@@ -132,7 +133,7 @@ def test_檔尾沒收尾時前面的句子照樣跑規則(tail, label):
     ("SELECT 1 /* a /* x */ ; y */ FROM t; DELETE FROM u", 2),
 ])
 def test_切句認得字串與註解(sql, count):
-    assert len(_statement_chunks(sql)) == count
+    assert len(statement_chunks(sql)) == count
 
 
 def test_特製內容不會讓切句變慢():
@@ -149,6 +150,65 @@ def test_切句不需要在函式裡匯入():
     import inspect
 
     from toolbox import sqltools
-    src = inspect.getsource(sqltools._statement_chunks) + inspect.getsource(
+    src = inspect.getsource(sqltools.statement_chunks) + inspect.getsource(
         sqltools._semicolon_cuts)
     assert "import" not in src
+
+
+# ─────────── 沒有分號的多句(#105 第 1 點)───────────
+#
+# `DELETE FROM t` 換行接 `SELECT 1 AS x`,兩句都正確但沒有分號。整份當成一句就解析
+# 不了,於是一條 AST 規則都不跑 —— 那句 DELETE 沒有 WHERE 的 blocker 也跟著不見。
+# 部署端的 dbt model 是一個檔一句碰不到,但 T-SQL 不寫分號很常見。
+
+@pytest.mark.parametrize("sql,rules", [
+    ("DELETE FROM t\nSELECT 1 AS x", ["R001"]),
+    ("UPDATE t SET a = 1\nDELETE FROM u", ["R001", "R001"]),
+    ("SELECT 1 AS x\nDELETE FROM t", ["R001"]),
+    ("DELETE FROM a;\nDELETE FROM b\nSELECT 1 AS x", ["R001", "R001"]),  # 混著分號
+    ("delete from t\nselect 1 as x", ["R001"]),                          # 小寫
+])
+def test_沒有分號也切得開(sql, rules):
+    out, hits = _out(sql)
+    assert not (isinstance(out, dict) and out.get("error")), out
+    assert [h["rule"] for h in hits if h["rule"] == "R001"] == rules
+
+
+@pytest.mark.parametrize("sql", [
+    "INSERT INTO t\nSELECT 1",                      # 延續寫法:SELECT 是 INSERT 的一部分
+    "SELECT 1\nUNION ALL\nSELECT 2",
+    "DELETE FROM t\nWHERE x = 1",                   # WHERE 另起一行
+    "WITH c AS (SELECT 1)\nSELECT * FROM c",
+    "SELECT 'a\nDELETE FROM t'",                    # 字串裡的關鍵字
+    "SELECT 1 AS x\n-- DELETE FROM t\nFROM t",     # 註解裡的關鍵字
+])
+def test_正常寫法不會被切錯(sql):
+    """只在**解析不了**時才試關鍵字切,而這些本來就解析得過 —— 根本走不到那一步。"""
+    out, hits = _out(sql)
+    assert not (isinstance(out, dict) and out.get("error")), out
+    assert [h for h in hits if h["rule"] == "R001"] == []
+
+
+def test_切完還是解析不了就當作沒切過():
+    """不要把「一句壞掉」變成「好幾句壞掉」:每一段都解析得過才採用。"""
+    out, _ = _out("DELETE FROM t\nSELECT * FROM ((((")
+    assert isinstance(out, dict) and out.get("error"), "整段仍然記成解析失敗"
+
+
+def test_關鍵字切句也只有一份():
+    """三處(規則層、行號對回、受影響比較)共用 parsed_chunks。"""
+    from orchestrator import dbt_affected, pipeline
+    from toolbox import sqltools
+
+    sql = "DELETE FROM t\nSELECT 1 AS x"
+    assert len(sqltools.parsed_chunks(sql)) == 2
+    assert len(dbt_affected._statement_keys(sql)) == 2
+    assert len(pipeline._rendered_starts(sql) or {}) == 2
+
+
+def test_只切出一段不算切過():
+    """切出來只有一段,等於沒切 —— 照舊回報那一段解析失敗,不要換一個位置重報一次。"""
+    from toolbox.sqltools import _split_by_keyword
+
+    assert _split_by_keyword("\nSELECT 1 AS x", 0) is None
+    assert _split_by_keyword("DELETE FROM t\nSELECT 1 AS x", 0) is not None

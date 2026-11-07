@@ -21,6 +21,8 @@ READ_ONLY = {
     "memory__retrieve_knowledge", "memory__get_conventions", "memory__check_style",
     "memory__lookup_similar_reviews", "load_skill",
 }
+# 唯讀、但只給管線自己用:模型用不到(get_mr_diff 已經有同樣的資料),照最小權限不開放
+PIPELINE_READ = {"gitlab__get_mr_refs"}
 WRITE_TOOLS = {
     "gitlab__post_inline_comment", "gitlab__post_summary", "gitlab__set_commit_status",
     "gitlab__create_rule_mr", "gitlab__set_label",
@@ -48,14 +50,14 @@ def test_白名單就是這十個唯讀工具():
 
 def test_每個已註冊的工具都被歸類():
     """新增工具時要決定它屬於哪一類;沒歸類就會在這裡紅。"""
-    assert set(_hub().tools) == READ_ONLY | WRITE_TOOLS
+    assert set(_hub().tools) == READ_ONLY | PIPELINE_READ | WRITE_TOOLS
 
 
 def test_交給模型的工具清單只有白名單():
     hub = _hub()
     names = _names(hub.openai_tools)
     assert names == READ_ONLY
-    assert not names & WRITE_TOOLS
+    assert not names & (WRITE_TOOLS | PIPELINE_READ)
 
 
 def test_沒有註冊的工具不會因為在白名單就出現():
@@ -242,10 +244,42 @@ def test_管線在決策前補這條_並讀的是同一個_hub():
 
 
 def test_審查迴圈走白名單入口():
-    """run_agent 執行模型要求的工具時,必須走 call_from_model,不能直接 call()。"""
-    src = inspect.getsource(agent.run_agent)
+    """執行模型要求的工具時,必須走 call_from_model,不能直接 call()。
+
+    掃的是**迴圈本身**(`_run_agent`):`run_agent` 現在是建立用戶端、跑完、保證
+    關掉的薄包裝,迴圈在裡面那一層。"""
+    src = inspect.getsource(agent._run_agent)
     assert "hub.call_from_model(tc.function.name, args)" in src
     assert "hub.call(" not in src
+
+
+def test_用戶端一定會被關掉():
+    """不關的話,httpx 的連線池會留到物件被回收才收尾,而那通常在事件迴圈關掉
+    之後 —— 每次 asyncio.run 結束都印一行 RuntimeError: Event loop is closed。"""
+    closed = []
+
+    class _Client:
+        def __init__(self, **_):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        async def _create(self, **_kw):
+            raise RuntimeError("端點掛了")
+
+        async def close(self):
+            closed.append(True)
+
+    import orchestrator.agent as agent_mod
+    original = agent_mod.AsyncOpenAI
+    agent_mod.AsyncOpenAI = _Client
+    try:
+        cfg = SimpleNamespace(endpoint="http://x/v1", api_key="k")
+        profile = SimpleNamespace(model="m", temperature=0, max_output_tokens=100,
+                                  seed=None, reasoning_effort=None)
+        with pytest.raises(RuntimeError, match="端點掛了"):
+            asyncio.run(agent.run_agent(cfg, profile, "sys", "user", _hub(), verbose=False))
+    finally:
+        agent_mod.AsyncOpenAI = original
+    assert closed == [True], "丟例外的時候也要關"
 
 
 BAD_MR_IDS = ["1/../../issues/5", "x/../../config/x", "1?private_token=x", "1#x", "", "-1",
@@ -301,4 +335,4 @@ def test_數字的_MR_編號照常(good, monkeypatch, tmp_path):
 def test_工具組沒有不在任何一類的函式():
     """TOOL_GROUPS 新增函式時,這個檔案的分類也要一起更新(避免默默開放或漏列)。"""
     names = {f"{g}__{fn.__name__}" for g, fns in tool_hub.TOOL_GROUPS.items() for fn in fns}
-    assert names == (READ_ONLY - {"load_skill"}) | WRITE_TOOLS
+    assert names == (READ_ONLY - {"load_skill"}) | PIPELINE_READ | WRITE_TOOLS

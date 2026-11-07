@@ -202,9 +202,18 @@ def _load_dbt_section(raw: dict) -> dict:
         project_dir = check_project_dir(section.get("project_dir", ""))
     except DbtProjectError as e:
         raise ValueError(f"{e};只接受 repo 內的相對目錄(英數與 _ . -,以 / 分段)") from None
-    # 只有設了才帶這個鍵(讀的一方用 .get("project_dir", "")):沒設時回傳的內容與接線前相同
+    # 部署端的 dbt-sqlserver 在專案沒寫 dbt_sqlserver_use_default_schema_concat 時,自訂
+    # schema 要不要接在 target 的 schema 後面(這個預設在不同版本相反,見 docs/09)。
+    # 只接受布林或不設:跟 enabled 一樣,字串 "false" 會被當成真值
+    concat = section.get("sqlserver_schema_concat")
+    if concat is not None and not isinstance(concat, bool):
+        raise ValueError(
+            f"設定檔 dbt.sqlserver_schema_concat 必須是布林值 true/false 或不設,目前是 {concat!r}"
+            f"({type(concat).__name__})")
+    # 只有設了才帶這些鍵(讀的一方用 .get):沒設時回傳的內容與接線前相同
     return {"enabled": enabled, "database": database,
-            **({"project_dir": project_dir} if project_dir else {})}
+            **({"project_dir": project_dir} if project_dir else {}),
+            **({"sqlserver_schema_concat": concat} if concat is not None else {})}
 
 
 def load_config(path: Path | None = None) -> Config:
