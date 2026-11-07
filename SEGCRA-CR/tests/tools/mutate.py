@@ -5449,5 +5449,20 @@ MUTANTS.update({
 })
 
 
+# ---- 模型用戶端要關掉(不關的話連線池留到迴圈關閉之後才收尾)
+MUTANTS.update({
+ "用戶端:跑完不關": ("agent.py",
+     "        closer = getattr(client, \"close\", None)" + NL
+     + "        if closer is not None:",
+     "        closer = None" + NL
+     + "        if closer is not None:"),
+ "用戶端:只有順利跑完才關(丟例外就不關)": ("agent.py",
+     "    finally:" + NL
+     + "        # 測試與評測會換上自己的假用戶端,不一定有 close();收尾失敗也不該讓一份",
+     "    except BaseException:" + NL
+     + "        # 測試與評測會換上自己的假用戶端,不一定有 close();收尾失敗也不該讓一份"),
+})
+
+
 if __name__ == "__main__":
     sys.exit(main())
