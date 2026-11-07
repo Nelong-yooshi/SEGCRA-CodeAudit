@@ -194,11 +194,18 @@ def test_命中時強制載入secure_sql():
         assert pipeline._needs_secure_sql(_pre(sql)), sql
 
 
-def test_每條新規則都有已報判定的關鍵詞():
-    """沒有關鍵詞的話,`_RULE_KEYWORDS.get(code, [code])` 會退回用規則碼比對 ——
-    模型的報告裡不會出現「R006」,於是每次都補報一條,變成固定的重複。"""
-    for code in NEW_RULES:
-        assert pipeline._RULE_KEYWORDS.get(code), code
+def test_每條新規則命中時都補報一條():
+    """規則命中一律補報(#104),不看模型有沒有提到 —— 原本用關鍵詞猜,而泛用的字眼
+    (「外部」「權限」)會讓模型講別的事情時整條不補。"""
+    model = [{"severity": "blocker", "file": "a.sql", "title": "這個 MR 的外部權限設定沒問題"}]
+    for code, sql in (("R006", "SELECT * FROM srv.db.dbo.t"),
+                      ("R007", "EXEC xp_cmdshell 'dir'"),
+                      ("R008", "GRANT SELECT ON t TO app"),
+                      ("R009", "EXEC('SELECT 1')"),
+                      ("R010", "{% set r = run_query('DELETE FROM audit_log') %}")):
+        pre = [{"path": "a.sql", "rules": _hits(sql)}]
+        report = pipeline.enforce_rules({"findings": list(model)}, pre)
+        assert any(f["title"].startswith(f"[{code}]") for f in report["findings"]), code
 
 
 # ─────────────────── 5. 環境相依但只提醒的寫法(#41 第 4 點)───────────────────

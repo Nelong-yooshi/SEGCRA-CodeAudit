@@ -153,21 +153,20 @@ def test_模型一條都沒報_兩條補的都寫行號():
     assert [f["line"] for f in report["findings"]] == [2, 5]
 
 
-def test_模型引用了第一句_補的第二句寫第二句的行號():
+@pytest.mark.parametrize("reply,label", [
+    ("`DELETE FROM transactions` 沒有 WHERE", "引用了第一句"),
+    ("有一句 DELETE 沒有 WHERE", "沒有引用任何一句"),
+])
+def test_兩處命中各自帶自己的行號(reply, label):
+    """規則命中一律補報(#104),每一條補的就是某一處命中,行號取那一處的。
+
+    以前要猜模型講的是哪一句:引用得出來才寫行號,猜不出來就整個不寫(寫錯行比不寫
+    更糟)。現在不必猜 —— 兩處都補,兩個行號都是確定的。"""
     pre = _pre(TWO_DELETES)
     _attach_statement_lines(pre, _files(TWO_DELETES))
-    model = [_reply("`DELETE FROM transactions` 沒有 WHERE")]
+    model = [_reply(reply)]
     report = enforce_rules({"findings": list(model)}, pre)
-    assert [f["line"] for f in _missing(report, model)] == [5]
-
-
-def test_模型沒引用語句_不知道補的是哪一處時不寫行號():
-    """退回比數量:模型那條可能講的是第二句,寫第二句的行號可能是錯的。數量仍然對。"""
-    pre = _pre(TWO_DELETES)
-    _attach_statement_lines(pre, _files(TWO_DELETES))
-    model = [_reply("有一句 DELETE 沒有 WHERE")]
-    missing = _missing(enforce_rules({"findings": list(model)}, pre), model)
-    assert len(missing) == 1 and missing[0]["line"] == 0
+    assert [f["line"] for f in _missing(report, model)] == [2, 5], label
 
 
 def test_比數量的_finding_沒有抵掉任何一處時仍然確定():
@@ -248,8 +247,9 @@ def test_整條管線_補的第二句帶行號_prompt_一個字都沒變(review)
     without, prompt_b = review(model, attach=False)
     assert prompt_a == prompt_b and '"line": 5' not in prompt_a
     added = [f for f in with_lines["findings"] if f["title"].startswith("[R001]")]
-    assert [f["line"] for f in added] == [5]
-    assert [f["line"] for f in without["findings"] if f["title"].startswith("[R001]")] == [0]
+    assert [f["line"] for f in added] == [2, 5]
+    assert [f["line"] for f in without["findings"]
+            if f["title"].startswith("[R001]")] == [0, 0]
     assert with_lines["decision"] == "blocked"
 
 
@@ -262,7 +262,7 @@ def test_語句前面有註解時_模型引用程式碼也算引用了那句():
     model = [_reply("`DELETE FROM accounts` 沒有 WHERE")]          # 引用的是第二句
     _attach_statement_lines(pre, _files(TWO_DELETES))
     missing = _missing(enforce_rules({"findings": list(model)}, pre), model)
-    assert [f["line"] for f in missing] == [2]                       # 補的是第一句
+    assert [f["line"] for f in missing] == [2, 5], "兩處都補,行號各自正確"
 
 
 def test_樣板標記只在註解裡時也不寫():
