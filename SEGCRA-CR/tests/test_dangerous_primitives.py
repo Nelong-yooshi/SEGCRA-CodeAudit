@@ -488,3 +488,119 @@ def test_prescan對展開成功的樣板也掃原文():
     entry = next(e for e in pre if e["path"] == "models/mrt_big.sql")
     assert "dbt_render_error" not in entry, "這個樣板要展開得成功,情境才成立"
     assert "H008" in [h["rule"] for h in entry["rules"]], entry["rules"]
+
+
+# ─────────────────── macro 呼叫圖只留一套(#103)───────────────────
+#
+# 正規式那份看不懂 `adapter.dispatch('x')`:被它呼叫到的 macro 裡如果有 DB_NAME(),
+# 就整個掃不到。改成先用語法樹(跟 macro 反查同一套、在子行程裡跑),解析不了或
+# 子行程失敗才退回正規式。
+
+# 兩個實作**分在不同檔**,helper 只由非 default__ 的那支呼叫 —— 這樣「只認
+# default__ 的實作」才會露餡(放同一個檔、helper 由 default__ 呼叫的話,少認一支
+# 也照樣掃到同一組檔案)。
+_DISPATCH_MACROS = {
+    "macros/env.sql": "{% macro helper() %}DB_NAME(){% endmacro %}",
+    "macros/impl_default.sql": "{% macro default__pick() %}SELECT 1{% endmacro %}",
+    "macros/impl_sqlserver.sql": "{% macro sqlserver__pick() %}{{ helper() }}{% endmacro %}",
+    "macros/other.sql": "{% macro never_called() %}{{ env_var('X') }}{% endmacro %}",
+}
+
+
+def _used(src, macros=None):
+    from orchestrator.dbt_impact import macros_referenced
+
+    out = macros_referenced({"m": src}, macros or _DISPATCH_MACROS)
+    assert out is not None, "這些樣板應該解析得了"
+    return sorted(out["m"])
+
+
+def test_dispatch_呼叫到的macro也掃得到():
+    """`adapter.dispatch('pick')` 會呼叫到所有 `<前綴>__pick`。哪一支被選中是執行期
+    才知道的,所以全部都算 —— 少算一支就等於那支裡的 DB_NAME() 掃不到。"""
+    assert _used("SELECT {{ adapter.dispatch('pick')() }}") == [
+        "default__pick", "helper", "sqlserver__pick"]
+
+
+def test_dispatch_沒呼叫到的照舊不掃():
+    assert "never_called" not in _used("SELECT {{ adapter.dispatch('pick')() }}")
+
+
+@pytest.mark.parametrize("src,label", [
+    ("{% set n = 'help' ~ 'er' %}{{ adapter.dispatch(n)() }}", "dispatch 的名稱是算出來的"),
+    ("{{ context['help' ~ 'er']() }}", "用 context 取名稱"),
+    ("{% set n = 'help' ~ 'er' %}{{ context.get(n)() }}", "context.get"),
+    ("{% for k, v in context.items() %}{% if k == 'help' ~ 'er' %}{{ v() }}{% endif %}"
+     "{% endfor %}", "走訪 context"),
+])
+def test_動態呼叫時全部的macro都算(src, label):
+    """名稱在執行期才決定,掃不出是哪幾支。多掃到沒被呼叫的只是多一條提醒,漏掉才是
+    問題 —— 反查遇到動態呼叫也是保守地全部列出來,這裡用同一份判斷。"""
+    assert _used(src) == ["default__pick", "helper", "never_called", "sqlserver__pick"], label
+
+
+def test_樣板解析不了時退回正規式():
+    """展開失敗的 model 也要能掃 —— 那正是最該看的情況之一。"""
+    from orchestrator.dbt_impact import macros_referenced
+
+    broken = "{% macro %}\nSELECT {{ db() }}"          # 壞掉的 Jinja,語法樹走不了
+    assert macros_referenced({"m": broken}, MACROS) is None
+    assert sorted(_macros_used(broken, _macro_index(MACROS))) == ["macros/readenv.sql"]
+
+def test_子行程失敗時退回正規式(monkeypatch):
+    """語法樹那條在子行程裡跑(解析的是 MR 帶進來的內容,要有時間與記憶體上限)。
+    逾時或失敗時不能整個不掃 —— 退回正規式,照樣掃得到。"""
+    monkeypatch.setattr(pipeline, "_macros_used_by_tree", lambda *a, **k: None)
+    project = dict(DBT.PROJECT)
+    project["macros/env.sql"] = ENV_MACRO
+    project["models/mrt_big.sql"] = CALLER
+    mr = DBT._mr([DBT._f("models/mrt_big.sql")])
+    ctx = DBT._ctx(files=project, mr=mr)
+    pre = asyncio.run(prescan(_RealRulesHub(), mr["files"], DBT.CFG, ctx))
+    scanned = {e["path"] for e in pre if e.get("called_macro")}
+    assert "macros/env.sql" in scanned, scanned
+
+
+def test_prescan經由語法樹掃到dispatch呼叫的macro():
+    """整條預掃都要走語法樹那條。只驗 macros_referenced 的話,「把 _macro_scan 改回
+    只用正規式」照樣是綠的 —— 而那正是這張要修的問題。"""
+    project = dict(DBT.PROJECT)
+    project["macros/impl_sqlserver.sql"] = (
+        "{% macro sqlserver__pick() %}{% if target.name == 'prod' %}1{% else %}2{% endif %}"
+        "{% endmacro %}")
+    project["macros/impl_default.sql"] = "{% macro default__pick() %}SELECT 1{% endmacro %}"
+    project["models/mrt_big.sql"] = (
+        "{{ config(materialized='table') }}\n"
+        "SELECT id FROM {{ ref('stg_txn') }} WHERE 1=1 -- {{ adapter.dispatch('pick')() }}\n")
+    mr = DBT._mr([DBT._f("models/mrt_big.sql")])
+    ctx = DBT._ctx(files=project, mr=mr)
+    pre = asyncio.run(prescan(_RealRulesHub(), mr["files"], DBT.CFG, ctx))
+    scanned = {e["path"] for e in pre if e.get("called_macro")}
+    assert "macros/impl_sqlserver.sql" in scanned, scanned
+
+
+def test_語法樹那條在子行程裡跑(monkeypatch):
+    """解析的是 MR 帶進來的內容,要有時間與記憶體上限。在主行程直接跑的話,預掃是
+    同步呼叫 —— 卡住就是整份審查卡住,外層的時間上限要等它跑完才生效。"""
+    seen = {}
+
+    def fake(fn, args, *a, **kw):
+        seen["fn"] = getattr(fn, "__name__", "")
+        seen["timeout"] = kw.get("timeout_s")
+        seen["memory"] = kw.get("max_memory_mb")
+        return {"m": set()}
+
+    monkeypatch.setattr(pipeline, "run_isolated", fake)
+    pipeline._macros_used_by_tree({"m": "SELECT 1"}, {"macros/a.sql": ""})
+    assert seen["fn"] == "macros_referenced"
+    assert seen["timeout"] and seen["memory"], "要帶時間與記憶體上限"
+
+
+def test_macro內部的動態呼叫也算動態():
+    """動態呼叫寫在 macro 裡(不是 model 裡)時一樣掃不出是哪幾支 —— 那支 macro 被
+    呼叫到,專案裡全部的 macro 都要算進來。"""
+    macros = dict(_DISPATCH_MACROS)
+    macros["macros/dyn.sql"] = (
+        "{% macro gate() %}{% set n = 'help' ~ 'er' %}{{ context.get(n)() }}{% endmacro %}")
+    assert _used("{{ gate() }}", macros) == [
+        "default__pick", "gate", "helper", "never_called", "sqlserver__pick"]
