@@ -322,7 +322,8 @@ def _summarize(project: DbtProject) -> tuple[DbtProjectInfo, dict]:
 def _summarize_isolated(project: DbtProject) -> tuple[DbtProjectInfo, dict] | None:
     """在子行程裡整理專案資訊;逾時、記憶體超限、異常或回傳的形狀不對都回 None。"""
     result = run_isolated(_summarize, (project,), timeout_s=DEFAULT_ISOLATED_TIMEOUT_S,
-                          max_memory_mb=DEFAULT_ISOLATED_MEMORY_MB, on_failure=lambda _message: None)
+                          max_memory_mb=DEFAULT_ISOLATED_MEMORY_MB, on_failure=lambda _message: None,
+                          types=(DbtProject, DbtProjectInfo))
     if (isinstance(result, tuple) and len(result) == 2
             and isinstance(result[0], DbtProjectInfo) and isinstance(result[1], dict)):
         return result

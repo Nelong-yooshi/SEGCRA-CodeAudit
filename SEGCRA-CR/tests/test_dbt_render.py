@@ -1000,12 +1000,14 @@ def _imports_of(path: pathlib.Path) -> set[str]:
     # contextvars:一份審查共用一個 invocation_id(每條執行緒各自一個值),不帶來任何對外能力
     ("dbt_render.py", {"contextvars", "copy", "dataclasses", "difflib", "jinja2", "pathlib", "re",
                        "secrets", "types", ".isolation"}),
-    # asyncio 本身開得了網路連線(open_connection)、起得了子行程(create_subprocess_exec)。
-    # isolation.py 可以有它:這支不讀、不展開不可信的內容(內容只在它起的子行程裡被處理),
-    # 用到的只有 run_in_thread 等背景執行緒結果的那幾個呼叫,由下面的
-    # test_isolation_uses_only_loop_calls_for_threads 鎖住,多用一個就失敗。
-    # contextvars、threading:把呼叫端的 ContextVar 帶進背景執行緒,不帶來對外能力
-    ("isolation.py", {"asyncio", "contextvars", "multiprocessing", "resource", "threading"}),
+    # 隔離子行程裡實際跑的那一側(進入點、JSON 編解碼):json、dataclasses、math、pathlib 做編解碼,
+    # importlib 照主行程指定的「模組:名稱」找回函式,sys 讀 stdin、寫 stdout,resource 設記憶體上限
+    ("isolation_child.py", {"dataclasses", "importlib", "json", "math", "pathlib", "resource", "sys"}),
+    # isolation.py(主行程那一側)不在這裡:它要啟動子行程,本來就需要 subprocess 與 os(只給列出的
+    # 環境變數),asyncio 也開得了連線與子行程。它可以有這些,因為它不讀、不展開不可信的內容——
+    # MR 的內容只當成參數編碼後交給子行程,子行程的指令固定(sys.executable -I 加固定的進入點,
+    # 不經 shell)。它實際用到哪些由語法樹檢查鎖住:asyncio 見下面的
+    # test_isolation_uses_only_loop_calls_for_threads,subprocess 與 os 見 tests/test_isolation.py。
     ("dbt_relations.py", {"re", "yaml", ".dbt_render"}),
     ("dbt_exec.py", {"__future__", "re", "sqlglot", ".dbt_render", "toolbox"}),
 ])
@@ -1048,6 +1050,11 @@ def test_isolation_uses_only_loop_calls_for_threads():
     assert holders == {"loop"}
 
 
+def test_isolation_child_never_writes_files_or_exec():
+    """隔離子行程裡實際跑的那一側,同上一條的語法樹檢查。"""
+    test_modules_never_write_files_or_exec("isolation_child.py")
+
+
 # ---------------------------------------------------------------- 隔離展開
 def test_isolated_render_matches_in_process(result):
     r = render_model_isolated(MODEL, code_root=CODE_ROOT, variables=SAMPLE_VARS,
@@ -1086,8 +1093,8 @@ def test_isolation_returns_result_and_fails_closed_on_crash_or_exception():
 
 
 def test_isolation_start_failure_is_closed():
-    """子行程啟動失敗(例如參數不能 pickle)也要收斂成失敗,不可把例外丟給呼叫端。"""
-    result = _isolated(len, lambda x: x)      # lambda 不能 pickle
+    """子行程啟動失敗(例如參數不能傳遞)也要收斂成失敗,不可把例外丟給呼叫端。"""
+    result = _isolated(len, lambda x: x)      # lambda 不能經 JSON 傳遞
     assert result[0] == "失敗"
     assert "子行程" in result[1]
 

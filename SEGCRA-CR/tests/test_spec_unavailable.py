@@ -92,7 +92,7 @@ def test_結果仍然解得開成兩個值(monkeypatch):
     lambda x: copy.copy(x), lambda x: copy.deepcopy(x),
     lambda x: pickle.loads(pickle.dumps(x))])
 def test_結果可以複製與pickle(roundtrip):
-    """管線有 deepcopy(capture),隔離子行程用 pickle 傳結果。沒有 __getnewargs__ 的話
+    """管線有 deepcopy(capture)。沒有 __getnewargs__ 的話
     tuple 子類別會把 (code, text) 整個當成第一個參數傳回 __new__,三種都丟 TypeError。"""
     got = roundtrip(SpecLookup("R-201", "# 規格", "too_large"))
     assert got == ("R-201", "# 規格") and got.unavailable == "too_large"

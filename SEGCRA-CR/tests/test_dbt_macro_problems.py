@@ -145,7 +145,7 @@ def test_隔離子行程跑得起來_結果帶得回來():
 
 @pytest.mark.parametrize("returned", [None, "x", RuntimeError("boom")])
 def test_子行程失敗或回傳不對時_ok是False(monkeypatch, returned):
-    def fake(fn, args, kwargs, *, timeout_s, max_memory_mb, on_failure):
+    def fake(fn, args, kwargs, *, timeout_s, max_memory_mb, on_failure, types=()):
         return on_failure("逾時") if isinstance(returned, Exception) else returned
     monkeypatch.setattr(dbt_render, "run_isolated", fake)
     assert dbt_render.check_macro_files_isolated(macro_files={}, database=DB) == MacroCheck(ok=False)
