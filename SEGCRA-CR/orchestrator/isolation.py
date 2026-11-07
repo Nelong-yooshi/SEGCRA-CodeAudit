@@ -11,11 +11,17 @@ Jinja 沙箱與各模組內的上限擋得住常見手法,但擋不住「一個�
 
 兩個模組共用這一份實作,避免各寫一套、各有漏洞。
 
+另外放「把同步呼叫丟到背景執行緒」的共用寫法(run_in_thread):執行驗證的沙盒與查受影響
+model 的規格都用它,外層的時間上限才插得進來。
+
 限制:
   * fn 必須是模組層級的函式,參數與回傳值必須可 pickle(multiprocessing spawn 的要求)
   * 呼叫端程式的進入點需有 `if __name__ == "__main__":` 保護
 """
+import asyncio
+import contextvars
 import multiprocessing
+import threading
 
 
 def _worker(conn, fn, max_memory_mb: int, args: tuple, kwargs: dict) -> None:
@@ -92,3 +98,47 @@ def run_isolated(fn, args: tuple = (), kwargs: dict | None = None, *,
     if status == "error":
         return on_failure(str(payload))
     return payload
+
+
+# ------------------------------------------------------------------ 背景執行緒
+
+async def run_in_thread(fn, *args, name: str = "segcra-background"):
+    """把同步函式丟到背景執行緒跑,讓外層的 await(與 asyncio.wait_for)能準時回來。
+
+    同步的呼叫(pymssql 的沙盒、在別的事件迴圈裡跑的查詢)在跑的時候,如果直接在事件迴圈裡
+    呼叫,迴圈整個卡住,外面的 `asyncio.wait_for` **插不進去**:上限 1 秒、沙盒卡 6 秒,結果
+    跑了 6 秒、沒有逾時、結果照常回傳。
+
+    * 不用 `asyncio.to_thread`(預設執行緒池):`asyncio.run` 結束時會等池子裡的工作做完,
+      等於逾時又被拖回去。自己開 daemon 執行緒,逾時就讓它自己跑完自己結束,外層不等它
+    * `contextvars` 要帶進去:審查釘住的 commit(toolbox.gitlab 的 review_ref)存在 ContextVar
+      裡,新開的執行緒不會繼承,讀到的會是預設值
+    * fn 丟的例外原樣交回 await 端
+    * 逾時之後外層不等這個執行緒,它可能在事件迴圈關掉之後才跑完:那時交回結果會丟
+      `RuntimeError: Event loop is closed`,發生在 daemon 執行緒裡沒有人接,log 每逾時一次就多
+      一段看起來很嚴重的 traceback。結果本來就不要了,**安靜地**放掉
+    """
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    ctx = contextvars.copy_context()
+
+    def settle(apply):
+        try:
+            loop.call_soon_threadsafe(apply)
+        except RuntimeError:                  # 迴圈已經關了
+            pass
+
+    def runner():
+        try:
+            out = ctx.run(fn, *args)
+        except BaseException as e:            # noqa: BLE001 — 原樣交回給 await 端
+            # **要先綁到自己的變數**:`except ... as e` 的 e 在區塊結束時就被刪掉,而這個
+            # lambda 是丟給事件迴圈稍後才跑的。直接捕捉 e 的話,跑的時候會丟 NameError,
+            # fut 永遠不會有結果,await 就**永遠掛著**。
+            exc = e
+            settle(lambda: fut.done() or fut.set_exception(exc))
+        else:
+            settle(lambda: fut.done() or fut.set_result(out))
+
+    threading.Thread(target=runner, name=name, daemon=True).start()
+    return await fut

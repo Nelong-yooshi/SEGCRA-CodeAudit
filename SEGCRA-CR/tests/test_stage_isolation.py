@@ -13,6 +13,7 @@ import json
 import pytest
 
 from orchestrator import pipeline
+from orchestrator.isolation import run_in_thread
 
 
 def _report(findings=()):
@@ -248,8 +249,7 @@ def test_同步卡住的沙盒也要在上限內中止(monkeypatch):
     async def main():
         t0 = _t.monotonic()
         with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(spec_exec._in_thread(spec_exec.execute_cases,
-                                                        "SELECT 1", {}, None),
+            await asyncio.wait_for(run_in_thread(spec_exec.execute_cases, "SELECT 1", {}, None),
                                    timeout=1)
         return _t.monotonic() - t0
 
@@ -259,7 +259,7 @@ def test_同步卡住的沙盒也要在上限內中止(monkeypatch):
 
 def test_背景執行緒是daemon且不是預設執行緒池():
     """不能用 asyncio.to_thread(預設執行緒池):`asyncio.run` 結束時會等池子裡的工作
-    做完,等於逾時又被拖回去(跟 #33 的 _wait_in_thread 同一個理由)。"""
+    做完,等於逾時又被拖回去。"""
     import threading
 
     from orchestrator import spec_exec
@@ -272,7 +272,7 @@ def test_背景執行緒是daemon且不是預設執行緒池():
         seen["name"] = cur.name
         return "done"
 
-    assert asyncio.run(spec_exec._in_thread(slow, 1)) == "done"
+    assert asyncio.run(run_in_thread(slow, 1)) == "done"
     assert seen["daemon"] is True, "非 daemon 的執行緒會讓程式結束時卡住等它"
     assert seen["name"] != "MainThread"
 
@@ -286,7 +286,7 @@ def test_背景執行緒帶得到contextvars():
 
     gitlab.pin_review_ref("cafe1234")
     try:
-        assert asyncio.run(spec_exec._in_thread(gitlab.review_ref)) == "cafe1234"
+        assert asyncio.run(run_in_thread(gitlab.review_ref)) == "cafe1234"
     finally:
         gitlab.pin_review_ref(None)
 

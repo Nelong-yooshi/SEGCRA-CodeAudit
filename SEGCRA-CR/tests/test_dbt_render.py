@@ -1000,7 +1000,12 @@ def _imports_of(path: pathlib.Path) -> set[str]:
     # contextvars:一份審查共用一個 invocation_id(每條執行緒各自一個值),不帶來任何對外能力
     ("dbt_render.py", {"contextvars", "copy", "dataclasses", "difflib", "jinja2", "pathlib", "re",
                        "secrets", "types", ".isolation"}),
-    ("isolation.py", {"multiprocessing", "resource"}),
+    # asyncio 本身開得了網路連線(open_connection)、起得了子行程(create_subprocess_exec)。
+    # isolation.py 可以有它:這支不讀、不展開不可信的內容(內容只在它起的子行程裡被處理),
+    # 用到的只有 run_in_thread 等背景執行緒結果的那幾個呼叫,由下面的
+    # test_isolation_uses_only_loop_calls_for_threads 鎖住,多用一個就失敗。
+    # contextvars、threading:把呼叫端的 ContextVar 帶進背景執行緒,不帶來對外能力
+    ("isolation.py", {"asyncio", "contextvars", "multiprocessing", "resource", "threading"}),
     ("dbt_relations.py", {"re", "yaml", ".dbt_render"}),
     ("dbt_exec.py", {"__future__", "re", "sqlglot", ".dbt_render", "toolbox"}),
 ])
@@ -1019,6 +1024,28 @@ def test_modules_never_write_files_or_exec(module):
     assert not names & {"open", "eval", "exec", "compile", "__import__", "input", "breakpoint"}
     assert not attrs & {"write_text", "write_bytes", "open", "unlink", "mkdir", "rmdir", "rmtree",
                         "system", "popen", "chmod", "rename", "replace_file", "symlink_to"}
+
+
+def test_isolation_uses_only_loop_calls_for_threads():
+    """isolation.py 用 asyncio 只為了等背景執行緒的結果:asyncio 只用 get_running_loop,
+    拿到的迴圈只用 create_future、call_soon_threadsafe。開連線、起子行程(open_connection、
+    create_subprocess_exec、loop.create_connection、loop.subprocess_exec……)都不在其中。"""
+    tree = ast.parse((PKG_ROOT / "orchestrator" / "isolation.py").read_text(encoding="utf-8"))
+    from_asyncio = [n for n in ast.walk(tree)
+                    if isinstance(n, ast.ImportFrom) and (n.module or "").startswith("asyncio")]
+    assert not from_asyncio
+    used = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name):
+            used.setdefault(n.value.id, set()).add(n.attr)
+    assert used.get("asyncio") == {"get_running_loop"}
+    assert used.get("loop") == {"create_future", "call_soon_threadsafe"}
+    # 迴圈只存在 loop 這個名字裡:換個名字就繞過上面的檢查
+    holders = {t.id for n in ast.walk(tree) if isinstance(n, ast.Assign)
+               and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Attribute)
+               and n.value.func.attr == "get_running_loop" for t in n.targets
+               if isinstance(t, ast.Name)}
+    assert holders == {"loop"}
 
 
 # ---------------------------------------------------------------- 隔離展開

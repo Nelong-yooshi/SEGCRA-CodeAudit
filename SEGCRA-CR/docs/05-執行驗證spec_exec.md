@@ -240,10 +240,10 @@ passed = bool(effective) and not sql_faults and not coverage_gaps
 1. `execute_cases` 收一個截止時間,**過了就不再開始新的案例**(手上那個照跑完 —— 單一
    查詢本來就有 120 秒上限,所以最多超過一個查詢的時間);沒跑到的案例由 `_unrun_gaps`
    列成覆蓋缺口,不會被當成「驗過而且沒問題」。
-2. 它被丟到一條 **daemon 背景執行緒**(`spec_exec._in_thread`),外層的 await 才能準時
-   回來。不用 `asyncio.to_thread` 的預設執行緒池:`asyncio.run` 結束時會等池子裡的工作
-   做完,等於逾時又被拖回去(跟 #33 的 `_wait_in_thread` 同一個理由)。`contextvars`
-   會帶進去 —— 審查用的 ref 釘在 ContextVar 裡(#31),不帶的話背景那邊讀到預設值。
+2. 它被丟到一條 **daemon 背景執行緒**(`isolation.run_in_thread`,查受影響 model 的規格也用
+   同一份),外層的 await 才能準時回來。不用 `asyncio.to_thread` 的預設執行緒池:`asyncio.run`
+   結束時會等池子裡的工作做完,等於逾時又被拖回去。`contextvars` 會帶進去 —— 審查用的 ref
+   釘在 ContextVar 裡(#31),不帶的話背景那邊讀到預設值。
 
 ### 為什麼要仲裁——測資生成也會幻覺(mr_003 實測)
 
