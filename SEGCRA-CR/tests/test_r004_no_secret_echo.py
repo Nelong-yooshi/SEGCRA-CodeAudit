@@ -18,13 +18,13 @@ from toolbox.sqltools import _text_rules, parse_error_text, run_rules
 
 # 假的值:每一個都夠特殊,出現在訊息裡一定抓得到
 CASES = [
-    ("SELECT 1 WHERE api_key = 'FAKE-EXAMPLE-KEY-000'", "FAKE-EXAMPLE-KEY-000", "API 金鑰"),
+    ("SET @api_key = 'FAKE-EXAMPLE-KEY-000'", "FAKE-EXAMPLE-KEY-000", "API 金鑰"),
     ("SELECT * FROM OPENQUERY(l, 'mssql://svc_user:FAKEPASS000@db.example.invalid/x')",
      "FAKEPASS000", "連線字串"),
     ("EXEC sp_do @password = 'FAKEPW000ZZ'", "FAKEPW000ZZ", "密碼"),
-    ("SELECT 1 WHERE ACCESS_KEY = 'FAKEAK000ZZ'", "FAKEAK000ZZ", "存取金鑰"),
-    ("SELECT 1 WHERE auth-token = 'FAKETK000ZZ'", "FAKETK000ZZ", "存取權杖"),
-    ("SELECT 1 WHERE credential = 'FAKECRED000'", "FAKECRED000", "憑證"),
+    ("SET @ACCESS_KEY = 'FAKEAK000ZZ'", "FAKEAK000ZZ", "存取金鑰"),
+    ("SET @auth-token = 'FAKETK000ZZ'", "FAKETK000ZZ", "存取權杖"),
+    ("SET @credential = 'FAKECRED000'", "FAKECRED000", "憑證"),
 ]
 
 
@@ -70,7 +70,7 @@ def test_鍵名的寫法不影響分類():
     """`API_KEY`、`api-key`、`apikey` 都要歸到同一類,而且訊息裡是我們的標籤、
     不是作者寫的那個字。"""
     for key in ("API_KEY", "api-key", "apikey", "Api_Key"):
-        [(_, _, message)] = _r004(f"SELECT 1 WHERE {key} = 'FAKEVALUE000'")
+        [(_, _, message)] = _r004(f"SET @{key} = 'FAKEVALUE000'")
         assert "API 金鑰" in message
         assert key not in message, message
 
@@ -79,6 +79,10 @@ def test_沒命中就不報():
     assert _r004("SELECT account_id FROM txn WHERE amount > 1000") == []
     # 鍵名像憑證但值不是字串常值(例如對欄位比較)→ 不是硬編碼
     assert _r004("SELECT 1 FROM users WHERE password = other_column") == []
+    # WHERE / AND / ON 後面的「欄位 = 字串」是比較,不是寫死憑證(#67):降成 H004
+    # 交模型判斷。沒被回應的檢核點照樣擋自動放行,所以不會因此靜靜放過。
+    assert _r004("SELECT id FROM t WHERE token = 'ACTIVE'") == []
+    assert _r004("SELECT id FROM t JOIN u ON u.api_key = 'LEGACY'") == []
 
 
 # ───────── 同一份報告的其他 finding 也不能把憑證帶出去(#42 review) ─────────
