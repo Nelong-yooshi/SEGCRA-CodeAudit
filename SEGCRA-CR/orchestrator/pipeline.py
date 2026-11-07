@@ -1938,7 +1938,7 @@ def enforce_spec_change(report: dict, mr: dict) -> dict:
 
 async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                     dry_run: bool = False, baseline: bool = False,
-                    capture: dict | None = None) -> dict:
+                    capture: dict | None = None, commit_status: bool = True) -> dict:
     """capture 給定時,記錄各階段中間產物(預掃前後、檢索到的知識、模型原始輸出、
     agent 工具對話、最終報告),供產生逐字 transcript。
 
@@ -2310,14 +2310,17 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         decision = report.get("decision", "needs_human")
         label = f"ai-review::{decision}"
         # commit status 與標籤先設、總結最後貼:這兩步沒寫上時要在總結寫明(看 MR 的人看得到)。
-        # commit status 回寫:CE 的 merge 閘門靠它(Pipelines must succeed)
-        _record_writeback(writeback, mr_id, "commit_status", await hub.call(
-            "gitlab__set_commit_status", {
-                "mr_id": mr_id, "sha": mr.get("sha", ""),
-                "state": "success" if decision == "auto_approved" else "failed",
-                "name": "segcra/review",
-                "description": f"{decision}:{report.get('summary', '')[:180]}",
-            }))
+        # commit status 回寫:不接 CI 時 CE 的 merge 閘門靠它(Pipelines must succeed)。
+        # commit_status=False 是審查做成 CI 的一個 job 時(見 orchestrator/ci_gate.py):job 的結果
+        # 就是閘門,不寫;留言、行內意見、label 照常
+        if commit_status:
+            _record_writeback(writeback, mr_id, "commit_status", await hub.call(
+                "gitlab__set_commit_status", {
+                    "mr_id": mr_id, "sha": mr.get("sha", ""),
+                    "state": "success" if decision == "auto_approved" else "failed",
+                    "name": "segcra/review",
+                    "description": f"{decision}:{report.get('summary', '')[:180]}",
+                }))
         _record_writeback(writeback, mr_id, "label", await hub.call(
             "gitlab__set_label", {"mr_id": mr_id, "label": label}))
         decision_text = {"auto_approved": "✅ 小幅變更且無實質問題,自動放行",

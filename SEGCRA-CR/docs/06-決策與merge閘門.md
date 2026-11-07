@@ -2,7 +2,7 @@
 
 ## 在幹嘛(一段白話)
 
-LLM 審完、執行驗證跑完之後,管線用兩個**確定性函式**把「這個 MR 接下來怎麼走」算出來:`apply_rubric` 依 finding 的 severity 組成重算分數與 verdict(模型自評分數只留檔不採用),`apply_policy` 依客觀訊號(diff 行數、是否新規則檔、rubric 分數、severity 組成、未回應檢核點、執行驗證結果)判成三態之一——`auto_approved` / `needs_human` / `blocked`。決策再以 commit status 回寫 GitLab,配合 CE 的「Pipelines must succeed」與 protected branch,讓 `needs_human` 與 `blocked` 的 MR **實際按不下 Merge 鈕**,而不是只留一句留言。
+LLM 審完、執行驗證跑完之後,管線用兩個**確定性函式**把「這個 MR 接下來怎麼走」算出來:`apply_rubric` 依 finding 的 severity 組成重算分數與 verdict(模型自評分數只留檔不採用),`apply_policy` 依客觀訊號(diff 行數、是否新規則檔、rubric 分數、severity 組成、未回應檢核點、執行驗證結果)判成三態之一——`auto_approved` / `needs_human` / `blocked`。審查是部署端 MR pipeline 最後一個 stage 的 job,決策變成 job 的結束碼,配合 GitLab 的「Pipelines must succeed」與 protected branch,讓 `blocked` 與沒跑完的審查**實際按不下 Merge 鈕**、`needs_human` 走既有的人工合併流程,而不是只留一句留言(見第 4 節;不接 CI 時改用 commit status,第 5 節)。
 
 ## 防的是什麼
 
@@ -10,7 +10,7 @@ LLM 審完、執行驗證跑完之後,管線用兩個**確定性函式**把「�
 - **模型被壓制後「假通過」**:提示注入若讓模型輸出 score 100 / findings 空,決策層還有 enforce 鏈補回的確定性 blocker(注入掃描命中必進 findings)→ `min_blockers` 條件把它擋成 `blocked`,與模型嘴上說什麼無關。
 - **「小改」偽裝**:自動放行只給小變更,但 diff 行數本身可被佔位 diff(`(generated)`)騙過;`apply_policy` 對不可靠 diff 退回 `full_content` 行數計算,新規則檔另有一條獨立的 `new_rule` 硬條件。
 - **只看靜態審查就放行**:SQL「看起來對」不代表「跑起來對」。`_spec_exec.passed` 是寫死在管線的硬條件(config 關不掉),沒通過執行驗證的 MR 永遠不會自動放行。
-- **決策做了卻擋不住人**:三態若只寫在留言裡,誰都能照樣按 Merge。所以決策落到 commit status,靠 GitLab 自身的 merge check 生效——這一段是機制,不是模型自律,也不是審查者自律。
+- **決策做了卻擋不住人**:三態若只寫在留言裡,誰都能照樣按 Merge。所以決策落到 pipeline 裡那個 job 的結果,靠 GitLab 自身的 merge check 生效——這一段是機制,不是模型自律,也不是審查者自律。
 
 ## 怎麼建的
 
@@ -66,12 +66,12 @@ LLM 審完、執行驗證跑完之後,管線用兩個**確定性函式**把「�
 
 與 `config/models.yaml` 的對應:`policy.auto_approve.{max_diff_lines, min_score, allowed_severities, forbid_pending_hints}` 與 `policy.block.min_blockers` 一一對應上述條件;寫死在程式的那幾項(`spec_exec_ok`、`_needs_human`、`spec_changed`、`incomplete`、`rule_hits`、`cold_read`)不在 yaml,因為它們不是可調參數而是不變量。規則層命中與冷讀命中在預設設定下也擋得住(`allowed_severities` 只許 info),寫死是為了設定放寬之後一樣擋得住;`rule_hits` 裡的檢核點在預設設定下也要靠它擋(模型一條提到關鍵詞的 info 就讓 `pending_hints` 不成立)。
 
-### 3. commit status 回寫(`orchestrator/pipeline.py:review_mr` 尾段 → `toolbox/gitlab.py:set_commit_status`)
+### 3. 回寫(`orchestrator/pipeline.py:review_mr` 尾段)
 
 `review_mr` 在決策後先取一次 MR(`gitlab__get_mr_refs`,只取 head 與 `diff_refs`、不取檔案內容):head 已經換了就不回寫(`_superseded`,見 07 篇),同一份 `diff_refs` 拿來開行內討論。接著依序回寫四樣東西:
 
 1. 逐 finding `gitlab__post_inline_comment`(行內留言,`_format_comment` 排版:標題/說明/建議/引用;位置用剛取回的 `diff_refs`,不再每條重取)。行內討論**被 GitLab 拒絕(4xx,例如行號對不上 diff)**時退成一般留言;**連線中斷、逾時、5xx 時不退**:GitLab 可能已經建立了討論、只是回應沒送到,改貼的話同一條會出現兩次。這種記成「沒有確定貼上」(`report["_writeback"]["unposted"]`),在總結**每一條都列出**(前 20 條連標題,其餘只列檔名與行號:看 MR 的人拿不到伺服器上的報告檔)。
-2. `gitlab__set_commit_status`:對 `mr["sha"]`(MR head commit)回寫 status,`name="segcra/review"`,**state 的映射:`auto_approved → success`,其餘(`needs_human`、`blocked`)→ `failed`**,description 帶 `decision:summary 前 180 字`。
+2. `gitlab__set_commit_status`:**只在不接 CI 時**(`review_mr(commit_status=True)`,webhook 那條路;部署端的 CI 那條路不寫,job 的結果就是閘門,見第 4 節)。對 `mr["sha"]`(MR head commit)回寫 status,`name="segcra/review"`,**state 的映射:`auto_approved → success`,其餘(`needs_human`、`blocked`)→ `failed`**,description 帶 `decision:summary 前 180 字`。
 3. `gitlab__set_label`:`ai-review::<decision>`。
 4. `gitlab__post_summary`:總評 + 三態決策文案(✅ 自動放行 / 👤 請人工確認 / ⛔ 修正前不得合入)+ rubric 分數 + verdict;有沒有確定貼上的 finding、或 commit status / 標籤沒寫上時附在最後。**總結排在最後**,前兩步沒寫上時才寫得進總結。
 
@@ -87,29 +87,109 @@ LLM 審完、執行驗證跑完之後,管線用兩個**確定性函式**把「�
 
 `toolbox/gitlab.py:set_commit_status` 兩路:real 模式(`GITLAB_URL`+`GITLAB_TOKEN`+`GITLAB_PROJECT` 三者齊備)打 GitLab REST `POST /projects/:id/statuses/:sha`;mock 模式寫進 `review_output/mr_<id>_review.json` 的 `commit_status` 欄。state 僅接受 success/failed/pending;real 模式缺 sha 時回 `failure: no_sha`,不會默默略過。
 
-webhook 在審查失敗或逾時時(`_notify_incomplete`)留言並把 commit status 設成失敗,兩步各自看結果:沒寫上時 log 寫「沒有設上」,不會印成「已設為失敗」;沒有 head sha 時用 `get_mr_refs` 取,不取檔案內容。
+webhook 那條路在審查失敗或逾時時(`_notify_incomplete`)留言並把 commit status 設成失敗(CI 那條路只留言),兩步各自看結果:沒寫上時 log 寫「沒有設上」,不會印成「已設為失敗」;沒有 head sha 時用 `get_mr_refs` 取,不取檔案內容。
 
-### 4. GitLab CE 的 merge 閘門三件套(README §7)
+### 4. 部署端的 merge 閘門:審查是 MR pipeline 的最後一個 stage
 
-CE 沒有 EE 的 approval rules,可行的擋法是三件事組起來:
+部署端要掛審查的 repo 有自己的 MR pipeline(只在 `merge_request_event` 跑),也設定了 pipeline 要過才能合併。審查做成這條 pipeline 最後一個 stage 的 job:pipeline 會等它跑完,結果就在 MR 看的同一條 pipeline 上,既有的「Pipelines must succeed」直接用。**部署端只用這一種觸發方式**,不設下一節的 webhook。
 
-1. **commit status**:上面第 3 步,每次審完對 head commit 回寫 `segcra/review` 的 success/failed。
-2. **Pipelines must succeed**:專案 → Settings → Merge requests → Merge checks 勾選。從此 status=failed 的 MR,Merge 按鈕被 GitLab 鎖住。
-3. **Protected branch**:`main` 設 protected,Allowed to push = No one、Allowed to merge = Maintainers——確保所有變更都走 MR、都經過審查,沒有側門直推。
+| 審查結果 | job 結束碼 | job | pipeline | 效果 |
+|---|---|---|---|---|
+| `auto_approved` | 0 | 成功 | 綠燈 | 可以合併 |
+| `needs_human`(審完了,交給人判斷) | 3 | 失敗,但 `allow_failure: exit_codes: [3]` 允許 | passed with warnings | 照既有的人工流程,有權限的人審完合併 |
+| `blocked` | 4 | 失敗 | 紅燈 | 鎖住 |
+| 審查沒跑完整(報告裡有環節未完整、整份失敗或逾時、被新的 commit 取代、審查服務連不上或拒絕) | 5 | 失敗 | 紅燈 | 鎖住;重審就是在 GitLab 上 retry 那個 job |
 
-三態的末端效果:
+結束碼的對應在 `orchestrator/ci_gate.py:exit_code`。沒跑完整時就算決策是 `needs_human` 也給 5:沒跑完就是沒有結論(可能是 MR 本身就有問題,例如 dbt 展開不了,後面執行驗證也跑不了),不能走「審完了、交給人判斷」那一條。`needs_human` 用 3:1 與 2 是程式異常結束時常見的結束碼(Python 沒接住的例外是 1、參數錯誤是 2),允許失敗的碼不能跟它們重疊。
+
+**job 呼叫審查服務,不在 runner 上直接跑審查。** runner 上跑哪些 job 由 MR 的 pipeline 設定決定,MR 可以加一個指定同一台 runner 的 job;審查需要的 GitLab token 與模型端點的通行碼若放在 runner 上,這種 job 讀得到。所以秘密只放在審查服務那台機器(`scripts/webhook_server.py`),job 只帶 GitLab 自動給的 `CI_JOB_TOKEN`:
+
+1. job 送 `POST /ci/review`(header `JOB-TOKEN`,body `{"mr_iid": …, "sha": …}`)。
+2. 服務拿這把 token 向 GitLab 查它是哪一個 job(`GET /api/v4/job`),再用自己的 token 查那條 pipeline 與 MR,確認(`ci_gate.check_request`):job 在執行中、屬於 `GITLAB_PROJECT` 這個專案;pipeline 是 `merge_request_event`、ref 是 `refs/merge-requests/<iid>/head`、sha 跟送來的一樣;MR 是開啟中、head 就是這個 sha。任一項不符回 403,不開始審查。
+3. 通過時開始審查(同一個 MR 還有進行中的就取消、改審這次的),回一個查詢用的編號;job 每 30 秒 `GET /ci/review/<編號>`(同一把 `JOB-TOKEN`,只有開始那份審查、還在執行中的 job 查得到),拿到 `done <結束碼>` 就照那個碼結束。
+4. 這條路不寫 commit status、不看 Draft、不等安靜期;留言、行內意見、label 照常。
+
+部署端要做的事:
+
+1. **審查服務**跑在有 GitLab token 與模型端點的主機上,runner 連得到它:環境變數同 README §5、§6(`GITLAB_URL`、`GITLAB_TOKEN`、`GITLAB_READ_TOKEN`、`GITLAB_PROJECT`),`GITLAB_PROJECT` 要填**專案的數字 id**(跟 GitLab 回的 `project_id` 比對;填路徑會一律拒絕)。啟動:`.venv/bin/python scripts/webhook_server.py --port 8000`。
+2. **CI/CD 變數** `SEGCRA_URL`:審查服務的位址(例如 `http://<審查主機>:8000`)。不是秘密,不用遮罩。
+3. **job**:接在最後一個 stage。runner 要有 `sh` 與 `curl`(用哪個映像依部署端的 runner 而定)。
+
+   ```yaml
+   stages:
+     # ……部署端既有的 stage
+     - segcra-review
+
+   segcra-review:
+     stage: segcra-review
+     rules:
+       - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+     inherit:
+       default: false              # 不吃 include 進來的 default(before_script 等)
+       variables: false
+     before_script: []
+     after_script: []
+     variables:
+       GIT_STRATEGY: none          # 不用取原始碼:審查服務自己向 GitLab 讀 MR
+     timeout: 1h                   # 要比整份審查的上限長(REVIEW_TIMEOUT_SECONDS,預設 2400 秒)
+     allow_failure:
+       exit_codes: [3]             # needs_human:passed with warnings
+     script:
+       - |
+         set -u
+         out=$(mktemp)
+         code=$(curl -sS -o "$out" -w '%{http_code}' -X POST "$SEGCRA_URL/ci/review" \
+           -H "JOB-TOKEN: $CI_JOB_TOKEN" -H "Content-Type: application/json" \
+           -d "{\"mr_iid\": $CI_MERGE_REQUEST_IID, \"sha\": \"$CI_COMMIT_SHA\"}") || code=000
+         if [ "$code" != 202 ]; then echo "審查服務沒有開始審查(HTTP $code):$(cat "$out")"; exit 5; fi
+         ticket=$(cat "$out")
+         echo "審查已開始,MR 上會出現留言;這個 job 等審查結束"
+         misses=0
+         while true; do
+           sleep 30
+           code=$(curl -sS -o "$out" -w '%{http_code}' "$SEGCRA_URL/ci/review/$ticket" \
+             -H "JOB-TOKEN: $CI_JOB_TOKEN") || code=000
+           if [ "$code" != 200 ]; then
+             misses=$((misses + 1))
+             if [ "$misses" -ge 10 ]; then echo "連續查不到審查狀態(HTTP $code):$(cat "$out")"; exit 5; fi
+             continue
+           fi
+           misses=0
+           r=$(cat "$out")
+           case "$r" in
+             running) ;;
+             "done 0"|"done 3"|"done 4"|"done 5") echo "審查結束:$r"; exit "${r#done }" ;;
+             *) echo "審查服務回了看不懂的內容"; exit 5 ;;
+           esac
+         done
+   ```
+
+4. **CI 設定檔放在 MR 改不到的地方**:專案 → Settings → CI/CD → General pipelines → *CI/CD configuration file* 填 `.gitlab-ci.yml@<群組>/<放 CI 設定的專案>`(GitLab CE 可用),那個專案只給負責 CI 的人寫入權。MR pipeline 用的是 MR 來源分支上的設定檔:設定檔留在同一個 repo 的話,MR 把這個 job 換成 `exit 0` 或拿掉,閘門就沒了。審查這個 job 寫在那份設定檔本身。部署端既有的 job 若用 `include: local` 從 repo 帶進來,要注意 include 進來的內容會跟主設定檔**合併**(同名 job 逐欄合併,`default:` 也會套到這個 job):repo 裡可以替這個 job 補上主設定檔沒寫的欄位(例如 `before_script: exit 0`),所以上面的 job 明寫了 `before_script`、`after_script` 為空、`inherit` 不吃 `default` 與全域變數;`stages` 與 `workflow` 也寫在主設定檔。帶進部署端前,先在測試 GitLab 上試一次「MR 改 repo 裡的設定能不能讓這個 job 變綠」。
+5. **Pipelines must succeed**(Settings → Merge requests → Merge checks)與 **protected branch**(`main` 的 Allowed to push = No one、Allowed to merge = Maintainers),確保所有變更都走 MR、都經過這條 pipeline。部署端已經設了「pipeline 要過才能合併」,不用再勾「Skipped pipelines are considered successful」。
+
+行為:
+
+- **重審**:在 GitLab 上 retry 這個 job(同一個 commit 再審一次)。推了新的 commit 會開新的 pipeline;舊的那份審查被取消,舊 pipeline 的 job 拿到 5。
+- **Draft 也審**:Draft 標成 Ready 不會重跑 pipeline,Draft 時跳過的話,標成 Ready 之後那條 pipeline 裡就沒有審查。
+- **逾時**:審查服務那邊整份審查超過 `REVIEW_TIMEOUT_SECONDS` 會中止(留言,結束碼 5);job 的 `timeout` 要更長,job 自己逾時也是失敗、鎖住。
+- **審查服務重新啟動**:進行中的審查沒了,job 查不到狀態,連續 10 次(約 5 分鐘)後以 5 結束;retry job 重審。
+
+### 5. 不接 CI 時:webhook + commit status(README §6、§7)
+
+測試環境或沒有 CI 的 repo 用這一條,部署端不用。MR 事件觸發審查(webhook),審完對 head commit 回寫 `segcra/review` 的 success/failed(第 3 節第 4 點),再配上 **Pipelines must succeed** 與 **protected branch**:
 
 | 決策 | commit status | 末端效果 |
 |---|---|---|
-| `auto_approved` | success | 小幅變更且無實質問題;Merge 按鈕可按(仍可要求人再看) |
+| `auto_approved` | success | Merge 按鈕可按 |
 | `needs_human` | failed | Merge 被鎖;人工確認後留言 `/review` 重審,或由有權限者依 GitLab 流程處置 |
-| `blocked` | failed | 有 blocker(注入、hardcode 憑證、DELETE 無 WHERE 等);修正前不得合入 |
+| `blocked` | failed | 修正前不得合入 |
+| 審查沒完成 | failed | 留言說明「審查未完成」 |
 
-`needs_human` 走 failed 是刻意保守:CE 的 merge check 只認 success/failed 兩種結果,凡是需要人看過的都先鎖住,由人做最後放行。注意 status 綁 commit——push 新 commit 後舊 status 不跟過去,要重審才會解鎖(這也是對的:新 commit 是沒審過的東西)。
+限制:審查在 pipeline 外面跑,pipeline 不會等它;補寫的 status 也不一定掛在 MR 看的那一條 pipeline 上,要靠「Pipelines must succeed」把外部 status 一起算進去。status 綁 commit,push 新 commit 後要重審才會解鎖。
 
 ## 對決策的影響
 
-本篇兩個函式**就是**決策本體:`apply_rubric` 產出 `score`/`verdict`(並把模型自評挪去 `_model_score`),`apply_policy` 產出 `decision` 與 `_policy_signals`。上游各防線的產物在這裡收口——enforce 鏈補的 blocker 走 `min_blockers` 進 `blocked`;`enforce_hints` 補的「檢核點待人工確認」觸發 `pending_hints`;spec_exec 的 major 既拉低 rubric 分數(−15)又帶入非 info severity,而 `_spec_exec.passed` 另走硬條件。決策再經 commit status 變成 GitLab 上實際可執行的閘門。
+本篇兩個函式**就是**決策本體:`apply_rubric` 產出 `score`/`verdict`(並把模型自評挪去 `_model_score`),`apply_policy` 產出 `decision` 與 `_policy_signals`。上游各防線的產物在這裡收口——enforce 鏈補的 blocker 走 `min_blockers` 進 `blocked`;`enforce_hints` 補的「檢核點待人工確認」觸發 `pending_hints`;spec_exec 的 major 既拉低 rubric 分數(−15)又帶入非 info severity,而 `_spec_exec.passed` 另走硬條件。決策再經 CI job 的結束碼變成 GitLab 上實際可執行的閘門。
 
 ## 怎麼驗證它在動
 
@@ -149,7 +229,7 @@ EOF
 
 **(b) 端到端(需模型)**:`.venv/bin/python demo.py --mr 003`。mr_003 帶提示注入 payload——注入掃描確定性命中 → blocker → 本機實測:rubric 算出 `score: 45`(blocker −40 + major −15,封頂 59 內)、模型自評 20 只留在 `_model_score`、決策 `blocked`;`review_output/mr_003_review.json` 的 `commit_status` 應為 `{"state": "failed", "name": "segcra/review", "description": "blocked:…"}`,`labels` 含 `ai-review::blocked`。`--mr 001`(SQL 與規格全符,執行驗證 `passed: true`)本機實測 `_policy_signals` 為 `{change_lines: 12, new_rule: true, spec_exec_passed: true}` → 決策 `needs_human`——執行驗證通過不等於自動放行,新規則檔一律至少人工過目。
 
-**(c) GitLab 端**:real 模式審完後,到 MR 頁面確認 status `segcra/review` 出現在 pipeline 區;`needs_human`/`blocked` 時 Merge 按鈕呈鎖定。若沒鎖住,先查專案是否勾了 Pipelines must succeed、審的是否為最新 commit(README §10 疑難排解表列有此症狀)。
+**(c) GitLab 端**:`tests/test_ci_gate.py` 驗四種結果的結束碼、`/ci/review` 只認這個 MR 的 job、這條路不寫 commit status。實際的燈號與能不能合併要在 GitLab 上試:用 README §8 的測試 GitLab 開一個專案,`.gitlab-ci.yml` 寫成 MR pipeline,把第 4 節的 job 接在一個會成功的 job 後面,四種結果各試一次,看 pipeline 的燈號與 Merge 按鈕。不接 CI 時(第 5 節)看 status `segcra/review` 出現在 pipeline 區、`needs_human`/`blocked` 時 Merge 按鈕呈鎖定。
 
 ## 擴充與注意
 
@@ -157,7 +237,7 @@ EOF
 - **改評分權重**:`orchestrator/pipeline.py:apply_rubric` 的公式(40/15/5 與 59 封頂)。動之前想清楚連動:`min_score: 95` 的意思是「至多一個 minor(100−5)」,權重一改,yaml 的 min_score 語意跟著變。
 - **加新的放行條件**:加在 `apply_policy` 的 `ok = (...)` 鏈上,並把新訊號寫進 `_policy_signals`,決策才可稽核。與 `spec_exec_ok` 同級的「不變量」請寫死在程式,不要進 yaml。
 - **已知限制**:
-  - 三態映射到 commit status 只有兩值(success/failed),GitLab 上看不出 `needs_human` 與 `blocked` 的差別——差別要看 label(`ai-review::<decision>`)與總評留言。
+  - 不接 CI 時(第 5 節)三態映射到 commit status 只有兩值(success/failed),GitLab 上看不出 `needs_human` 與 `blocked` 的差別——差別要看 label(`ai-review::<decision>`)與總評留言。CI 那條路(第 4 節)分得出來:`needs_human` 是 passed with warnings。
   - `new_rule` 的判定靠路徑(`rules/`)與 diff 形態(`@@ -0,0` / `generated`),repo 目錄慣例改了要同步改 `apply_policy`。
-  - commit status 需要 `mr["sha"]`;real 模式由 `gitlab__get_mr_diff` 回傳,若 API 拿不到 sha,status 回寫會失敗(有錯誤訊息,不會默默成功)。
+  - 不接 CI 時 commit status 需要 `mr["sha"]`;real 模式由 `gitlab__get_mr_diff` 回傳,若 API 拿不到 sha,status 回寫會失敗(有錯誤訊息,不會默默成功)。
   - `apply_rubric` 只看 severity 個數,不看 finding 內容真偽——內容品質由上游(引用白名單、enforce 鏈、仲裁)把關,rubric 不重複做。
