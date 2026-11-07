@@ -106,10 +106,6 @@ def test_模型只用info帶過時仍要補major():
                for f in report["findings"])
 
 
-def test_R005有對應的已報判定關鍵詞():
-    assert "R005" in pipeline._RULE_KEYWORDS
-
-
 def test_命中R005時強制載入secure_sql():
     """模型要知道這種寫法為什麼危險,secure-sql 的說明才會在 prompt 裡。"""
     assert pipeline._needs_secure_sql(_pre(f"{BASE} AND DB_NAME() <> 'x'"))
@@ -247,12 +243,13 @@ def test_現有的SQL檔沒有誤報():
     assert n >= 110, f"只掃到 {n} 段,來源可能漏了(應該有 54 個 .sql + 64 段 JSON)"
 
 
-def test_已報判定的關鍵詞不含沙盒():
-    """review 的小建議:「沙盒」範圍太廣——同一個檔案裡模型的其他 major 只要提到
-    沙盒(例如「沙盒無法連線」),R005 就會被當成已經報過而不補報。"""
-    kws = pipeline._RULE_KEYWORDS["R005"]
-    assert "沙盒" not in kws, "「沙盒」會讓別的 finding 把 R005 吃掉"
-    assert "執行環境" in kws and "sys." in kws
+def test_模型提到別的事情時R005照樣補報():
+    """以前用關鍵詞猜「模型已經報過」:同一個檔案裡的其他 major 只要提到「沙盒」,
+    R005 就整條不補(#27 review 抓到的)。現在一律補報,結構上不可能。"""
+    model = [{"severity": "major", "file": "a.sql", "title": "沙盒無法連線,執行環境未驗證"}]
+    report = pipeline.enforce_rules({"findings": list(model)},
+                                    _pre(f"{BASE} AND DB_NAME() <> 'x'"))
+    assert any(f["title"].startswith("[R005]") for f in report["findings"])
 
 
 def test_模型報了別的沙盒問題時R005照樣補報():

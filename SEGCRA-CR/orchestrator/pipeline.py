@@ -28,6 +28,8 @@ from .dbt_affected import (
 from .change_view import build_full_text_section
 from .cold_read import (UNREAD_NEAR_LIMIT, UNREAD_NO_USAGE, UNREAD_TOO_FEW, ColdRead,
                         cold_read as _cold_read, record as _cold_read_record)
+from .isolation import run_isolated
+from .dbt_impact import DEFAULT_ISOLATED_MEMORY_MB, DEFAULT_ISOLATED_TIMEOUT_S, macros_referenced
 from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_hidden_writes import IN_TAGS, UNREACHED, UNVERIFIED, WRITE_KEYWORDS, find_hidden_writes
 from .dbt_render import is_dbt_template, render_model_isolated
@@ -916,8 +918,12 @@ async def _non_sql_entry(hub: ToolHub, text: str, kind: str, path: str) -> dict:
 # 就掃得到;但**編譯期**的寫法(`{% if target.name == 'prod' %}`、`env_var()`)決定的是
 # 「展開出哪一段 SQL」,它們自己不會出現在展開結果裡 —— 展開完就看不見了。
 #
-# 用文字層的呼叫圖而不是展開器的追蹤:展開失敗的 model 也要能掃(展開失敗正是最該看的
-# 情況之一),而且不必動展開器。多掃到沒被呼叫的 macro 只是多一條提醒,漏掉才是問題。
+# 呼叫圖**先走語法樹**(`_macros_used_by_tree` → `dbt_impact.macros_referenced`,跟 macro
+# 反查同一套、在子行程裡跑):正規式看不懂 `adapter.dispatch('x')` 這類間接呼叫。樣板解析
+# 不了、子行程逾時或失敗時,才退回下面的正規式 —— 展開失敗的 model 也要能掃(展開失敗
+# 正是最該看的情況之一),而且不必動展開器。
+# 多掃到沒被呼叫的 macro 只是多一條提醒,漏掉才是問題:名稱在執行期才決定的動態呼叫,
+# 語法樹那條會把專案裡全部的 macro 都算進來,跟反查的做法一致。
 _MACRO_DEF_RE = re.compile(r"\{%-?\s*macro\s+(\w+)\s*\(")
 _MACRO_CALL_RE = re.compile(r"(?<![\w.])(\w+)\s*\(")
 # 只留讀取環境那一家族:macro 裡的 SELECT * 之類由 model 展開後的結果負責,
@@ -934,8 +940,27 @@ def _macro_index(macro_files: dict) -> dict:
     return index
 
 
+def _macros_used_by_tree(sources: dict, macro_files: dict) -> dict | None:
+    """語法樹版的呼叫圖,**在子行程裡跑**:`{來源的鍵: {macro 名稱…}}`;失敗回 None。
+
+    要放子行程的理由跟 macro 反查一樣:解析的是 MR 帶進來的內容,在主行程直接跑
+    沒有時間與記憶體上限,而預掃是同步呼叫 —— 卡住就是整份審查卡住(實測一個 3 MB
+    的 model 要 6 秒、多用 73 MB)。逾時或失敗就回 None,呼叫端退回正規式。
+    """
+    if not sources:
+        return {}
+    return run_isolated(macros_referenced, (dict(sources), dict(macro_files or {})),
+                        timeout_s=DEFAULT_ISOLATED_TIMEOUT_S,
+                        max_memory_mb=DEFAULT_ISOLATED_MEMORY_MB,
+                        on_failure=lambda _message: None)
+
 def _macros_used(src: str, index: dict) -> dict:
-    """這段樣板用到的 macro(含 macro 再呼叫 macro),{專案內路徑: 內容}。"""
+    """這段樣板用到的 macro(含 macro 再呼叫 macro),{專案內路徑: 內容}。
+
+    **正規式版,只在語法樹那條走不通時用**(樣板解析不了、子行程失敗或逾時):
+    看不懂 `adapter.dispatch('x')` 這類間接呼叫,但展開失敗的 model 也要能掃,
+    而那正是最該看的情況之一 —— 退回去的代價只是間接呼叫看不到,總比整個不掃好。
+    """
     out, seen, queue = {}, set(), [str(src or "")]
     while queue:
         text = queue.pop()
@@ -1126,12 +1151,20 @@ async def _macro_scan(hub: ToolHub, sources: dict, dbt_ctx, already: set,
     out = [] if out is None else out
     if not sources or dbt_ctx is None or getattr(dbt_ctx, "project", None) is None:
         return out
-    index = _macro_index(getattr(dbt_ctx, "macro_files", None) or {})
+    macro_files = getattr(dbt_ctx, "macro_files", None) or {}
+    index = _macro_index(macro_files)
     if not index:
         return out
+    # 語法樹那條一次處理全部來源(macro 檔只解析一次,而且在子行程裡跑);
+    # 回 None 代表樣板解析不了或子行程失敗 —— 逐檔退回正規式。
+    by_tree = _macros_used_by_tree(sources, macro_files)
     bodies = {}
-    for src in sources.values():
-        bodies.update(_macros_used(src, index))
+    if by_tree is None:
+        for src in sources.values():
+            bodies.update(_macros_used(src, index))
+    else:
+        for names in by_tree.values():
+            bodies.update({index[n][0]: index[n][1] for n in names if n in index})
     prefix = (getattr(dbt_ctx, "prefix", "") or "").strip("/")
     for rel, body in sorted(bodies.items()):
         path = f"{prefix}/{rel}" if prefix else rel
@@ -2064,6 +2097,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_claim_evidence(report)
 
         report = apply_rubric(report)
+        # 規則層命中的代號由程式從預掃結果寫進報告(模型輸出的同名欄位在這裡被蓋掉),
+        # 決策閘門據此判斷;這一步出錯時記成環節未完整,一樣不得自動放行
+        report["_rule_hits"] = _step(report, "規則命中彙整", _rule_hit_codes, None, pre)
         report = apply_policy(report, mr, cfg.policy)
         if not report.get("decision"):
             # 決策閘門自己壞掉時沒有決策可用——不能留空(呼叫端會以為沒問題)。
@@ -2229,25 +2265,6 @@ def _needs_secure_sql(pre: list[dict]) -> bool:
     return any(h.get("rule") in _SECURE_SQL_RULES for e in pre for h in e.get("rules", []))
 
 
-# rule 命中 → 判定「模型已涵蓋」的關鍵詞(報告全文含任一即視為已報,避免重複)
-_RULE_KEYWORDS = {
-    "R001": ["WHERE", "全表", "整表", "整張表", "purge"],
-    "R002": ["SELECT *", "明列欄位", "star"],
-    "R003": ["NOT IN", "NULL 陷阱", "NOT EXISTS"],
-    "R004": ["憑證", "密碼", "金鑰", "硬編碼", "hardcode", "credential", "secret"],
-    # 「沙盒」刻意不列(#27 review 的建議):它的範圍太廣,同一個檔案裡模型的其他
-    # major 只要提到沙盒,R005 就會被當成已經報過而不補報。
-    "R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys."],
-    # 危險 SQL 原語:關鍵詞要用那一類**特有**的字。原本這幾種會被報成「語法錯誤」
-    # 「效能問題」,所以泛用的字眼(「外部」「權限」)不能用——模型用它講別的事情時,
-    # 這一條就會被當成已經報過而不補報。
-    "R006": ["OPENROWSET", "OPENDATASOURCE", "OPENQUERY", "BULK INSERT", "linked server",
-             "四段式"],
-    "R007": ["xp_cmdshell", "作業系統指令", "作業系統命令"],
-    "R008": ["GRANT", "REVOKE", "EXECUTE AS", "ALTER ROLE", "授權", "權限授予"],
-    "R009": ["動態 SQL", "sp_executesql", "字串串接", "組出來再執行"],
-    "R010": ["run_query", "編譯期", "compile"],
-}
 
 
 _PARSE_FAIL_TITLE = "預掃無法解析此檔的 SQL,rule-base 規則未執行"
@@ -2758,10 +2775,16 @@ def _hit_line(hit: dict, exact: bool) -> int:
 
 
 def _count_note(code: str, total: int, missing: int, n: int) -> str:
-    """同一個檔案同一個代碼有多處命中時,附在補的說明後面的數量(只有一處時不加)。"""
+    """同一個檔案同一個代碼有多處命中時,附在補的說明後面的數量(只有一處時不加)。
+
+    檢核點(`enforce_hints`)仍然要判斷模型回應了幾處,所以保留 `missing`;規則
+    (`enforce_rules`)一律補報,兩個數字相同,說明就只寫「共幾處、這是第幾條」。
+    """
     if total <= 1:
         return ""
-    return (f"(這個檔案共有 {total} 處命中 {code},模型的 finding 只對應到 {total - missing} 處;"
+    answered = ("" if missing == total
+                else f",模型的 finding 只對應到 {total - missing} 處")
+    return (f"(這個檔案共有 {total} 處命中 {code}{answered};"
             f"這是程式補上的第 {n} 條,共 {missing} 條。請逐一檢查每一處。)")
 
 
@@ -3005,8 +3028,17 @@ def enforce_rules(report: dict, pre: list[dict]) -> dict:
             if code.startswith("R"):       # hint(H 系列)由 enforce_hints 處理
                 by_code.setdefault(code, []).append(h)
         for code, hits in by_code.items():
-            missing, exact = _coverage(before, entry["path"], _RULE_KEYWORDS.get(code, [code]),
-                                       hits)
+            # **一律補報,不看模型有沒有提到**(#104)。規則命中是程式判定的事實,
+            # 不需要靠猜來決定要不要說。原本用關鍵詞猜「模型已經講過同一件事」,而那
+            # 會誤中:模型在別的 finding 裡提到 `GRANT`,R008 就整條不補 —— 代價是
+            # 安靜地漏報,要到稽核才會發現。
+            #
+            # **補上的不會跟模型的去重**:`sanitize_findings` 排在這之前(見 review_mr),
+            # 所以模型講過同一件事時,報告上一律是兩條。不要為了少一條而在這之後再去重:
+            # 去重留下的是建議較長、引用較多的那條、不看嚴重度,模型寫一條標題近似的
+            # info 附一段建議,這裡補的 blocker 就會被換掉(#16 的那個洞)。
+            # 多一條的代價是有人多看一眼,漏一條的代價是帶著問題上線。
+            missing, exact = hits, True
             for n, h in enumerate(missing, 1):
                 detail = h.get("message", "") + (
                     "(這個命中在 is_incremental() 為 True 的增量分支裡)"
@@ -3489,6 +3521,33 @@ def enforce_claim_evidence(report: dict) -> dict:
     return report
 
 
+# 檢核點裡跟規則層一樣寫死、不看模型有沒有回應的(見 _rule_hit_codes)。其他檢核點照
+# enforce_hints 看同一個檔的 finding 有沒有回應,以及設定的 forbid_pending_hints。
+_HARD_HINT_CODES = frozenset({
+    "H004",   # 撈憑證/密碼類欄位、明碼比對密碼:資安類
+    "H006",   # 以下四項是環境相依的寫法:沙盒與正式環境會走不同分支,執行驗證驗不到
+    "H007",   # 讀連線的語系/日期設定
+    "H008",   # dbt 編譯期的環境資訊
+    "H009",   # 現在時間與寫死的日期比較
+})
+
+
+def _rule_hit_codes(pre: list[dict]) -> list[str]:
+    """預掃裡規則層(R 系列)與 _HARD_HINT_CODES 列的檢核點命中的代號,排序、不重複。
+    決策閘門的硬條件用(見 apply_policy)。
+
+    從預掃結果算,不從 finding 認:模型可以自己寫一條同標題的 finding,也可以把命中的那條
+    寫成 info;檢核點「有沒有回應」看的是同一個檔的 finding 有沒有含關鍵詞,一條提到「密碼」
+    的 info 就算回應過。其他檢核點與學到的風格(S 系列)不算。"""
+    codes = set()
+    for entry in pre if isinstance(pre, list) else []:
+        for hit in entry.get("rules", []) if isinstance(entry, dict) else []:
+            code = hit.get("rule") if isinstance(hit, dict) else None
+            if isinstance(code, str) and (code.startswith("R") or code in _HARD_HINT_CODES):
+                codes.add(code)
+    return sorted(codes)
+
+
 @_isolated_stage("決策閘門")
 def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     """決策閘門(確定性):auto_approved / needs_human / blocked。
@@ -3534,6 +3593,14 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
     # allowed_severities 只許 info 擋著(未完成的那條是 major),設定一放寬,
     # 沒跑完的審查就會被當成「沒問題」自動放行。跟執行驗證一樣不可由設定關閉。
     incomplete = review_incomplete(report)
+    # 規則層有命中、冷讀命中或沒看完 → 不得自動放行,也**寫死在程式裡**。只靠設定檔的
+    # allowed_severities 只許 info 擋著的話(命中至少是 minor、冷讀那條是 major),設定一放寬,
+    # 規則層驗到差異、或有文字在對審查者說話的 MR 就會被自動放行。資安與環境相依的檢核點
+    # (_HARD_HINT_CODES)也算在 rule_hits 裡:不看模型有沒有回應。兩個訊號都是程式寫的
+    # (`_rule_hits` 從預掃結果算、`_cold_read` 由冷讀那一道寫),不看 finding 的標題或嚴重度。
+    rule_hits = [str(code) for code in (report.get("_rule_hits") or [])]
+    cold = report.get("_cold_read")
+    cold_read = isinstance(cold, dict) and (cold.get("flagged") is True or cold.get("truncated") is True)
 
     blk = policy.get("block", {})
     if sum(s == "blocker" for s in
@@ -3548,6 +3615,8 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
           and not needs_human
           and not spec_changed
           and not incomplete
+          and not rule_hits
+          and not cold_read
           and report.get("score", 0) >= aa.get("min_score", 101)
           and severities <= set(aa.get("allowed_severities", []))
           and not (aa.get("forbid_pending_hints", True) and pending_hints))
@@ -3558,7 +3627,9 @@ def apply_policy(report: dict, mr: dict, policy: dict) -> dict:
                                  "spec_exec_passed": spec_exec_ok,
                                  "needs_human": needs_human,
                                  "spec_changed": spec_changed,
-                                 "incomplete": incomplete}
+                                 "incomplete": incomplete,
+                                 "rule_hits": rule_hits,
+                                 "cold_read": cold_read}
     return report
 
 

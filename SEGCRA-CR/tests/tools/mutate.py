@@ -2469,16 +2469,44 @@ MUTANTS.update({
  "解析失敗:連位置都不留(看不出哪裡壞了)": ("../toolbox/sqltools.py",
      '    for d in getattr(e, "errors", None) or []:',
      "    for d in []:"),
+ 'R004:密碼家族的比較也降級(寫死的密碼被放過)': ("../toolbox/sqltools.py",
+     '    if not key or key in _PASSWORD_KEYS:',
+     '    if not key:'),
+ 'R004:降級不看值像不像狀態碼(hunter2 也放過)': ("../toolbox/sqltools.py",
+     '    return bool(_STATUS_VALUE_RE.match(sql, m.end("key")))',
+     '    return True'),
  "R004:訊息回顯比對到的原文": ("../toolbox/sqltools.py",
-     'f"疑似硬編碼憑證/密碼/金鑰於 SQL:{_secret_kind(m)}——"',
-     'f"疑似硬編碼憑證/密碼/金鑰於 SQL:「{m.group(0)[:40]}」——"'),
+     '                     f"疑似硬編碼憑證/密碼/金鑰於 SQL:{_secret_kind(secret)}——"',
+     '                     f"疑似硬編碼憑證/密碼/金鑰於 SQL:「{secret.group(0)[:40]}」——"'),
+ # 偵測範圍(#67):漏抓等於密碼進正式環境,誤報直接把 MR 擋下來
+ "R004:不認 N 前綴的字串(T-SQL 的 N'…' 漏抓)": ("../toolbox/sqltools.py",
+     '_QUOTED = r"""N?\'[^\'\\n]{1,}\'|N?\\"[^\\"\\n]{1,}\\""""',
+     '_QUOTED = r"""\'[^\'\\n]{1,}\'|\\"[^\\"\\n]{1,}\\""""'),
+ 'R004:佔位符也當成寫死的值(env_var 被報成 blocker)': ("../toolbox/sqltools.py",
+     '_PLACEHOLDER_RE = re.compile(r"(?i)\\{\\{|\\$\\{|env_var\\s*\\(")',
+     '_PLACEHOLDER_RE = re.compile(r"(?!x)x")'),
+ 'R004:不認位置參數(sp_addlogin 的密碼漏抓)': ("../toolbox/sqltools.py",
+     '    found = list(_SECRET_RE.finditer(sql)) + list(_SECRET_PROC_RE.finditer(sql))',
+     '    found = list(_SECRET_RE.finditer(sql))'),
+ 'R004:欄位比較不降級(狀態值的比較被擋下)': ("../toolbox/sqltools.py",
+     '                   if _hardcoded_value(m) and not _is_comparison(sql, m)), None)',
+     '                   if _hardcoded_value(m)), None)'),
+ 'R004:等號後面的識別字也算寫死(欄位比較被誤報)': ("../toolbox/sqltools.py",
+     '      | =\\s*(?P<equals>""" + _QUOTED + r"""|[0-9][\\w.$-]{0,})',
+     '      | =\\s*(?P<equals>""" + _QUOTED + r"""|[^\\s#,;)\\n]{1,})'),
+ 'R004:只看第一處(前面被排除就整份不報)': ("../toolbox/sqltools.py",
+     '    secret = next((m for m in _secret_matches(sql)',
+     '    secret = next((m for m in _secret_matches(sql)[:1]'),
+ 'R004:佔位符看整行而不是值本身': ("../toolbox/sqltools.py",
+     '    value = groups.get("colon") or groups.get("equals") or groups.get("secret") or ""',
+     '    value = m.string[m.start():m.start() + 60]'),
  "R004:回顯鍵名原文(大小寫與寫法是作者的文字)": ("../toolbox/sqltools.py",
-     '    key = re.sub(r"[_-]", "", m.group("key") or "").lower()' + NL
+     '    key = re.sub(r"[_-]", "", groups.get("key") or "").lower()' + NL
      + "    return f\"{_SECRET_KINDS.get(key, '憑證')}類的鍵指定了字串常值\"",
-     '    key = m.group("key") or ""' + NL
+     '    key = groups.get("key") or ""' + NL
      + '    return f"{key} 指定了字串常值"'),
  "R004:連線字串那一支也報成鍵": ("../toolbox/sqltools.py",
-     '    if m.group("url"):' + NL + '        return "連線字串含帳號與密碼"',
+     '    if groups.get("url"):' + NL + '        return "連線字串含帳號與密碼"',
      "    if False:" + NL + '        return "連線字串含帳號與密碼"'),
 })
 
@@ -2517,15 +2545,43 @@ MUTANTS.update({
  "R005:不抓不帶括號的身分函式": ("../toolbox/sqltools.py",
      r'(SYSTEM_USER|CURRENT_USER|SESSION_USER)\b"',
      r'(SYSTEM_USER)\b"'),
- # review 的小建議:「沙盒」範圍太廣,同一個檔案裡其他 major 提到沙盒就會讓 R005
- # 被當成已經報過。
- "R005:已報判定關鍵詞含「沙盒」(範圍過廣)": ("pipeline.py",
-     '"R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys."],',
-     '"R005": ["執行環境", "DB_NAME", "HOST_NAME", "SUSER_NAME", "SERVERNAME", "sys.", "沙盒"],'),
+ # 規則命中一律補報(#104):原本用關鍵詞猜「模型已經報過」,泛用的字眼會讓模型講
+ # 別的事情時整條不補 —— 安靜地漏報,要到稽核才發現。
+ "補報:規則命中改回看模型有沒有提到": ("pipeline.py",
+     "            missing, exact = hits, True",
+     "            missing, exact = _coverage(before, entry[\"path\"], [code], hits)"),
+ "補報:只補第一處(同一個檔案的其他命中漏掉)": ("pipeline.py",
+     "            missing, exact = hits, True",
+     "            missing, exact = hits[:1], True"),
+ "補報:行號回到「不確定就不寫」": ("pipeline.py",
+     "            missing, exact = hits, True",
+     "            missing, exact = hits, False"),
 })
 
 # ---- 注入掃描的總量上限:放得下一份展開結果
 MUTANTS.update({
+ # macro 呼叫圖只留一套(#103)
+ '呼叫圖:不用語法樹,只用正規式(dispatch 抓不到)': ('pipeline.py',
+     '    by_tree = _macros_used_by_tree(sources, macro_files)',
+     '    by_tree = None'),
+ '呼叫圖:子行程失敗時不退回正規式(整個不掃)': ('pipeline.py',
+     '    if by_tree is None:',
+     '    if False:'),
+ '呼叫圖:在主行程直接解析(沒有時間與記憶體上限)': ('pipeline.py',
+     '    return run_isolated(macros_referenced, (dict(sources), dict(macro_files or {})),' + NL
+     + '                        timeout_s=DEFAULT_ISOLATED_TIMEOUT_S,' + NL
+     + '                        max_memory_mb=DEFAULT_ISOLATED_MEMORY_MB,' + NL
+     + '                        on_failure=lambda _message: None)',
+     '    return macros_referenced(dict(sources), dict(macro_files or {}))'),
+ '呼叫圖:dispatch 只認 default__ 的實作': ('dbt_impact.py',
+     '                index.setdefault(name[cut + 2:], set()).add(name)',
+     '                index.setdefault(name[cut + 2:], set()).add(name) if name.startswith("default__") else None'),
+ '呼叫圖:動態呼叫時不把全部 macro 算進來': ('dbt_impact.py',
+     '            out[key] = set(known)\n            continue',
+     '            out[key] = set()\n            continue'),
+ '呼叫圖:macro 內的動態呼叫不算': ('dbt_impact.py',
+     '                if _refs_is_dynamic(inner, callables):',
+     '                if False:'),
     "掃描上限:改回放不下一份展開結果": ("pipeline.py",
         "MAX_EXTRA_SCAN_CHARS = 5_000_000",
         "MAX_EXTRA_SCAN_CHARS = 200_000"),
@@ -2550,10 +2606,10 @@ MUTANTS.update({
  "後處理:解析失敗改回直接附加": ("pipeline.py",
      "            _put_program_finding(report, _parse_fail_finding(entry))",
      '            report.setdefault("findings", []).append(_parse_fail_finding(entry))'),
- "規則補報:不看嚴重度(info 可蓋掉 blocker)": ("pipeline.py",
+ "檢核點:不看嚴重度(不認得的嚴重度也算回應)": ("pipeline.py",
      '            if i not in covered and rank >= need[i]:',
      '            if i not in covered:'),
- "規則補報:嚴重度差一級也算報過": ("pipeline.py",
+ "檢核點:嚴重度差一級也算回應(不認得的也算)": ("pipeline.py",
      '            if i not in covered and rank >= need[i]:',
      '            if i not in covered and rank >= need[i] - 1:'),
  "規則補報:summary 提到也算報過": ("pipeline.py",
@@ -2562,9 +2618,7 @@ MUTANTS.update({
  "規則補報:檔名也拿來比對關鍵詞": ("pipeline.py",
      '        text = " ".join(str(f.get(k) or "") for k in ("title", "detail", "suggestion"))',
      "        text = json.dumps(f, ensure_ascii=False)"),
- "規則補報:不認得的嚴重度當成最輕": ("pipeline.py",
-     '    need = [_SEVERITY_RANK.get(h.get("severity", "major"), _SEVERITY_RANK["blocker"])',
-     '    need = [_SEVERITY_RANK.get(h.get("severity", "major"), 0)'),
+
  # ---- 同一個檔案有多處相同規則的命中(#28 review)
  "規則補報:同檔有一條報過就全部不補(一條抵多處)": ("pipeline.py",
      '    return [h for i, h in enumerate(hits) if i not in covered]',
@@ -2572,7 +2626,10 @@ MUTANTS.update({
  "規則補報:引用同一句的兩條 finding 各抵一處": ("pipeline.py",
      '        (quoted if refs else generic).append((rank, refs or range(len(hits))))',
      '        generic.append((rank, range(len(hits))))'),
- "規則補報:沒引用語句的 finding 先對應(會多補)": ("pipeline.py",
+ # 「命中的嚴重度不認得時當成最輕」不列為突變點:**它已經是等價的**。_coverage 現在
+ # 只剩檢核點在用(規則改成一律補報),而檢核點呼叫時把每一處都改成 info,那個預設值
+ # 永遠用不到。留著只會得到一個永遠抓不到的突變點。
+ "檢核點:沒引用語句的回應先對應(會多補一條未回應)": ("pipeline.py",
      '    for n, (rank, options) in enumerate(quoted + generic):   # 有引用語句的先對應',
      '    for n, (rank, options) in enumerate(generic + quoted):'),
  "規則補報:語句比對分大小寫與空白": ("pipeline.py",
@@ -3870,6 +3927,46 @@ MUTANTS.update({
 })
 
 
+# ---- 決策閘門的硬條件:規則層有命中、冷讀命中或沒看完,不得自動放行(不可由設定關閉)
+MUTANTS.update({
+    "決策硬條件:規則命中不擋": ("pipeline.py",
+        "          and not incomplete" + NL + "          and not rule_hits" + NL,
+        "          and not incomplete" + NL),
+    "決策硬條件:冷讀不擋": ("pipeline.py",
+        "          and not rule_hits" + NL + "          and not cold_read" + NL,
+        "          and not rule_hits" + NL),
+    "決策硬條件:冷讀沒看完不算": ("pipeline.py",
+        '(cold.get("flagged") is True or cold.get("truncated") is True)',
+        '(cold.get("flagged") is True)'),
+    "決策硬條件:冷讀命中不算": ("pipeline.py",
+        '(cold.get("flagged") is True or cold.get("truncated") is True)',
+        '(cold.get("truncated") is True)'),
+    "決策硬條件:冷讀紀錄不看是不是 True": ("pipeline.py",
+        '(cold.get("flagged") is True or cold.get("truncated") is True)',
+        '(bool(cold.get("flagged")) or bool(cold.get("truncated")))'),
+    "決策硬條件:不是物件的冷讀紀錄也讀": ("pipeline.py",
+        "    cold_read = isinstance(cold, dict) and (",
+        "    cold_read = ("),
+    "決策硬條件:沒有寫規則命中": ("pipeline.py",
+        '        report["_rule_hits"] = _step(report, "規則命中彙整", _rule_hit_codes, None, pre)' + NL, ""),
+    "決策硬條件:檢核點與風格也算命中": ("pipeline.py",
+        '            if isinstance(code, str) and (code.startswith("R") or code in _HARD_HINT_CODES):',
+        "            if isinstance(code, str):"),
+    "決策硬條件:資安與環境相依的檢核點不算": ("pipeline.py",
+        '            if isinstance(code, str) and (code.startswith("R") or code in _HARD_HINT_CODES):',
+        '            if isinstance(code, str) and code.startswith("R"):'),
+    "決策硬條件:H004 不算": ("pipeline.py",
+        '    "H004",   # 撈憑證/密碼類欄位、明碼比對密碼:資安類' + NL, ""),
+    "決策硬條件:H006 不算": ("pipeline.py",
+        '    "H006",   # 以下四項是環境相依的寫法:沙盒與正式環境會走不同分支,執行驗證驗不到' + NL, ""),
+    "決策硬條件:H007 不算": ("pipeline.py", '    "H007",   # 讀連線的語系/日期設定' + NL, ""),
+    "決策硬條件:H008 不算": ("pipeline.py", '    "H008",   # dbt 編譯期的環境資訊' + NL, ""),
+    "決策硬條件:H009 不算": ("pipeline.py", '    "H009",   # 現在時間與寫死的日期比較' + NL, ""),
+    "決策硬條件:形狀不對的命中照讀": ("pipeline.py",
+        '            code = hit.get("rule") if isinstance(hit, dict) else None',
+        '            code = hit.get("rule")'),
+})
+
 # ---- 測資生成的覆蓋度重試(spec_exec)
 # 這道防線的失效是**靜默**的:覆蓋不完整的測資照樣跑得完、報告看起來正常,
 # 只是執行驗證少驗了幾個條件。沒有突變點的話,測試是不是真的守著它無從得知。
@@ -4361,8 +4458,14 @@ MUTANTS.update({
      "        report = enforce_spec_pending(report, spec_text)\n"
      "        report = enforce_claim_evidence(report)\n\n"
      "        report = apply_rubric(report)\n"
+     "        # 規則層命中的代號由程式從預掃結果寫進報告(模型輸出的同名欄位在這裡被蓋掉),\n"
+     "        # 決策閘門據此判斷;這一步出錯時記成環節未完整,一樣不得自動放行\n"
+     "        report[\"_rule_hits\"] = _step(report, \"規則命中彙整\", _rule_hit_codes, None, pre)\n"
      "        report = apply_policy(report, mr, cfg.policy)",
      "        report = apply_rubric(report)\n"
+     "        # 規則層命中的代號由程式從預掃結果寫進報告(模型輸出的同名欄位在這裡被蓋掉),\n"
+     "        # 決策閘門據此判斷;這一步出錯時記成環節未完整,一樣不得自動放行\n"
+     "        report[\"_rule_hits\"] = _step(report, \"規則命中彙整\", _rule_hit_codes, None, pre)\n"
      "        report = apply_policy(report, mr, cfg.policy)\n"
      "        report = calibrate_with_execution(report)\n"
      "        report = enforce_spec_pending(report, spec_text)\n"
@@ -4751,9 +4854,9 @@ MUTANTS.update({
      "            out[rel] = body" + NL + "            queue.append(body)",
      "            out[rel] = body"),
  "macro 掃描:專案裡的 macro 全掃(不看有沒有被呼叫)": (P,
-     "    for src in sources.values():" + NL
-     + "        bodies.update(_macros_used(src, index))",
-     "    bodies.update(getattr(dbt_ctx, \"macro_files\", None) or {})"),
+     "        for names in by_tree.values():" + NL
+     + "            bodies.update({index[n][0]: index[n][1] for n in names if n in index})",
+     "        bodies.update(macro_files)"),
  # 特製內容不得讓規則層變成平方時間(內容由 MR 決定)
  "上限:函式名與括號之間的空白/註解不設上限": (T,
      r'_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/)){0,500}\*/|--[^\n]*\n){0,30}"',
