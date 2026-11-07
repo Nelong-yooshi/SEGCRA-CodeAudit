@@ -3923,6 +3923,46 @@ MUTANTS.update({
 })
 
 
+# ---- 決策閘門的硬條件:規則層有命中、冷讀命中或沒看完,不得自動放行(不可由設定關閉)
+MUTANTS.update({
+    "決策硬條件:規則命中不擋": ("pipeline.py",
+        "          and not incomplete" + NL + "          and not rule_hits" + NL,
+        "          and not incomplete" + NL),
+    "決策硬條件:冷讀不擋": ("pipeline.py",
+        "          and not rule_hits" + NL + "          and not cold_read" + NL,
+        "          and not rule_hits" + NL),
+    "決策硬條件:冷讀沒看完不算": ("pipeline.py",
+        '(cold.get("flagged") is True or cold.get("truncated") is True)',
+        '(cold.get("flagged") is True)'),
+    "決策硬條件:冷讀命中不算": ("pipeline.py",
+        '(cold.get("flagged") is True or cold.get("truncated") is True)',
+        '(cold.get("truncated") is True)'),
+    "決策硬條件:冷讀紀錄不看是不是 True": ("pipeline.py",
+        '(cold.get("flagged") is True or cold.get("truncated") is True)',
+        '(bool(cold.get("flagged")) or bool(cold.get("truncated")))'),
+    "決策硬條件:不是物件的冷讀紀錄也讀": ("pipeline.py",
+        "    cold_read = isinstance(cold, dict) and (",
+        "    cold_read = ("),
+    "決策硬條件:沒有寫規則命中": ("pipeline.py",
+        '        report["_rule_hits"] = _step(report, "規則命中彙整", _rule_hit_codes, None, pre)' + NL, ""),
+    "決策硬條件:檢核點與風格也算命中": ("pipeline.py",
+        '            if isinstance(code, str) and (code.startswith("R") or code in _HARD_HINT_CODES):',
+        "            if isinstance(code, str):"),
+    "決策硬條件:資安與環境相依的檢核點不算": ("pipeline.py",
+        '            if isinstance(code, str) and (code.startswith("R") or code in _HARD_HINT_CODES):',
+        '            if isinstance(code, str) and code.startswith("R"):'),
+    "決策硬條件:H004 不算": ("pipeline.py",
+        '    "H004",   # 撈憑證/密碼類欄位、明碼比對密碼:資安類' + NL, ""),
+    "決策硬條件:H006 不算": ("pipeline.py",
+        '    "H006",   # 以下四項是環境相依的寫法:沙盒與正式環境會走不同分支,執行驗證驗不到' + NL, ""),
+    "決策硬條件:H007 不算": ("pipeline.py", '    "H007",   # 讀連線的語系/日期設定' + NL, ""),
+    "決策硬條件:H008 不算": ("pipeline.py", '    "H008",   # dbt 編譯期的環境資訊' + NL, ""),
+    "決策硬條件:H009 不算": ("pipeline.py", '    "H009",   # 現在時間與寫死的日期比較' + NL, ""),
+    "決策硬條件:形狀不對的命中照讀": ("pipeline.py",
+        '            code = hit.get("rule") if isinstance(hit, dict) else None',
+        '            code = hit.get("rule")'),
+})
+
 # ---- 測資生成的覆蓋度重試(spec_exec)
 # 這道防線的失效是**靜默**的:覆蓋不完整的測資照樣跑得完、報告看起來正常,
 # 只是執行驗證少驗了幾個條件。沒有突變點的話,測試是不是真的守著它無從得知。
@@ -4414,8 +4454,14 @@ MUTANTS.update({
      "        report = enforce_spec_pending(report, spec_text)\n"
      "        report = enforce_claim_evidence(report)\n\n"
      "        report = apply_rubric(report)\n"
+     "        # 規則層命中的代號由程式從預掃結果寫進報告(模型輸出的同名欄位在這裡被蓋掉),\n"
+     "        # 決策閘門據此判斷;這一步出錯時記成環節未完整,一樣不得自動放行\n"
+     "        report[\"_rule_hits\"] = _step(report, \"規則命中彙整\", _rule_hit_codes, None, pre)\n"
      "        report = apply_policy(report, mr, cfg.policy)",
      "        report = apply_rubric(report)\n"
+     "        # 規則層命中的代號由程式從預掃結果寫進報告(模型輸出的同名欄位在這裡被蓋掉),\n"
+     "        # 決策閘門據此判斷;這一步出錯時記成環節未完整,一樣不得自動放行\n"
+     "        report[\"_rule_hits\"] = _step(report, \"規則命中彙整\", _rule_hit_codes, None, pre)\n"
      "        report = apply_policy(report, mr, cfg.policy)\n"
      "        report = calibrate_with_execution(report)\n"
      "        report = enforce_spec_pending(report, spec_text)\n"
