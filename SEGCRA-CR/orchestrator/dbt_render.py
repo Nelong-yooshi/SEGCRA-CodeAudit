@@ -488,7 +488,7 @@ def model_identity(project: "DbtProjectInfo | None", name: str, schema: str) -> 
 
 
 def _make_relations(database: str | None, schema: str, usage: dict,
-                    project: "DbtProjectInfo | None" = None):
+                    project: "DbtProjectInfo | None" = None, sandbox_tables: dict | None = None):
     """dbt 的 ref() / source(),比照正式環境展開成 "<database>"."<schema>"."<表>"。
 
     usage 是呼叫端給的共用字典:呼叫到 ref()/source() 記 used;有專案資訊但這次
@@ -502,7 +502,12 @@ def _make_relations(database: str | None, schema: str, usage: dict,
       * 找不到但無法確定(專案用了套件等),或有會改變表名的設定 → 記 uncertain,
         仍以慣例展開(規則層不看表名,不影響判斷)
       * 找得到的 model 照 dbt 的規則套用 alias 與自訂 schema(model_identity)
+
+    sandbox_tables 給定時是執行驗證用的展開(見 _sandbox_relations):source() 指向規格建的
+    測資表,ref() 與 {{ this }} 不支援。
     """
+    if sandbox_tables is not None:
+        return _sandbox_relations(usage, project, sandbox_tables)
 
     def relation(name, rel_schema=schema) -> str:
         usage["used"] = True
@@ -583,6 +588,59 @@ def _make_relations(database: str | None, schema: str, usage: dict,
         alias, rel_schema, _ = model_identity(project, name, schema)
         text = f'"{database}"."{_check_ident("綱要", rel_schema)}"."{alias}"'
         return _Relation(text, database, rel_schema, alias)
+
+    return ref, source, this
+
+
+_EXEC_NO_REF = ("執行驗證尚未支援 ref():被引用的 model 要先在沙盒建出來,"
+                "或由測資代替,目前都還沒有做")
+_EXEC_NO_THIS = "執行驗證尚未支援 {{ this }}(這個 model 自己的表不在沙盒裡)"
+_EXEC_LOADING = "載入 macro 時不提供表名"
+
+
+def _sandbox_relations(usage: dict, project: "DbtProjectInfo | None", sandbox_tables: dict):
+    """執行驗證用的 ref() / source() / this。sandbox_tables 是規格「資料表定義」建的表
+    {表名(小寫): 沙盒裡的寫法(每段加上方括號);同名的表不只一張時是 None}。
+
+    source() 只在表名確定時對到測資表:有專案資訊、sources.yml 有宣告、schema / identifier 不是
+    樣板值,而且規格裡有同名(不分大小寫)的表。表名用 identifier(沒宣告就是 table 名),不看
+    來源的 schema:沙盒只有規格建的那幾張表。兩個不同的來源對到同一張測資表時無法分辨,展開失敗。
+    任何一項不成立就展開失敗(錯誤訊息是原因),不猜表名:猜錯的話執行結果會被當成程式的問題。
+
+    ref() 與 {{ this }} 不支援(上游 model 與增量的目標表都不在沙盒裡)。
+    表名物件只提供 identifier / name / table;database 與 schema 在沙盒裡跟正式環境不同,取用就失敗。"""
+    seen: dict = usage.setdefault("sandbox_sources", {})
+
+    def ref(*args, **kwargs):
+        if usage.get("loading_macros"):
+            return _UnavailableRelation(_EXEC_LOADING)
+        raise DbtRenderError(_EXEC_NO_REF)
+
+    def source(source_name, table_name):
+        _check_ident("來源", source_name)
+        _check_ident("表", table_name)
+        if usage.get("loading_macros"):
+            return _UnavailableRelation(_EXEC_LOADING)
+        usage["used"] = True
+        key = (source_name, table_name)
+        if project is None:
+            raise DbtRenderError("沒有 dbt 專案資訊,無法確定 source() 指向的表")
+        if key not in project.sources:
+            raise DbtRenderError(f"source() 未在 sources.yml 宣告:{source_name}.{table_name}")
+        elif key in project.uncertain_sources:
+            raise DbtRenderError(f"source() 的表名無法確定(樣板值等):{source_name}.{table_name}")
+        identifier = _check_ident("表", project.sources[key][1] or table_name)
+        folded = identifier.lower()
+        if folded not in sandbox_tables:
+            raise DbtRenderError(f"規格的資料表定義沒有 source() 指向的表:{identifier}")
+        if sandbox_tables[folded] is None:
+            raise DbtRenderError(f"規格的資料表定義有不只一張叫這個名稱的表:{identifier}")
+        if seen.setdefault(folded, key) != key:
+            raise DbtRenderError(f"兩個不同的 source() 都對到規格的同一張表:{identifier}")
+        return _SandboxRelation(sandbox_tables[folded], identifier)
+
+    def this(name: str):
+        return _UnavailableRelation(_EXEC_NO_THIS)
 
     return ref, source, this
 
@@ -746,6 +804,24 @@ class _Relation(str):
         return obj
 
 
+class _SandboxRelation(_Relation):
+    """執行驗證時 source() 的結果:字串內容是沙盒裡的表名。database / schema 跟正式環境不同,
+    取用就失敗(不給一個看起來像真的值)。"""
+
+    def __new__(cls, text: str, name: str):
+        obj = str.__new__(cls, text)
+        obj.identifier = obj.name = obj.table = name
+        return obj
+
+    @property
+    def database(self):
+        raise UndefinedError("執行驗證時表名物件沒有 database")
+
+    @property
+    def schema(self):
+        raise UndefinedError("執行驗證時表名物件沒有 schema")
+
+
 class _Adapter:
     """只提供 dispatch 的 adapter 樁。
 
@@ -897,7 +973,7 @@ def build_env(code_root=None, variables: dict | None = None,
               macro_dirs=DEFAULT_MACRO_DIRS, adapter: str = DEFAULT_ADAPTER,
               project: DbtProjectInfo | None = None, macro_files: dict | None = None,
               model_name: str | None = None, incremental: bool = False,
-              invocation_id: str | None = None):
+              invocation_id: str | None = None, sandbox_tables: dict | None = None):
     """建好含 dbt 樁與 macro 的 Environment。code_root 與 macro_files 都沒給時不載入任何 macro。
 
     macro_files 專案的檔案 {相對專案根的路徑: 內容}(從 GitLab 取回、不在磁碟上的專案用)。
@@ -909,6 +985,7 @@ def build_env(code_root=None, variables: dict | None = None,
     incremental `is_incremental()` 的回傳值;True 時需要 model_name
     model_name  這次展開的 model 名稱({{ this }} 的表名;沒給時不提供 {{ this }})
     invocation_id 這次展開的 invocation_id(uuid4 的寫法);沒給時產生新的
+    sandbox_tables 執行驗證用:source() 指向規格建的測資表(見 _sandbox_relations)
 
     回傳 (env, macro 名稱清單, 同名衝突清單)。
     """
@@ -938,7 +1015,8 @@ def build_env(code_root=None, variables: dict | None = None,
     if project is not None and not isinstance(project, DbtProjectInfo):
         raise DbtRenderError("project 必須是 DbtProjectInfo")
     env.segcra_relation_usage = {"used": False, "uncertain": False}
-    ref, source, this = _make_relations(database, schema, env.segcra_relation_usage, project)
+    ref, source, this = _make_relations(database, schema, env.segcra_relation_usage, project,
+                                        sandbox_tables)
     env.globals["ref"] = ref
     env.globals["source"] = source
     if incremental and model_name is None:
@@ -1236,7 +1314,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
                  adapter: str = DEFAULT_ADAPTER,
                  project: DbtProjectInfo | None = None,
                  macro_files: dict | None = None, incremental: bool = False,
-                 invocation_id: str | None = None) -> RenderResult:
+                 invocation_id: str | None = None,
+                 sandbox_tables: dict | None = None) -> RenderResult:
     """在同一行程內展開一份 dbt model。**待審的 MR 內容請改用 render_model_isolated()。**
 
     model_path  model 檔路徑(相對 code_root 或絕對路徑皆可)
@@ -1255,6 +1334,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
     incremental 以 `is_incremental()` 為 True 展開(增量分支);`{{ this }}`(這個 model
                 自己的表名,檔名去掉副檔名)。預設 False,與 dbt compile 相同
     invocation_id 這次展開的 invocation_id(uuid4 的寫法);沒給時產生新的
+    sandbox_tables 執行驗證用的展開:{表名(小寫): 沙盒裡的寫法};source() 指向規格建的測資表,
+                ref() 與 {{ this }} 不支援(見 _sandbox_relations)
 
     任何失敗都收斂成 ok=False 而不丟例外。
     """
@@ -1274,7 +1355,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
         env, macros, conflicts, problems = build_env(root, variables, database, schema,
                                                      macro_dirs, adapter, project, macro_files,
                                                      model_path.stem, incremental,
-                                                     invocation_id=invocation_id)
+                                                     invocation_id=invocation_id,
+                                                     sandbox_tables=sandbox_tables)
         # dbt 讀檔時會去掉頭尾空白再渲染(開頭空行不會出現在編譯結果裡)
         body = source.strip()
         tree = env.parse(body)

@@ -256,7 +256,7 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 | 預掃前展開 | 已接上 | 含樣板的檔案先以 `render_model_isolated()` 展開再交給規則層;展開失敗則原樣退回,由 `enforce_dbt_render_failure()` 一律補 major(見下方)。lint 跑原始文字:lint 管的是開發者寫的程式,展開後的 SQL 不是他們寫、也不會看到的 |
 | 依檔名對應規格 | 已接上 | 完全沒有 R 編號時,先查本機 `specs/`、再逐一探測 GitLab 的候選路徑 |
 | `ref()`/`source()` 精確度提醒 | 已接上 | 預掃結果帶 `dbt_render_notice`,後處理由 `enforce_dbt_notice()` 確定性補成 info finding(正式路徑與 dry-run 皆同) |
-| 執行驗證(沙盒) | **不支援** | SQL 是樣板時不送進沙盒,回報「尚未支援」major、交人工——原樣執行只會得到語法錯誤,會錯誤地指控程式有誤。改到 dbt 而執行驗證卻通過時,`enforce_dbt_unexecuted()` 補 major |
+| 執行驗證(沙盒) | **只支援只引用 `source()` 的 model** | 展開成沙盒用的 SQL 再執行(見「執行驗證」)。其他樣板不送進沙盒,回報「尚未支援」major、交人工——原樣執行只會得到語法錯誤,會錯誤地指控程式有誤。改到 dbt 而執行驗證卻通過時,`enforce_dbt_unexecuted()` 補 major(通過的就是展開執行的那個 model、而且 MR 只改了它時不補) |
 | 專案的 macro 與專案資訊 | 已接上(真實 GitLab 模式) | 依 MR 的 head commit 取回專案;取不回來一律交人工。mock 模式要在 fixture 目錄放專案才有(見「接進審查管線」),沒放時呼叫專案 macro 的 model 展開失敗 |
 | macro 反查 | 已接上(真實 GitLab 模式) | MR 改到 macro、屬性檔或專案設定檔時反查受影響的 model,比較變更前後的規則命中,由 `enforce_dbt_impact()` 補成一條 finding |
 
@@ -511,7 +511,31 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 2. `enforce_dbt_unexecuted`:MR 改到 dbt 的東西(樣板、macro、屬性檔、專案設定檔、或專案取不回來),
    而執行驗證的結果是通過 → 補 major(被執行的是同一個 MR 裡別的內容)。這一層在 mock 模式
    也生效:沒有取回專案時,改看手上的內容有沒有樣板標記(樣板檔與純 SQL 檔混在同一個 MR、
-   通過的是純 SQL 檔)。沒開 dbt 時不介入
+   通過的是純 SQL 檔)。沒開 dbt 時不介入。例外:執行驗證跑的就是展開後送進沙盒的那個 model
+   (見下方「執行驗證」),而且 MR 改到 dbt 的只有它(沒改 macro、屬性檔、設定檔,其他檔案也不是
+   樣板)時,通過的就是這個 model 本身,不補
+
+### 執行驗證
+
+執行驗證要跑的檔案(MR 裡最後一個有內容的檔案)是取回的 dbt 專案裡的 model 時,先另外展開一次
+(`dbt_exec.render_for_exec`,一樣走 `render_model_isolated()`),再把展開後的 SQL 交給執行驗證。
+沙盒每次建一個新的資料庫,依規格「資料表定義」建表,所以展開時:
+
+| 寫法 | 展開成 |
+|---|---|
+| `source()` | sources.yml 有宣告、表名確定(identifier 沒宣告就是 table 名,不是樣板值),而且規格「資料表定義」有同名的表(不分大小寫)→ 規格裡的寫法(`[txn]`、`[stage].[txn]`)。不看來源的 schema:沙盒只有規格建的表 |
+| `ref()` | 不支援(上游 model 要先在沙盒建出來,或由測資代替,還沒做) |
+| `{{ this }}` | 不支援(有定義,用到就失敗) |
+| 表名物件的 `database` / `schema` | 取用就失敗(沙盒的值跟正式環境不同) |
+
+下列情況不展開,執行驗證照舊回「尚未支援」major,另外補一條 info「dbt model 沒有送進沙盒執行」
+寫出原因:上面任一項不成立、規格裡同名的表不只一張、兩個不同的來源對到同一張表、呼叫了
+`is_incremental()`(增量那段要先放一份上一次執行後的目標表,還沒做)、專案有同名的 macro、展開後
+仍有樣板標記、MR 沒有自己的規格而借來的受影響 model 規格不是這個 model 的、資料庫名稱不是約定的假名。
+不猜表名:猜錯的話執行失敗或結果不符,會被說成程式的問題。
+
+要跑的檔案不是 model(純 SQL、macro 檔、seed 等)、不是樣板、沒有取回專案或沒有規格時,照舊交給
+執行驗證,行為不變。紀錄寫在報告的 `_dbt_exec`(`{file, ok, reason}`;不適用時是 null)。
 
 檢查受影響的 model 時若發生非預期的錯誤,審查不中斷:結果收斂成「全部 model 可能受影響」→ major,
 只留錯誤的類型、不回顯內容。
@@ -528,7 +552,7 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 開啟與回復的步驟、以及不接 GitLab 就能跑的範例,見 README「開啟 dbt 接線」與 `examples/dbt_wiring/`。
 mock 模式下,fixture 目錄若放了 MR 那個 commit 的專案(`<FIXTURES_DIR>/dbt_archives/<commit 編號>/`),
 接線會從那裡取得專案——打包成 GitLab 的形狀後交給同一個 `load_dbt_project`,解壓與檢查走同一條路;
-沒有放就不適用。預設的 `fixtures/` 與 golden set 都沒有放,行為不變。
+沒有放就不適用。預設的 `fixtures/` 沒有放,行為不變;golden set 只有 `mr_413`、`mr_862` 放了(哪些 case 會取回專案由 `tests/test_dbt_wiring_example.py` 鎖住)。
 
 **真實 GitLab 實測**(2026-10-12,測試用 GitLab、只含假資料的專案)。只讀取:不呼叫模型、不寫回
 GitLab;執行的是 `review_mr` 在呼叫模型之前的部分(取 MR → 取回專案 → 預掃 → 反查 → 檢查受影響的
@@ -568,7 +592,7 @@ major。加上非 SQL 檔的處理之後,改由非 SQL 檔的分類與設定比�
 
 **已知限制**
 
-- mock 模式而 fixture 沒有放專案時(預設的 `fixtures/`、golden set):macro 檔仍會被當成 model 展開
+- mock 模式而 fixture 沒有放專案時(預設的 `fixtures/`、golden set 裡沒有放專案的 case):macro 檔仍會被當成 model 展開
   (接線前的行為)。要在 mock 模式看到接線的效果,得照 `examples/dbt_wiring/` 的方式放專案
 - 注入掃描涵蓋 MR、取回的完整內容與預掃展開後的 SQL(會以規則命中的語句、解析錯誤的片段進 prompt);
   受影響 model 的展開結果不進 prompt(只有路徑、規則代號、語句序號),不另外掃。取回的完整內容與展開後的
@@ -605,9 +629,9 @@ major。加上非 SQL 檔的處理之後,改由非 SQL 檔的分類與設定比�
 
 ## 後續
 
-- **展開結果尚未在 MS SQL 沙盒實際執行過**(目前只驗證了展開字串與 `dbt compile`
-  逐字一致)。要支援樣板的執行驗證,需把 `ref()`/`source()` 對應到沙盒每次建立的
-  資料庫,且 model 引用的上游表與規格建立的測資表名稱不同,需要處理
+- 執行驗證:只引用 `source()` 的 model 已經會展開後送進沙盒(見「執行驗證」);`ref()` 到其他
+  model(上游 model 要先建出來或由測資代替)與增量 model(一般模式與增量模式各驗一次)還沒做。
+  展開後的 SQL 還沒有在 MS SQL 沙盒上用正式規則實際跑過
 - 真實 GitLab 模式下,dbt 專案以外的 SQL 檔(與專案裡不是樣板的 SQL 檔)仍只有 diff 新增的行,
   完整內容由 #22 以 Files API 依 head sha 取得
 - 不分析第三方套件內的 macro;目錄由呼叫端指定
