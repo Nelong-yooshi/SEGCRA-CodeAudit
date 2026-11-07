@@ -44,6 +44,8 @@ from .security import scan_mr
 from toolbox.gitlab import (WRITE_FAILED, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UNCERTAIN,
                             write_failure)
 from .skills_loader import always_skills, load_skills, skills_index
+from .dbt_context import PROJECT_FILE_REMOVED, PROJECT_YAML_INVALID, check_yaml_files_isolated
+from .dbt_project import YAML_MODELS_NOT_LIST, YAML_SYNTAX
 from .spec_exec import SpecLookup, find_spec, run_spec_exec
 from .tool_hub import ToolHub
 from toolbox.sqltools import LINT_INCOMPLETE_CODE, LINT_MAX_CHARS, LINT_TIMEOUT_SECONDS
@@ -1937,6 +1939,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # MR 改到的 macro 檔載入得了嗎:Jinja 語法錯誤時 dbt 整個專案都編譯不了
         macro_issues = _step(report_stub, "macro 檔檢查", _macro_file_issues, [],
                              mr, dbt_ctx, cfg.dbt)
+        # MR 改到的 dbt 設定檔(dbt_project.yml、屬性檔):dbt 解析專案時一定失敗的寫法
+        yaml_issues = _step(report_stub, "dbt 設定檔檢查", _dbt_yaml_issues, [], mr, dbt_ctx)
         if spec_code is None and spec_text is None and affected is not None and affected.spec:
             # MR 本身對不到規格(只改了 macro),而受影響的 model 都對到同一份:用它來審
             spec_code, spec_text = affected.spec
@@ -1990,7 +1994,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                                          affected, dbt_ctx, cfg.dbt,
                                          incomplete=report_stub["findings"],
                                          affected_specs=affected_specs,
-                                         macro_issues=macro_issues)
+                                         macro_issues=macro_issues, yaml_issues=yaml_issues)
 
         # 路徑觸發的 skill 自動注入:異常交易規則檔一律載入領域知識,不賭模型主動載
         always_block = always_skills(skills)
@@ -2085,6 +2089,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_scan_skipped(report, scan_target.get("_scan_skipped", 0))  # 內容太多沒掃完
         report = enforce_dbt_impact(report, affected, dbt_ctx)  # macro 等變更影響的其他 model
         report = enforce_dbt_macro_problems(report, macro_issues)  # macro 檔語法錯誤、載入失敗
+        report = enforce_dbt_project_broken(report, yaml_issues)   # 設定檔讓 dbt 整個專案失敗
         report = enforce_non_sql(report, pre)  # 非 SQL 檔沒跑 SQL 規則:說明文件 info,其他 major
         report = enforce_dbt_config_change(report, mr, dbt_ctx, cfg.dbt)  # 只改設定時展開結果不變
         report = enforce_dbt_asset_names(report, mr, dbt_ctx, cfg.dbt)  # 名稱不合 Dagster 規則:部署失敗
@@ -2855,6 +2860,90 @@ def enforce_dbt_macro_problems(report: dict, issues) -> dict:
     確定性補報;標題只能由程式產生;只寫種類與行號,不帶錯誤訊息(含樣板內容)。"""
     for issue in issues if isinstance(issues, list) else []:
         problem = _macro_problem_finding(issue)
+        if problem is not None:
+            _put_program_finding(report, problem)
+    return report
+
+
+_PROJECT_BROKEN_TITLE = "dbt 設定檔有 dbt 解析不了的寫法,dbt 整個專案會解析失敗"
+_YAML_UNCHECKED_TITLE = "無法確認 dbt 屬性檔 dbt 解析得過"
+_YAML_CHECK_FAILED = "check_failed"       # 檢查本身沒做完(逾時、資源上限)
+_YAML_PROBLEM_TEXT = {
+    PROJECT_YAML_INVALID: "dbt_project.yml 不是合法的 YAML",
+    PROJECT_FILE_REMOVED: "這個 MR 刪掉或移走了 dbt_project.yml,dbt 找不到專案設定",
+    YAML_SYNTAX: "不是合法的 YAML",
+    YAML_MODELS_NOT_LIST: "`models:` 不是清單",
+}
+
+
+def _dbt_yaml_issues(mr: dict, dbt_ctx: DbtContext | None) -> list[dict]:
+    """MR 改到的 dbt 設定檔有沒有 dbt 解析專案時一定失敗的寫法:[{path(MR 裡的路徑), kind, line}]。
+
+    - dbt_project.yml 不是合法的 YAML(取回專案時發現,DbtContext.broken),或 MR 刪掉、移走了它
+    - 改到的屬性檔:YAML 語法錯誤、`models:` 不是清單(dbt_project.yaml_file_problems,在子行程裡
+      檢查;沒檢查完記成無法確認,不當成沒有問題)
+
+    只看 MR 改到的檔:專案裡本來就壞的檔不是這個 MR 造成的;那時取不回專案,專案裡改到的檔
+    已經記成展開失敗交人工(見 _dbt_head_source)。"""
+    if dbt_ctx is None:
+        return []
+    files = [f for f in mr.get("files", []) if isinstance(f, dict)] if isinstance(mr, dict) else []
+    project_file = f"{dbt_ctx.prefix}/dbt_project.yml" if dbt_ctx.prefix else "dbt_project.yml"
+    if dbt_ctx.broken == PROJECT_FILE_REMOVED:
+        return [{"path": project_file, "kind": PROJECT_FILE_REMOVED, "line": 0}]
+    if dbt_ctx.broken == PROJECT_YAML_INVALID:
+        changed = any(f.get("path") == project_file for f in files)
+        return [{"path": project_file, "kind": PROJECT_YAML_INVALID, "line": 0}] if changed else []
+    if dbt_ctx.project is None:
+        return []
+    texts = {}
+    for f in files:
+        path = f.get("path")
+        rel = dbt_ctx.relative(path) if isinstance(path, str) else None
+        # dbt_project.yml 不送去檢查:它的 models: 是設定(物件),不是屬性檔的 models 清單,當成屬性檔
+        # 檢查會誤報(它本身的 YAML 語法錯誤在取回專案時就分出來了,見上面)
+        if rel is None or rel == "dbt_project.yml" or f.get("deleted") or not is_dbt_yaml(rel):
+            continue
+        text = dbt_ctx.head_text(path)
+        if isinstance(text, str):
+            texts[path] = text
+    if not texts:
+        return []
+    found = check_yaml_files_isolated(texts)
+    if found is None:
+        return [{"path": path, "kind": _YAML_CHECK_FAILED, "line": 0} for path in sorted(texts)]
+    return found
+
+
+def _dbt_yaml_finding(issue) -> dict | None:
+    if not isinstance(issue, dict) or not isinstance(issue.get("path"), str):
+        return None
+    kind, line = issue.get("kind"), issue.get("line")
+    line = line if type(line) is int and line > 0 else 0          # bool 不算行號
+    where = _code_span(issue["path"]) + (f" 第 {line} 行附近" if line else "")
+    if kind in _YAML_PROBLEM_TEXT:
+        return {"file": issue["path"], "line": line, "title": _PROJECT_BROKEN_TITLE,
+                "severity": "blocker",
+                "detail": (f"{where}:{_YAML_PROBLEM_TEXT[kind]}。dbt 解析專案時會失敗,部署端也會整個"
+                           "載入失敗,影響的不只這個檔案。"),
+                "suggestion": "修正後用 dbt parse 確認整個專案解析得過。",
+                "citations": []}
+    if kind == _YAML_CHECK_FAILED:
+        return {"file": issue["path"], "line": 0, "severity": "major",
+                "title": _YAML_UNCHECKED_TITLE,
+                "detail": (f"{where}:檢查沒有做完(逾時或超過資源上限)。屬性檔有 YAML 語法錯誤時,"
+                           "dbt 整個專案解析失敗,不得自動放行。"),
+                "suggestion": "用 dbt parse 確認整個專案解析得過。",
+                "citations": []}
+    return None
+
+
+@_isolated_stage("dbt 設定檔問題揭露")
+def enforce_dbt_project_broken(report: dict, issues) -> dict:
+    """MR 改到的 dbt 設定檔讓 dbt 整個專案解析失敗時補 blocker(見 _dbt_yaml_issues);沒檢查完補 major。
+    確定性補報;標題只能由程式產生;只寫種類與行號,不帶檔案內容。"""
+    for issue in issues if isinstance(issues, list) else []:
+        problem = _dbt_yaml_finding(issue)
         if problem is not None:
             _put_program_finding(report, problem)
     return report
@@ -4212,7 +4301,8 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
                           spec_code, spec_text, affected: AffectedCheck | None = None,
                           dbt_ctx: DbtContext | None = None, dbt_cfg: dict | None = None,
                           incomplete: list[dict] | None = None,
-                          affected_specs: tuple = (), macro_issues: list | None = None) -> dict:
+                          affected_specs: tuple = (), macro_issues: list | None = None,
+                          yaml_issues: list | None = None) -> dict:
     """不經 LLM 的管線煙霧測試:預掃結果直接轉 findings,並驗證 memory/spec 可用。
     (執行驗證需要 LLM 生成測資,dry-run 不跑;只回報 spec 是否找得到。)
 
@@ -4245,6 +4335,7 @@ async def _dry_run_report(hub: ToolHub, mr_id: str, mr: dict, pre: list[dict],
     report = enforce_non_sql(report, pre)      # 與正式路徑一致
     report = enforce_lint_incomplete(report, pre)
     report = enforce_dbt_macro_problems(report, macro_issues or [])  # 與正式路徑一致
+    report = enforce_dbt_project_broken(report, yaml_issues or [])
     report = enforce_dbt_config_change(report, mr, dbt_ctx, dbt_cfg)
     report = enforce_dbt_notice(report, pre)   # 與正式路徑一致:表名未驗證的提醒不可少
     report = enforce_dbt_asset_names(report, mr, dbt_ctx, dbt_cfg)

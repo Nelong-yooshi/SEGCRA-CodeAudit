@@ -72,6 +72,8 @@ class DbtProject:
     names: tuple[str, ...] = ()
     analysis_paths: tuple[str, ...] = ()
     test_paths: tuple[str, ...] = ()
+    # ok=False 且原因是 dbt_project.yml 不是合法的 YAML:dbt 解析專案時一樣失敗(見 DbtProjectSyntaxError)
+    yaml_syntax_error: bool = False
 
     @property
     def resource_paths(self) -> tuple[str, ...]:
@@ -111,6 +113,11 @@ class DbtProjectError(Exception):
     """本模組判定的失敗;訊息是固定文字,不含下載內容。"""
 
 
+class DbtProjectSyntaxError(DbtProjectError):
+    """dbt_project.yml 不是合法的 YAML。dbt 解析專案時一樣失敗,整個專案解析失敗(dbt-core 1.12 的
+    行為),跟「取不回來」(下載失敗、權限)分開:前者是這份內容的錯,後者不一定。"""
+
+
 _cache: "OrderedDict[tuple[str, str], DbtProject]" = OrderedDict()
 _cache_lock = threading.Lock()          # webhook server 以執行緒並行審查
 
@@ -138,7 +145,8 @@ def load_dbt_project(sha: str, project_dir: str = "", *, download=None) -> DbtPr
         _remember(key, project)
         return project
     except Exception as e:                  # noqa: BLE001 — 一律收斂成失敗結果
-        return DbtProject(ok=False, error=_safe_error(e))
+        return DbtProject(ok=False, error=_safe_error(e),
+                          yaml_syntax_error=isinstance(e, DbtProjectSyntaxError))
 
 
 # ------------------------------------------------------------------ 解析
@@ -171,11 +179,40 @@ def _parse(data: bytes, prefix: str) -> DbtProject:
                       analysis_paths=analysis_paths, test_paths=test_paths)
 
 
+# 屬性檔裡 dbt 解析專案時一定失敗的寫法(dbt-core 1.12 的行為)
+YAML_SYNTAX = "syntax"                  # 不是合法的 YAML
+YAML_MODELS_NOT_LIST = "models_not_list"    # `models:` 有值但不是清單
+
+
+def yaml_file_problems(texts: dict) -> list[dict]:
+    """屬性檔(dbt 目錄裡的 .yml / .yaml)有沒有 dbt 解析專案時一定失敗的寫法:[{path, kind, line}]。
+
+    只認兩種:YAML 語法錯誤(line 是錯誤所在的行,不知道時 0),與 `models:` 有值但不是清單。
+    其他結構上的問題 dbt 不一定失敗(例如描述不存在的 model 只有警告),不在這裡判斷。
+    超過 MAX_SNAPSHOT_YML_CHARS 的檔不檢查(解析太久)。
+
+    會解析待審 repo 的 yml,正式路徑經 dbt_context.check_yaml_files_isolated 在子行程呼叫。"""
+    found = []
+    for path, text in sorted(texts.items()):
+        if not isinstance(text, str) or len(text) > MAX_SNAPSHOT_YML_CHARS:
+            continue
+        try:
+            doc = yaml.load(text, Loader=yaml.CSafeLoader) if _LIBYAML else yaml.safe_load(text)
+        except yaml.YAMLError as e:
+            mark = getattr(e, "problem_mark", None)
+            found.append({"path": path, "kind": YAML_SYNTAX,
+                          "line": mark.line + 1 if mark is not None else 0})
+            continue
+        if isinstance(doc, dict) and doc.get("models") is not None and not isinstance(doc["models"], list):
+            found.append({"path": path, "kind": YAML_MODELS_NOT_LIST, "line": 0})
+    return found
+
+
 def _read_paths(text: str) -> tuple[tuple[str, ...], ...]:
     try:
         raw = yaml.safe_load(text)
     except Exception:                       # noqa: BLE001
-        raise DbtProjectError("dbt_project.yml 不是合法的 YAML") from None
+        raise DbtProjectSyntaxError("dbt_project.yml 不是合法的 YAML") from None
     if not isinstance(raw, dict):
         raise DbtProjectError("dbt_project.yml 的最上層必須是物件")
     # dbt 1.0 以前叫 source-paths / data-paths;兩個都寫時以新名稱為準(與 dbt 相同)

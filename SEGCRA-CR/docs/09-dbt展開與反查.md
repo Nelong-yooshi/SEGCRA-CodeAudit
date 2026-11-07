@@ -491,6 +491,19 @@ macro 載入一次(隔離子行程),看改到的檔載入得了嗎:
 - 只看改到的檔:專案裡本來就壞的檔不是這個 MR 造成的,用到它的 model 展開失敗時已經會報
 - 只寫種類與行號,不帶 Jinja 的錯誤訊息(裡面有樣板內容)
 
+**改到的 dbt 設定檔本身。** dbt 解析專案時一定失敗的寫法補 **blocker**「dbt 設定檔有 dbt 解析不了的寫法,
+dbt 整個專案會解析失敗」(`enforce_dbt_project_broken`;dbt-core 1.12 的行為):
+
+- `dbt_project.yml` 不是合法的 YAML:取回專案時就會失敗(`DbtProjectSyntaxError`,`DbtContext.broken`);MR 有
+  改到它才補 blocker
+- MR 刪掉或移走了 `dbt_project.yml`:head commit 讀不到它時,看 MR 的變更清單分得出是 MR 刪的(刪除,或改名成
+  別的路徑),原因寫「MR 刪掉或移走了 dbt_project.yml」;其餘照舊寫「專案目錄設定錯誤,或唯讀 token 看不到這個
+  專案」(GitLab 對沒有權限的專案也回「找不到」,這兩個分不出來)
+- MR 改到的屬性檔(dbt 目錄裡的 .yml / .yaml):YAML 語法錯誤(寫出行號)、`models:` 有值但不是清單。屬性檔是
+  待審 repo 的內容,在子行程裡解析(`dbt_project.yaml_file_problems`);沒檢查完補 major「無法確認」
+- 其他結構上的問題不報:dbt 不一定失敗(例如描述不存在的 model 只有警告)
+- 只看改到的檔:專案本來就壞的設定檔不是這個 MR 造成的;那時取不回專案,專案裡改到的檔已經記成展開失敗交人工
+
 **受影響的 model(MR 改到 macro、屬性檔、專案設定檔時)。**
 
 - 不放進預掃、也不放進模型的 prompt:它們不在 diff 裡,放進預掃會讓每個檢核點各補一條
