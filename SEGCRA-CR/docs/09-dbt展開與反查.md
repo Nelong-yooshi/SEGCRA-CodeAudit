@@ -288,6 +288,21 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 (`test_macro_output_escapes_comments_and_strings`)。展開失敗 = 不知道輸出是什麼,
 無法證明它跳不出去,所以不看標記的位置。
 
+**樣板自己的 Jinja 語法錯誤補 blocker**:model、analysis、singular test 目錄的檔,展開失敗的
+原因是這份樣板自己的 Jinja 語法錯誤時(區塊沒閉合、運算式寫錯、不認得的標籤或濾器、重複
+定義的 block、model 檔裡的 `{% snapshot %}`),改補 blocker「dbt 樣板有 Jinja 語法錯誤,dbt
+整個專案會編譯失敗」,寫出行號、不帶錯誤訊息:dbt 解析專案時一樣失敗,部署端整個載入失敗
+(dbt-core 1.12 的行為)。下面這些不算,照舊是展開失敗的 major:
+
+- 執行時的錯誤、呼叫不存在的 macro(dbt 到 compile 才失敗)、macro 檔的問題、展開器的限制
+- model 檔裡的 `{% test %}`、`{% materialization %}`:dbt 解析得過、編譯出的 SQL 也不含區塊
+  內容,但區塊裡的 SQL 會在別的地方執行,展開器照樣中止展開(丟掉的話那段 SQL 就逃過預掃)
+- snapshot 目錄的檔:展開器把它當 model 展開,`{% snapshot %}` 區塊本身就會失敗,分不出是不是
+  真的語法錯誤
+- 沒有取回專案(不知道目錄設定)、或檔案不在專案裡
+
+model 檔裡的 `{% docs %}` 區塊跟 dbt 一樣丟掉(只是說明文字,不會被執行),不算展開失敗。
+
 資料庫名稱以環境變數提供,**固定使用假名** `SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER`
 (#14 review 同意):它只用來把 `ref()`/`source()` 展開成完整表名給規則層掃描,
 不會連線;`toolbox/sqltools.py` 目前沒有任何規則看資料庫名,用假名不影響判斷。

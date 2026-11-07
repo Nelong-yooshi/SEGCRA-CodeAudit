@@ -235,7 +235,7 @@ MUTANTS = {
         "    return len(text.splitlines())"),
     # ---- dbt 專屬區塊 / macro 逐檔隔離 / config
     "dbt 專屬區塊在 model 檔也吞掉(整段 SQL 逃過預掃)": (
-        '        if not getattr(self.environment, "segcra_macro_phase", False):',
+        '        if not getattr(self.environment, "segcra_macro_phase", False) and tag != "docs":',
         "        if False:"),
     "macro 階段旗標不關閉(model 檔跟著被吞)": (
         "    env.segcra_macro_phase = False" + NL + "    return env, sorted(macros), conflicts, problems",
@@ -1877,8 +1877,10 @@ MUTANTS.update({
      '    dbt_enabled = bool(dbt_cfg) and dbt_cfg.get("enabled") is True',
      "    dbt_enabled = bool(dbt_cfg)"),
  "接線:展開失敗時送出不完整結果": ("pipeline.py",
-     "        return _Expanded(sql, rendered.error, None)",
-     "        return _Expanded(rendered.sql, rendered.error, None)"),
+     "        return _Expanded(sql, rendered.error, None," + NL
+     + "                         syntax_line=rendered.error_line if rendered.syntax_error else None)",
+     "        return _Expanded(rendered.sql, rendered.error, None," + NL
+     + "                         syntax_line=rendered.error_line if rendered.syntax_error else None)"),
  "接線:lint 吃展開後的 SQL(行號基準錯位)": ("pipeline.py",
      '        lint = await hub.call_json("sqltools__lint", {"sql": sql})',
      '        lint = await hub.call_json("sqltools__lint", {"sql": rule_sql})'),
@@ -5508,6 +5510,50 @@ MUTANTS.update({
  "逐句:錯誤訊息不設則數上限": (TOOLS,
      "    shown = list(dict.fromkeys(errors))[:_MAX_PARSE_ERRORS]",
      "    shown = list(dict.fromkeys(errors))"),
+})
+
+# ---- dbt 樣板自己的 Jinja 語法錯誤:dbt 整個專案解析失敗,補 blocker(dbt-core 1.12 實測的範圍)
+MUTANTS.update({
+    "樣板語法:model 裡的 docs 也中止展開": ("dbt_render.py",
+        '        if not getattr(self.environment, "segcra_macro_phase", False) and tag != "docs":',
+        '        if not getattr(self.environment, "segcra_macro_phase", False):'),
+    "樣板語法:model 裡的 snapshot 當成 dbt 解析得過": ("dbt_render.py",
+        '            if tag == "snapshot":', "            if False:"),
+    "樣板語法:model 裡的 test 區塊也算語法錯誤": ("dbt_render.py",
+        "        except DbtBlockInModel:" + NL + "            raise" + NL, ""),
+    "樣板語法:不標語法錯誤": ("dbt_render.py",
+        "            return RenderResult(ok=False, error=_safe_error(e), syntax_error=True,",
+        "            return RenderResult(ok=False, error=_safe_error(e), syntax_error=False,"),
+    "樣板語法:不認得的濾器與重複的 block 不算": ("dbt_render.py",
+        "        except jinja2.TemplateSyntaxError as e:" + NL
+        + "            return RenderResult(ok=False, error=_safe_error(e), syntax_error=True,",
+        "        except jinja2.TemplateSyntaxError as e:" + NL
+        + "            if isinstance(e, jinja2.TemplateAssertionError):" + NL + "                raise" + NL
+        + "            return RenderResult(ok=False, error=_safe_error(e), syntax_error=True,"),
+    "樣板語法:行號沒加回開頭的空行": ("dbt_render.py",
+        '    return e.lineno + source[:len(source) - len(source.lstrip())].count("\\n")',
+        "    return e.lineno"),
+    "樣板語法:預掃拿不到語法錯誤的行號": ("pipeline.py",
+        "                         syntax_line=rendered.error_line if rendered.syntax_error else None)",
+        "                         syntax_line=None)"),
+    "樣板語法:不看檔案在哪個目錄": ("pipeline.py",
+        '            if expanded.syntax_line is not None and _parsed_whole_by_dbt(f.get("path"), render_ctx):',
+        "            if expanded.syntax_line is not None:"),
+    "樣板語法:只認 model 目錄": ("pipeline.py",
+        "        rel, project.model_paths + project.analysis_paths + project.test_paths)",
+        "        rel, project.model_paths)"),
+    "樣板語法:不認子目錄": ("pipeline.py",
+        '    return any(rel == d or rel.startswith(d.rstrip("/") + "/") for d in dirs)',
+        "    return any(rel == d for d in dirs)"),
+    "樣板語法:不補 blocker": ("pipeline.py",
+        "    if isinstance(line, int) and not isinstance(line, bool):" + NL + "        where",
+        "    if False:" + NL + "        where"),
+    "樣板語法:行號是 True 也照用": ("pipeline.py",
+        "    if isinstance(line, int) and not isinstance(line, bool):" + NL + "        where",
+        "    if isinstance(line, int):" + NL + "        where"),
+    "樣板語法:補成 major": ("pipeline.py",
+        '        return {"file": entry["path"], "line": line, "severity": "blocker",',
+        '        return {"file": entry["path"], "line": line, "severity": "major",'),
 })
 
 # ---- 取不到規格 ≠ 沒有規格(#90 第 2 點)。混在一起的話,報告會叫開發者去補一份
