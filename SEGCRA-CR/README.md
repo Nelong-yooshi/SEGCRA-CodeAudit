@@ -219,6 +219,16 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
    read -rs -p "LLM_API_KEY: " LLM_API_KEY && export LLM_API_KEY && echo
    ```
 
+   模型名稱、上下文長度(`num_ctx`)、`reasoning_effort` 跟端點的不同時,**不要直接改 repo 的
+   `config/models.yaml`**(換新版程式碼時會被蓋掉):複製一份放到程式目錄以外改,用環境變數指過去:
+
+   ```bash
+   mkdir -p ~/segcra-config && cp config/models.yaml ~/segcra-config/models.yaml   # 改這份
+   export SEGCRA_MODELS_CONFIG=~/segcra-config/models.yaml
+   ```
+
+   有些模型不接受 `reasoning_effort: none`(端點回 400),冷讀的 profile 改成 `low`。
+
 ### 開啟 dbt 接線(選用;預設關閉)
 
 規則程式是 dbt model 時,審查要先把樣板展開成 SQL 才檢查得了。這個功能**預設關閉**;關閉時含樣板的檔案一律

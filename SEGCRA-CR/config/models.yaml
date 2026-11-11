@@ -1,4 +1,5 @@
 # 模型設定 — orchestrator 不綁模型,換模型只改這裡。
+# 部署端要改的話複製一份到程式目錄以外,用環境變數 SEGCRA_MODELS_CONFIG 指過去(換新版程式碼時這份會被蓋掉)。
 # endpoint 可用環境變數 OLLAMA_URL 覆蓋(預設 http://localhost:11434/v1;OpenAI 相容的端點都可以)。
 endpoint: http://localhost:11434/v1
 # Ollama 不驗證,佔位即可。端點要驗證時用環境變數 LLM_API_KEY 給,不要把真的 key 寫在這裡。
