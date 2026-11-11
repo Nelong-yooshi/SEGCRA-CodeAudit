@@ -54,6 +54,11 @@ class _FakeGitLab(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _route(self, method):
+        # 先把請求內容讀完再回:沒讀完就關連線的話,Windows 會送 RST,用戶端偶爾收到
+        # 「連線被中止」而重送,同一個請求就被記成兩次
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
         time.sleep(self.latency)
         path = self.path.split("?", 1)[0]
         prefix = f"/api/v4/projects/{PROJECT}"
