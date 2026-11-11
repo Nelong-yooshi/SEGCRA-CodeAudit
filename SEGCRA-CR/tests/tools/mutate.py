@@ -5996,6 +5996,34 @@ MUTANTS.update({
         + '        print(f"[webhook] MR !{mr_iid} 已留言'),
 })
 
+# ---- webhook 認得出機器人留的言:審查自己的帳號(啟動時查一次)與 GitLab 產生的機器人帳號名稱
+MUTANTS.update({
+    "機器人:不認 project / group access token 的帳號": ("../scripts/webhook_server.py",
+        r'_BOT_NAME = re.compile(r"ai-|root|(?:project|group)_\d+_bot")',
+        r'_BOT_NAME = re.compile(r"ai-|root")'),
+    "機器人:名稱不從開頭比": ("../scripts/webhook_server.py",
+        '    if _BOT_NAME.match(user.get("username") or ""):',
+        '    if _BOT_NAME.search(user.get("username") or ""):'),
+    "機器人:不認自己的帳號 id": ("../scripts/webhook_server.py",
+        "    return _own_user_id is not None and uid == _own_user_id",
+        "    return False"),
+    "機器人:布林的 id 也拿來比": ("../scripts/webhook_server.py",
+        "    if not isinstance(uid, int) or isinstance(uid, bool):        # True == 1,布林不算",
+        "    if not isinstance(uid, int):        # True == 1,布林不算"),
+    "機器人:啟動時不查帳號": ("../scripts/webhook_server.py",
+        "    _learn_own_account()" + NL + "    srv = ThreadingHTTPServer((args.host, args.port), Handler)",
+        "    srv = ThreadingHTTPServer((args.host, args.port), Handler)"),
+    "機器人:查帳號打錯 API": ("../toolbox/gitlab.py",
+        '        r = httpx.get(f"{GITLAB_URL}/api/v4/user", headers={"PRIVATE-TOKEN": GITLAB_TOKEN},',
+        '        r = httpx.get(f"{GITLAB_URL}/api/v4/users", headers={"PRIVATE-TOKEN": GITLAB_TOKEN},'),
+    "機器人:GitLab 回錯誤也拿來用": ("../toolbox/gitlab.py",
+        "        r.raise_for_status()" + NL + '        uid = r.json().get("id")',
+        '        uid = r.json().get("id")'),
+    "機器人:查到的 id 不檢查型別": ("../toolbox/gitlab.py",
+        "    return uid if isinstance(uid, int) and not isinstance(uid, bool) else None",
+        "    return uid"),
+})
+
 # ---- 評測用的 token 用量(#84)。數字錯了不會有人發現,只會得到錯的結論。
 A = "agent.py"
 MUTANTS.update({

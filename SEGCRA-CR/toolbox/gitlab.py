@@ -733,6 +733,24 @@ def job_from_token(job_token: str) -> dict | None:
     return job if isinstance(job, dict) else None
 
 
+def token_user_id() -> int | None:
+    """GITLAB_TOKEN 這把 token 是哪一個帳號(GET /user 的 id)。查不到、mock 模式回 None。
+
+    webhook 服務用它認出「審查自己留的言」:project / group access token 的帳號名稱由 GitLab
+    產生,不一定是我們取的前綴。"""
+    if not REAL_MODE:
+        return None
+    import httpx
+    try:
+        r = httpx.get(f"{GITLAB_URL}/api/v4/user", headers={"PRIVATE-TOKEN": GITLAB_TOKEN},
+                      timeout=10)
+        r.raise_for_status()
+        uid = r.json().get("id")
+    except Exception:                        # noqa: BLE001 — 查不到就只靠名稱判斷
+        return None
+    return uid if isinstance(uid, int) and not isinstance(uid, bool) else None
+
+
 def pipeline_info(pipeline_id: int) -> dict | None:
     """這個專案的某條 pipeline(GET /projects/:id/pipelines/:pipeline_id);取不到回 None。"""
     if not REAL_MODE or not isinstance(pipeline_id, int) or isinstance(pipeline_id, bool):
