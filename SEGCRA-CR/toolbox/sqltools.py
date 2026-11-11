@@ -126,6 +126,47 @@ def _first_token(sql: str, i: int, end: int) -> int:
     return end
 
 
+def strip_comments(sql: str) -> str:
+    """把註解換成等長的空白,**字串常值與識別字原樣保留**;換行留著,行號不變。
+
+    用途是「送出去的內容不該帶註解」(例如送仲裁:註解不影響執行結果,仲裁也用不到,
+    但 MR 作者可以在裡面寫陳述句影響判斷)。
+
+    跟切句共用同一份跳過規則(`_skip_block_comment`):字串裡的 `--` 不是註解開頭,
+    區塊註解可以巢狀。各寫一份的話,一邊補了跳脫規則另一邊沒補,就會有一種寫法
+    在某一條路上被當成註解切掉。
+    """
+    out, i, n = list(sql), 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch == "'":                        # 字串('' 是跳脫,不是結束)
+            i += 1
+            while i < n:
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                i += 1
+        elif ch in '"[':                     # 以引號或方括號包起來的識別字
+            j = sql.find('"' if ch == '"' else "]", i + 1)
+            i = n if j < 0 else j + 1
+        elif sql.startswith("--", i):        # 行註解:留著換行
+            j = sql.find("\n", i)
+            end = n if j < 0 else j
+            out[i:end] = " " * (end - i)
+            i = end
+        elif sql.startswith("/*", i):        # 區塊註解(可巢狀):換行留著
+            end = _skip_block_comment(sql, i, n)
+            for k in range(i, end):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = end
+        else:
+            i += 1
+    return "".join(out)
+
 def statement_chunks(sql: str) -> list[Chunk]:
     """依分號切成一句一句。
 
