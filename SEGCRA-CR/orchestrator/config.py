@@ -217,8 +217,19 @@ def _load_dbt_section(raw: dict) -> dict:
             **({"sqlserver_schema_concat": concat} if concat is not None else {})}
 
 
+def models_config_path() -> Path:
+    """要讀的模型設定檔:環境變數 SEGCRA_MODELS_CONFIG 指定的檔案;沒設、空字串或只有空白時是
+    repo 的 config/models.yaml。
+
+    部署端要改模型、上下文長度這些設定時,複製一份放在程式目錄以外,用這個變數指過去。直接改 repo
+    裡那份的話,換新版程式碼時會被蓋掉。"""
+    custom = os.environ.get("SEGCRA_MODELS_CONFIG", "").strip()
+    return Path(custom) if custom else PKG_ROOT / "config" / "models.yaml"
+
+
 def load_config(path: Path | None = None) -> Config:
-    raw = yaml.safe_load((path or PKG_ROOT / "config" / "models.yaml").read_text(encoding="utf-8"))
+    """path 有給時讀那個檔案(測試用),沒給時讀 models_config_path()。"""
+    raw = yaml.safe_load((path or models_config_path()).read_text(encoding="utf-8"))
     # endpoint 可用環境變數覆蓋(如 Ollama 掛在遠端或 tunnel 上;OpenAI 相容的端點都可以)
     endpoint = os.environ.get("OLLAMA_URL", raw.get("endpoint", "http://localhost:11434/v1"))
     # 端點要驗證時,金鑰用環境變數給,不寫進 models.yaml:那個檔案在共用的主機上,會進版控與

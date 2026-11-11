@@ -122,7 +122,7 @@ def test_環境變數的名稱不分大小寫():
 MAIN_PROCESS_ONLY = {
     # orchestrator/config.py:load_config 等讀設定的函式,只在主行程呼叫
     "LLM_TEMPERATURE", "LLM_SEED", "LLM_REASONING_EFFORT", "SEGCRA_DBT_DATABASE", "OLLAMA_URL",
-    "LLM_API_KEY",
+    "LLM_API_KEY", "SEGCRA_MODELS_CONFIG",
 }
 
 

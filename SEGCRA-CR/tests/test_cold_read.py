@@ -350,11 +350,17 @@ def test_輸入超過預算時記成沒看完(monkeypatch):
 
 
 @pytest.mark.parametrize("prompt_tokens,reason", [
-    (None, cr.UNREAD_NO_USAGE), (40000, cr.UNREAD_NEAR_LIMIT), (1, cr.UNREAD_TOO_FEW)])
+    (lambda p: None, cr.UNREAD_NO_USAGE),
+    (lambda p: p.num_ctx - p.max_output_tokens + 1, cr.UNREAD_NEAR_LIMIT),     # 剛好超過一點
+    (lambda p: 1, cr.UNREAD_TOO_FEW)])
 def test_端點讀入量不對時記成沒看完(monkeypatch, prompt_tokens, reason):
-    """端點超過上下文時不報錯、截掉 prompt 開頭:冷讀會在沒看到的情況下回「沒命中」。"""
-    _fake_model(monkeypatch, {"flagged": False}, prompt_tokens=prompt_tokens)
-    result = asyncio.run(cr.cold_read(load_config(), _mr()))
+    """端點超過上下文時不報錯、截掉 prompt 開頭:冷讀會在沒看到的情況下回「沒命中」。
+
+    「超過上下文」照設定檔裡冷讀的 num_ctx 算,不寫死數字:部署端的設定檔換了上下文長度也一樣成立。"""
+    cfg = load_config()
+    _fake_model(monkeypatch, {"flagged": False},
+                prompt_tokens=prompt_tokens(cfg.role_profile("cold_read")))
+    result = asyncio.run(cr.cold_read(cfg, _mr()))
     assert result.truncated and result.unread == reason and result.omitted == []
     assert not result.flagged
 
@@ -881,9 +887,22 @@ def test_輸出的路徑去掉控制字元並截長度():
         assert "\x1b" not in text and "\x07" not in text and "a" * 300 not in text
 
 
-def test_冷讀的_profile_不思考_而且是端點認得的值(monkeypatch):
-    """yaml 裡的值不像環境變數會檢查:寫錯一個字會原樣送給端點,可能被忽略而照樣思考。"""
+def test_冷讀的_profile_不思考(monkeypatch):
+    """repo 附的設定:冷讀不思考(實測判定相同、快很多,見 models.yaml 的註解)。
+
+    讀 repo 裡那份,不讀 SEGCRA_MODELS_CONFIG 指的部署設定:有些模型不接受 none,部署端可以改成
+    low,這裡只守 repo 附的預設值。"""
+    monkeypatch.delenv("LLM_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("SEGCRA_MODELS_CONFIG", raising=False)
+    assert load_config().role_profile("cold_read").reasoning_effort == "none"
+
+
+def test_用到的設定檔裡_reasoning_effort_是端點認得的值(monkeypatch):
+    """yaml 裡的值不像環境變數會檢查:寫錯一個字會原樣送給端點,可能被忽略而照樣思考。
+    讀實際會用的設定檔(部署端的也算),每個 profile 都看。"""
     monkeypatch.delenv("LLM_REASONING_EFFORT", raising=False)
     from orchestrator.config import _EFFORT_LEVELS
-    profile = load_config().role_profile("cold_read")
-    assert profile.reasoning_effort == "none" and profile.reasoning_effort in _EFFORT_LEVELS
+    cfg = load_config()
+    for name in cfg.profiles:
+        effort = cfg.profile(name).reasoning_effort
+        assert effort is None or effort in _EFFORT_LEVELS, (name, effort)
