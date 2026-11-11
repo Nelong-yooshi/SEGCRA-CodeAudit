@@ -314,17 +314,41 @@ def parsed_chunks(sql: str, catch=(SqlglotError, RecursionError)
             if not _block_unclear(chunk.text, parsed):
                 out.append((chunk, parsed, None))
                 continue
-            # 程序性的區塊:裡面的寫入語句對規則層消失了。剝掉外框再解析一次。
+            # 看不到裡面的寫入語句時,依序試兩種恢復方式;哪一種都要「解析得過 **而且**
+            # 原文寫著的寫入語句都回到語法樹裡」才算數,不然照舊記成解析失敗。
+            #   1. 剝掉區塊外框(BEGIN…END、IF/WHILE 的條件、程序標頭)
+            #   2. 以行首的語句關鍵字再切一次 —— `DECLARE @x INT` 換行接
+            #      `UPDATE t SET a = 1` 這種:沒有分號、整段被解析成一個看不懂的
+            #      Command(不報錯),所以「解析失敗才切」的那一層碰不到它。
+            recovered = None
             inner = _strip_block_heads(chunk.text)
-            try:
-                retry = parse_statements(inner) if inner.strip() else []
-            except catch:
-                retry = None
-            if retry is not None and not _block_unclear(inner, retry):
-                out.append((Chunk(inner, chunk.line_offset, chunk.start), retry, None))
+            if inner.strip() and inner != chunk.text:
+                try:
+                    retry = parse_statements(inner)
+                except catch:
+                    retry = None
+                if retry is not None and not _block_unclear(inner, retry):
+                    recovered = [(Chunk(inner, chunk.line_offset, chunk.start), retry)]
+            if recovered is None:
+                pieces = _split_by_keyword(chunk.text, chunk.line_offset) or []
+                parsed_pieces = []
+                for piece in pieces:
+                    try:
+                        sub = parse_statements(piece.text)
+                    except catch:
+                        parsed_pieces = []
+                        break
+                    if _block_unclear(piece.text, sub):
+                        parsed_pieces = []
+                        break
+                    parsed_pieces.append((Chunk(piece.text, piece.line_offset,
+                                                chunk.start + piece.start), sub))
+                recovered = parsed_pieces or None
+            if recovered is not None:
+                out.extend((c, p, None) for c, p in recovered)
             else:
-                # 剝不開、或剝完還是看不到那些寫入語句:**不可以回報成沒有命中**。
-                # 記成解析失敗,由 enforce_parse 補一條「預掃無法解析」交人工。
+                # 兩種都不行:**不可以回報成沒有命中**。記成解析失敗,由 enforce_parse
+                # 補一條「預掃無法解析」交人工。
                 out.append((chunk, [], _BlockNotParsed(
                     "程序性區塊(BEGIN…END / IF / WHILE / TRY…CATCH)裡的語句無法解析")))
             continue
