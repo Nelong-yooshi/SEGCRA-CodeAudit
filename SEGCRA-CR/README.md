@@ -211,7 +211,13 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
    curl http://127.0.0.1:11434/api/tags     # 有回模型清單即通
    ```
 
-   endpoint 在別處時:`export OLLAMA_URL=http://<host>:11434/v1`。
+   endpoint 在別處時:`export OLLAMA_URL=http://<host>:11434/v1`。OpenAI 相容的端點(例如 vLLM)也一樣用
+   `OLLAMA_URL` 指定;要 API key 的端點,key 用環境變數 `LLM_API_KEY` 給,**不要寫進 `config/models.yaml`**
+   (那個檔案會進版控與離線包):
+
+   ```bash
+   read -rs -p "LLM_API_KEY: " LLM_API_KEY && export LLM_API_KEY && echo
+   ```
 
 ### 開啟 dbt 接線(選用;預設關閉)
 
