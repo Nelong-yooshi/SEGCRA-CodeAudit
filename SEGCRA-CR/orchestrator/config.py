@@ -124,7 +124,8 @@ def _env_seed(name: str) -> int | None:
 @dataclass
 class Config:
     endpoint: str
-    api_key: str
+    # 不放進 repr:Config 被印出來或寫進例外訊息時,金鑰不跟著出去
+    api_key: str = field(repr=False)
     default_profile: str
     profiles: dict
     roles: dict
@@ -218,10 +219,13 @@ def _load_dbt_section(raw: dict) -> dict:
 
 def load_config(path: Path | None = None) -> Config:
     raw = yaml.safe_load((path or PKG_ROOT / "config" / "models.yaml").read_text(encoding="utf-8"))
-    # endpoint 可用環境變數覆蓋(如 Ollama 掛在遠端或 tunnel 上)
+    # endpoint 可用環境變數覆蓋(如 Ollama 掛在遠端或 tunnel 上;OpenAI 相容的端點都可以)
     endpoint = os.environ.get("OLLAMA_URL", raw.get("endpoint", "http://localhost:11434/v1"))
+    # 端點要驗證時,金鑰用環境變數給,不寫進 models.yaml:那個檔案在共用的主機上,會進版控與
+    # 離線包。順序是環境變數 > models.yaml > 預設;前後的空白不算,空字串或只有空白當成沒設定。
+    api_key = os.environ.get("LLM_API_KEY", "").strip() or raw.get("api_key", "ollama")
     return Config(
-        endpoint=endpoint, api_key=raw.get("api_key", "ollama"),
+        endpoint=endpoint, api_key=api_key,
         default_profile=raw["default_profile"], profiles=raw["profiles"],
         roles=raw.get("roles", {}), budget=raw["budget"],
         policy=raw.get("policy", {}), dbt=_load_dbt_section(raw),

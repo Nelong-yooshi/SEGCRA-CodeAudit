@@ -760,6 +760,26 @@ def copy_project(src: pathlib.Path, dst: pathlib.Path) -> None:
             shutil.copyfile(item, dst / item.name)
 
 
+# ---- 模型端點的 API key 用環境變數給,不寫進 models.yaml;印出設定時不帶金鑰
+MUTANTS.update({
+ "金鑰:環境變數不覆蓋": ("config.py",
+     '    api_key = os.environ.get("LLM_API_KEY", "").strip() or raw.get("api_key", "ollama")',
+     '    api_key = raw.get("api_key", "ollama")'),
+ "金鑰:空白也當成金鑰": ("config.py",
+     '    api_key = os.environ.get("LLM_API_KEY", "").strip() or raw.get("api_key", "ollama")',
+     '    api_key = os.environ.get("LLM_API_KEY", raw.get("api_key", "ollama"))'),
+ "金鑰:前後的空白帶進金鑰": ("config.py",
+     '    api_key = os.environ.get("LLM_API_KEY", "").strip() or raw.get("api_key", "ollama")',
+     '    api_key = os.environ.get("LLM_API_KEY", "") or raw.get("api_key", "ollama")'),
+ "金鑰:印出設定時帶金鑰": ("config.py",
+     '    api_key: str = field(repr=False)',
+     '    api_key: str'),
+ "金鑰:讀到了但沒用": ("config.py",
+     '        endpoint=endpoint, api_key=api_key,',
+     '        endpoint=endpoint, api_key=raw.get("api_key", "ollama"),'),
+})
+
+
 # ---- 冷讀:另一支只看 MR 文字的模型呼叫(只能加擋)
 MUTANTS.update({
  "冷讀:改動與全文不排序": ("cold_read.py",

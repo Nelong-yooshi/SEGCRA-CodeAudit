@@ -26,7 +26,7 @@
 
 逐步:
 
-1. 建 `AsyncOpenAI` client:`base_url=cfg.endpoint`(`config/models.yaml` 的 `endpoint`,可用環境變數 `OLLAMA_URL` 覆蓋;見 `orchestrator/config.py`:`load_config`)、`timeout=REQUEST_TIMEOUT`、**`max_retries=0`(不自動重試)**。`REQUEST_TIMEOUT` 由環境變數 `LLM_TIMEOUT`(秒)覆蓋,預設 3600——單次請求上限 1 小時。
+1. 建 `AsyncOpenAI` client:`base_url=cfg.endpoint`(`config/models.yaml` 的 `endpoint`,可用環境變數 `OLLAMA_URL` 覆蓋;見 `orchestrator/config.py`:`load_config`)、`api_key=cfg.api_key`(`models.yaml` 的 `api_key`,可用環境變數 `LLM_API_KEY` 覆蓋;端點要驗證時用環境變數給,不寫進 yaml)、`timeout=REQUEST_TIMEOUT`、**`max_retries=0`(不自動重試)**。`REQUEST_TIMEOUT` 由環境變數 `LLM_TIMEOUT`(秒)覆蓋,預設 3600——單次請求上限 1 小時。
 2. `messages = [system, user]`;`use_tools` 且有 hub 時帶 `tools=hub.openai_tools, tool_choice="auto"`(**只含唯讀白名單**,見下方 `MODEL_TOOLS`)(baseline 模式 `use_tools=False`,純一問一答)。
 3. 迴圈至多 `MAX_ITERATIONS = 12` 輪,每輪呼叫 `chat.completions.create`(帶 profile 的 `temperature`、`max_output_tokens`),把回覆 append 進 messages。
 4. **無 tool_calls 時**:若 `content` 非空 → 直接回傳(正常結束);若為空 → append 一則 user 訊息「請直接輸出最終報告 JSON,不要其他文字。」再 continue(**空回應補推**,對付推理型模型偶發的空 content)。

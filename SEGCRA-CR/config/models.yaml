@@ -1,7 +1,8 @@
 # 模型設定 — orchestrator 不綁模型,換模型只改這裡。
-# endpoint 可用環境變數 OLLAMA_URL 覆蓋(預設 http://localhost:11434/v1)。
+# endpoint 可用環境變數 OLLAMA_URL 覆蓋(預設 http://localhost:11434/v1;OpenAI 相容的端點都可以)。
 endpoint: http://localhost:11434/v1
-api_key: ollama          # Ollama 不驗證,佔位即可
+# Ollama 不驗證,佔位即可。端點要驗證時用環境變數 LLM_API_KEY 給,不要把真的 key 寫在這裡。
+api_key: ollama
 default_profile: review
 
 # temperature/seed 的方針(對應 eval/README.md「發現三:測資生成覆蓋度不穩定」):
