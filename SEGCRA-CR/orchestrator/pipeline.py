@@ -1936,6 +1936,40 @@ def enforce_spec_change(report: dict, mr: dict) -> dict:
     return report
 
 
+# 取不到 MR 時的原因分類。工具失敗時 ToolHub 回的是「Error executing tool …: <例外訊息>」
+# 這樣的字串,原文常帶 GitLab 的網址與主機名稱,所以只用它來判斷種類,不把原文放進訊息。
+# 依序比對,先中的先用:憑證錯誤的訊息裡也會出現 "connect",所以憑證要排在連線前面。
+_MR_FETCH_REASONS = (
+    (("CERTIFICATE_VERIFY_FAILED", "SSLError", "[SSL"),
+     "HTTPS 憑證驗證失敗:GitLab 使用的憑證不受信任(例如內部 CA 簽發的),"
+     "執行環境要信任簽發的 CA"),
+    (("'401",), "GitLab 回 401:token 無效或已過期(GITLAB_TOKEN)"),
+    (("'403",), "GitLab 回 403:token 沒有讀取這個專案的權限"),
+    (("'404",), "GitLab 回 404:找不到專案或 MR(確認 GITLAB_PROJECT 與 MR 編號,"
+                "或 token 看不到這個專案)"),
+    (("Server error '5",), "GitLab 伺服器錯誤(5xx),稍後再試"),
+    (("timed out", "Timeout"), "連線 GitLab 逾時"),
+    (("Name or service not known", "getaddrinfo", "nodename nor servname"),
+     "GitLab 的主機名稱解析失敗(確認 GITLAB_URL)"),
+    (("Connection refused", "All connection attempts failed", "ConnectError",
+      "Network is unreachable"),
+     "連不到 GitLab(確認 GITLAB_URL、網路與防火牆)"),
+    (("fixture 不存在",), "mock 模式找不到這個編號的測試資料(要連 GitLab 時,GITLAB_URL、"
+                           "GITLAB_TOKEN、GITLAB_PROJECT 三個都要設)"),
+    (("MR 編號必須是數字",), "MR 編號必須是數字"),
+)
+
+
+def _mr_fetch_reason(raw: str) -> str:
+    """把取 MR 失敗時工具回傳的內容,轉成看得懂、可以照著處理的原因。"""
+    for needles, reason in _MR_FETCH_REASONS:
+        if any(n in raw for n in needles):
+            return reason
+    if raw.startswith("Error executing tool"):
+        return "呼叫 GitLab 時發生無法分類的錯誤(可用 curl 對同一個 API 確認)"
+    return "回應不是預期的 MR 資料"
+
+
 async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                     dry_run: bool = False, baseline: bool = False,
                     capture: dict | None = None) -> dict:
@@ -1966,9 +2000,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
              "required": ["name"]},
         )
 
-        mr = await hub.call_json("gitlab__get_mr_diff", {"mr_id": mr_id})
+        raw = await hub.call("gitlab__get_mr_diff", {"mr_id": mr_id}, truncate=False)
+        try:
+            mr = json.loads(raw)
+        except json.JSONDecodeError:
+            mr = None
         if not mr:
-            raise RuntimeError(f"無法取得 MR {mr_id}")
+            raise RuntimeError(f"無法取得 MR {mr_id}:{_mr_fetch_reason(raw)}")
 
         # 把這次審查釘在 MR 的 head commit 上:之後 get_file 不指定 ref 時讀的就是
         # 「正在審的那一版」,而不是目標分支的現況(目標分支讀到的是**改之前**的

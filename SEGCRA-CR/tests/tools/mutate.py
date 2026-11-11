@@ -728,6 +728,28 @@ MUTANTS.update({
      + '               if f.get("full_content_unavailable") and not f.get("unreviewable")]',
      '    no_full = []'),
 })
+# ---- 取不到 MR 時:訊息要說出原因,不能帶出原始錯誤(常含 GitLab 網址)
+MUTANTS.update({
+ "取 MR:訊息不帶原因": ("pipeline.py",
+     '            raise RuntimeError(f"無法取得 MR {mr_id}:{_mr_fetch_reason(raw)}")',
+     '            raise RuntimeError(f"無法取得 MR {mr_id}")'),
+ "取 MR:訊息帶出原始錯誤": ("pipeline.py",
+     '            raise RuntimeError(f"無法取得 MR {mr_id}:{_mr_fetch_reason(raw)}")',
+     '            raise RuntimeError(f"無法取得 MR {mr_id}:{_mr_fetch_reason(raw)} {raw}")'),
+ "取 MR:回應不是 JSON 時直接炸": ("pipeline.py",
+     "        try:" + NL + "            mr = json.loads(raw)" + NL
+     + "        except json.JSONDecodeError:" + NL + "            mr = None",
+     "        mr = json.loads(raw)"),
+ "取 MR:認不出憑證錯誤": ("pipeline.py",
+     '    (("CERTIFICATE_VERIFY_FAILED", "SSLError", "[SSL"),',
+     '    (("__never__",),'),
+ "取 MR:認不出 404": ("pipeline.py",
+     """    (("'404",), "GitLab 回 404""",
+     """    (("__never__",), "GitLab 回 404"""),
+ "取 MR:認不出連不到": ("pipeline.py",
+     '    (("Connection refused", "All connection attempts failed", "ConnectError",',
+     '    (("__never__",'),
+})
 
 
 
