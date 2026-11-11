@@ -218,12 +218,19 @@ async def draft_binding(cfg, directive_text: str, profile_name: str | None = Non
                         default_scope: list[str] | None = None) -> Item | None:
     """AI 把一句口語指示轉成結構化 binding 知識項(source=user-explicit,權威最高)。
     這只是『起草』——仍要開 MR 給人 merge 才會生效。"""
-    from .agent import extract_json, run_agent
+    from .agent import extract_json, output_truncated, run_agent
     from .tool_hub import ToolHub
+    profile = cfg.profile(profile_name)
+    meta: dict = {}
     async with ToolHub(servers=[]) as hub:
-        raw = await run_agent(cfg, cfg.profile(profile_name), DRAFT_SYSTEM,
+        raw = await run_agent(cfg, profile, DRAFT_SYSTEM,
                               f"審查人員留言:「{directive_text}」\n請判斷並輸出 JSON。",
-                              hub, use_tools=False, verbose=False)
+                              hub, use_tools=False, verbose=False, meta=meta)
+    # 被截斷的輸出不採信:json-repair 會把斷掉的 JSON 補成合法物件,`text` 可能只有
+    # 半句話 —— 那會變成一條起草出來的 binding 知識項,內容卻是殘的。起草失敗回 None
+    # 的路徑本來就有(呼叫端會據此不建 MR),走同一條。
+    if output_truncated(meta, profile.max_output_tokens):
+        return None
     d = extract_json(raw) or {}
     if not d.get("is_rule") or not d.get("text"):
         return None

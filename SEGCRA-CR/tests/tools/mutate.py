@@ -2575,6 +2575,22 @@ MUTANTS.update({
 
 # ---- 注入掃描的總量上限:放得下一份展開結果
 MUTANTS.update({
+ # 其他 LLM 呼叫的截斷偵測與送仲裁前去註解(#26 第 1、6 點)
+ '仲裁:輸出被截斷也照樣採信': ('spec_exec.py',
+     '    if output_truncated(meta, profile.max_output_tokens):\n        return {"who_is_wrong": "sql", "reason": "(仲裁輸出被截斷,保守列為 SQL 側待人工確認)",',
+     '    if False:\n        return {"who_is_wrong": "sql", "reason": "(仲裁輸出被截斷,保守列為 SQL 側待人工確認)",'),
+ '仲裁:送出去的 SQL 帶著註解': ('spec_exec.py',
+     '            f"## MR 的 SQL\\n```sql\\n{_without_comments(sql)}\\n```\\n\\n"',
+     '            f"## MR 的 SQL\\n```sql\\n{sql}\\n```\\n\\n"'),
+ '知識起草:輸出被截斷也照樣建項目': ('knowledge_governance.py',
+     '    if output_truncated(meta, profile.max_output_tokens):\n        return None',
+     '    if False:\n        return None'),
+ '去註解:字串常值裡的 -- 也當成註解': ('../toolbox/sqltools.py',
+     '        if ch == "\'":                        # 字串(\'\' 是跳脫,不是結束)\n            i += 1\n            while i < n:\n                if sql[i] == "\'":\n                    if i + 1 < n and sql[i + 1] == "\'":\n                        i += 2\n                        continue\n                    i += 1\n                    break\n                i += 1\n        elif ch in \'"[\':                     # 以引號或方括號包起來的識別字\n            j = sql.find(\'"\' if ch == \'"\' else "]", i + 1)\n            i = n if j < 0 else j + 1\n        elif sql.startswith("--", i):        # 行註解:留著換行',
+     '        if sql.startswith("--", i):        # 行註解:留著換行'),
+ '去註解:把換行也清掉(行號跟著跑掉)': ('../toolbox/sqltools.py',
+     '            for k in range(i, end):\n                if out[k] != "\\n":\n                    out[k] = " "',
+     '            for k in range(i, end):\n                out[k] = " "'),
  # macro 呼叫圖只留一套(#103)
  '呼叫圖:不用語法樹,只用正規式(dispatch 抓不到)': ('pipeline.py',
      '    by_tree = _macros_used_by_tree(sources, macro_files)',

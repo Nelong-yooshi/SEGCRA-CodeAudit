@@ -51,6 +51,12 @@ def make_point():
     return Point(1)
 
 
+# 不算「本專案的檔案」的目錄。`.venv` 通常就建在專案根目錄底下,不排除的話第三方套件
+# 會被當成本專案模組掃進去 —— 於是 pytest 自己讀的 PYTEST_ADDOPTS、FORCE_COLOR 變成
+# 「沒有決定的環境變數」,本機跑全套就紅(CI 的 venv 在別的地方,所以 CI 看不到)。
+_NOT_PROJECT = ("tests", ".venv", "venv", "site-packages", "__pypackages__")
+
+
 def project_modules(names):
     """匯入這些模組之後,子行程裡載入了哪些本專案的檔案(相對路徑)。"""
     for name in names:
@@ -59,8 +65,12 @@ def project_modules(names):
     out = []
     for module in list(sys.modules.values()):
         path = getattr(module, "__file__", None)
-        if path and pathlib.Path(path).resolve().is_relative_to(root) and "tests" not in pathlib.Path(path).parts:
-            out.append(pathlib.Path(path).resolve().relative_to(root).as_posix())
+        if not path:
+            continue
+        resolved = pathlib.Path(path).resolve()
+        if (resolved.is_relative_to(root)
+                and not set(resolved.parts) & set(_NOT_PROJECT)):
+            out.append(resolved.relative_to(root).as_posix())
     return sorted(out)
 
 
