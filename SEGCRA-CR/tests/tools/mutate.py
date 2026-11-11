@@ -4172,6 +4172,26 @@ MUTANTS.update({
 })
 
 
+# ---- 閘道的請求上限:開啟時請求內容帶 timeout,預設不送
+MUTANTS.update({
+ "閘道上限:開啟了也不送": ("agent.py",
+     '    timeout_kwargs = {"extra_body": {"timeout": REQUEST_TIMEOUT}} if SEND_TIMEOUT else {}',
+     "    timeout_kwargs = {}"),
+ "閘道上限:沒開也送": ("agent.py",
+     '    timeout_kwargs = {"extra_body": {"timeout": REQUEST_TIMEOUT}} if SEND_TIMEOUT else {}',
+     '    timeout_kwargs = {"extra_body": {"timeout": REQUEST_TIMEOUT}}'),
+ "閘道上限:送的不是 LLM_TIMEOUT 的值": ("agent.py",
+     '    timeout_kwargs = {"extra_body": {"timeout": REQUEST_TIMEOUT}} if SEND_TIMEOUT else {}',
+     '    timeout_kwargs = {"extra_body": {"timeout": 30}} if SEND_TIMEOUT else {}'),
+ "閘道上限:沒有傳進請求": ("agent.py",
+     "            **seed_kwargs, **effort_kwargs, **timeout_kwargs,",
+     "            **seed_kwargs, **effort_kwargs,"),
+ "閘道上限:讀不懂的值也當成開啟": ("agent.py",
+     '    return raw.strip().lower() in ("1", "true", "yes", "on")',
+     '    return raw.strip().lower() not in ("", "0", "false", "no", "off")'),
+})
+
+
 # ---- 決策閘門的硬條件:規則層有命中、冷讀命中或沒看完,不得自動放行(不可由設定關閉)
 MUTANTS.update({
     "決策硬條件:規則命中不擋": ("pipeline.py",
