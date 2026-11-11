@@ -47,7 +47,7 @@ from .skills_loader import always_skills, load_skills, skills_index
 from .dbt_context import PROJECT_FILE_REMOVED, PROJECT_YAML_INVALID, check_yaml_files_isolated
 from .dbt_project import YAML_MODELS_NOT_LIST, YAML_SYNTAX
 from .spec_exec import SpecLookup, find_spec, run_spec_exec
-from .tool_hub import ToolHub
+from .tool_hub import REFUSED_OTHER_MR, REFUSED_OTHER_REF, REFUSED_SCAN_FAILED, ToolHub
 from toolbox.sqltools import LINT_INCOMPLETE_CODE, LINT_MAX_CHARS, LINT_TIMEOUT_SECONDS
 from toolbox.sqltools import run_rules
 from toolbox.sqltools import DIALECT, parse_statements, parsed_chunks
@@ -1979,6 +1979,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 拿不到 head sha 時釘 None——get_file 會明講取不到,不會退回舊版。
         from toolbox import gitlab as _gitlab
         _gitlab.pin_review_ref(mr.get("head_sha"))
+        # 模型能讀的範圍也在這裡定:這次的 MR、這次 MR 的版本與目標分支(tool_hub 的 READ_TOOLS)
+        hub.set_review_scope(mr_id, mr)
 
         if baseline:
             # 裸模型 A/B 對照組 — 無 skills/memory/工具/預掃/執行驗證,不回寫 GitLab
@@ -2195,6 +2197,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_truncation(report, output_meta, profile.max_output_tokens)  # 輸出被截斷
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
         report = enforce_tool_refusals(report, hub.refused_calls)  # 模型要求了寫入工具
+        report = enforce_tool_reads(report, hub.refused_reads, hub.tool_injection_hits)  # 讀了範圍外或含注入的內容
 
         # 執行驗證(必跑;測資生成 → 沙盒執行 → 仲裁)——在 rubric 之前。
         # **整段有時間上限**:沙盒的單一查詢自己有上限,但整段沒有,而測資生成可以跑
@@ -4140,6 +4143,56 @@ def enforce_tool_refusals(report: dict, refused: list[str]) -> dict:
     return report
 
 
+_TOOL_READ_REFUSAL_TITLE = "審查模型要求讀這次審查範圍以外的內容"
+_TOOL_READ_INJECTION_TITLE = "工具讀回的內容疑似含提示注入(確定性掃描命中)"
+# 被拒絕的讀取:代碼 → 寫進 finding 的說法(固定文字;模型給的參數不寫)
+_REFUSED_READ_TEXT = {
+    REFUSED_OTHER_MR: "要求讀別的 MR",
+    REFUSED_OTHER_REF: "要求讀這次 MR 的版本與目標分支以外的版本",
+    REFUSED_SCAN_FAILED: "讀回的內容沒有完成注入掃描",
+}
+
+
+@_isolated_stage("工具讀取揭露")
+def enforce_tool_reads(report: dict, refused: list[str], hits: list[dict]) -> dict:
+    """審查模型用工具讀 MR 與檔案時,範圍外的讀取與讀回內容的注入掃描命中。
+
+    讀回的內容命中注入掃描,跟 MR 本身命中一樣處理:寫進 _injection_scan(apply_policy 的
+    硬條件,直接 blocked),再補一條 blocker。內容已經沒有交給模型(tool_hub 的 _screen),
+    但模型會去讀,多半是 MR 的文字引導的,這次審查的結果要人工確認。
+
+    範圍外的讀取(別的 MR、別的版本)已被拒絕、沒有執行;補一條 major 交人工,理由同
+    enforce_tool_refusals:幾乎可以確定是照著 MR 內容的指示在做。
+
+    finding 只寫類別、工具名稱與固定的說法,不寫模型給的參數或讀回的原文(會貼回 MR)。"""
+    if hits:
+        report["_injection_scan"] = list(report.get("_injection_scan") or []) + [
+            {"category": h.get("category"), "source": "tool"} for h in hits]
+        cats = ", ".join(sorted({str(h.get("category")) for h in hits}))
+        tools = ", ".join(sorted({str(h.get("tool")) for h in hits}))
+        injected = {
+            "file": "(MR 內容)", "line": 0, "severity": "blocker",
+            "title": _TOOL_READ_INJECTION_TITLE,
+            "detail": (f"審查模型用工具({tools})讀回的內容含疑似操縱審查器的指令,類別:{cats}。"
+                       "這段內容沒有交給模型;模型會去讀它,很可能是 MR 的文字引導的,"
+                       "這次審查結果需要人工資安確認。"),
+            "suggestion": "檢查 MR 標題、描述與註解中是否有引導審查器去讀特定檔案的文字,"
+                          "以及被讀的那個檔案裡的內容。",
+            "citations": []}
+        _put_program_finding(report, injected)
+    reasons = [_REFUSED_READ_TEXT[r] for r in dict.fromkeys(refused) if r in _REFUSED_READ_TEXT]
+    if reasons:
+        refusal = {
+            "file": "(MR 內容)", "line": 0, "severity": "major",
+            "title": _TOOL_READ_REFUSAL_TITLE,
+            "detail": ("審查模型" + "、".join(reasons) + ",已被拒絕、沒有讀到。"
+                       "模型很可能受到 MR 內容的指示,這次審查結果需要人工確認。"),
+            "suggestion": "檢查 MR 標題、描述與註解中是否有指示審查器去讀其他 MR 或其他版本的文字。",
+            "citations": []}
+        _put_program_finding(report, refusal)
+    return report
+
+
 _UNREVIEWABLE_TITLE = "部分變更內容無法取得,未經審查"
 
 
@@ -4176,7 +4229,7 @@ def enforce_unreviewable(report: dict, mr: dict) -> dict:
     if no_full:
         parts.append(f"以下檔案取不到完整的新版內容,只能依 diff 判斷:"
                      f"{', '.join(no_full[:10])}" + ("等" if len(no_full) > 10 else "")
-                     + "(可能是拿不到被審的 commit、未設定唯讀 token、或超過單檔上限)。")
+                     + "(可能是拿不到被審的 commit、未設定唯讀 token、超過單檔上限,或內容是二進位)。")
     if truncated:
         parts.append("MR 變更的檔案數超過可取得的分頁上限,部分檔案未能取得。")
     report.setdefault("findings", []).insert(0, {
