@@ -125,7 +125,7 @@ webhook 那條路在審查失敗或逾時時(`_notify_incomplete`)留言並把 c
      rules:
        - if: $CI_PIPELINE_SOURCE == "merge_request_event"
      inherit:
-       default: false              # 不吃 include 進來的 default(before_script 等)
+       default: false              # 不吃這份設定檔的 default(before_script 等,給既有 job 用的)
        variables: false
      before_script: []
      after_script: []
@@ -164,7 +164,11 @@ webhook 那條路在審查失敗或逾時時(`_notify_incomplete`)留言並把 c
          done
    ```
 
-4. **CI 設定檔放在 MR 改不到的地方**:專案 → Settings → CI/CD → General pipelines → *CI/CD configuration file* 填 `.gitlab-ci.yml@<群組>/<放 CI 設定的專案>`(GitLab CE 可用),那個專案只給負責 CI 的人寫入權。MR pipeline 用的是 MR 來源分支上的設定檔:設定檔留在同一個 repo 的話,MR 把這個 job 換成 `exit 0` 或拿掉,閘門就沒了。審查這個 job 寫在那份設定檔本身。部署端既有的 job 若用 `include: local` 從 repo 帶進來,要注意 include 進來的內容會跟主設定檔**合併**(同名 job 逐欄合併,`default:` 也會套到這個 job):repo 裡可以替這個 job 補上主設定檔沒寫的欄位(例如 `before_script: exit 0`),所以上面的 job 明寫了 `before_script`、`after_script` 為空、`inherit` 不吃 `default` 與全域變數;`stages` 與 `workflow` 也寫在主設定檔。帶進部署端前,先在測試 GitLab 上試一次「MR 改 repo 裡的設定能不能讓這個 job 變綠」。
+4. **CI 設定檔放在 MR 改不到的地方,而且不 include 待審 repo 裡的任何設定**:專案 → Settings → CI/CD → General pipelines → *CI/CD configuration file* 填 `.gitlab-ci.yml@<群組>/<放 CI 設定的專案>`(GitLab CE 可用),那個專案只給負責 CI 的人寫入權。**部署端既有的 job 整份搬到那份設定檔**,審查這個 job 也寫在那裡;`stages` 與 `workflow` 一樣。
+   - 設定檔留在同一個 repo:MR pipeline 用的是 MR 來源分支上的設定檔,MR 把這個 job 換成 `exit 0` 或拿掉,閘門就沒了。
+   - 用 `include`(`local` 或 `project` 指到待審 repo)把 repo 裡的設定帶進來也不行:include 進來的內容跟主設定檔**合併**,同名 job 逐欄合併,主設定檔沒寫的欄位都補得進來,一欄一欄擋擋不完。例如 `image` 換成照樣印出 `done 0` 的映像、`services` 用別名把 `SEGCRA_URL` 的主機名指到自己起的服務、`variables` 設 `http_proxy` 讓 curl 走自己的代理。
+   - 上面的 job 仍明寫 `before_script`、`after_script` 為空、`inherit` 不吃 `default` 與全域變數:設定檔裡給既有 job 用的 `default:` 不會套到它。
+   - 帶進部署端前,先在測試 GitLab 上試一次:MR 改 repo 裡的設定(包括在 repo 放一份 `.gitlab-ci.yml`)不會讓這個 job 變綠。
 5. **Pipelines must succeed**(Settings → Merge requests → Merge checks)與 **protected branch**(`main` 的 Allowed to push = No one、Allowed to merge = Maintainers),確保所有變更都走 MR、都經過這條 pipeline。部署端已經設了「pipeline 要過才能合併」,不用再勾「Skipped pipelines are considered successful」。
 
 行為:
