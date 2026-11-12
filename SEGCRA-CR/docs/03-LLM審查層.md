@@ -175,7 +175,7 @@
 ## 擴充與注意
 
 - **換模型/調參**:只改 `config/models.yaml` 的 `profiles`(model/num_ctx/temperature/max_output_tokens);orchestrator 不綁模型。角色化(testgen/arbiter)在 `roles` 段。
-- **調 timeout**:環境變數 `LLM_TIMEOUT`(秒);迭代上限改 `orchestrator/agent.py` 的 `MAX_ITERATIONS`。
+- **調 timeout**:環境變數 `LLM_TIMEOUT`(秒);迭代上限改 `orchestrator/agent.py` 的 `MAX_ITERATIONS`。模型前面有閘道(例如 LiteLLM)時,另設 `LLM_SEND_TIMEOUT=1` 把同一個上限放進請求內容,否則閘道會照它自己的上限切斷(見 docs/10)。
 - **加工具**:toolbox 寫純函式(型別註記 + docstring)→ 掛 `orchestrator/tool_hub.py` 的 `TOOL_GROUPS`;orchestrator 本地工具用 `register_local`。**要讓審查模型呼叫,另外加進 `MODEL_TOOLS`,而且必須確認它不會寫入**(`tests/test_model_tool_allowlist.py` 會要求每個工具都被歸類)。
 - **加 skill**:新增 `skills/<name>/SKILL.md`(front-matter 必填 `name`;`trigger: always` 慎用——會吃每次審查的 context)。要強制注入的觸發條件,加在 `pipeline.review_mr` 的 always_block 組裝段。
 - **調 context 預算**:`config/models.yaml` 的 `budget`(diff/spec/memory/tool_result_max_chars)。

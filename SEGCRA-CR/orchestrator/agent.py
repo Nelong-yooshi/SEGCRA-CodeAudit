@@ -16,6 +16,18 @@ MAX_ITERATIONS = 12
 REQUEST_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "3600"))
 
 
+def _flag_on(raw: str) -> bool:
+    """只有明確開啟才算;讀不懂的值當成沒開(跟預設一樣,不會多送端點不認得的欄位)。"""
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# LLM_TIMEOUT 是用戶端願意等多久。端點前面若有模型閘道(例如 LiteLLM),閘道對每次請求另有
+# 自己的上限(可能只有幾十秒),超過就切斷,用戶端等再久也沒用。LiteLLM 會照請求
+# 內容裡的 `timeout` 改用那個上限,所以 LLM_SEND_TIMEOUT=1 時把同一個值放進請求
+# 內容。預設不送,理由同 reasoning_effort:不認得這個欄位的端點可能整個退回請求。
+SEND_TIMEOUT = _flag_on(os.environ.get("LLM_SEND_TIMEOUT", ""))
+
+
 def output_truncated(meta: dict, max_output_tokens: int) -> bool:
     """run_agent 回填的 meta(最後一次回應)是不是被輸出長度上限切斷。
 
@@ -158,6 +170,8 @@ async def _run_agent(client, cfg: Config, profile: ModelProfile, system: str, us
     # 請求被退回,比多花一點 token 嚴重得多,所以預設不送而不是預設關閉思考。
     effort_kwargs = ({"reasoning_effort": profile.reasoning_effort}
                      if profile.reasoning_effort else {})
+    # 閘道的請求上限(見 SEND_TIMEOUT):放在 extra_body,openai 套件會原樣併進請求內容
+    timeout_kwargs = {"extra_body": {"timeout": REQUEST_TIMEOUT}} if SEND_TIMEOUT else {}
     if meta is not None:
         # 一開始就寫 False:呼叫端用 meta.get("exhausted") 時,「沒有這個 key」
         # (舊版程式)與「跑完沒用光輪次」要分得出來。
@@ -168,7 +182,7 @@ async def _run_agent(client, cfg: Config, profile: ModelProfile, system: str, us
             model=profile.model, messages=messages, **tool_kwargs,
             temperature=profile.temperature,
             max_tokens=profile.max_output_tokens,
-            **seed_kwargs, **effort_kwargs,
+            **seed_kwargs, **effort_kwargs, **timeout_kwargs,
         )
         msg = resp.choices[0].message
         usage = getattr(resp, "usage", None)

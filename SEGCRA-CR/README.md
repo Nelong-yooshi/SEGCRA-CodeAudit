@@ -413,6 +413,7 @@ ssh -L 8929:localhost:8929 <your-user>@<your-server>
 | 模型連不上(connection refused / timeout) | `curl $OLLAMA_URL` 的主機端(如 `curl http://127.0.0.1:11434/api/tags`)。經反向 tunnel 掛進來的 endpoint，確認 tunnel 活著;模型名不存在時先 `ollama pull` |
 | 審查極慢或 OOM | 換小模型:`--profile fast`，或把 `config/models.yaml` 的 fast 換成更小的模型 |
 | LLM 請求逾時(`APITimeoutError`) | 單次 LLM 請求上限預設 3600 秒、不自動重試;硬體更慢時以環境變數 `LLM_TIMEOUT`(秒)調高。測資生成/仲裁的 LLM 失敗不會中斷管線——降級為 major「執行驗證無法完成」轉 needs_human |
+| 較長的生成固定在約 30 秒失敗,端點回 400 且訊息含 `Timeout passed=30.0` | 模型前面的閘道(例如 LiteLLM)有自己的請求上限,跟 `LLM_TIMEOUT` 無關。設環境變數 `LLM_SEND_TIMEOUT=1`,把上限放進請求內容(見 docs/10) |
 | webhook 回 401 | webhook 的 Secret token 與 `GITLAB_WEBHOOK_SECRET` 不一致，或啟動時忘了 export |
 | webhook 完全收不到(GitLab 端顯示錯誤) | ① Admin Area → Settings → Network → Outbound requests 沒勾 **Allow requests to the local network from webhooks**;② URL 要用 `http://172.17.0.1:8000/...`(容器內打 `localhost` 是打容器自己);③ webhook server 沒起來(`curl http://127.0.0.1:8000/health`) |
 | MR 觸發了但沒審 | webhook server 的 stdout:action 不在 open/reopen/update,或是 `update` 但沒帶 `oldrev`(= 只改了 label/標題/描述,不是推新 commit) |
