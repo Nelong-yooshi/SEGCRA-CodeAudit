@@ -5695,6 +5695,43 @@ MUTANTS.update({
         '        return {"file": entry["path"], "line": line, "severity": "major",'),
 })
 
+# ---- 三段式表名剝成純表名(#26 第 4 點):編譯輸出的表名要對得上沙盒的測資
+MUTANTS.update({
+ '表名:跑批前的探針不用編譯輸出的形狀': ("../eval/preflight.py",
+     'PROBE_SQL_QUALIFIED = \'SELECT id FROM "PROBE_DW"."dbo"."preflight_probe" WHERE amt > 100\'',
+     'PROBE_SQL_QUALIFIED = "SELECT id FROM preflight_probe WHERE amt > 100"'),
+ '表名:探針剝不掉也說過了': ("../eval/preflight.py",
+     '    if ex.get("table_error") or ex.get("sql_error") or ex.get("testdata_error"):\n        return Check("三段式表名", "fail",',
+     '    if False:\n        return Check("三段式表名", "fail",'),
+ '表名:三段式不剝(編譯輸出整個跑不進沙盒)': ("spec_exec.py",
+     '    prepared, table_error = _strip_table_qualifiers(prepared, _ddl_tables(plan.get("schema_ddl")))',
+     '    table_error = None'),
+ '表名:連不是測資裡的表也剝(指到別的表)': ("spec_exec.py",
+     '            if name in tables and name not in ctes:',
+     '            if name not in ctes:'),
+ '表名:剝到跟 CTE 同名(悄悄換成另一份資料)': ("spec_exec.py",
+     '            if name in tables and name not in ctes:',
+     '            if name in tables:'),
+ '表名:兩段式也剝': ("spec_exec.py",
+     '        if len(parts) == 3:',
+     '        if len(parts) >= 2:'),
+ '表名:不同資料庫的同名表照樣剝': ("spec_exec.py",
+     '    if clashed:\n        return sql, ("受審 SQL 用了不同資料庫/schema 下的同名表(" + "、".join(clashed)',
+     '    if False:\n        return sql, ("受審 SQL 用了不同資料庫/schema 下的同名表(" + "、".join(clashed)'),
+ '表名:撞名時照樣連沙盒跑(結果不是在驗這份 SQL)': ("spec_exec.py",
+     '    if table_error:\n        # 表名對不上測資時就不要連沙盒了:跑出來的結果不是在驗這份 SQL\n        return out',
+     '    if False:\n        return out'),
+ '表名:對不上測資說成 SQL 有錯': ("spec_exec.py",
+     '    if ex.get("table_error"):',
+     '    if False:'),
+ '表名:比對大小寫(編譯輸出與規格 DDL 的大小寫常常不同)': ("spec_exec.py",
+     '                names.add(parts[-1].lower())',
+     '                names.add(parts[-1])'),
+ '表名:字串常值與註解裡的點也當成表名': ("spec_exec.py",
+     '        toks = Tokenizer(dialect="tsql").tokenize(sql)',
+     '        toks = []'),
+})
+
 # ---- 取不到規格 ≠ 沒有規格(#90 第 2 點)。混在一起的話,報告會叫開發者去補一份
 # 其實已經存在的規格,而維運看不出是 token 設錯了。
 G = "../toolbox/gitlab.py"

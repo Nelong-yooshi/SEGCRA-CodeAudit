@@ -64,7 +64,7 @@ MUTANTS = {
         ("拿掉小額入帳排除",
          "        AND amount > 1000\n", "", "*/2"),
         ("拿掉 EarlyJob 排除",
-         "WHERE NOT EXISTS (\n    SELECT 1\n    FROM retail_m1_earlyjob e\n"
+         "WHERE NOT EXISTS (\n    SELECT 1\n    FROM \"SAMPLE_DW\".\"dbo\".\"retail_m1_earlyjob\" e\n"
          "    WHERE e.account_id = f.account_id\n"
          "    AND e.TABLE_DATE = DATEADD(DAY, -1, @start_date)\n)",
          "WHERE 1 = 1"),
@@ -195,7 +195,7 @@ def main() -> int:
 
     sql = reference_sql(code)
     ok = execute_cases(sql, plan)
-    for k in ("sandbox_error", "sql_error", "testdata_error"):
+    for k in ("sandbox_error", "sql_error", "testdata_error", "table_error"):
         if ok[k]:
             print(f"正確的 SQL 跑不起來({k}):{ok[k]}")
             return 1

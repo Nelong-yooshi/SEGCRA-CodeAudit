@@ -164,7 +164,7 @@ def _branch_targets(branches) -> list[tuple]:
 _IN = "op_code IN ('OP01','OP02','OP03')"
 _KIOSK = "op_code IN ('OP11','OP12')"
 _OUT = "op_code IN ('OP21','OP22','OP23')"
-_EARLYJOB = ("WHERE NOT EXISTS (\n    SELECT 1\n    FROM retail_m1_earlyjob e\n"
+_EARLYJOB = ("WHERE NOT EXISTS (\n    SELECT 1\n    FROM \"SAMPLE_DW\".\"dbo\".\"retail_m1_earlyjob\" e\n"
              "    WHERE e.account_id = f.account_id\n"
              "    AND e.TABLE_DATE = DATEADD(DAY, -1, @start_date)\n)")
 

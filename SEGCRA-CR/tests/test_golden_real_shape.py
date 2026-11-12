@@ -4,8 +4,8 @@
 **為什麼要有這個檔**:現有 golden case 都是 10~20 行的簡化 SQL,與正式環境的
 規則程式有結構性落差(真實規則是 dbt model,`dbt compile` 後是 200 行、多層 CTE、
 視窗函式、OR-of-ANDs 的三組條件)。mr_701 用的就是 `dbt compile` 的實際輸出
-(`tests/fixtures/dbt_compiled/sqlserver/mrt_RETAIL_M1.sql`),只改兩處讓它能在
-沙盒執行。整個 case 的端到端行為要模型與 MS SQL 沙盒才驗得完,但底下這幾件事
+(`tests/fixtures/dbt_compiled/sqlserver/mrt_RETAIL_M1.sql`),只把 dbt var 代入的
+固定日期改成 `@start_date`(測資建在固定的執行窗上),表名與邏輯原樣。整個 case 的端到端行為要模型與 MS SQL 沙盒才驗得完,但底下這幾件事
 是確定性的,值得在 CI 上釘住——它們壞掉時,那個 case 會以看起來無關的方式失敗
 (「無規格可驗」而不是「檔名對應壞了」)。
 
@@ -17,7 +17,7 @@
   3. `case_config()` 只對標記過的 case 換設定,不影響其他 case。
   4. 已編譯的 SQL 不會被誤判成 dbt 樣板(否則會被擋在沙盒外)。
   5. `prepare_sql()` 會宣告 `@start_date`——沙盒跑得動的前提。
-  6. **已知缺口**:`dbt compile` 原始輸出的三段式表名,`prepare_sql()` 不會改寫。
+  6. 編譯輸出的三段式表名剝得掉:剝完的純表名正是這份規格釘死的 schema 建的那些表。
 """
 import asyncio
 import json
@@ -31,12 +31,21 @@ from run_eval import case_config  # noqa: E402
 
 from orchestrator.config import Config  # noqa: E402
 from orchestrator.dbt_render import is_dbt_template  # noqa: E402
-from orchestrator.spec_exec import extract_rule_codes, find_spec, prepare_sql  # noqa: E402
+from orchestrator.spec_exec import (_ddl_tables, _strip_table_qualifiers,  # noqa: E402
+                                   extract_rule_codes, find_spec, prepare_sql)
 
 PKG_ROOT = Path(__file__).resolve().parents[1]
 CASE_PATH = PKG_ROOT / "eval" / "golden" / "mr_701.json"
 BUGGED_PATH = PKG_ROOT / "eval" / "golden" / "mr_702.json"
 COMPILED = PKG_ROOT / "tests" / "fixtures" / "dbt_compiled" / "sqlserver" / "mrt_RETAIL_M1.sql"
+SPEC = PKG_ROOT / "specs" / "RETAIL_M1_EVAL.md"
+
+
+def _spec_ddl() -> list[str]:
+    """規格裡「釘死 schema」那段的 CREATE TABLE(執行驗證就是照它建測資表)。"""
+    text = SPEC.read_text(encoding="utf-8")
+    return [s.strip() + ";" for s in text.split("```sql")[1].split("```")[0].split(";")
+            if s.strip()]
 
 
 @pytest.fixture
@@ -108,9 +117,10 @@ def test_已編譯的SQL不會被當成dbt樣板(case):
 
 
 def test_prepare_sql會宣告start_date(case):
+    """`prepare_sql` 只管執行窗與語句形狀;表名的限定詞是沙盒那一步剝的
+    (測資有哪些表只有 execute_cases 知道),所以這裡還看得到 SAMPLE_DW。"""
     prepared = prepare_sql(case["files"][0]["full_content"])
     assert "DECLARE @start_date DATE" in prepared
-    assert "SAMPLE_DW" not in prepared, "case 裡的 SQL 應已改成沙盒建得出來的單純表名"
 
 
 def test_埋雷版只動條件1的那一行(bugged):
@@ -170,18 +180,28 @@ def test_執行驗證失敗時小diff也不得自動放行(bugged):
     assert out["decision"] == "needs_human", "執行驗證沒過就不得自動放行"
 
 
-def test_編譯輸出的三段式表名prepare_sql不會改寫():
-    """**已知缺口,不是這個測試在挑剔**:`dbt compile` 的輸出一定帶三段式表名
-    (`"<database>"."<schema>"."<表>"`),但執行驗證的沙盒把測資建在隨機命名的
-    `segcra_sbx_*` 資料庫、表名是規格 DDL 裡的單純名稱——兩邊對不起來,查詢會
-    以「Invalid object name」失敗。
+def test_編譯輸出的三段式表名剝得掉():
+    """`dbt compile` 的輸出一定帶三段式表名(`"<database>"."<schema>"."<表>"`),而沙盒
+    把測資建在隨機命名的 `segcra_sbx_*` 資料庫、表名是規格 DDL 的單純名稱。剝完要剛好
+    對上那些表 —— 這條路是 README 寫的正式流程(「規則 SQL 先 dbt compile 展開再送進
+    管線」),對不上的話查詢會以 Invalid object name 失敗。
 
-    這條路徑是 README 寫的正式流程(「規則 SQL 先 dbt compile 展開再送進管線」),
-    所以這不只是評測的問題。mr_701 目前是靠**改寫**表名繞過;真正的修法要嘛讓
-    沙盒以同名資料庫承接,要嘛在 prepare_sql 剝掉限定詞,兩者都要單獨設計與審。
-
-    這個測試釘住的是「現況就是不會改寫」——哪天有人實作了改寫,這裡會紅,
-    提醒回來把 mr_701 的繞道拿掉。
+    規格釘死的 schema 是真值:從它取出表名,拿去剝編譯輸出,不該剩下任何限定名。
     """
-    prepared = prepare_sql(COMPILED.read_text(encoding="utf-8"))
-    assert '"SAMPLE_DW"."dbo"."txn_log_net"' in prepared
+    ddl = _spec_ddl()
+    tables = _ddl_tables(ddl)
+    assert tables, "規格裡要有釘死 schema 的 CREATE TABLE"
+    stripped, why = _strip_table_qualifiers(COMPILED.read_text(encoding="utf-8"), tables)
+    assert why is None, why
+    assert '"SAMPLE_DW"' not in stripped
+    for t in tables:
+        assert t in stripped.lower(), t
+
+
+def test_mr_701_不再改寫表名(case):
+    """繞道拿掉了:case 裡的 SQL 與編譯輸出的表名一致。"""
+    content = case["files"][0]["full_content"]
+    assert '"SAMPLE_DW"."dbo"."txn_log_net"' in content
+    assert '"SAMPLE_DW"."dbo"."retail_m1_earlyjob"' in content
+    stripped, why = _strip_table_qualifiers(content, _ddl_tables(_spec_ddl()))
+    assert why is None and '"SAMPLE_DW"' not in stripped

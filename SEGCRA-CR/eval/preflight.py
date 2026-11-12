@@ -330,6 +330,10 @@ PROBE_PLAN = {
     ],
 }
 PROBE_SQL = "SELECT id FROM preflight_probe WHERE amt > 100"
+# 同一份探針,表名寫成 dbt compile 輸出的形狀。沙盒的測資建在隨機命名的資料庫裡,
+# 所以這個三段式名稱只有在 execute_cases 把限定詞剝掉之後才解得開 —— 剝的邏輯壞掉時
+# 這條會紅,而那是只有真的 SQL Server 才驗得出來的事(單元測試只看得到字串)。
+PROBE_SQL_QUALIFIED = 'SELECT id FROM "PROBE_DW"."dbo"."preflight_probe" WHERE amt > 100'
 
 
 def check_sandbox() -> Check:
@@ -359,6 +363,33 @@ def check_sandbox() -> Check:
         return Check("執行驗證沙盒", "fail",
                      f"探針案例比對不符({len(bad)} 個不符)——比對邏輯或方言語意有問題", data)
     return Check("執行驗證沙盒", "ok", f"{ex['engine']},一正一反皆符合({took}s)", data)
+
+
+def check_table_names() -> Check:
+    """三段式表名(dbt compile 的輸出形狀)在真的沙盒上跑得動。
+
+    `dbt compile` 的輸出一定帶 `"<資料庫>"."<schema>"."<表>"`,而測資建在隨機命名的
+    資料庫裡 —— 要靠 `execute_cases` 把限定詞剝掉才解得開。剝錯或不剝,真實規則的
+    執行驗證會整組落在「SQL 無法在測資上執行」,看起來像程式有問題。
+    """
+    from orchestrator.spec_exec import execute_cases
+    try:
+        ex = execute_cases(PROBE_SQL_QUALIFIED, PROBE_PLAN)
+    except Exception as e:                   # noqa: BLE001 — 只記種類與訊息
+        return Check("三段式表名", "fail", f"{type(e).__name__}: {str(e)[:150]}", {})
+    data = {"sql_error": ex.get("sql_error"), "table_error": ex.get("table_error"),
+            "sandbox_error": ex.get("sandbox_error")}
+    if ex.get("sandbox_error"):
+        return Check("三段式表名", "skip", "沙盒不可用,這項無從驗", data)
+    if ex.get("table_error") or ex.get("sql_error") or ex.get("testdata_error"):
+        return Check("三段式表名", "fail",
+                     f"限定詞沒被剝掉或剝錯(table={ex.get('table_error')} "
+                     f"sql={ex.get('sql_error')} testdata={ex.get('testdata_error')})", data)
+    bad = [r for r in ex["case_results"] if not r["ok"]]
+    if bad or len(ex["case_results"]) != 2:
+        return Check("三段式表名", "fail",
+                     f"剝完比對不符({len(bad)} 個不符)——可能剝到別的表", data)
+    return Check("三段式表名", "ok", "編譯輸出形狀的表名剝得掉、一正一反皆符合", data)
 
 
 # ─────────────────────── 三、模型探針(會真的呼叫模型) ───────────────────────
@@ -600,6 +631,7 @@ def build_fingerprint(checks: list[Check], cfg, profiles: list[str]) -> dict:
             "truncation_reported": d("輸出截斷回報").get("reported", "未測"),
         },
         "sandbox": d("執行驗證沙盒"),
+        "table_names": d("三段式表名"),
         "timing": d("推論延遲"),
         "preflight": {
             "verdict": verdict(checks),
@@ -647,7 +679,11 @@ async def run(args) -> int:
         checks.append(check_model(cfg, profiles) if ep.level != "fail" else
                       Check("模型 digest", "skip", "端點連不到,無從比對權重"))
         # 沙盒與端點互不相干(一個是 GPU 上游、一個是本機 SQL Server),照查
-        checks.append(check_sandbox())
+        sb = check_sandbox()
+        checks.append(sb)
+        # 沙盒本身不通時這項只會再吐一次同一個錯
+        checks.append(check_table_names() if sb.level != "fail" else
+                      Check("三段式表名", "skip", "沙盒不可用,這項無從驗"))
 
     llm_ok = all(c.level != "fail" for c in checks)
     if args.offline or args.quick:
