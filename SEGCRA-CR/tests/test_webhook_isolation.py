@@ -92,8 +92,8 @@ def test_逾時要中止並在MR上留言(ws, monkeypatch):
 def test_留言內容要說明這不是沒問題(ws, monkeypatch):
     posted = {}
 
-    def fake_post_summary(mr_id, body, score, verdict):
-        posted.update(mr_id=mr_id, body=body, score=score, verdict=verdict)
+    def fake_post_summary(mr_id, body, score, verdict, kind="review"):
+        posted.update(mr_id=mr_id, body=body, score=score, verdict=verdict, kind=kind)
         return "ok"
 
     from toolbox import gitlab
@@ -102,6 +102,7 @@ def test_留言內容要說明這不是沒問題(ws, monkeypatch):
     assert posted["mr_id"] == "9"
     assert "請人工處理" in posted["body"]
     assert "不是「沒問題」" in posted["body"], "要講清楚未完成不等於通過"
+    assert posted["kind"] == "incomplete", "這則通知不可以蓋掉完整的審查報告"
 
 
 def test_新的commit會取消舊的審查(ws, monkeypatch):

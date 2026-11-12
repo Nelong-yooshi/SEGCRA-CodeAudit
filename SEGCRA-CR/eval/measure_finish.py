@@ -63,6 +63,9 @@ class _FakeGitLab(BaseHTTPRequestHandler):
             items = [{"new_path": p, "old_path": p, "diff": "@@ -0,0 +1 @@\n+" + t}
                      for p, t in self.files.items()]
             body, headers = items, {"X-Next-Page": ""}
+        elif method == "GET" and rest.endswith("/notes"):
+            # 貼總結前先找上一則(有記號的那則)。這裡一律回空清單 = 第一次審查
+            kind, body, headers = "GET 留言清單", [], {}
         elif method == "GET" and rest.startswith("/merge_requests/"):
             kind = "GET MR"
             body = {"title": "量測用", "description": "", "sha": HEAD,
