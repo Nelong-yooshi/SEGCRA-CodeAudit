@@ -238,14 +238,11 @@ MUTANTS = {
         '        if not getattr(self.environment, "segcra_macro_phase", False) and tag != "docs":',
         "        if False:"),
     "macro 階段旗標不關閉(model 檔跟著被吞)": (
-        "    env.segcra_macro_phase = False" + NL + "    return env, sorted(macros), conflicts, problems",
+        "    env.segcra_macro_phase = False" + NL + '    return env, sorted(macros), conflicts, [macro_problem_text(i) for i in env.segcra_macro_issues]',
+        '    return env, sorted(macros), conflicts, [macro_problem_text(i) for i in env.segcra_macro_issues]'),
+    "壞掉的 macro 檔略過,說明文字卻不由分類產生(沒有說明)": (
+        '    return env, sorted(macros), conflicts, [macro_problem_text(i) for i in env.segcra_macro_issues]',
         "    return env, sorted(macros), conflicts, problems"),
-    "壞掉的 macro 檔略過但不記錄": (
-        '            problems.append(f"{rel}:{_safe_error(e)}")' + NL
-        + "            env.segcra_macro_issues.append(macro_issue(rel, e))" + NL + "            continue" + NL
-        + "        for name in dir(module):",
-        "            env.segcra_macro_issues.append(macro_issue(rel, e))" + NL + "            continue" + NL
-        + "        for name in dir(module):"),
     # ── MR 改到的 macro 檔:Jinja 語法錯誤補 blocker、其他載入失敗補 major ──
     "macro 檢查:載入失敗不分類記下": (
         "            env.segcra_macro_issues.append(macro_issue(rel, e))" + NL + "            continue" + NL
@@ -428,8 +425,8 @@ MUTANTS.update({
         "        for path in sorted(valid):",
         "        for path in valid:"),
     "無法解析的 model 不列入": (I,
-        "        for path in self.unparsable_models:\n            self._add_model(",
-        "        for path in ():\n            self._add_model("),
+        "        for path, why in self.unparsable_models:\n            self._add_model(",
+        "        for path, why in ():\n            self._add_model("),
     "被略過的專案檔不觸發保守判定": (I,
         "            if rejected_project_files:",
         "            if False:"),
@@ -2793,8 +2790,8 @@ MUTANTS.update({
      '        for path, chain in snapshot_hits:\n            self.uncertain.append(',
      '        for path, chain in []:\n            self.uncertain.append('),
  'snapshot:看不懂的 snapshot 不標不確定': ('dbt_impact.py',
-     '        for path in self.unparsable_snapshots:\n            self.uncertain.append(',
-     '        for path in []:\n            self.uncertain.append('),
+     '        for path, why in self.unparsable_snapshots:\n            self.uncertain.append(',
+     '        for path, why in []:\n            self.uncertain.append('),
  'snapshot:不追 snapshot 的呼叫': ('dbt_impact.py',
      '                callers_of.setdefault(target, set()).add(("snapshot", path))',
      '                pass'),
@@ -2849,6 +2846,38 @@ MUTANTS.update({
  '專案接線:沒掃完只給 info': ('pipeline.py',
      '"severity": "major", "title": _SCAN_SKIPPED_TITLE',
      '"severity": "info", "title": _SCAN_SKIPPED_TITLE'),
+})
+
+# ---- dbt 的失敗原因分開寫:macro 反查的語法錯誤與巢狀太深;macro 載入失敗只記分類
+R = "dbt_render.py"
+MUTANTS.update({
+ '失敗原因:巢狀太深也寫成語法錯誤': (I,
+     '            return None, SCAN_TOO_DEEP',
+     '            return None, SCAN_SYNTAX'),
+ '失敗原因:沒改到的 macro 檔不寫原因': (I,
+     '                self.all_reasons.append(f"macro 檔 {path} {why},無法確認其中的呼叫關係")',
+     '                self.all_reasons.append(f"macro 檔 {path} 無法解析,無法確認其中的呼叫關係")'),
+ '失敗原因:改到的 macro 檔變更前後不寫原因': (I,
+     '                    problems.append(f"macro 檔 {path}({label}){why},無法得知變更了哪些 macro")',
+     '                    problems.append(f"macro 檔 {path}({label})無法解析,無法得知變更了哪些 macro")'),
+ '失敗原因:snapshot 不寫原因': (I,
+     '            self.uncertain.append(f"snapshot {path} {why},無法確認它呼叫了哪些 macro")',
+     '            self.uncertain.append(f"snapshot {path} 無法解析,無法確認它呼叫了哪些 macro")'),
+ '失敗原因:model 的判定原因不寫是哪一種': (I,
+     '            self._add_model(path, (f"model {why},無法確認它呼叫了哪些 macro",), False)',
+     '            self._add_model(path, ("model 無法解析,無法確認它呼叫了哪些 macro",), False)'),
+ '失敗原因:model 的不確定說明不寫是哪一種': (I,
+     '            self.uncertain.append(f"model {path} {why},無法確認它呼叫了哪些 macro")',
+     '            self.uncertain.append(f"model {path} 無法解析,無法確認它呼叫了哪些 macro")'),
+ 'macro 說明:不寫行號': (R,
+     '    line = f"(第 {issue[\'line\']} 行)" if issue.get("line") else ""',
+     '    line = ""'),
+ 'macro 說明:語法錯誤寫成載入失敗': (R,
+     '    MACRO_SYNTAX: "Jinja 語法錯誤",',
+     '    MACRO_SYNTAX: "載入失敗",'),
+ 'macro 說明:巢狀太深寫成載入失敗': (R,
+     '    MACRO_TOO_DEEP: "巢狀太深",',
+     '    MACRO_TOO_DEEP: "載入失敗",'),
 })
 
 # ---- 注入掃描:跟 MR 檔案本身相同的內容不重複加

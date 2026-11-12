@@ -192,6 +192,8 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 | **變更前內容不齊** | 有給 `base_files` 卻缺了被改的檔案,且未宣告為新增檔 |
 | 其他 | 專案 hook、檔案解析失敗、路徑不合法、超過資源上限 |
 
+檔案解析失敗時寫出是哪一種(`dbt_impact.SCAN_SYNTAX` / `SCAN_TOO_DEEP`):**Jinja 語法錯誤**(dbt 一樣解析不了,整個專案失敗;改到的 macro 檔另有 blocker,見下方「改到的 macro 檔本身」)與**巢狀太深**(分析用的遞迴上限,dbt 不一定失敗)。macro 檔、model、snapshot、變更前後的比對都一樣。超過資源上限不在這裡:整個反查直接保守判定,另有說明。
+
 同時確認**常見的正常寫法不會誤報**(否則每個 macro MR 都得交人工):與範例相同的
 `{% set config = {...} %}` 註冊表、寫死的 hook、`config.get`、`set_sql_header(config)`、
 `join('_')`、`sort(attribute='name')` 等 22 種,且都確認過 dbt 接受。
@@ -489,7 +491,7 @@ macro 載入一次(隔離子行程),看改到的檔載入得了嗎:
 - dbt 加的五個濾器(`as_text`、`as_bool`、`as_native`、`as_number`、`is_list`,dbt_common 的 `TEXT_FILTERS`)
   展開器照 dbt 的行為提供:前四個原樣回傳,`is_list` 判斷是不是 list。用到它們的 macro 與 model 照常展開
 - 只看改到的檔:專案裡本來就壞的檔不是這個 MR 造成的,用到它的 model 展開失敗時已經會報
-- 只寫種類與行號,不帶 Jinja 的錯誤訊息(裡面有樣板內容)
+- 只寫種類與行號,不帶 Jinja 的錯誤訊息(裡面有樣板內容)。載入失敗只記這一份分類(`segcra_macro_issues`);展開結果的 `macro_problems`(`路徑:原因(第 N 行)`)由分類產生(`macro_problem_text`),不另外記一份
 
 **改到的 dbt 設定檔本身。** dbt 解析專案時一定失敗的寫法補 **blocker**「dbt 設定檔有 dbt 解析不了的寫法,
 dbt 整個專案會解析失敗」(`enforce_dbt_project_broken`;dbt-core 1.12 的行為):

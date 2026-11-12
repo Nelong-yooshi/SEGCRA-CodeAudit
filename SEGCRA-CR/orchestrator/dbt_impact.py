@@ -517,6 +517,14 @@ def _local_config_line(body, params, macro_line: int = 0):
     return min(lines) if lines else None
 
 
+# 掃描失敗的原因。分開寫:語法錯誤 dbt 一樣解析不了(整個專案失敗,另有 blocker 說明);
+# 巢狀太深是這裡的遞迴上限,dbt 不一定會失敗。寫成同一句「無法解析」,看的人分不出是
+# 該修樣板,還是分析做不到。超過資源上限(節點數、檔案數…)不在這裡:整個反查直接
+# 保守判定,另有說明。
+SCAN_SYNTAX = "有 Jinja 語法錯誤"
+SCAN_TOO_DEEP = "的巢狀太深(超過分析用的遞迴上限,dbt 不一定會失敗)"
+
+
 class _Scanner:
     def __init__(self):
         # 只用來解析(parse),從不 render;仍用沙箱、不掛 loader
@@ -646,11 +654,14 @@ class _Scanner:
         for part in (inner.top, *inner.macros.values()):
             refs.merge(part)
 
-    def try_scan(self, text: str) -> _FileScan | None:
+    def try_scan(self, text: str) -> tuple[_FileScan | None, str | None]:
+        """掃描一份檔案。回傳 (結果, None),失敗時 (None, 原因)。"""
         try:
-            return self.scan(text)
-        except (TemplateSyntaxError, RecursionError):
-            return None
+            return self.scan(text), None
+        except TemplateSyntaxError:
+            return None, SCAN_SYNTAX
+        except RecursionError:
+            return None, SCAN_TOO_DEEP
 
 
 # ------------------------------------------------------------------ macro 的內容指紋
@@ -981,8 +992,8 @@ class _Analysis:
             if rejected_project_files:
                 self.all_reasons.append(
                     f"有 {rejected_project_files} 個專案檔案路徑或內容不合法而被略過,無法確認其中的呼叫關係")
-            for path in self.unparsable_macro_files:
-                self.all_reasons.append(f"macro 檔 {path} 無法解析,無法確認其中的呼叫關係")
+            for path, why in self.unparsable_macro_files:
+                self.all_reasons.append(f"macro 檔 {path} {why},無法確認其中的呼叫關係")
             for name, paths in sorted(self.macro_files.items()):
                 if len(paths) > 1:
                     self.uncertain.append(f"macro {name} 在多個檔案中重複定義({', '.join(sorted(paths))})")
@@ -1091,18 +1102,19 @@ class _Analysis:
         self.macro_refs: dict[str, _Refs] = {}
         self.macro_files: dict[str, set] = {}
         self.model_refs: dict[str, _Refs] = {}
-        self.unparsable_macro_files: list[str] = []
-        self.unparsable_models: list[str] = []
+        # 解析不了的檔:[(路徑, 原因)]
+        self.unparsable_macro_files: list[tuple[str, str]] = []
+        self.unparsable_models: list[tuple[str, str]] = []
         self.snapshot_refs: dict[str, _Refs] = {}
-        self.unparsable_snapshots: list[str] = []
+        self.unparsable_snapshots: list[tuple[str, str]] = []
         for path in sorted(self.project):
             kind = self._kind(path)
             if kind not in ("macro", "model", "snapshot"):
                 continue
-            result = self.scanner.try_scan(self.project[path])
+            result, why = self.scanner.try_scan(self.project[path])
             if result is None:
                 {"macro": self.unparsable_macro_files, "model": self.unparsable_models,
-                 "snapshot": self.unparsable_snapshots}[kind].append(path)
+                 "snapshot": self.unparsable_snapshots}[kind].append((path, why))
                 continue
             if kind == "snapshot":
                 refs = _Refs()
@@ -1137,9 +1149,9 @@ class _Analysis:
             for label, text in (("變更後", new_text), ("變更前", old_text)):
                 if text is None:
                     continue
-                result = self.scanner.try_scan(text)
+                result, why = self.scanner.try_scan(text)
                 if result is None:
-                    problems.append(f"macro 檔 {path}({label})無法解析,無法得知變更了哪些 macro")
+                    problems.append(f"macro 檔 {path}({label}){why},無法得知變更了哪些 macro")
                     continue
                 names[label] = set(result.macros)
             if len(names) == 2:
@@ -1274,8 +1286,8 @@ class _Analysis:
         for path, chain in snapshot_hits:
             self.uncertain.append(
                 f"snapshot {path} 呼叫了變更的 macro({' → '.join(chain)}),反查不檢查 snapshot 的展開結果")
-        for path in self.unparsable_snapshots:
-            self.uncertain.append(f"snapshot {path} 無法解析,無法確認它呼叫了哪些 macro")
+        for path, why in self.unparsable_snapshots:
+            self.uncertain.append(f"snapshot {path} {why},無法確認它呼叫了哪些 macro")
 
         unreferenced = []
         for name in sorted(changed_macros):
@@ -1286,9 +1298,9 @@ class _Analysis:
                 unreferenced.append(name)
 
         # 動態呼叫:這些位置可能呼叫任何 macro,連同呼叫它們的 model 都保守列入
-        for path in self.unparsable_models:
-            self._add_model(path, ("model 無法解析,無法確認它呼叫了哪些 macro",), False)
-            self.uncertain.append(f"model {path} 無法解析,無法確認它呼叫了哪些 macro")
+        for path, why in self.unparsable_models:
+            self._add_model(path, (f"model {why},無法確認它呼叫了哪些 macro",), False)
+            self.uncertain.append(f"model {path} {why},無法確認它呼叫了哪些 macro")
         dynamic_macros = {who for kind, who in dynamic_scopes if kind == "macro"}
         dynamic_ymls = []
         for kind, who in dynamic_scopes:
