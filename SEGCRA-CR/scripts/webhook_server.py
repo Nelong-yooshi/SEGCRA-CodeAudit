@@ -64,7 +64,8 @@ def _notify_incomplete(mr_iid: int, reason: str, head_sha: str | None = None) ->
             f"這不是「沒問題」——是這次審查沒有跑完,沒有結論。")
     from toolbox import gitlab
     try:
-        failure = gitlab.write_failure(gitlab.post_summary(str(mr_iid), body, 0, "審查未完成"))
+        failure = gitlab.write_failure(gitlab.post_summary(
+            str(mr_iid), body, 0, "審查未完成", kind="incomplete"))
     except Exception as e:                   # noqa: BLE001 — 只記種類
         failure = type(e).__name__
     if failure is None:

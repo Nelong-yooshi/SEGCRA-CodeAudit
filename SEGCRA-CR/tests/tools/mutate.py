@@ -5755,7 +5755,40 @@ MUTANTS.update({
         '        refs = {"base_sha": base_sha, "head_sha": head_sha,' + NL
         + '                                         "start_sha": start_sha}'),
     "回寫位置:不知道有沒有建立時照樣改貼": (G,
-        "            if not _rejected_by_gitlab(e):", "            if False:"),
+        "            if not _rejected_by_gitlab(e):" + NL
+        + "                return _write_failed(WRITE_UNCERTAIN)" + NL
+        + "            # 行號對不上 diff 時退成一般留言",
+        "            if False:" + NL + "                return _write_failed(WRITE_UNCERTAIN)" + NL
+        + "            # 行號對不上 diff 時退成一般留言"),
+    # ---- 一則總結改寫自己(部署端現場 S3):重審不再一則一則貼
+    "總結:重審再貼一則而不是改寫上一則": (G,
+        '                _api("PUT", f"/merge_requests/{mr_id}/notes/{note_id}", json={"body": text})' + NL
+        + '                return json.dumps({"ok": True}, ensure_ascii=False)',
+        '                pass'),
+    "總結:記號沒寫進留言(下次就找不到上一則)": (G,
+        r'text = f"{marker}\n## 🤖 AI 審查報告',
+        r'text = f"## 🤖 AI 審查報告'),
+    "總結:改寫被拒絕(上一則被刪了)就不補貼": (G,
+        "                if not _rejected_by_gitlab(e):" + NL
+        + "                    return _write_failed(WRITE_UNCERTAIN)",
+        "                return _write_failed(_failure_kind(e))"),
+    "總結:不知道有沒有改到時照樣再貼一則": (G,
+        "                if not _rejected_by_gitlab(e):" + NL
+        + "                    return _write_failed(WRITE_UNCERTAIN)",
+        "                if False:" + NL + "                    return _write_failed(WRITE_UNCERTAIN)"),
+    "總結:審查未完成的通知蓋掉審查報告": (G,
+        '_SUMMARY_MARKERS = {"review": "<!-- segcra:review-summary -->",' + NL
+        + '                    "incomplete": "<!-- segcra:review-incomplete -->"}',
+        '_SUMMARY_MARKERS = {"review": "<!-- segcra:review-summary -->",' + NL
+        + '                    "incomplete": "<!-- segcra:review-summary -->"}'),
+    "總結:找上一則時不看記號": (G,
+        '        if isinstance(n, dict) and marker in (n.get("body") or ""):',
+        "        if isinstance(n, dict):"),
+    "總結:問不出留言清單時當成改寫失敗": (G,
+        "    except Exception:                        # noqa: BLE001 — 問不出來就當作沒有" + NL
+        + "        return None",
+        "    except Exception:                        # noqa: BLE001 — 問不出來就當作沒有" + NL
+        + "        raise"),
     "回寫位置:拿不到位置時照樣開行內討論": (G,
         "        if not refs or not all(refs.values()):", "        if False:"),
     "回寫位置:每條自己重取 diff_refs": (P,
@@ -5842,8 +5875,10 @@ MUTANTS.update({
         '    report["_writeback"] = writeback' + NL + "    return report",
         "    return report"),
     "回寫結果:通知不看留言的結果": (W,
-        '        failure = gitlab.write_failure(gitlab.post_summary(str(mr_iid), body, 0, "審查未完成"))',
-        '        failure = None and gitlab.post_summary(str(mr_iid), body, 0, "審查未完成")'),
+        "        failure = gitlab.write_failure(gitlab.post_summary(" + NL
+        + '            str(mr_iid), body, 0, "審查未完成", kind="incomplete"))',
+        "        failure = None and gitlab.post_summary(" + NL
+        + '            str(mr_iid), body, 0, "審查未完成", kind="incomplete")'),
     "回寫結果:通知不看 commit status 的結果": (W,
         "        failure = gitlab.write_failure(gitlab.set_commit_status(",
         "        failure = None and (gitlab.set_commit_status("),

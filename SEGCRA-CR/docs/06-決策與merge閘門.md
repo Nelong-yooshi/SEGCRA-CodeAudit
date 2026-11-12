@@ -68,12 +68,14 @@ LLM 審完、執行驗證跑完之後,管線用兩個**確定性函式**把「�
 
 ### 3. commit status 回寫(`orchestrator/pipeline.py:review_mr` 尾段 → `toolbox/gitlab.py:set_commit_status`)
 
-`review_mr` 在決策後先取一次 MR(`gitlab__get_mr_refs`,只取 head 與 `diff_refs`、不取檔案內容):head 已經換了就不回寫(`_superseded`,見 07 篇),同一份 `diff_refs` 拿來開行內討論。接著依序回寫四樣東西:
+`review_mr` 在決策後依序回寫四樣東西,**每一步寫入之前都先取一次 MR**(`gitlab__get_mr_refs`,只取 head 與 `diff_refs`、不取檔案內容):head 已經換了就停在那裡,後面的步驟不再寫(`_writeback_target`,見 07 篇);沒換就用剛取回的 `diff_refs` 開行內討論。
 
 1. 逐 finding `gitlab__post_inline_comment`(行內留言,`_format_comment` 排版:標題/說明/建議/引用;位置用剛取回的 `diff_refs`,不再每條重取)。行內討論**被 GitLab 拒絕(4xx,例如行號對不上 diff)**時退成一般留言;**連線中斷、逾時、5xx 時不退**:GitLab 可能已經建立了討論、只是回應沒送到,改貼的話同一條會出現兩次。這種記成「沒有確定貼上」(`report["_writeback"]["unposted"]`),在總結**每一條都列出**(前 20 條連標題,其餘只列檔名與行號:看 MR 的人拿不到伺服器上的報告檔)。
 2. `gitlab__set_commit_status`:對 `mr["sha"]`(MR head commit)回寫 status,`name="segcra/review"`,**state 的映射:`auto_approved → success`,其餘(`needs_human`、`blocked`)→ `failed`**,description 帶 `decision:summary 前 180 字`。
 3. `gitlab__set_label`:`ai-review::<decision>`。
 4. `gitlab__post_summary`:總評 + 三態決策文案(✅ 自動放行 / 👤 請人工確認 / ⛔ 修正前不得合入)+ rubric 分數 + verdict;有沒有確定貼上的 finding、或 commit status / 標籤沒寫上時附在最後。**總結排在最後**,前兩步沒寫上時才寫得進總結。
+   **同一個 MR 只有一則總結**:留言裡放一個 HTML 註解當記號(`_SUMMARY_MARKERS`,在 GitLab 的 markdown 上看不見),重審時找回上一則、原地改寫。沒有記號的留言不動(那是人留的)。改寫被明確拒絕(4xx,上一則被刪了)就改貼新的一則;逾時或 5xx 不補貼(可能已經改好了,只是回應沒送到)。問不出留言清單時就貼新的一則:多一則是看得見的雜訊,總結完全沒貼上去是無聲失敗。
+   webhook 的「審查未完成」通知用**另一個**記號:它會覆蓋自己那一則(連續失敗不洗版),但不會蓋掉一份完整的審查報告。
 
 **每一步都看結果**(`gitlab.write_failure`):寫回的函式不丟例外,失敗時回 `{"ok": false, "failure": 種類}`——`rejected`(GitLab 拒絕,4xx)、`uncertain`(連線中斷、逾時、5xx,不確定有沒有寫上)、`no_sha`、`failed`(寫入工具本身出錯)。沒寫上的步驟記進 `report["_writeback"]`(`commit_status`、`label`、`summary`),印一行 log(只寫步驟與種類,不寫例外訊息)。
 

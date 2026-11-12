@@ -31,11 +31,14 @@ class FakeGitLab:
     `notes`、`label`、`status` 同樣;給清單時依序取用(最後一個重複用),模擬「失敗後重送成功」。"""
 
     def __init__(self, discussions=201, mr_status=200, diff_refs=REFS, notes=201,
-                 label=200, status=201):
+                 label=200, status=201, existing_notes=None, edit=200):
         self.calls = []
+        self.sent = []                  # (method, path, json body):驗留言內容
         self.discussions, self.mr_status, self.diff_refs, self.notes = (
             discussions, mr_status, diff_refs, notes)
         self.label, self.status = label, status
+        # existing_notes:列留言時回的清單(None = 回 404,模擬問不出來);edit:改寫留言的回應
+        self.existing_notes, self.edit = existing_notes, edit
 
     @staticmethod
     def _reply(spec, req, n):
@@ -47,7 +50,16 @@ class FakeGitLab:
     def __call__(self, method, url, **kw):
         path = url.split("/api/v4/projects/1", 1)[1]
         self.calls.append((method, path))
+        self.sent.append((method, path, kw.get("json")))
         req = httpx.Request(method, url)
+        if method == "GET" and path.startswith("/merge_requests/7/notes"):
+            if self.existing_notes is None:
+                return httpx.Response(404, json={}, request=req)
+            return httpx.Response(200, json=self.existing_notes, request=req)
+        if method == "PUT" and "/notes/" in path:
+            if isinstance(self.edit, Exception):
+                raise self.edit
+            return httpx.Response(self.edit, json={"id": 1}, request=req)
         if method == "GET" and path == "/merge_requests/7":
             return httpx.Response(self.mr_status, json={"sha": HEAD, "diff_refs": self.diff_refs},
                                   request=req)
@@ -298,6 +310,95 @@ def test_總結貼上了(real):
     assert fake.count("POST", "/notes") == 1
 
 
+# ─────────────────── 一則總結改寫自己(重審不洗版) ───────────────────
+#
+# 同一個 MR 推五次就有五則總結的話,最新的結論被埋在中間,看 MR 的人得自己比時間。
+# 總結留言裡放一個 HTML 註解當記號,重審時找回上一則、原地改寫。
+
+REVIEW_MARKER = gitlab._SUMMARY_MARKERS["review"]
+INCOMPLETE_MARKER = gitlab._SUMMARY_MARKERS["incomplete"]
+
+
+def _edited(fake):
+    """改寫過的留言:[(note_id, 內文)]。"""
+    return [(p.rsplit("/", 1)[1], (j or {}).get("body", ""))
+            for m, p, j in fake.sent if m == "PUT" and "/notes/" in p]
+
+
+def _posted_notes(fake):
+    return [(j or {}).get("body", "") for m, p, j in fake.sent
+            if m == "POST" and p.endswith("/notes")]
+
+
+def test_總結留言帶著記號_下次才找得回來(real):
+    fake = real(FakeGitLab(existing_notes=[]))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert _posted_notes(fake) == [f"{REVIEW_MARKER}\n## 🤖 AI 審查報告\n\n"
+                                   "**評分:80/100 — ok**\n\n內容"]
+
+
+def test_重審改寫上一則_不再貼一則(real):
+    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": f"{REVIEW_MARKER}\n舊的結論"}]))
+    assert json.loads(gitlab.post_summary("7", "新的結論", 70, "needs_changes")) == {"ok": True}
+    assert len(_edited(fake)) == 1 and _edited(fake)[0][0] == "55"
+    assert "新的結論" in _edited(fake)[0][1] and REVIEW_MARKER in _edited(fake)[0][1]
+    assert _posted_notes(fake) == [], "改寫成功就不該再貼一則"
+
+
+def test_只改寫我們自己貼的那則(real):
+    """沒有記號的留言是別人的 —— 人的留言被我們改掉是最糟的失敗。"""
+    fake = real(FakeGitLab(existing_notes=[{"id": 9, "body": "麻煩看一下這段"}]))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert _edited(fake) == [] and len(_posted_notes(fake)) == 1
+
+
+def test_上一則被刪掉時改貼新的一則(real):
+    """改寫被明確拒絕(4xx):一定沒有改到,補貼才不會整份總結消失。"""
+    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": REVIEW_MARKER}], edit=404))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert len(_edited(fake)) == 1 and len(_posted_notes(fake)) == 1
+
+
+@pytest.mark.parametrize("failure", _UNCERTAIN)
+def test_不知道有沒有改到就不補貼(real, failure):
+    """逾時、5xx:GitLab 可能已經改好了,只是回應沒送到。補貼會變成兩則。"""
+    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": REVIEW_MARKER}], edit=failure))
+    out = gitlab.post_summary("7", "內容", 80, "ok")
+    assert json.loads(out) == {"ok": False, "failure": "uncertain"}
+    assert _posted_notes(fake) == [] and SECRET not in out
+
+
+def test_問不出留言清單就貼新的一則(real):
+    """多一則總結是看得見的雜訊;總結完全沒貼上去是無聲失敗,後者嚴重得多。"""
+    fake = real(FakeGitLab(existing_notes=None))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert _edited(fake) == [] and len(_posted_notes(fake)) == 1
+
+
+def test_審查未完成的通知不蓋掉審查報告(real):
+    """那份報告是看 MR 的人唯一看得到的結論,不可以被「審查未完成」取代。"""
+    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": f"{REVIEW_MARKER}\n完整的報告"}]))
+    assert json.loads(gitlab.post_summary("7", "逾時", 0, "審查未完成",
+                                          kind="incomplete")) == {"ok": True}
+    assert _edited(fake) == []
+    assert len(_posted_notes(fake)) == 1 and INCOMPLETE_MARKER in _posted_notes(fake)[0]
+
+
+def test_未完成的通知改寫自己那一則(real):
+    """連續失敗也不洗版。"""
+    fake = real(FakeGitLab(existing_notes=[{"id": 60, "body": f"{INCOMPLETE_MARKER}\n上次失敗"}]))
+    assert json.loads(gitlab.post_summary("7", "逾時", 0, "審查未完成",
+                                          kind="incomplete")) == {"ok": True}
+    assert len(_edited(fake)) == 1 and _edited(fake)[0][0] == "60"
+    assert _posted_notes(fake) == []
+
+
+def test_不認得的種類不打任何請求(real):
+    fake = real(FakeGitLab(existing_notes=[]))
+    assert "kind" in json.loads(gitlab.post_summary("7", "內容", 80, "ok", kind="別的"))["error"]
+    assert fake.calls == []
+
+
 @pytest.mark.parametrize("failure", _UNCERTAIN)
 def test_標籤失敗重送一次(real, failure):
     fake = real(FakeGitLab(label=[failure, 200]))
@@ -472,8 +573,9 @@ def _notify(monkeypatch, summary, status, head_sha=None, refs=None):
     import scripts.webhook_server as ws
     calls = []
 
-    def post_summary(*a):
-        calls.append("post_summary")
+    def post_summary(*a, **k):
+        # kind:未完成的通知改寫自己那一則,不會蓋掉已經貼上的審查報告
+        calls.append(("post_summary", k.get("kind")))
         if isinstance(summary, Exception):
             raise summary
         return summary
@@ -504,13 +606,14 @@ _OK = json.dumps({"ok": True})
 def test_通知_兩步都寫上(monkeypatch, capsys):
     calls = _notify(monkeypatch, _OK, _OK, head_sha=HEAD)
     out = capsys.readouterr().out
-    assert calls == ["post_summary", ("set_commit_status", HEAD)]
+    assert calls == [("post_summary", "incomplete"), ("set_commit_status", HEAD)]
     assert "已留言告知審查未完成" in out and "commit status 設為失敗" in out
 
 
 def test_通知_沒有_sha_時只取_MR_的位置(monkeypatch):
     calls = _notify(monkeypatch, _OK, _OK)
-    assert calls == ["post_summary", "get_mr_refs", ("set_commit_status", HEAD)]
+    assert calls == [("post_summary", "incomplete"), "get_mr_refs",
+                     ("set_commit_status", HEAD)]
 
 
 @pytest.mark.parametrize("status", [
