@@ -1197,6 +1197,116 @@ def _sandbox_params() -> dict:
             "login_timeout": 10, "timeout": 120}
 
 
+# dbt compile 的輸出一定帶三段式表名(`"<資料庫>"."<schema>"."<表>"`),而沙盒的測資建在
+# 隨機命名的 segcra_sbx_* 資料庫裡、表名就是規格 DDL 寫的那個單純名稱 —— 兩邊對不起來,
+# 查詢會以 Invalid object name 失敗。「規則 SQL 先 dbt compile 再送進管線」是正式流程,
+# 所以這是真的會遇到的情況,不是只有評測。
+#
+# 做法是把三段式名稱剝成純表名,但**只剝剝完真的對得上測資的那些**:
+#   * 剝完的名稱要是規格 DDL 真的建了的表。剝錯會指到別的表,那種錯從結果看不出來;
+#     留著不剝只是查詢失敗,看得見。
+#   * 剝完撞到 CTE 的名字時不剝 —— 那會悄悄換成另一份資料。
+#   * 兩個不同資料庫/schema 下的同名表剝完會撞在一起,而沙盒只有一份測資:整段都不剝,
+#     由呼叫端報成「表名無法對應沙盒的測資」交人工。
+# 只處理三段式:兩段式(`dbo.transactions`)在沙盒本來就解得開(測資建在 dbo),不必動。
+# 三段式的最後一段在 T-SQL 也可能是欄位(`dbo.t.col`),但那要欄位名剛好跟測資的某張表
+# 同名才會誤剝,而且誤剝的結果是查詢直接失敗、不是悄悄換一張表。
+_CREATE_TABLE_NAME = re.compile(
+    r"""^\s*CREATE\s+TABLE\s+(?:\[([^\]]+)\]|"([^"]+)"|([A-Za-z_@#][\w@#$]*))"""
+    r"""(?:\s*\.\s*(?:\[([^\]]+)\]|"([^"]+)"|([A-Za-z_@#][\w@#$]*)))*""", re.I)
+
+
+def _ddl_tables(schema_ddl) -> set[str]:
+    """規格 DDL 建了哪些表(只取表名本身,不含 schema)。
+
+    比對用小寫:SQL Server 預設的定序不分大小寫,而編譯輸出與規格 DDL 的大小寫常常
+    不一樣(`TXN_LOG_NET` / `txn_log_net`)。
+    """
+    names = set()
+    for ddl in schema_ddl or []:
+        if not isinstance(ddl, str):
+            continue
+        m = _CREATE_TABLE_NAME.match(ddl)
+        if m:
+            parts = [g for g in m.groups() if g]
+            if parts:
+                names.add(parts[-1].lower())
+    return names
+
+
+def _ident_spans(sql: str):
+    """SQL 裡的識別字與點號位置:[(種類, 文字, 起, 迄)];`[x]` 折成一段。
+
+    用 sqlglot 的 tokenizer 而不是自己寫 regex:字串常值與註解裡的 `a.b.c`
+    不可以被當成表名(`WHERE note = 'a.b.c'`)。tokenize 失敗時回 None,呼叫端就不剝。
+    """
+    from sqlglot import TokenType
+    from sqlglot.tokens import Tokenizer
+    try:
+        toks = Tokenizer(dialect="tsql").tokenize(sql)
+    except Exception:                        # noqa: BLE001 — 切不出 token 就不動這段 SQL
+        return None
+    out, i = [], 0
+    while i < len(toks):
+        t = toks[i]
+        if (t.token_type == TokenType.L_BRACKET and i + 2 < len(toks)
+                and toks[i + 2].token_type == TokenType.R_BRACKET):
+            out.append(("ident", toks[i + 1].text, t.start, toks[i + 2].end))
+            i += 3
+            continue
+        kind = ("ident" if t.token_type in (TokenType.VAR, TokenType.IDENTIFIER)
+                else "dot" if t.token_type == TokenType.DOT else "other")
+        out.append((kind, t.text, t.start, t.end))
+        i += 1
+    return out
+
+
+_CTE_NAME = re.compile(
+    r"""(?:\bWITH\b|,)\s*(?:\[([^\]]+)\]|"([^"]+)"|([A-Za-z_@#][\w@#$]*))"""
+    r"""\s*(?:\([^)]*\)\s*)?AS\s*\(""", re.I)
+
+
+def _cte_names(sql: str) -> set[str]:
+    """這段 SQL 自己定義的 CTE 名稱(小寫)。"""
+    return {g.lower() for m in _CTE_NAME.finditer(sql) for g in m.groups() if g}
+
+
+def _strip_table_qualifiers(sql: str, tables: set[str]) -> tuple[str, str | None]:
+    """把三段式表名剝成純表名。回 (剝過的 SQL, 無法處理的原因或 None)。"""
+    spans = _ident_spans(sql)
+    if spans is None or not tables:
+        return sql, None
+    ctes = _cte_names(sql)
+    cuts: list[tuple[int, int, str]] = []      # (起, 迄, 換成什麼)
+    seen: dict[str, set[str]] = {}             # {表名: 它前面出現過哪些限定詞}
+    i = 0
+    while i < len(spans):
+        if spans[i][0] != "ident":
+            i += 1
+            continue
+        parts, j = [spans[i]], i
+        while j + 2 < len(spans) and spans[j + 1][0] == "dot" and spans[j + 2][0] == "ident":
+            parts.append(spans[j + 2])
+            j += 2
+        if len(parts) == 3:
+            name = parts[2][1].lower()
+            if name in tables and name not in ctes:
+                seen.setdefault(name, set()).add(".".join(x[1].lower() for x in parts[:2]))
+                cuts.append((parts[0][2], parts[2][3], parts[2][1]))
+        i = j + 1
+    clashed = sorted(n for n, quals in seen.items() if len(quals) > 1)
+    if clashed:
+        return sql, ("受審 SQL 用了不同資料庫/schema 下的同名表(" + "、".join(clashed)
+                     + "),沙盒的測資只有一份,無法對應:需人工執行驗證")
+    out, last = [], 0
+    for start, end, text in cuts:
+        out.append(sql[last:start])
+        out.append(text)
+        last = end + 1
+    out.append(sql[last:])
+    return "".join(out), None
+
+
 def prepare_sql(sql: str) -> str:
     """把規則 SQL 準備成可在沙盒執行的形式。**SQL 本體原樣執行,不轉譯**:
     - INSERT INTO … SELECT、CREATE [OR ALTER] VIEW … AS SELECT → 只取 SELECT
@@ -1318,11 +1428,16 @@ def execute_cases(sql: str, plan: dict, deadline: float | None = None) -> dict:
     import pymssql
     params = _sandbox_params()
     prepared = prepare_sql(sql)
+    # 編譯輸出的三段式表名剝成純表名(沙盒的測資就是規格 DDL 的那些名稱)
+    prepared, table_error = _strip_table_qualifiers(prepared, _ddl_tables(plan.get("schema_ddl")))
     results, mismatches = [], []
     truth: dict[str, dict] = {}       # {case_id: 每個條件在這個案例裡的真假}
     out = {"case_results": results, "mismatches": mismatches, "sql_error": None,
-           "testdata_error": None, "sandbox_error": None, "engine": None,
-           "timed_out": False}
+           "testdata_error": None, "sandbox_error": None, "table_error": table_error,
+           "engine": None, "timed_out": False}
+    if table_error:
+        # 表名對不上測資時就不要連沙盒了:跑出來的結果不是在驗這份 SQL
+        return out
 
     if not params["password"]:
         out["sandbox_error"] = "未設定 SANDBOX_MSSQL_PASSWORD(見 config/sandbox.env.example)"
@@ -1973,6 +2088,17 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
         ex = await run_in_thread(_execute, sql, plan, deadline, name="spec-exec-sandbox")
     finally:
         _leave(STAGE_SANDBOX, _t)
+    if ex.get("table_error"):
+        # 剝不掉的三段式表名 ≠ SQL 有錯:沙盒的測資對不上這份 SQL 要讀的表,是我們
+        # 驗不了,不是程式寫錯 —— 說成「SQL 無法在測資上執行」會讓人去改沒問題的 SQL。
+        findings.append(_finding(path, "major", "執行驗證無法完成(表名無法對應沙盒的測資)",
+                                 f"{ex['table_error']}。未經執行驗證,本 MR 不得自動放行。",
+                                 "請人工依核定規格核對實作邏輯。"))
+        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],
+                "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
+                "case_results": [], "dropped_cases": dropped_cases,
+                "table_error": ex["table_error"],
+                "stage_seconds": stage_seconds, "findings": findings}
     if ex["sandbox_error"]:
         # 沙盒不可用 ≠ 驗證通過:照樣不得自動放行,並講清楚是環境問題而非程式問題
         findings.append(_finding(path, "major", "執行驗證無法完成(沙盒不可用)",

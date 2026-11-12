@@ -64,7 +64,7 @@ MUTANTS = {
         ("拿掉小額入帳排除",
          "        AND amount > 1000\n", "", "*/2"),
         ("拿掉 EarlyJob 排除",
-         "WHERE NOT EXISTS (\n    SELECT 1\n    FROM retail_m1_earlyjob e\n"
+         "WHERE NOT EXISTS (\n    SELECT 1\n    FROM \"SAMPLE_DW\".\"dbo\".\"retail_m1_earlyjob\" e\n"
          "    WHERE e.account_id = f.account_id\n"
          "    AND e.TABLE_DATE = DATEADD(DAY, -1, @start_date)\n)",
          "WHERE 1 = 1"),

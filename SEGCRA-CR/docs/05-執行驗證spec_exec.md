@@ -170,6 +170,14 @@ RETAIL_M1 那組快了 15 分鐘,但那是因為它提早放棄拆解,不是效�
 2. 系統日期函式(`GETDATE()`、`SYSDATETIME()`、`CURRENT_TIMESTAMP` 等)換成窗尾,確保可重現;
 3. 用到 `@start_date` / `@end_date` 時,前面補 `DECLARE @start_date DATE = '2026-06-01', @end_date DATE = '2026-06-02';`,並固定 `SET NOCOUNT ON; SET DATEFORMAT ymd;`。
 
+**三段式表名剝成純表名**(`_strip_table_qualifiers`,在 `execute_cases` 裡、`prepare_sql` 之後):`dbt compile` 的輸出一定帶三段式表名(`"<資料庫>"."<schema>"."<表>"`),而測資建在 `segcra_sbx_<隨機碼>` 裡、表名是規格 DDL 的單純名稱 —— 不剝就以 `Invalid object name` 失敗,而「規則 SQL 先 dbt compile 再送進管線」是正式流程。剝的範圍刻意收得很窄:
+
+- **只剝剝完等於規格 DDL 真的建了的那張表**(`_ddl_tables`,比對不分大小寫)。剝錯會指到別的表,那種錯從結果看不出來;留著不剝只是查詢失敗,看得見。
+- **剝完撞到 CTE 名字的不剝**:那會悄悄換成另一份資料,查詢照樣跑得過,但驗的不是這份 SQL。
+- **兩段式(`dbo.t`)不動**:測資建在 dbo,沙盒本來就解得開。
+- 位置用 sqlglot 的 tokenizer 取,所以**字串常值與註解裡的 `a.b.c` 不會被當成表名**;切不出 token(例如字串沒收尾)就整段不剝,錯誤留給沙盒講。
+- 兩個不同資料庫/schema 下的同名表剝完會撞在一起,而沙盒只有一份測資:**整段都不剝**,回 `table_error`,`run_spec_exec` 轉 major「執行驗證無法完成(表名無法對應沙盒的測資)」並**不連沙盒**——這時跑出來的結果不是在驗這份 SQL。說成「SQL 無法在測資上執行」會讓人去改沒問題的 SQL。
+
 **逐案執行**(`execute_cases`):每次執行在沙盒建一個專用資料庫(`segcra_sbx_<隨機碼>`,同時進行的審查互不干擾),結束後刪除;超過一小時的殘留資料庫會在下次執行時清掉。每個案例在**獨立交易**裡執行,結束一律 rollback,下一個案例從乾淨狀態開始:
 
 1. 跑 plan 的所有 `schema_ddl` 建表;
