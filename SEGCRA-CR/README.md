@@ -204,7 +204,7 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
    .venv/bin/python demo.py --mr <MR 的 iid>
    ```
 
-   審完到 GitLab 該 MR 頁面看:行內留言、總評(分數/verdict/決策)、`ai-review::<決策>` label，以及 commit status `segcra/review`。
+   審完到 GitLab 該 MR 頁面看:行內留言、總評(分數/verdict/決策)、`ai-review::<決策>` label，以及 commit status `segcra/review`(手動或 webhook 審查才寫;部署端的 CI 那條路不寫,見 §7)。
 4. **模型端點哪來**:管線讀 `OLLAMA_URL`(預設 `http://localhost:11434/v1`)。Ollama 跑在別台機器時,常見作法是以 SSH(或 autossh)反向 tunnel 把 11434 掛到執行管線那台機器的 loopback;掛好後驗證:
 
    ```bash
@@ -258,6 +258,10 @@ export SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER FIXTURES_DIR=examples/dbt_wiring/fixt
 
 ## 6. Webhook 自動觸發
 
+> **部署端不用這一節的 webhook**:審查做成 MR pipeline 最後一個 stage 的 job(§7)。
+> 這一節是測試環境或沒有 CI 的 repo 用的做法。§7 的 job 呼叫的審查服務也是同一支
+> `scripts/webhook_server.py`,啟動方式相同,只是 GitLab 那邊不用設 webhook。
+
 webhook server 建議跑在**與 GitLab 同一台主機**(放在哪個目錄都可以):
 
 ```bash
@@ -301,24 +305,28 @@ GitLab 設定(逐步):
 
 ## 7. Merge 閘門(CE 的作法)
 
-GitLab CE 沒有 approval rules，可行的擋法是:**commit status(external pipeline)+ 專案設定「Pipelines must succeed」+ protected branch**。
+審查做成要掛審查的 repo 的 **MR pipeline 最後一個 stage 的 job**:pipeline 會等它跑完,結果就在
+MR 看的同一條 pipeline 上,專案既有的「Pipelines must succeed」直接用。這條路不寫 commit status。
 
-1. 審查管線每次審完會對 MR 的 head commit 回寫 commit status(name=`segcra/review`):
-   - `auto_approved` → **success**
-   - `needs_human` / `blocked` → **failed**(description 帶原因)
-2. 專案 → Settings → Merge requests → Merge checks → 勾 **Pipelines must succeed** → Save。
-   從此 status 為 failed 的 MR，Merge 按鈕會被鎖住。
-3. 專案 → Settings → Repository → Protected branches:把 `main` 設為 protected，*Allowed to push* 設 No one、*Allowed to merge* 設 Maintainers——確保所有變更都走 MR、都經過審查。
+| 審查結果 | job | pipeline | 效果 |
+|---|---|---|---|
+| `auto_approved` | 成功(結束碼 0) | 綠燈 | 可以合併 |
+| `needs_human`(審完了,交給人判斷) | 失敗,但 `allow_failure: exit_codes: [3]` 允許 | passed with warnings | 有權限的人審完合併 |
+| `blocked` | 失敗(結束碼 4) | 紅燈 | 鎖住 |
+| 審查沒跑完整(環節未完整、整份失敗或逾時) | 失敗(結束碼 5) | 紅燈 | 鎖住;重審就是 retry 那個 job |
 
-三態決策的實際效果:
+job 不在 runner 上跑審查,而是帶 `CI_JOB_TOKEN` 呼叫審查服務(`scripts/webhook_server.py` 的
+`/ci/review`)等結果:審查要用的 GitLab token 與模型通行碼只放在審查服務那台機器,MR 自己加的
+job 讀不到。審查服務會向 GitLab 確認呼叫者是這個專案、這個 MR 的 MR pipeline 裡正在跑的 job。
 
-| 決策 | commit status | 效果 |
-|---|---|---|
-| `auto_approved` | success | 小幅變更且無實質問題;Merge 按鈕可按(仍可要求人再看) |
-| `needs_human` | failed | Merge 被鎖;人工確認後，人可留言 `/review` 重審，或由有權限者依 GitLab 流程處置 |
-| `blocked` | failed | 有 blocker(注入攻擊、hardcode 憑證、DELETE 無 WHERE 等);修正前不得合入 |
+設定步驟、要加的 job(YAML)、為什麼 CI 設定檔要放在 MR 改不到的專案,見
+**[docs/06 第 4 節](docs/06-決策與merge閘門.md)**。另外兩件 GitLab 專案設定:
 
-補充:`needs_human` 走 failed 是刻意保守——CE 的 merge check 只認 success/failed 兩種結果，凡是需要人看過的都先鎖住，由人做最後放行。
+1. 專案 → Settings → Merge requests → Merge checks → 勾 **Pipelines must succeed** → Save。
+2. 專案 → Settings → Repository → Protected branches:把 `main` 設為 protected,*Allowed to push* 設 No one、*Allowed to merge* 設 Maintainers——確保所有變更都走 MR、都經過審查。
+
+不接 CI 時(§6 的 webhook),審完改用 commit status(name=`segcra/review`,`auto_approved` →
+success、其餘 → failed)當閘門,搭配上面同樣的兩件設定;做法與限制見 docs/06 第 5 節。
 
 ## 8. 自架一個測試用 GitLab CE(docker)
 

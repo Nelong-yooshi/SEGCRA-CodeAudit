@@ -2,14 +2,18 @@
 
 ## 在幹嘛(一段白話)
 
-`scripts/webhook_server.py` 是一個純 Python 標準庫寫成的 HTTP 服務,跑在能連到 GitLab 的內網主機上。GitLab 專案一有 MR 動作(開新 MR、重開、推新 commit)就打一個 webhook 過來,server 驗完密鑰後在背景執行整條審查管線(`orchestrator/pipeline.py:review_mr`),審完把行內留言、總評分數、`ai-review::<decision>` label 與 commit status 回寫到 GitLab。開發者留言 `/review` 也能手動觸發重審。搭配 GitLab 專案設定「Pipelines must succeed」+ protected branch,commit status(`segcra/review`)就成了 CE 版的 merge 閘門——不必等人手動跑指令,MR 進來自動被審。
+`scripts/webhook_server.py` 是一個純 Python 標準庫寫成的 HTTP 服務,跑在能連到 GitLab 的內網主機上。GitLab 專案一有 MR 動作(開新 MR、重開、推新 commit、從 Draft 標成 Ready)就打一個 webhook 過來,server 驗完密鑰後在背景執行整條審查管線(`orchestrator/pipeline.py:review_mr`),審完把行內留言、總評分數、`ai-review::<decision>` label 與 commit status 回寫到 GitLab。開發者留言 `/review` 也能手動觸發重審。Draft 的 MR 不審,Draft 期間要看就留 `/review`。搭配 GitLab 專案設定「Pipelines must succeed」+ protected branch,commit status(`segcra/review`)就成了 CE 版的 merge 閘門——不必等人手動跑指令,MR 進來自動被審。
 
 ## 防的是什麼
 
 - **防「忘了審」**:審查若靠人手動觸發,漏跑一次就等於該 MR 完全沒有 AI 防線(漏報的最上游形態)。webhook 把觸發變成事件驅動,MR 一動就審。
 - **防外部亂打**:server 監聽 `0.0.0.0`,任何能連到這台機器的人都打得到 endpoint。沒有 token 驗證的話,攻擊者可以偽造 payload 對任意 MR 觸發審查(浪費 GPU 資源)、甚至藉由灌事件干擾正常審查節奏。這裡用密鑰比對確定性擋掉,不是靠「應該沒人知道這個 URL」。
-- **防自我觸發迴圈**:審查完成會回寫留言,留言又會發 note webhook——若 note 事件無條件重審,就是無限迴圈燒 GPU。所以 note 事件只認明確的 `/review` 指令,且 bot 帳號(username 以 `ai-` 或 `root` 開頭)的留言一律忽略。這是機制擋,不是期待模型或人「小心一點」。
+- **防自我觸發迴圈**:審查完成會回寫留言,留言又會發 note webhook——若 note 事件無條件重審,就是無限迴圈燒 GPU。所以 note 事件只認寫在留言開頭的 `/review` 指令(網址、內文裡的 `/review`、`/reviews` 都不算),且 bot 帳號(username 以 `ai-` 或 `root` 開頭)的留言一律忽略。這是機制擋,不是期待模型或人「小心一點」。
 - **防重複觸發**:GitLab 對同一 MR 短時間可能連發多個 update 事件。只有**真的推了新 commit**(事件帶 `oldrev`)才會重審,其餘 update(改 label、標題、描述、指派人 —— 包括審查自己最後加 label 那一下)一律忽略。推了新 commit 時取消進行中的那次、改審新的:舊的那次審的是舊程式,結論貼到新 commit 上是錯的。
+  同一個 MR 短時間內連續觸發(連推幾個 commit、連續留言)時,等 `WEBHOOK_DEBOUNCE_SECONDS`(預設 10 秒)
+  沒有新事件才開始,只審最後一次:每份審查都是完整的模型呼叫,每來一個事件就開一份再取消只是白白佔住模型。
+- **Draft 不審**:開發中反覆推 commit 時,每推一次就整份審一次。標成 Ready 時審(那次是沒有 `oldrev` 的
+  update,從 `changes` 的 `draft` 由 true 變 false 認出來;GitLab 較早的版本用 `work_in_progress`,兩個都認)。
 
 ## 怎麼建的
 
@@ -17,25 +21,45 @@
 
 **Token 驗證(`Handler.do_POST`)**:GitLab webhook 會把專案設定裡填的 Secret token 原文放在 `X-Gitlab-Token` header。server 讀環境變數 `GITLAB_WEBHOOK_SECRET`,用 `hmac.compare_digest(token, SECRET)` 做常數時間比對(防 timing attack;注意這是明文密鑰比對,不是 HMAC 簽章——GitLab CE 的 webhook 就是送原文)。`SECRET` 未設或比對失敗一律回 401。啟動時若沒 export 密鑰,`main()` 會印警告「所有 webhook 請求都會被拒絕」。
 
-**事件路由(`Handler.do_POST`)**:只收 `POST /gitlab-webhook`(其他路徑 404),依 payload 的 `object_kind` 分流:
+**事件路由(`_handle`,`Handler.do_POST` 驗完 token 後呼叫)**:只收 `POST /gitlab-webhook`(其他路徑 404),依 payload 的 `object_kind` 分流:
 
-1. `merge_request`:取 `object_attributes.action` 與 `iid`,只有 `action ∈ TRIGGER_ACTIONS = {"open", "reopen", "update"}` 才觸發(approve、close、merge 等動作回 `ignored (action=...)`)。
-2. `note`:必須同時滿足四個條件才重審——`noteable_type == "MergeRequest"`、payload 帶 `merge_request.iid`、留言文字含 `/review`、留言者 username 不以 `ai-`/`root` 開頭(`author_bot` 判斷)。最後一條就是防迴圈:審查器自己回寫的留言不會再觸發自己。
+1. `merge_request`:取 `object_attributes.action` 與 `iid`,只有 `action ∈ TRIGGER_ACTIONS = {"open", "reopen", "update"}` 才觸發(approve、close、merge 等動作回 `ignored (action=...)`)。MR 是 Draft(`draft` 或 `work_in_progress` 為 true)時不觸發,回 `ignored (draft)`;`update` 要帶 `oldrev`(推了新 commit),或 `changes` 顯示從 Draft 標成 Ready,其餘回 `ignored (update 沒有新 commit)`。
+2. `note`:必須同時滿足四個條件才重審——`noteable_type == "MergeRequest"`、payload 帶 `merge_request.iid`、留言開頭是 `/review` 指令(後面是空白或結尾,`_REVIEW_COMMAND`;Draft 的 MR 也算)、留言者 username 不以 `ai-`/`root` 開頭(`author_bot` 判斷)。最後一條就是防迴圈:審查器自己回寫的留言不會再觸發自己。
 3. 其他 kind 回 `ignored (kind=...)`,一律 200(GitLab 收到非 2xx 會標記 webhook 失敗並重試/停用)。
 
-**取消舊審查(`_trigger` / `_cancel`)**:模組層一個 `_inflight: dict`({mr_iid: (event_loop, task)})配 `threading.Lock`。`_trigger(mr_iid, head_sha)` 先試著取消同一個 MR 進行中的那次(跨執行緒要用 `loop.call_soon_threadsafe(task.cancel)`,task 屬於那個執行緒的迴圈),再開一條新的 thread。取消只會在下一個真正的等待點生效,所以舊的那次有可能一路走到回寫 —— `review_mr` 在回寫前會比對 MR 目前的 head sha,發現已被取代就不貼(見 `orchestrator/pipeline.py:_superseded`)。
+**連續觸發只審最後一次(`_trigger` / `_start`)**:`_trigger(mr_iid, head_sha)` 不立刻開始,而是排一個計時器(`_pending`,{mr_iid: 計時器}):`WEBHOOK_DEBOUNCE_SECONDS` 內同一個 MR 又有事件就取消舊的計時器、改排新的(帶最新的 head sha)。計時器到了(`_start`)先確認自己還是這個 MR 最新的那一個——取消得太晚、已經在跑的舊計時器就不開始,不會出現兩份。
 
-**背景執行(`_trigger` → `_run_review`)**:審查耗時數十秒到數分鐘,而 GitLab webhook 有逾時限制,所以 `_trigger` 起一個 `threading.Thread(daemon=True)` 跑 `_run_review` 後**立刻**回 200。`_run_review` 內用 `asyncio.run(review_mr(_cfg, str(mr_iid), profile_name=PROFILE))` 跑完整管線(profile 由 `REVIEW_PROFILE` 環境變數決定,預設 `review`)。HTTP 服務本身用 `ThreadingHTTPServer`,審查進行中仍能收後續事件。
+**取消舊審查(`_start` / `_cancel`)**:模組層一個 `_inflight: dict`({mr_iid: (event_loop, task)})配 `threading.Lock`。`_start` 先試著取消同一個 MR 進行中的那次(跨執行緒要用 `loop.call_soon_threadsafe(task.cancel)`,task 屬於那個執行緒的迴圈),再開一條新的 thread。取消只會在下一個真正的等待點生效,所以舊的那次有可能一路走到回寫 —— `review_mr` 在回寫前會比對 MR 目前的 head sha,發現已被取代就不貼(見 `orchestrator/pipeline.py:_superseded`)。
 
-**Graceful 失敗(`_run_review`)**:整段包在 try/except——模型連不上、fixture 不存在、管線任何 exception 都只印 `[webhook] MR !N 審查失敗:...` 到 stdout,server 不死;`finally` 保證把 iid 從 `_inflight` 移除,失敗的 MR 之後還能再觸發。payload 不是合法 JSON 回 400。`log_message` 覆寫為靜音,stdout 只留自己的結構化 print。
+**背景執行(`_trigger` → `_run_review`)**:審查耗時數十秒到數分鐘,而 GitLab webhook 有逾時限制,所以 `_trigger` 排好計時器就**立刻**回 200,`_start` 再起一個 `threading.Thread(daemon=True)` 跑 `_run_review`。`_run_review` 在這條執行緒開自己的事件迴圈,用 `run_until_complete` 跑 `asyncio.wait_for(review_mr(_cfg, str(mr_iid), profile_name=PROFILE), REVIEW_TIMEOUT_SECONDS)`(profile 由 `REVIEW_PROFILE` 環境變數決定,預設 `review`);迴圈與 task 登記在 `_inflight`,新 commit 進來時才取消得到。HTTP 服務本身用 `ThreadingHTTPServer`,審查進行中仍能收後續事件。
 
-**資料流**:GitLab 事件 → `POST /gitlab-webhook`(驗 token)→ 路由抽出 `mr_iid`(update 事件另外看 `oldrev`)→ 取消同 MR 進行中的審查 → 背景 thread 跑 `review_mr` → 管線經 `toolbox/gitlab.py` 回寫 GitLab:逐條 finding 行內留言、總評留言(決策文字)、`ai-review::<decision>` label、commit status `segcra/review`(`auto_approved` → success,`needs_human`/`blocked` → failed,description 帶原因;見 `orchestrator/pipeline.py` 決策回寫段)。
+**Graceful 失敗(`_run_review`)**:整段包在 try/except——模型連不上、fixture 不存在、管線任何 exception 都只印 `[webhook] MR !N 審查失敗:...` 到 stdout,server 不死;`finally` 保證把 iid 從 `_inflight` 移除,失敗的 MR 之後還能再觸發。**關掉事件迴圈前先收尾**(`_close_loop`,跟 `asyncio.run` 收尾一樣):取消還沒結束的工作並等它們收完,再收掉 async generator 與預設的執行緒池,最後才關迴圈。外層逾時或新 commit 取消舊審查時,審查裡另外開的工作(背景的模型呼叫等)會一起被取消,不會留下沒人收尾、還在打模型的請求。等待有上限(`_LOOP_CLEANUP_SECONDS`,30 秒):吞掉取消、繼續跑的工作不會讓這條執行緒卡住,照樣關掉並記一筆 log。收尾出錯不往外丟,log 只寫例外類型。payload 不是合法 JSON 回 400。`log_message` 覆寫為靜音,stdout 只留自己的結構化 print。
+
+**資料流**:GitLab 事件 → `POST /gitlab-webhook`(驗 token)→ 路由抽出 `mr_iid`(Draft 不審;update 事件另外看 `oldrev` 與 `changes`)→ 等 `WEBHOOK_DEBOUNCE_SECONDS` 沒有新事件 → 取消同 MR 進行中的審查 → 背景 thread 跑 `review_mr` → 管線經 `toolbox/gitlab.py` 回寫 GitLab:逐條 finding 行內留言、總評留言(決策文字)、`ai-review::<decision>` label、commit status `segcra/review`(`auto_approved` → success,`needs_human`/`blocked` → failed,description 帶原因;見 `orchestrator/pipeline.py` 決策回寫段)。
 
 **GitLab 端對應設定**(README 第 6 節有實測步驟):
 
 1. Admin Area → Settings → Network → Outbound requests → 勾 **Allow requests to the local network from webhooks and integrations**(GitLab 容器要打回同機內網位址,不開會被 GitLab 自己擋)。
 2. 專案 → Settings → Webhooks → Add new webhook:URL 填 `http://172.17.0.1:8000/gitlab-webhook`(容器打回宿主機走 docker bridge gateway;容器內打 `localhost` 是打容器自己)、Secret token 填與 `GITLAB_WEBHOOK_SECRET` 相同的值、勾 **Merge request events** 與 **Comments**(後者供 `/review` 重審)。
 3. 建好後用該 webhook 的 Test → Merge request events 驗證,server stdout 應出現觸發紀錄。
+
+### CI 的 job 呼叫的那條路(`/ci/review`,部署端用這一條)
+
+部署端不設 webhook:審查做成 MR pipeline 最後一個 stage 的 job,job 呼叫同一支服務的
+`POST /ci/review` 與 `GET /ci/review/<編號>`(設定步驟與 job 的 YAML 見 06 篇第 4 節)。跟 webhook
+那條路的差別:
+
+| | webhook(`/gitlab-webhook`) | CI(`/ci/review`) |
+|---|---|---|
+| 怎麼確認呼叫者 | `X-Gitlab-Token` 跟 `GITLAB_WEBHOOK_SECRET` 相同 | job 的 `JOB-TOKEN` 向 GitLab 查是哪個 job,再確認專案、MR pipeline、ref、sha 與 MR 目前的 head(`orchestrator/ci_gate.py:check_request`) |
+| Draft | 不審 | 審(Draft 標成 Ready 不會重跑 pipeline) |
+| 安靜期 | 等 `WEBHOOK_DEBOUNCE_SECONDS` | 不等,每個 job 都要自己的結果;webhook 那條路還在等的同一個 MR 不再審 |
+| 結果 | commit status `segcra/review` | job 的結束碼(`ci_gate.exit_code`),不寫 commit status |
+| 沒跑完 | 留言 + commit status 設成失敗 | 留言,job 拿到 5 |
+
+兩條路共用 `_run_review`(同一個 MR 有進行中的審查就取消、改審新的)與 `REVIEW_TIMEOUT_SECONDS`。
+進行中的 CI 審查記在記憶體(`_ci_reviews`,最多 `MAX_CI_REVIEWS` 份,超過時丟掉最舊的、已經結束的),
+服務重新啟動就沒了:job 查不到狀態,連續 10 次後以 5 結束,retry job 重審。
 
 ## 對決策的影響
 
@@ -62,9 +86,9 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:8000/gitlab-we
 curl -s -X POST http://127.0.0.1:8000/gitlab-webhook \
   -H 'X-Gitlab-Token: test123' -H 'Content-Type: application/json' \
   -d '{"object_kind":"merge_request","object_attributes":{"action":"open","iid":1}}'
-# → "review triggered for MR !1";server 印「→ 觸發審查 MR !1」
+# → "review scheduled for MR !1";等 WEBHOOK_DEBOUNCE_SECONDS(預設 10 秒)後 server 印「→ 觸發審查 MR !1」
 
-# 4. 立刻重發同一事件(帶 oldrev)→ 取消舊的、改審新的
+# 4. 重發同一事件:10 秒內重發只重新計時,只審一次;審查開始之後再發 → 取消舊的、改審新的
 #(重跑上一條 curl)→ server 印「MR !1 取消進行中的舊審查,改審新的」
 
 # 5. 不觸發的 action
@@ -73,7 +97,7 @@ curl -s -X POST http://127.0.0.1:8000/gitlab-webhook \
   -d '{"object_kind":"merge_request","object_attributes":{"action":"approved","iid":1}}'
 # → "ignored (action=approved)"
 
-# 6. note 事件:含 /review 且非 bot → 觸發;bot 留言 → ignored
+# 6. note 事件:開頭是 /review 且非 bot → 觸發;bot 留言 → ignored
 curl -s -X POST http://127.0.0.1:8000/gitlab-webhook \
   -H 'X-Gitlab-Token: test123' -H 'Content-Type: application/json' \
   -d '{"object_kind":"note","user":{"username":"ai-reviewer"},"merge_request":{"iid":1},"object_attributes":{"noteable_type":"MergeRequest","note":"/review"}}'
