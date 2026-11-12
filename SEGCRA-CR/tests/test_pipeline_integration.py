@@ -563,6 +563,107 @@ def test_head_sha_換掉就算被取代():
     assert pipeline._superseded({"sha": "new"}, "old") is True          # mock 模式只有 sha
 
 
+# ───────── 回寫途中被新的 commit 取代(部署端現場 S2) ─────────
+#
+# 回寫前只查一次不夠:回寫本身要花上幾十秒(一條 finding 一個請求),新的 commit 常常
+# 就是在這段時間裡推上來的 —— 前面的行內意見貼得還算合理,最後那句總結與 label 卻是
+# 舊結論。所以每一步寫入前都要重查。
+
+def _written(output, mr_id):
+    """mock 模式回寫落檔的內容(還沒寫過任何東西時回空殼)。"""
+    f = output / f"mr_{mr_id}_review.json"
+    return (json.loads(f.read_text(encoding="utf-8")) if f.exists()
+            else {"inline_comments": [], "summary": None, "labels": [], "commit_status": None})
+
+
+def _three_findings():
+    return {**MODEL_REPORT, "verdict": "needs_changes", "findings": [
+        {"file": "sql/maintenance/x.sql", "line": n, "severity": "minor",
+         "title": f"第 {n} 行的欄位命名", "detail": "命名與同庫其他表不一致。",
+         "suggestion": "改成 account_id。", "citations": []} for n in (2, 3, 4)]}
+
+
+def _superseded_from(monkeypatch, nth: int) -> list[int]:
+    """第 `nth` 次檢查(從 0 算)開始回「已被取代」;回傳檢查次數的計數器。"""
+    calls = []
+
+    def counting(now, reviewed_sha):
+        calls.append(1)
+        return len(calls) > nth
+
+    monkeypatch.setattr(pipeline, "_superseded", counting)
+    return calls
+
+
+def test_每一步寫入前都重查一次(run, monkeypatch):
+    calls = _superseded_from(monkeypatch, 99)          # 一直都是最新的
+    report, output, mr_id = run(_mr(CLEAN_SQL), _three_findings())
+    posted = _written(output, mr_id)
+    assert len(posted["inline_comments"]) == len(report["findings"])
+    # 行內意見每條一次,加上 commit status、標籤、總結
+    assert len(calls) == len(report["findings"]) + 3
+    assert "writeback_skipped" not in report
+
+
+def _superseded_when(monkeypatch, decide) -> None:
+    """照「目前已經貼了幾條行內意見」決定何時被取代 —— 不綁 finding 的條數(後處理
+    會補報,條數不是測試說得準的)。`decide(已貼條數, 上一次檢查時的條數)` 回 True
+    就算被取代。"""
+    last = [-1]
+
+    def counting(now, reviewed_sha):
+        n = len(_written(gitlab.OUTPUT_DIR, "900")["inline_comments"])
+        was, last[0] = last[0], n
+        return decide(n, was)
+
+    monkeypatch.setattr(pipeline, "_superseded", counting)
+
+
+def test_貼到一半被取代就停下_總結與標籤不貼(run, monkeypatch):
+    """已經貼出去的行內意見收不回來(GitLab 沒有這種 API),但後面的不再寫 ——
+    label 與總結是「這個 MR 現在的結論」,舊的蓋上去最難發現。"""
+    _superseded_when(monkeypatch, lambda n, was: n >= 2)
+    report, output, mr_id = run(_mr(CLEAN_SQL), _three_findings())
+    assert len(report["findings"]) > 2, "這個測試要貼不完才驗得到「停在中途」"
+    posted = _written(output, mr_id)
+    assert len(posted["inline_comments"]) == 2
+    assert posted["summary"] is None and posted["labels"] == [] \
+        and posted["commit_status"] is None
+    assert "行內意見" in report["writeback_skipped"]
+    assert "之後的步驟不再回寫" in report["writeback_skipped"]
+
+
+def test_行內意見貼完才被取代_標籤與總結不貼(run, monkeypatch):
+    """最後一步才被取代:標籤與總結不寫。這兩個是「這個 MR 現在的結論」,舊的蓋上去
+    最難發現;commit status 是跟 sha 走的,寫在舊 sha 上不影響新的那次。
+
+    觸發點是「這次檢查之後沒有新的行內意見」—— 行內那圈與 commit status 都過了。"""
+    _superseded_when(monkeypatch, lambda n, was: n == was)
+    report, output, mr_id = run(_mr(CLEAN_SQL), _three_findings())
+    posted = _written(output, mr_id)
+    assert len(posted["inline_comments"]) == len(report["findings"])
+    assert posted["commit_status"], "commit status 跟 sha 走,這一步照寫"
+    assert posted["summary"] is None and posted["labels"] == []
+    assert "標籤" in report["writeback_skipped"]
+
+
+def test_整次都沒回寫時不說成停在中途(run, monkeypatch):
+    """一條都還沒寫就被取代 —— 訊息要跟「停在中途」分得開,不然看報告的人以為 MR 上
+    已經有一半的東西。"""
+    _superseded_from(monkeypatch, 0)
+    report, output, mr_id = run(_mr(CLEAN_SQL), _three_findings())
+    assert _written(output, mr_id)["inline_comments"] == []
+    assert "之後的步驟" not in report["writeback_skipped"]
+    assert report["writeback_skipped"] == "已有更新的 commit,這次審查的結論不再回寫"
+
+
+def test_被取代之後不再重查(run, monkeypatch):
+    """停下來以後就不要再問 GitLab:剩下的步驟都不寫了,多問幾次只是多幾個請求。"""
+    calls = _superseded_from(monkeypatch, 1)
+    run(_mr(CLEAN_SQL), _three_findings())
+    assert len(calls) == 2, "第二次查到被取代就該停,之後不再查"
+
+
 def test_注入掃描丟例外時交人工_而不是當成沒有注入(run, monkeypatch):
     """掃描的兩步不吃 report,所以 `@_isolated_stage` 套不上、掃原始碼的測試也看不到
     —— 而它們丟例外就是整份審查沒有輸出(#45 要防的情況)。

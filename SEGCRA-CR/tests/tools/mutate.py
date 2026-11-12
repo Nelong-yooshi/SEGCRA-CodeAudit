@@ -695,8 +695,8 @@ MUTANTS.update({
      "def enforce_lint_incomplete("),
  # 第 3 點:舊審查不得把結論貼上去
  "回寫:不確認是不是最新的那次審查": ("pipeline.py",
-     '        if _superseded(now, mr.get("head_sha") or mr.get("sha")):',
-     "        if False:"),
+     "    if _superseded(now, reviewed_sha):" + NL + "        return None",
+     "    if False:" + NL + "        return None"),
  "回寫:問不出目前的 sha 就不回寫(變成另一種無聲失敗)": ("pipeline.py",
      "    return bool(current) and current != reviewed_sha",
      "    return not current or current != reviewed_sha"),
@@ -4884,15 +4884,16 @@ MUTANTS.update({
         "        report[\"_review_deadline_seconds\"] = REVIEW_BUDGET_SECONDS",
         "        report.setdefault(\"_review_deadline_seconds\", REVIEW_BUDGET_SECONDS)"),
     "階段耗時:收尾在回寫前就記": (P,
-        "        for fd in report.get(\"findings\", []):" + NL + "            result = await hub.call(\"gitlab__post_inline_comment\"",
+        "        unposted = []" + NL + "        for fd in report.get(\"findings\", []):",
         "        clock.finish(); clock.finish = lambda: None" + NL
-        + "        for fd in report.get(\"findings\", []):" + NL + "            result = await hub.call(\"gitlab__post_inline_comment\""),
+        + "        unposted = []" + NL + "        for fd in report.get(\"findings\", []):"),
     "階段耗時:回寫完不記收尾": (P,
         "        clock.finish()" + NL + "        if capture is not None:" + NL + "            capture[\"report\"] = report" + NL + "        return report",
         "        if capture is not None:" + NL + "            capture[\"report\"] = report" + NL + "        return report"),
-    "階段耗時:已被取代時不記收尾": (P,
-        "            clock.finish()" + NL + "            if capture is not None:",
-        "            if capture is not None:"),
+    # 「已被取代時不記收尾」不列為突變點:**它已經沒有對應的程式碼**。被取代時不再提早
+    # return(每一步寫入前各自檢查,該寫的不寫、流程照樣走到底),clock.finish() 只有一個
+    # 出口,沒有「這條路忘了記收尾」這種寫法可以突變。被取代時仍然記收尾,由
+    # test_stage_timing.py 的「已有更新的 commit 不回寫時也記到收尾」守著。
     "階段耗時:每段都從頭算": (P, "        self._last = now", "        pass"),
     "階段耗時:總時間只算最後一段": (P,
         "        self.seconds[\"total\"] = round(self._last - self.start, 1)",
@@ -5829,6 +5830,35 @@ MUTANTS.update({
         '    if writeback.get("commit_status"):', "    if False:"),
     "回寫結果:總結不寫標籤沒寫上": (P,
         '    if writeback.get("label"):', "    if False:"),
+    "回寫結果:行內意見只在第一條之前比對一次 head": (P,
+        '        unposted = []' + NL
+        + '        for fd in report.get("findings", []):' + NL
+        + '            refs = await writable(_WRITEBACK_STEPS["inline"])' + NL
+        + '            if refs is None:' + NL
+        + '                break',
+        '        unposted = []' + NL
+        + '        refs = await writable(_WRITEBACK_STEPS["inline"])' + NL
+        + '        for fd in report.get("findings", []):' + NL
+        + '            if refs is None:' + NL
+        + '                break'),
+    "回寫結果:已經停下來還繼續問 GitLab": (P,
+        '            if stopped:' + NL
+        + '                return None' + NL
+        + '            refs = await _writeback_target(hub, mr_id, reviewed_sha)',
+        '            if False:' + NL
+        + '                return None' + NL
+        + '            refs = await _writeback_target(hub, mr_id, reviewed_sha)'),
+    "回寫結果:停在中途跟整次沒回寫說成同一件事": (P,
+        '                    f"回寫到「{step}」時 MR 已有更新的 commit,之後的步驟不再回寫"' + NL
+        + '                    if wrote else "已有更新的 commit,這次審查的結論不再回寫")',
+        '                    f"回寫到「{step}」時 MR 已有更新的 commit,之後的步驟不再回寫"' + NL
+        + '                    if True else "已有更新的 commit,這次審查的結論不再回寫")'),
+    "回寫結果:標籤不比對 head 就設上去": (P,
+        '        if await writable(_WRITEBACK_STEPS["label"]) is not None:',
+        '        if True:'),
+    "回寫結果:總結不比對 head 就貼上去": (P,
+        '        if await writable(_WRITEBACK_STEPS["summary"]) is not None:',
+        '        if True:'),
     "回寫結果:總結先貼": (P,
         "        decision = report.get(\"decision\", \"needs_human\")" + NL
         + "        label = f\"ai-review::{decision}\"",
