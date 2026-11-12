@@ -880,7 +880,8 @@ class RenderResult:
     map_method: str = "none"          # sentinel | difflib | none
     macros: list[str] = field(default_factory=list)
     macro_conflicts: list[str] = field(default_factory=list)
-    # 載入失敗而被略過的 macro 檔(路徑:原因)。ok 仍可能為 True——只用到其他
+    # 載入失敗而被略過的 macro 檔(`路徑:原因(第 N 行)`,由 macro_issue 的分類產生,不含
+    # 錯誤訊息)。ok 仍可能為 True——只用到其他
     # macro 的 model 照常展開;呼叫到被略過檔案裡的 macro 則會展開失敗。
     macro_problems: list[str] = field(default_factory=list)
     source_lines: int = 0
@@ -1082,7 +1083,8 @@ def build_env(code_root=None, variables: dict | None = None,
     macros: list[str] = []
     conflicts: list[str] = []
     problems: list[str] = []
-    # 同樣的失敗,另外分類記下(見 macro_issue):給 check_macro_files 用
+    # 載入失敗的 macro 檔只記分類(見 macro_issue);回傳的說明文字(macro_problems)由分類
+    # 產生,不另外記一份 —— 兩份各自 append,改了一邊就會跟另一邊對不上
     env.segcra_macro_issues = []
     if code_root is None and macro_files is None:
         return env, macros, conflicts, problems
@@ -1122,7 +1124,6 @@ def build_env(code_root=None, variables: dict | None = None,
         try:
             text = origin if isinstance(origin, str) else origin.read_bytes().decode("utf-8")
         except UnicodeDecodeError as e:
-            problems.append(f"{rel}:{_safe_error(e)}")
             env.segcra_macro_issues.append(macro_issue(rel, e))
             continue
         total += len(text)
@@ -1140,7 +1141,6 @@ def build_env(code_root=None, variables: dict | None = None,
             # 單一 macro 檔壞掉(語法錯誤、模組層執行失敗)不該讓整個專案都展不開:
             # 略過它並記錄。真的需要它的 model 仍會因為名稱未定義而大聲失敗,
             # 不會靜靜產出少了那段邏輯的 SQL。
-            problems.append(f"{rel}:{_safe_error(e)}")
             env.segcra_macro_issues.append(macro_issue(rel, e))
             continue
         for name in dir(module):
@@ -1171,7 +1171,7 @@ def build_env(code_root=None, variables: dict | None = None,
     env.segcra_this_called["called"] = False
     env.segcra_incremental["called"] = False
     env.segcra_macro_phase = False
-    return env, sorted(macros), conflicts, problems
+    return env, sorted(macros), conflicts, [macro_problem_text(i) for i in env.segcra_macro_issues]
 
 
 def _mark_called(flag: dict):
@@ -1476,6 +1476,21 @@ def macro_issue(rel: str, error: BaseException) -> dict:
     else:
         kind = MACRO_LOAD_FAILED
     return {"path": rel, "kind": kind, "line": line}
+
+
+_MACRO_KIND_TEXT = {
+    MACRO_SYNTAX: "Jinja 語法錯誤",
+    MACRO_UNSUPPORTED: "用到不認得的濾器或重複定義的 block",
+    MACRO_TOO_DEEP: "巢狀太深",
+    MACRO_LOAD_FAILED: "載入失敗",
+}
+
+
+def macro_problem_text(issue: dict) -> str:
+    """macro_issue 的分類寫成一行(`路徑:原因(第 N 行)`)。只用分類與行號,不帶錯誤訊息:
+    錯誤訊息可能含樣板內容,而這段文字會進報告。"""
+    line = f"(第 {issue['line']} 行)" if issue.get("line") else ""
+    return f"{issue['path']}:{_MACRO_KIND_TEXT.get(issue['kind'], '載入失敗')}{line}"
 
 
 @dataclass(frozen=True)
