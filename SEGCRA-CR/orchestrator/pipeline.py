@@ -901,8 +901,9 @@ def _dbt_exec_mr(exec_mr: dict, exec_text, spec_text, affected_specs: tuple[Spec
     model(.sql、在 model 目錄、內容是樣板),而且有規格時才展開;規格是從受影響 model 借來的
     (MR 自己沒有規格)時,還要是這個 model 對到的那份。
     回傳 (交給執行驗證的 MR, 紀錄)。紀錄是 None 表示不適用(照舊交給執行驗證);
-    {"file", "ok", "reason"}:ok 時那個檔案的內容換成展開後的 SQL,不 ok 時 MR 不動
-    (執行驗證照舊回「尚未支援」),reason 是原因。"""
+    {"file", "ok", "reason", "stand_ins"}:ok 時那個檔案的內容換成展開後的 SQL,stand_ins 是由規格
+    的測資表代替的上游 model(ref() 的對象);不 ok 時 MR 不動(執行驗證照舊回「尚未支援」),reason
+    是原因。"""
     if not dbt_cfg or dbt_cfg.get("enabled") is not True:
         return exec_mr, None
     if dbt_ctx is None or dbt_ctx.project is None or dbt_ctx.error is not None:
@@ -925,20 +926,21 @@ def _dbt_exec_mr(exec_mr: dict, exec_text, spec_text, affected_specs: tuple[Spec
         return exec_mr, None
     if not exec_text:
         return exec_mr, None                 # 沒有規格:執行驗證自己會說
-    record = {"file": path, "ok": False, "reason": None}
+    record = {"file": path, "ok": False, "reason": None, "stand_ins": []}
     if not spec_text and not (affected_specs and rel in affected_specs[0].models):
         record["reason"] = "MR 沒有自己的規格,借用的受影響 model 規格不是這個 model 的"
         return exec_mr, record
     if DBT_DATABASE_PLACEHOLDER != dbt_cfg.get("database"):
         record["reason"] = _DBT_DATABASE_MISMATCH
         return exec_mr, record
-    sql, reason = render_for_exec(path, source, exec_text, dbt_cfg["database"],
-                                  _render_project(dbt_ctx))
+    sql, reason, stand_ins = render_for_exec(path, source, exec_text, dbt_cfg["database"],
+                                             _render_project(dbt_ctx))
     if sql is None:
         record["reason"] = reason
         return exec_mr, record
     files[i] = {**f, "full_content": sql}
     record["ok"] = True
+    record["stand_ins"] = list(stand_ins)
     return {**exec_mr, "files": files}, record
 
 
@@ -3102,18 +3104,38 @@ def _only_dbt_file(mr: dict, dbt_ctx: DbtContext | None, path: str) -> bool:
 
 
 _DBT_EXEC_NOTE_TITLE = "dbt model 沒有送進沙盒執行"
+_DBT_EXEC_STAND_IN_TITLE = "執行驗證時上游 model 由測資代替"
 
 
 @_isolated_stage("dbt 執行驗證說明")
 def enforce_dbt_exec_note(report: dict, dbt_exec: dict | None) -> dict:
     """執行驗證要跑的 dbt model 沒能展開成沙盒用的 SQL 時,補一條 info 寫出原因。
-    決策不受影響(執行驗證自己已經回了「尚未支援」的 major),只讓審查者知道差在哪裡。"""
-    if not dbt_exec or dbt_exec.get("ok") or not dbt_exec.get("reason"):
+    決策不受影響(執行驗證自己已經回了「尚未支援」的 major),只讓審查者知道差在哪裡。
+
+    展開了、但有上游 model 由規格的測資表代替時,也補一條 info:執行驗證通過的是這個 model
+    本身,上游 model 的邏輯沒有在這次執行。model 名稱過了識別字白名單,不是 MR 的任意內容。"""
+    if not dbt_exec:
+        return report
+    if dbt_exec.get("ok"):
+        stand_ins = [n for n in dbt_exec.get("stand_ins") or [] if isinstance(n, str)]
+        if stand_ins:
+            _put_program_finding(report, {
+                "file": dbt_exec["file"] or "(MR 內容)", "line": 0, "severity": "info",
+                "title": _DBT_EXEC_STAND_IN_TITLE,
+                "detail": f"執行驗證時,ref() 指向的上游 model 由規格「資料表定義」裡同名的測資表代替:"
+                          f"{'、'.join(stand_ins[:10])}"
+                          f"{f'(共 {len(stand_ins)} 個)' if len(stand_ins) > 10 else ''}。"
+                          f"這些上游 model 自己的邏輯沒有在這次執行。",
+                "suggestion": "上游 model 有改動時,要另外驗證它本身。",
+                "citations": [], "_source": PROGRAM_SOURCE})
+        return report
+    if not dbt_exec.get("reason"):
         return report
     _put_program_finding(report, {
         "file": dbt_exec["file"] or "(MR 內容)", "line": 0, "severity": "info",
         "title": _DBT_EXEC_NOTE_TITLE,
-        "detail": f"執行驗證只支援只引用 source() 的 model;這個 model 沒有展開:{dbt_exec['reason']}。",
+        "detail": f"執行驗證支援引用 source() 與 ref()(上游 model 由規格裡同名的測資表代替)的 model;"
+                  f"這個 model 沒有展開:{dbt_exec['reason']}。",
         "suggestion": "以 dbt compile 取得展開後的 SQL,人工依核定規格核對。",
         "citations": [], "_source": PROGRAM_SOURCE})
     return report

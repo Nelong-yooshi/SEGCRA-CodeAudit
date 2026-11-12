@@ -1,7 +1,8 @@
-"""dbt model 的執行驗證:只引用 source() 的 model 展開成沙盒用的 SQL 再執行。
+"""dbt model 的執行驗證:引用 source() / ref() 的 model 展開成沙盒用的 SQL 再執行。
 
   * 規格「資料表定義」的表名(spec_tables)
-  * 展開模式:source() 指向規格建的測資表;ref()、{{ this }}、增量 model 不支援
+  * 展開模式:source() 指向規格建的測資表;ref() 由同名的測資表代替(細節見 test_dbt_exec_ref);
+    {{ this }}、增量 model 不支援
   * pipeline:哪個檔案要展開、什麼情況照舊回「尚未支援」、原因寫進報告、
     展開後執行通過時不再補「dbt 的變更沒有經過執行驗證」
 """
@@ -11,7 +12,8 @@ import orchestrator.dbt_exec as dbt_exec
 import orchestrator.pipeline as pipeline
 from orchestrator.dbt_exec import AMBIGUOUS, render_for_exec, spec_tables
 from orchestrator.dbt_render import DbtProjectInfo, render_model, render_model_isolated
-from orchestrator.pipeline import (_DBT_EXEC_NOTE_TITLE, _DBT_UNEXECUTED_TITLE, _dbt_exec_mr,
+from orchestrator.pipeline import (_DBT_EXEC_NOTE_TITLE, _DBT_EXEC_STAND_IN_TITLE, _DBT_UNEXECUTED_TITLE,
+                                   _dbt_exec_mr,
                                    enforce_dbt_exec_note, enforce_dbt_unexecuted)
 from orchestrator.dbt_affected import SpecForModels
 from tests.test_dbt_affected import (CFG, DB, HEAD, _Loader, prepare_dbt_context, review,
@@ -115,8 +117,8 @@ def test_表名物件只給名稱():
     ("{{ source('raw', 'nope') }}", "未在 sources.yml 宣告"),
     ("{{ source('raw', 'templated') }}", "無法確定"),
     ("{{ source('raw', 'transactions') }}{{ source('other', 'transactions') }}", "同一張表"),
-    ("{{ ref('stg_a') }}", "尚未支援 ref()"),
-    ("{{ ref('sample', 'stg_a') }}", "尚未支援 ref()"),
+    ("{{ ref('stg_a') }}", "表名無法確定"),               # 沒有表名紀錄(naming)
+    ("{{ ref('sample', 'stg_a') }}", "表名無法確定"),
     ("{{ this }}", "尚未支援 {{ this }}"),
     ("{{ source('raw', 'transactions').database }}", "沒有 database"),
     ("{{ source('raw', 'transactions').schema }}", "沒有 schema"),
@@ -189,7 +191,7 @@ def _for_exec(source, spec=SPEC, project=INFO, **kw):
 
 def test_render_for_exec_成功(in_process):
     assert _for_exec("SELECT 1 FROM {{ source('raw', 'transactions') }}") == (
-        "SELECT 1 FROM [transactions]", None)
+        "SELECT 1 FROM [transactions]", None, ())
 
 
 @pytest.mark.parametrize("source, spec, project, why", [
@@ -198,19 +200,19 @@ def test_render_for_exec_成功(in_process):
     ("{{ source('raw', 'transactions') }}", "# 沒有資料表定義\n", INFO, "沒有可以解析的 CREATE TABLE"),
     ("{% if is_incremental() %}x{% endif %}{{ source('raw', 'transactions') }}", SPEC, INFO,
      "增量 model"),
-    ("{{ ref('stg_a') }}", SPEC, INFO, "尚未支援 ref()"),
+    ("{{ ref('stg_a') }}", SPEC, INFO, "表名無法確定"),
     ("{{ '{{' }} {{ source('raw', 'transactions') }}", SPEC, INFO, "仍含樣板標記"),
     ("{% if false %}{{ source('raw', 'transactions') }}{% endif %}", SPEC, INFO, "沒有 SQL"),
 ])
 def test_render_for_exec_不能展開的原因(in_process, source, spec, project, why):
-    sql, reason = _for_exec(source, spec, project)
-    assert sql is None and why in reason
+    sql, reason, stand_ins = _for_exec(source, spec, project)
+    assert sql is None and why in reason and stand_ins == ()
 
 
 def test_render_for_exec_同名_macro(in_process):
     macros = {"macros/a.sql": "{% macro m() %}1{% endmacro %}",
               "macros/b.sql": "{% macro m() %}2{% endmacro %}"}
-    sql, reason = _for_exec("{{ source('raw', 'transactions') }}", macro_files=macros)
+    sql, reason, _ = _for_exec("{{ source('raw', 'transactions') }}", macro_files=macros)
     assert sql is None and "同名的 macro" in reason
 
 
@@ -244,7 +246,7 @@ def _exec_mr(paths, contents=None):
 def test_最後一個檔案是_model_展開後換掉內容(in_process):
     mr = _exec_mr(["models/mrt_BIG.sql"])
     out, record = _dbt_exec_mr(mr, SPEC, SPEC, (), _ctx(["models/mrt_BIG.sql"]), CFG)
-    assert record == {"file": "models/mrt_BIG.sql", "ok": True, "reason": None}
+    assert record == {"file": "models/mrt_BIG.sql", "ok": True, "reason": None, "stand_ins": []}
     assert out["files"][0]["full_content"] == "SELECT account_no FROM [transactions]"
     assert mr["files"][0]["full_content"] == MODEL                  # 傳進來的 MR 不動
 
@@ -320,17 +322,17 @@ def test_展開失敗時_MR_不動_記下原因(in_process):
     mr = _exec_mr(["models/mrt_BIG.sql"], {"models/mrt_BIG.sql": "SELECT 1 FROM {{ ref('x') }}"})
     out, record = _dbt_exec_mr(mr, SPEC, SPEC, (), _ctx(["models/mrt_BIG.sql"]), CFG)
     assert out is mr and record["file"] == "models/mrt_BIG.sql" and not record["ok"]
-    assert "尚未支援 ref()" in record["reason"]
+    assert "ref() 指向專案裡不存在" in record["reason"]
 
 
 # ─────────────────── 後處理 ───────────────────
 
 def test_沒展開的原因寫成_info():
     report = enforce_dbt_exec_note({"findings": []}, {"file": "models/a.sql", "ok": False,
-                                                       "reason": "執行驗證尚未支援 ref()"})
+                                                       "reason": "規格的資料表定義沒有 ref() 指向的表:stg_a"})
     (fd,) = report["findings"]
     assert (fd["severity"], fd["title"], fd["file"]) == ("info", _DBT_EXEC_NOTE_TITLE, "models/a.sql")
-    assert "執行驗證尚未支援 ref()" in fd["detail"]
+    assert "規格的資料表定義沒有 ref() 指向的表:stg_a" in fd["detail"]
 
 
 @pytest.mark.parametrize("record", [None, {"file": "a", "ok": True, "reason": None},
@@ -423,20 +425,70 @@ def test_只引用_source_的_model_送進沙盒執行(run):
     assert sqls == ["SELECT account_no FROM [transactions]"]
     assert report["_spec_exec"]["passed"] is True
     assert report["_spec_exec"]["executed_file"] == "models/mrt_BIG.sql"
-    assert report["_dbt_exec"] == {"file": "models/mrt_BIG.sql", "ok": True, "reason": None}
+    assert report["_dbt_exec"] == {"file": "models/mrt_BIG.sql", "ok": True, "reason": None,
+                                   "stand_ins": []}
     assert _DBT_UNEXECUTED_TITLE not in _titles(report)
     assert not any("尚未支援" in t for t in _titles(report))
 
 
-def test_用到_ref_的_model_照舊交人工_並寫出原因(run):
-    report, sqls = run(["models/mrt_BIG.sql"],
-                       {"models/stg_a.sql": "SELECT 1 AS account_no",
-                        "models/mrt_BIG.sql": "SELECT account_no FROM {{ ref('stg_a') }}\n"})
+REF_FILES = {"models/stg_a.sql": "SELECT 1 AS account_no",
+             "models/mrt_BIG.sql": "SELECT account_no FROM {{ ref('stg_a') }}\n"}
+# 規格多一張跟上游 model 同名的表:由它代替 stg_a 的輸出
+SPEC_STG = SPEC.replace("CREATE TABLE transactions(", "CREATE TABLE stg_a(account_no INT);\n"
+                        "CREATE TABLE transactions(")
+
+
+def test_ref_指向的表規格裡沒有時_照舊交人工_並寫出原因(run):
+    report, sqls = run(["models/mrt_BIG.sql"], REF_FILES)
     assert sqls == []
     assert report["_spec_exec"].get("dbt_template") is True
     note = next(f for f in report["findings"] if f["title"] == _DBT_EXEC_NOTE_TITLE)
-    assert "尚未支援 ref()" in note["detail"]
+    assert "規格的資料表定義沒有 ref() 指向的表:stg_a" in note["detail"]
     assert report["decision"] == "needs_human"
+
+
+def test_ref_由規格裡同名的表代替_記下代替了哪些(in_process):
+    mr = _exec_mr(["models/mrt_BIG.sql"], REF_FILES)
+    out, record = _dbt_exec_mr(mr, SPEC_STG, SPEC_STG, (), _ctx(["models/mrt_BIG.sql"], REF_FILES), CFG)
+    assert record == {"file": "models/mrt_BIG.sql", "ok": True, "reason": None, "stand_ins": ["stg_a"]}
+    assert out["files"][0]["full_content"] == "SELECT account_no FROM [stg_a]"
+
+
+def test_ref_由測資代替時送進沙盒_並寫出上游的邏輯沒有執行(run):
+    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC_STG, encoding="utf-8")
+    report, sqls = run(["models/mrt_BIG.sql"], REF_FILES)
+    assert sqls == ["SELECT account_no FROM [stg_a]"]
+    assert report["_dbt_exec"]["stand_ins"] == ["stg_a"]
+    note = next(f for f in report["findings"] if f["title"] == _DBT_EXEC_STAND_IN_TITLE)
+    assert note["severity"] == "info" and "stg_a" in note["detail"]
+    assert "沒有在這次執行" in note["detail"]
+    assert _DBT_EXEC_NOTE_TITLE not in _titles(report)
+
+
+def test_由測資代替的_info():
+    report = enforce_dbt_exec_note({"findings": []}, {"file": "models/a.sql", "ok": True,
+                                                       "reason": None, "stand_ins": ["stg_a", "stg_b"]})
+    (fd,) = report["findings"]
+    assert (fd["severity"], fd["title"], fd["file"]) == ("info", _DBT_EXEC_STAND_IN_TITLE, "models/a.sql")
+    assert "stg_a、stg_b" in fd["detail"]
+
+
+def test_由測資代替的_info_最多列十個_不是字串的不列():
+    names = [f"m{i}" for i in range(12)] + [None, 3]
+    report = enforce_dbt_exec_note({"findings": []}, {"file": "a", "ok": True, "reason": None,
+                                                       "stand_ins": names})
+    detail = report["findings"][0]["detail"]
+    assert "m9" in detail and "m10" not in detail and "共 12 個" in detail
+    assert "None" not in detail
+
+
+def test_模型同標題的代替說明_被程式的取代():
+    decoy = {"file": "models/a.sql", "line": 0, "severity": "info", "title": _DBT_EXEC_STAND_IN_TITLE,
+             "detail": "上游也驗過了", "suggestion": "", "citations": []}
+    report = enforce_dbt_exec_note({"findings": [decoy]}, {"file": "models/a.sql", "ok": True,
+                                                            "reason": None, "stand_ins": ["stg_a"]})
+    (fd,) = report["findings"]
+    assert "上游也驗過了" not in fd["detail"] and "stg_a" in fd["detail"]
 
 
 def test_同時改了_macro_時_通過也要補未執行(run):
@@ -479,5 +531,6 @@ def test_golden_的_dbt_model_送進沙盒的是跟_mr_406_相同的_SQL(in_proc
     assert ctx.error is None and ctx.project is not None
     exec_mr = pipeline._mr_for_spec_exec(mr, ctx)
     out, record = _dbt_exec_mr(exec_mr, spec, spec, (), ctx, cfg)
-    assert record == {"file": "models/mrt_cash_inbound.sql", "ok": True, "reason": None}
+    assert record == {"file": "models/mrt_cash_inbound.sql", "ok": True, "reason": None,
+                      "stand_ins": []}
     assert out["files"][-1]["full_content"] == plain.replace("FROM txn_log t", "FROM [txn_log] t")
