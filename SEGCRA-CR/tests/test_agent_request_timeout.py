@@ -123,6 +123,7 @@ def test_模組讀的是_LLM_SEND_TIMEOUT_且預設不送():
 class _Gateway(BaseHTTPRequestHandler):
     """像 LiteLLM:請求內容沒有 timeout 就回它逾時時的 400;有的話正常回答。"""
     bodies = []
+    codes = []       # 回了什麼狀態碼(驗失敗原因用,不靠 openai 套件的錯誤訊息格式)
 
     def log_message(self, *a):
         pass
@@ -142,6 +143,7 @@ class _Gateway(BaseHTTPRequestHandler):
                    "usage": {"prompt_tokens": 999999, "completion_tokens": 5, "total_tokens": 1000004}}
             code = 200
         data = json.dumps(out).encode()
+        _Gateway.codes.append(code)
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
@@ -155,6 +157,7 @@ def gateway():
     t = threading.Thread(target=srv.serve_forever, daemon=True)
     t.start()
     _Gateway.bodies = []
+    _Gateway.codes = []
     yield f"http://127.0.0.1:{srv.server_address[1]}/v1"
     srv.shutdown()
     srv.server_close()
@@ -168,9 +171,12 @@ def test_經過閘道時開啟就成功(monkeypatch, gateway):
 
 
 def test_經過閘道時沒開就被切斷(monkeypatch, gateway):
-    """對照組:同一個閘道、沒開時要失敗,才證明上面那條是因為帶了 timeout 才過。"""
+    """對照組:同一個閘道、沒開時要失敗,才證明上面那條是因為帶了 timeout 才過。
+
+    失敗原因看閘道這邊的紀錄:收到的請求都沒有 timeout、回的都是逾時的 400(套件重試的話不只一次)。
+    不比對例外的文字:openai 套件的錯誤訊息帶不帶回應內容,各版本不同。"""
     monkeypatch.setattr(agent, "SEND_TIMEOUT", False)
-    with pytest.raises(Exception) as info:
+    with pytest.raises(Exception):
         _run(_cfg(gateway))
-    assert "Timeout passed=30.0" in str(info.value)
-    assert "timeout" not in _Gateway.bodies[0]
+    assert _Gateway.codes and set(_Gateway.codes) == {400}
+    assert all("timeout" not in body for body in _Gateway.bodies)
