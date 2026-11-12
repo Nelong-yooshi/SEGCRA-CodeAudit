@@ -5930,5 +5930,43 @@ MUTANTS.update({
 })
 
 
+
+# ---- 重審收掉上一輪的行內意見(部署端現場 S3 後半):不收的話同一行疊好幾輪
+MUTANTS.update({
+ '收舊意見:行內意見不帶記號(下一輪認不出是我們開的)': (G,
+     '        text = f"{_INLINE_MARKER}\\n**[{severity}]** {body}"',
+     '        text = f"**[{severity}]** {body}"'),
+ '收舊意見:有人回覆過的討論也標成已解決': (G,
+     '    if not isinstance(notes, list) or len(notes) != 1:\n        return None',
+     '    if not isinstance(notes, list) or not notes:\n        return None'),
+ '收舊意見:不看記號,別人開的討論也標': (G,
+     '    if not isinstance(n, dict) or _INLINE_MARKER not in (n.get("body") or ""):\n        return None',
+     '    if not isinstance(n, dict):\n        return None'),
+ '收舊意見:不可解決或已解決的照樣送一次': (G,
+     '    if not n.get("resolvable") or n.get("resolved"):\n        return None',
+     '    if False:\n        return None'),
+ '收舊意見:標不掉就往外丟(中斷回寫)': (G,
+     '        except Exception:                    # noqa: BLE001 — 標不掉只是舊意見留著\n            failed += 1',
+     '        except Exception:                    # noqa: BLE001 — 標不掉只是舊意見留著\n            raise'),
+ '收舊意見:問不出清單就往外丟': (G,
+     '        except Exception:                    # noqa: BLE001 — 問不出來就不標,不是錯誤\n            break',
+     '        except Exception:                    # noqa: BLE001 — 問不出來就不標,不是錯誤\n            raise'),
+ '收舊意見:只看第一頁(討論多的收不乾淨)': (G,
+     '        if len(got) < 100:\n            break',
+     '        if True:\n            break'),
+ '收舊意見:翻頁沒有上限': (G,
+     '    for page in range(1, MAX_DISCUSSION_PAGES + 1):',
+     '    for page in range(1, 10_000):'),
+ '收舊意見:貼新的之前不收舊的': (P,
+     '        if await writable(_WRITEBACK_STEPS["resolve"]) is not None:\n            report["_resolved_stale"] = _resolved_count(\n                await hub.call("gitlab__resolve_stale_comments", {"mr_id": mr_id}))',
+     '        if False:\n            pass'),
+ '收舊意見:收掉之前不比對 head': (P,
+     '        if await writable(_WRITEBACK_STEPS["resolve"]) is not None:',
+     '        if True:'),
+ '收舊意見:看不懂回傳就猜一個數字': (P,
+     '        return int(got.get("resolved", 0)) if isinstance(got, dict) else 0',
+     '        return int(got.get("resolved", 0)) if isinstance(got, dict) else 1'),
+})
+
 if __name__ == "__main__":
     sys.exit(main())

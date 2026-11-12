@@ -63,6 +63,9 @@ class _FakeGitLab(BaseHTTPRequestHandler):
             items = [{"new_path": p, "old_path": p, "diff": "@@ -0,0 +1 @@\n+" + t}
                      for p, t in self.files.items()]
             body, headers = items, {"X-Next-Page": ""}
+        elif method == "GET" and rest.endswith("/discussions"):
+            # 重審會先把上一輪我們開的行內討論標成已解決。這裡一律回空清單 = 第一次審查
+            kind, body, headers = "GET 討論清單", [], {}
         elif method == "GET" and rest.startswith("/merge_requests/"):
             kind = "GET MR"
             body = {"title": "量測用", "description": "", "sha": HEAD,

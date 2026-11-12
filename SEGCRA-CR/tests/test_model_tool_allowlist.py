@@ -25,7 +25,7 @@ READ_ONLY = {
 PIPELINE_READ = {"gitlab__get_mr_refs"}
 WRITE_TOOLS = {
     "gitlab__post_inline_comment", "gitlab__post_summary", "gitlab__set_commit_status",
-    "gitlab__create_rule_mr", "gitlab__set_label",
+    "gitlab__create_rule_mr", "gitlab__set_label", "gitlab__resolve_stale_comments",
     "memory__learn_style_from_examples", "memory__record_feedback",
 }
 

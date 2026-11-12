@@ -405,7 +405,8 @@ def _unposted_section(unposted: list[dict]) -> str:
 
 
 # 回寫的步驟(寫進 report["_writeback"] 的鍵 → 報告與 log 上的名稱)與失敗的種類
-_WRITEBACK_STEPS = {"inline": "行內意見", "commit_status": "merge 閘門(commit status)",
+_WRITEBACK_STEPS = {"resolve": "收掉上一輪的行內意見", "inline": "行內意見",
+                    "commit_status": "merge 閘門(commit status)",
                     "label": "標籤", "summary": "總結留言"}
 _WRITE_FAILURE_TEXT = {
     WRITE_REJECTED: "GitLab 拒絕了這個請求",
@@ -413,6 +414,16 @@ _WRITE_FAILURE_TEXT = {
     WRITE_NO_SHA: "沒有 commit 的 sha",
     WRITE_FAILED: "寫入工具出錯",
 }
+
+
+def _resolved_count(result) -> int:
+    """`resolve_stale_comments` 標掉了幾個。看不懂它回什麼就當成 0:這個數字只寫進報告
+    給人看,猜一個數字比寫 0 糟。"""
+    try:
+        got = json.loads(result)
+        return int(got.get("resolved", 0)) if isinstance(got, dict) else 0
+    except Exception:                        # noqa: BLE001 — ToolHub 把例外轉成錯誤字串
+        return 0
 
 
 def _record_writeback(writeback: dict, mr_id: str, step: str, result: str) -> str | None:
@@ -2316,6 +2327,14 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             else:
                 wrote.append(step)
             return refs
+
+        # 貼這一輪的行內意見之前,先把上一輪我們開的那些標成已解決:總結只有一則,
+        # 行內意見卻是每次 N 條重貼一遍 —— 不收掉的話同一行會疊好幾輪的意見,看 MR 的
+        # 人分不出哪些還有效。標不掉不影響這次審查(舊意見留著,新的照樣貼),所以只
+        # 記個數字,不當成回寫失敗。
+        if await writable(_WRITEBACK_STEPS["resolve"]) is not None:
+            report["_resolved_stale"] = _resolved_count(
+                await hub.call("gitlab__resolve_stale_comments", {"mr_id": mr_id}))
 
         unposted = []
         for fd in report.get("findings", []):

@@ -156,9 +156,10 @@ def test_量收尾的工具跑得動_回寫走真的_gitlab_模組(tmp_path, mon
     req = r["finish_requests"]
     assert r["findings"] >= 3                       # 兩條 R001 + 一條模型的
     assert req["PUT label"] == 1 and req["POST commit status"] == 1
-    # 每一步寫入前比對一次 head(行內意見每條一次,加 commit status、label、總結);
-    # 收尾不取檔案內容
-    assert req["GET MR"] == r["findings"] + 3
+    # 每一步寫入前比對一次 head(行內意見每條一次,加收掉上一輪、commit status、
+    # label、總結);收尾不取檔案內容
+    assert req["GET MR"] == r["findings"] + 4
+    assert req["GET 討論清單"] == 1, "重審要先找出上一輪我們開的行內討論"
     assert "GET diffs" not in req and "GET 檔案" not in req
     assert req.get("POST 行內討論", 0) + req.get("POST 一般留言", 0) >= r["findings"] + 1  # + 總結
     assert list(r["stage_seconds"]) == STAGES

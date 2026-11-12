@@ -600,8 +600,8 @@ def test_每一步寫入前都重查一次(run, monkeypatch):
     report, output, mr_id = run(_mr(CLEAN_SQL), _three_findings())
     posted = _written(output, mr_id)
     assert len(posted["inline_comments"]) == len(report["findings"])
-    # 行內意見每條一次,加上 commit status、標籤、總結
-    assert len(calls) == len(report["findings"]) + 3
+    # 行內意見每條一次,加上收掉上一輪、commit status、標籤、總結
+    assert len(calls) == len(report["findings"]) + 4
     assert "writeback_skipped" not in report
 
 
@@ -637,8 +637,9 @@ def test_行內意見貼完才被取代_標籤與總結不貼(run, monkeypatch):
     """最後一步才被取代:標籤與總結不寫。這兩個是「這個 MR 現在的結論」,舊的蓋上去
     最難發現;commit status 是跟 sha 走的,寫在舊 sha 上不影響新的那次。
 
-    觸發點是「這次檢查之後沒有新的行內意見」—— 行內那圈與 commit status 都過了。"""
-    _superseded_when(monkeypatch, lambda n, was: n == was)
+    觸發點是「這次檢查之後沒有新的行內意見」—— 行內那圈與 commit status 都過了。
+    `n > 0` 是因為「收掉上一輪」那一步排在行內之前,那時還一條都沒貼。"""
+    _superseded_when(monkeypatch, lambda n, was: n == was and n > 0)
     report, output, mr_id = run(_mr(CLEAN_SQL), _three_findings())
     posted = _written(output, mr_id)
     assert len(posted["inline_comments"]) == len(report["findings"])

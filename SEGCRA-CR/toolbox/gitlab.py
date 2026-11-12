@@ -581,6 +581,70 @@ def _send_with_retry(send, attempts: int) -> str | None:
         time.sleep(RETRY_DELAY_SECONDS)
 
 
+# 行內意見裡的記號:重審時用它認出「上一輪是我們開的那些討論」,把它們標成已解決
+# (`resolve_stale_comments`)。總結只有一則(見 _SUMMARY_MARKERS),但行內意見是每次
+# N 條重貼一遍 —— 不收掉的話,同一行會疊五輪的意見,看 MR 的人分不出哪些還有效。
+# HTML 註解在 GitLab 的 markdown 上看不見。
+_INLINE_MARKER = "<!-- segcra:review-inline -->"
+
+# 列討論最多翻幾頁(每頁 100 則)。超過這個量的 MR,重審洗版已經不是主要問題,
+# 而且收尾有時間上限,不該無上限追下去。
+MAX_DISCUSSION_PAGES = 5
+
+
+def _our_unresolved(d: dict) -> str | None:
+    """這個討論是不是「上一輪我們開的、而且沒有人回過」?是就回 discussion id。
+
+    三個條件都要:
+      * 只有一則留言 —— **有人回覆過的是對話**,標成已解決會把人的話收起來;
+      * 那一則帶著我們的記號 —— 沒有記號的是別人開的討論,不能動;
+      * 還沒被標成已解決(resolvable 且未 resolved)—— 已經解決的再送一次只是多一個請求。
+    """
+    notes = d.get("notes")
+    if not isinstance(notes, list) or len(notes) != 1:
+        return None
+    n = notes[0]
+    if not isinstance(n, dict) or _INLINE_MARKER not in (n.get("body") or ""):
+        return None
+    if not n.get("resolvable") or n.get("resolved"):
+        return None
+    return str(d.get("id") or "") or None
+
+
+def resolve_stale_comments(mr_id: str) -> str:
+    """把上一輪審查開的行內討論標成已解決,回 `{"ok": true, "resolved": N, "failed": M}`。
+
+    **這一步失敗不影響這次審查**:標不掉只是舊意見留在上面(看 MR 的人仍然看得到新的
+    那些),所以逐個討論各自 try,失敗只數一個數字回去,不會讓回寫中斷。問不出討論清單
+    時回 `resolved: 0`,不當成錯誤。
+    """
+    if not REAL_MODE:
+        # mock 模式沒有討論可以標(結果是落檔,不是 GitLab 上的討論)
+        return json.dumps({"ok": True, "resolved": 0, "failed": 0}, ensure_ascii=False)
+    mr_id = _check_mr_id(mr_id)
+    ids: list[str] = []
+    for page in range(1, MAX_DISCUSSION_PAGES + 1):
+        try:
+            got = _api("GET", f"/merge_requests/{mr_id}/discussions",
+                       params={"per_page": 100, "page": page})
+        except Exception:                    # noqa: BLE001 — 問不出來就不標,不是錯誤
+            break
+        if not isinstance(got, list) or not got:
+            break
+        ids += [i for d in got if isinstance(d, dict) and (i := _our_unresolved(d))]
+        if len(got) < 100:
+            break
+    resolved = failed = 0
+    for did in ids:
+        try:
+            _api("PUT", f"/merge_requests/{mr_id}/discussions/{did}",
+                 json={"resolved": True})
+            resolved += 1
+        except Exception:                    # noqa: BLE001 — 標不掉只是舊意見留著
+            failed += 1
+    return json.dumps({"ok": True, "resolved": resolved, "failed": failed}, ensure_ascii=False)
+
+
 def post_inline_comment(mr_id: str, file: str, line: int, body: str,
                         severity: str = "info", base_sha: str = "", head_sha: str = "",
                         start_sha: str = "") -> str:
@@ -593,7 +657,7 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
     已經建立了討論、只是回應沒送到,再貼一般留言同一條就出現兩次。這時回傳
     `{"ok": false, "failure": "uncertain"}`,由呼叫端記下來。"""
     if REAL_MODE:
-        text = f"**[{severity}]** {body}"
+        text = f"{_INLINE_MARKER}\n**[{severity}]** {body}"
         if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
             # 沒有對應的行號(檔案層的 finding):直接貼一般留言,不拿第 0 行去開行內討論、
             # 再靠 API 失敗分流;開頭不寫 `檔名:0`(看起來像第 0 行)
