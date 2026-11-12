@@ -5574,6 +5574,12 @@ MUTANTS.update({
      '    return [i + 1 for i, ch in _scan_code(sql) if ch == ";"]',
      '    return [i + 1 for i, ch in enumerate(sql) if ch == ";"]'),
  # 程序性區塊裡的寫入語句(#106)
+ '區塊:剝不開時不再以關鍵字切(DECLARE 後面那句漏掉)': ("../toolbox/sqltools.py",
+     '            if recovered is None:\n                pieces = _split_by_keyword(chunk.text, chunk.line_offset) or []',
+     '            if False:\n                pieces = _split_by_keyword(chunk.text, chunk.line_offset) or []'),
+ '區塊:關鍵字切完不檢查寫入語句有沒有回來': ("../toolbox/sqltools.py",
+     '                    if _block_unclear(piece.text, sub):\n                        parsed_pieces = []\n                        break',
+     '                    if False:\n                        parsed_pieces = []\n                        break'),
  "區塊:R001 只看最外層(預存程序、IF、WHILE 裡的寫入語句漏掉)": (TOOLS,
      "    bad = [node.key.upper() for node in st.find_all(exp.Update, exp.Delete)",
      "    bad = [node.key.upper() for node in ([st] if isinstance(st, (exp.Update, exp.Delete)) else [])"),
@@ -5603,8 +5609,8 @@ MUTANTS.update({
      "        if False:"),
  # 沒有分號的多句 T-SQL(#105 第 1 點)
  "無分號:整份當一句,不以關鍵字再切": (TOOLS,
-     "        pieces = _split_by_keyword(chunk.text, chunk.line_offset)",
-     "        pieces = None"),
+     "            continue" + NL + "        pieces = _split_by_keyword(chunk.text, chunk.line_offset)",
+     "            continue" + NL + "        pieces = None"),
  "無分號:切完沒有全部解析得過也採用": (TOOLS,
      "        except (SqlglotError, RecursionError):   # 有一段解析不了就當作沒切過" + NL
      + "            return None",
