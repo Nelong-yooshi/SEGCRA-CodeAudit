@@ -6,6 +6,7 @@ MR 的標題、描述、註解可以引導模型去讀東西。這裡驗:
   3. 模型只能讀這次審查的 MR;檔案只能讀這次 MR 的版本(head、base、start、來源分支)或目標分支
   4. 讀回的內容跟 MR 本身一樣過注入掃描:命中就不交給模型,報告跟 MR 命中一樣 blocked
   5. 範圍外的讀取被拒絕,報告補一條 major,不寫模型給的參數
+  6. 查回的審查判例逐筆過注入掃描:命中的那筆不交給模型;不算成這次 MR 的命中,只印一行紀錄
 不呼叫真的模型與 GitLab。
 """
 import asyncio
@@ -17,10 +18,11 @@ from orchestrator import pipeline, tool_hub
 from orchestrator.config import load_config
 from orchestrator.pipeline import (_TOOL_READ_INJECTION_TITLE, _TOOL_READ_REFUSAL_TITLE,
                                    apply_policy, enforce_tool_reads)
-from orchestrator.tool_hub import (INJECTION_WITHHELD, READ_REFUSAL, REFUSED_OTHER_MR,
-                                   REFUSED_OTHER_REF, REFUSED_SCAN_FAILED, SCAN_FAILED_WITHHELD,
-                                   ToolHub)
-from toolbox import gitlab
+from orchestrator.tool_hub import (HISTORY_SCAN_FAILED, HISTORY_TOOL, HISTORY_WITHHELD,
+                                   HISTORY_WITHHELD_NOTE, INJECTION_WITHHELD, READ_REFUSAL,
+                                   REFUSED_OTHER_MR, REFUSED_OTHER_REF, REFUSED_SCAN_FAILED,
+                                   SCAN_FAILED_WITHHELD, ToolHub)
+from toolbox import gitlab, memory
 
 HEAD = "a" * 40
 BASE = "b" * 40
@@ -420,3 +422,132 @@ def test_review_mr_沒有讀取時不多出這兩條(monkeypatch, tmp_path):
     assert seen == ["SELECT 1"]
     assert not _titles(report) & {_TOOL_READ_REFUSAL_TITLE, _TOOL_READ_INJECTION_TITLE}
     assert "_injection_scan" not in report
+
+
+# ─────────────────── 6. 審查判例 ───────────────────
+
+def _history(monkeypatch, tmp_path, *records):
+    path = tmp_path / "history.jsonl"
+    path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records),
+                    encoding="utf-8")
+    monkeypatch.setattr(memory, "HISTORY_FILE", path)
+
+
+def _clean(ts=1):
+    return {"ts": ts, "title": "SELECT * 不建議", "detail": "欄位要列出來", "sql": "SELECT * FROM t",
+            "disposition": "rejected", "note": "", "tag": "H001"}
+
+
+def test_判例沒命中時跟原本的結果一樣(monkeypatch, tmp_path):
+    _history(monkeypatch, tmp_path, _clean(1), _clean(2))
+    hub = _hub()
+    assert _call(hub, HISTORY_TOOL, {"text": "SELECT *"}) == memory.lookup_similar_reviews("SELECT *")
+    assert hub.withheld_history == []
+
+
+def test_判例的_sql_註解含注入句_那筆不給_其他照給(monkeypatch, tmp_path):
+    bad = {**_clean(2), "sql": "SELECT * FROM t -- " + INJECTION}
+    _history(monkeypatch, tmp_path, _clean(1), bad)
+    hub = _hub()
+    out = _call(hub, HISTORY_TOOL, {"text": "SELECT *"})
+    assert INJECTION not in out
+    data = json.loads(out)
+    assert [r["ts"] for r in data["results"]] == [1]
+    assert data["withheld"] == HISTORY_WITHHELD_NOTE.format(n=1)
+    assert [w["ts"] for w in hub.withheld_history] == [2]
+    assert hub.withheld_history[0]["categories"]
+    # 判例不是這次 MR 的:不算成這次的命中,也不是範圍外的讀取
+    assert hub.tool_injection_hits == [] and hub.refused_reads == []
+
+
+@pytest.mark.parametrize("bad", [
+    {"title": INJECTION}, {"detail": INJECTION}, {"note": INJECTION}, {"tag": INJECTION},
+    {"extra": INJECTION},              # 不認得的欄位也交給模型,也要掃
+    {"detail": [INJECTION]},           # 不是字串的值
+    {"sql": {"text": INJECTION}},
+    {INJECTION: "x"},                  # 欄位名稱本身
+])
+def test_判例的每個欄位都掃(monkeypatch, tmp_path, bad):
+    _history(monkeypatch, tmp_path, {**_clean(5), **bad})
+    hub = _hub()
+    out = _call(hub, HISTORY_TOOL, {"text": "SELECT *"})
+    assert INJECTION not in out and json.loads(out)["results"] == []
+    assert [w["ts"] for w in hub.withheld_history] == [5]
+
+
+@pytest.mark.parametrize("ts", [True, "5", None])
+def test_判例的時間不是整數時不記(monkeypatch, tmp_path, ts):
+    _history(monkeypatch, tmp_path, {**_clean(), "ts": ts, "note": INJECTION})
+    hub = _hub()
+    _call(hub, HISTORY_TOOL, {"text": "SELECT *"})
+    assert hub.withheld_history[0]["ts"] is None
+
+
+def test_判例掃描整份_不是截斷後的(monkeypatch, tmp_path):
+    _history(monkeypatch, tmp_path, {**_clean(3), "sql": "SELECT 1\n" * 2000 + "-- " + INJECTION})
+    hub = _hub()
+    hub.max_chars = 100
+    out = _call(hub, HISTORY_TOOL, {"text": "SELECT"})
+    assert json.loads(out)["results"] == [] and hub.withheld_history
+
+
+def test_判例掃描出錯時整份不給(monkeypatch, tmp_path):
+    def boom(mr):
+        raise RuntimeError("掃描錯誤:" + INJECTION)
+    _history(monkeypatch, tmp_path, _clean(1))
+    monkeypatch.setattr(tool_hub, "scan_mr", boom)
+    hub = _hub()
+    assert _call(hub, HISTORY_TOOL, {"text": "SELECT *"}) == HISTORY_SCAN_FAILED
+    assert hub.withheld_history == [{"ts": None, "categories": None}]
+    assert hub.refused_reads == []
+
+
+def test_判例查回的不是預期形狀時整段掃():
+    hub = _hub()
+    hub._functions[HISTORY_TOOL] = _Spy("錯誤:" + INJECTION)
+    assert _call(hub, HISTORY_TOOL, {"text": "x"}) == HISTORY_WITHHELD
+    assert hub.withheld_history[0]["ts"] is None
+    hub = _hub()
+    hub._functions[HISTORY_TOOL] = _Spy("Error executing tool memory__lookup_similar_reviews: x")
+    assert _call(hub, HISTORY_TOOL, {"text": "x"}).startswith("Error executing tool")
+    assert hub.withheld_history == []
+
+
+def test_判例的結果只留_results():
+    hub = _hub()
+    hub._functions[HISTORY_TOOL] = _Spy(json.dumps({"results": [_clean(1)], "extra": INJECTION}))
+    out = json.loads(_call(hub, HISTORY_TOOL, {"text": "x"}))
+    assert out == {"results": [_clean(1)]}
+
+
+def test_管線自己查判例不經過掃描(monkeypatch, tmp_path):
+    """dry-run 的煙霧測試用 call_json 查判例,結果不交給模型,不必掃。"""
+    _history(monkeypatch, tmp_path, {**_clean(1), "note": INJECTION})
+    hub = _hub()
+    assert asyncio.run(hub.call_json(HISTORY_TOOL, {"text": "SELECT *"}))["results"]
+    assert hub.withheld_history == []
+
+
+def test_判例的紀錄只寫筆數_時間與類別(capsys):
+    pipeline._log_withheld_history("9", [{"ts": 7, "categories": ["override"]},
+                                         {"ts": None, "categories": None}])
+    line = capsys.readouterr().out
+    assert "MR !9" in line and "1 筆" in line and "1 次沒有完成注入掃描" in line
+    assert "7" in line and "override" in line
+
+
+def test_沒有被擋的判例時不印(capsys):
+    pipeline._log_withheld_history("9", [])
+    assert capsys.readouterr().out == ""
+
+
+def test_review_mr_判例含注入句_不給模型_也不擋這次的_MR(monkeypatch, tmp_path, capsys):
+    _history(monkeypatch, tmp_path, {**_clean(42), "sql": "SELECT * -- " + INJECTION})
+    report, seen, output = _review(monkeypatch, tmp_path, [(HISTORY_TOOL, {"text": "SELECT *"})])
+    assert INJECTION not in seen[0] and json.loads(seen[0])["results"] == []
+    assert _TOOL_READ_INJECTION_TITLE not in _titles(report)
+    assert "_injection_scan" not in report
+    line = [l for l in capsys.readouterr().out.splitlines() if "審查判例" in l]
+    assert len(line) == 1 and "42" in line[0] and INJECTION not in line[0]
+    posted = "".join(p.read_text(encoding="utf-8") for p in output.rglob("*.json"))
+    assert INJECTION not in posted

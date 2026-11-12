@@ -2198,6 +2198,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
         report = enforce_tool_refusals(report, hub.refused_calls)  # 模型要求了寫入工具
         report = enforce_tool_reads(report, hub.refused_reads, hub.tool_injection_hits)  # 讀了範圍外或含注入的內容
+        _log_withheld_history(mr_id, hub.withheld_history)  # 判例不是這次 MR 的,不進報告
 
         # 執行驗證(必跑;測資生成 → 沙盒執行 → 仲裁)——在 rubric 之前。
         # **整段有時間上限**:沙盒的單一查詢自己有上限,但整段沒有,而測資生成可以跑
@@ -4191,6 +4192,25 @@ def enforce_tool_reads(report: dict, refused: list[str], hits: list[dict]) -> di
             "citations": []}
         _put_program_finding(report, refusal)
     return report
+
+
+def _log_withheld_history(mr_id, withheld: list[dict]) -> None:
+    """沒有交給模型的判例印一行,讓維運的人去檢查判例檔(memory 的 HISTORY_FILE)。
+
+    判例是以前記下來的,不是這次 MR 帶進來的,所以不進這次的報告、不影響判定;
+    只寫筆數、判例的時間(ts)與命中類別,不寫判例的內容。"""
+    if not withheld:
+        return
+    failed = sum(1 for w in withheld if w.get("categories") is None)
+    stamps = sorted({w["ts"] for w in withheld if w.get("ts") is not None})
+    cats = sorted({c for w in withheld for c in (w.get("categories") or [])})
+    parts = [f"{len(withheld) - failed} 筆疑似含對審查工具的指令"] if len(withheld) > failed else []
+    if failed:
+        parts.append(f"{failed} 次沒有完成注入掃描")
+    print(f"[pipeline] MR !{mr_id} 查回的審查判例有" + "、".join(parts) + ",沒有交給模型"
+          + (f";類別:{', '.join(cats)}" if cats else "")
+          + (f";判例時間(ts):{', '.join(map(str, stamps))}" if stamps else "")
+          + ";請檢查判例檔", flush=True)
 
 
 _UNREVIEWABLE_TITLE = "部分變更內容無法取得,未經審查"
