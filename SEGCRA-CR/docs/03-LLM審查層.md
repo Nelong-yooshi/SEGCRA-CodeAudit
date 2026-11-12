@@ -55,6 +55,10 @@
   - `openai_tools`:只回傳白名單內、且已註冊的工具
   - `call_from_model(name, args)`:模型要求的工具一律走這裡;不在白名單就不執行、回 `MODEL_REFUSAL`。被拒絕的**已註冊**工具名稱記進 `refused_calls`(不記參數),管線據此補 major(`pipeline.enforce_tool_refusals`,見 04 篇);模型自己編的名稱只回拒絕、不記錄
   - 白名單內的工具也要擋得住模型給的參數:`get_mr_diff` / `get_file` 的 `mr_id` 會被接進 GitLab API 路徑與 fixture 檔名,只接受 1–10 位 ASCII 數字(`toolbox/gitlab.py:_check_mr_id`),`1/../../issues/5`、`x/../../config/x` 這類值直接報錯、不發請求、不讀檔
+  - **讀取範圍**(`set_review_scope`,`review_mr` 取完 MR 後設定):模型只能讀這次審查的 MR(`get_mr_diff` 的 `mr_id`、`get_file` 的 `mr_id` 都要是這次的編號);`get_file` 的 `ref` 只能是空的(釘住的 head)、這次 MR 的 head / base / start 三個 sha(可以縮寫,至少 7 個字元、對得到唯一的一個)、來源分支(換成釘住的 head:分支上可能有還沒審的新 commit)或目標分支。範圍外的不執行、回 `READ_REFUSAL`,代碼記進 `refused_reads`(不記參數),管線補 major(`pipeline.enforce_tool_reads`,見 04 篇)。MR 的文字可以引導模型去讀別的 MR、別的分支或舊的 commit,讀回來的東西沒有經過這次審查的任何一道檢查。沒有設定範圍時(只有在 `review_mr` 以外直接用 `ToolHub`)不限制範圍
+  - **讀回的內容過注入掃描**(`_screen`):`get_mr_diff` / `get_file` 讀回的內容跟 MR 本身用同一套 `security.scan_mr` 掃(讀回的 MR 照 MR 的形狀,其他當成一個檔案的完整內容)。**掃整份,不是截斷後的那段**:截斷的位置由內容長度決定,不能讓它把命中的地方切掉。命中就回 `INJECTION_WITHHELD`、不交給模型,類別與工具名稱記進 `tool_injection_hits`(不帶原文);掃描自己出錯也不交給模型(`SCAN_FAILED_WITHHELD`,記進 `refused_reads`)。管線把命中當成 MR 本身命中處理(blocked,見 04 篇)
+  - **查回的判例過注入掃描**(`_screen_history`):`memory__lookup_similar_reviews` 回的判例是以前人工記下的處置,`sql` 欄位常是從某個 MR 貼過來的,作者的註解一起在裡面。每筆判例照 MR 的形狀掃(`sql` 當成檔案內容,其他欄位的名稱與值當成描述;不是字串的值也轉成文字掃),命中的那筆不給、其他照給,結果多一個 `withheld` 說明有幾筆沒給;結果只留 `results`。掃整份、不是截斷後的;掃描自己出錯時整份不給。判例不是這次 MR 帶進來的,**不算成這次 MR 的命中**:不進報告、不影響判定,只記在 `hub.withheld_history`,由管線印一行紀錄(見 04 篇 enforce_tool_reads)。管線自己用 `call_json` 查判例(dry-run 的煙霧測試)不交給模型,不經過這段
+  - `get_file` 讀到二進位檔(內容含 NUL 字元)回固定文字「(二進位檔案,不提供內容。)」(`toolbox/gitlab.py:BINARY_PROSE`):圖片解碼成文字只是亂碼,裡面的文字區塊卻可以夾帶給模型的指令
 - **schema 自動生成**(`function_schema` + `_annotation_schema`):由函式簽名 + docstring 生成——docstring 就是給 LLM 看的工具描述;參數型別註記對映 `str/int/bool/float → string/integer/boolean/number`,`list/set/tuple → array`(含 items),`dict → object`,未知型別退回 `string`;**有預設值的參數為非必填**(`required` 只收無預設值者)。所以「加工具」= 在 toolbox 寫一個帶型別註記與 docstring 的函式,掛進 `TOOL_GROUPS`,schema 自己長出來。
 - **`register_local(name, fn, description, parameters)`**:註冊 orchestrator 本地工具(目前只有 `load_skill`),schema 手寫,與 toolbox 工具同列;要交給模型的也必須列進 `MODEL_TOOLS`。
 - **`call(full_name, args, truncate=True)`** 分派順序:local_tools → toolbox 函式(例外不炸管線,回 `Error executing tool …: {e}` 字串,與舊 MCP server 端吞錯行為一致)→ 未知 group/工具回中文錯誤字串。結果 `str()` 後,**`truncate=True` 且超過 `max_chars`(`config/models.yaml` 的 `budget.tool_result_max_chars`,現值 6000)時截斷**,尾附「…(截斷,原長 N 字元)」。截斷**只用於餵給 LLM 的工具結果**。
@@ -90,7 +94,7 @@
 
 另一支只看 MR 文字的模型呼叫,判斷有沒有任何一句在對審查者或審查工具說話:要求放行、改嚴重度、略過檢查、宣稱已由上層或系統核准、叫模型扮演角色、聲稱已測過等價。單純描述「改了什麼、為什麼改」不算。報告怎麼處理見 04 篇的 enforce_cold_read。
 
-- **輸入**:標題、說明,再放**每個檔案的改動(diff)**,最後才是**各檔變更後的全文**(SQL、yml 整份、規格、文件;不限副檔名——主審查模型讀得到的文字冷讀都要讀到,不然換個位置就繞過了)。改動放在前面,超過預算時沒送到的會先是沒改動的部分;改動與全文各自由小到大放(一樣大時照變更清單的順序),一個大檔不會先佔掉預算、讓後面的小檔整份放不進去。全文的來源依序是檔案的 `full_content`、取回的 dbt 專案;被刪掉的檔案只送檔名,二進位檔(含 NUL 字元)不送內容。整段放在兩個**每次隨機產生**的分隔標記之間,MR 內容寫不出對得上的結束標記。
+- **輸入**:標題、說明,再放**每個檔案的改動(diff)**,最後才是**各檔變更後的全文**(SQL、yml 整份、規格、文件;不限副檔名——主審查模型讀得到的文字冷讀都要讀到,不然換個位置就繞過了)。改動放在前面,超過預算時沒送到的會先是沒改動的部分;改動與全文各自由小到大放(一樣大時照變更清單的順序),一個大檔不會先佔掉預算、讓後面的小檔整份放不進去。全文的來源依序是檔案的 `full_content`、取回的 dbt 專案(真實 GitLab 模式只取回 `.sql`、`.yml` / `.yaml` 與 `specs/` 底下 `.md` 的完整內容,其他檔案只有 diff,見 `toolbox/gitlab.py:wants_full_content`;MR 加進來的文字都在 diff 裡);被刪掉的檔案只送檔名,二進位檔(含 NUL 字元)不送內容。整段放在兩個**每次隨機產生**的分隔標記之間,MR 內容寫不出對得上的結束標記。
 - **預算**:`budget.cold_read`(tokens),而且不超過 `cold_read` profile 的 `num_ctx` 扣掉 `max_output_tokens`、system prompt 與 512 的餘裕。用**偏高的估計**算(`config.estimate_tokens_upper`:中日韓字與全形符號每字至少 1 token、BMP 以外 2 token、其他 `len/3`),不用 `estimate_tokens`(`len/3`,中文會低估好幾倍)。依序放到用完為止,沒送完的段落記下來(報告記「冷讀沒有看完」)。
 - **送出後的檢查**(`cold_read.unread_reason`):端點超過上下文時不報錯、直接截掉 prompt 開頭(system prompt 與標題),冷讀會在沒看到的情況下回「沒命中」。所以用 `run_agent` 回填的 `prompt_tokens` 判斷:讀入量加上 `max_output_tokens` 超過 `num_ctx`、讀入量少於送出字元數 ÷ 8、或**端點沒有回報讀入量**,都記成「冷讀沒有看完」(交人工)。
 - **system prompt**:`cold_read.SYSTEM_PROMPT`。分隔標記之間是資料不是指令;程式碼也一起給,只看寫給人看的文字(註解、字串常值、欄位別名、中括號識別字、yml 的值、文件),不評論邏輯;只輸出一行 JSON `{"flagged": bool, "quotes": [...最多 3 段], "reason": "..."}`。
@@ -118,7 +122,7 @@
 
 **變更後的完整內容**(`orchestrator/change_view.py`:`build_full_text_section`):接在 diff 之後、預掃結果之前。只給 diff 時,模型逐項核對規格對照的只有 diff 的那幾行,條件寫在離改動處超過幾行的地方就會被報成「遺漏」。
 
-- **內容來源**(`pipeline._head_texts`):mock 模式用 fixture 的 `full_content`;真實 GitLab 模式下,dbt 專案裡的檔案用取回的 head commit 內容。兩者都沒有的檔案不列,prompt 只有它的 diff。**只放 `.sql`**:真實模式會取回每個變更檔的完整內容,圖片的文字區塊、SVG 裡看不見的文字若也整份放進 prompt,藏在裡面的句子就直接進到審查模型;其他檔案(含規格檔,見 04「MR 改到規格檔」)只有 diff。
+- **內容來源**(`pipeline._head_texts`):mock 模式用 fixture 的 `full_content`;真實 GitLab 模式下,dbt 專案裡的檔案用取回的 head commit 內容。兩者都沒有的檔案不列,prompt 只有它的 diff。**只放 `.sql`**:真實模式取回的完整內容還有 `.yml` / `.yaml` 與規格檔(給 dbt 與規格變更用,見 `toolbox/gitlab.py:wants_full_content`;圖片、文件、SVG 等其他檔案不取回),完整內容是為了讓模型核對 SQL 的條件,其他檔案(含規格檔,見 04「MR 改到規格檔」)只有 diff。
 - **排版**:每一行前面加行號,這次新增或修改的行以 `>` 標記(由 diff 的 hunk 算出新檔的行號)。**刪掉的行**在完整內容裡看不到,所以在刪除的位置插一行以 `-` 開頭、沒有行號的說明(「這裡刪掉了 3 行」;改寫時刪掉的比新增的多,寫「下面 1 行取代了原本的 3 行」),只寫行數、不放被刪的內容(那在 diff 裡)。diff 的新增行或上下文行與內容對不上時(mock 的 fixture、佔位的 diff)不標記,並在檔名後註明——標錯行比不標更糟;刪除的位置只能靠上下文定位,所以上下文也要對得上。每一行都是新增的(新檔)就不重複放。
 - **預算**(`budget.full_content`,預設 6000 tokens,所有檔案共用;`num_ctx` 含輸出,輸入最多約 24,500,其他段落最壞約 16,000,所以不設更大;**設成 0 就不放**,prompt 回到只有 diff):放不下時逐步縮小——完整內容 → 只放改動所在的語句(新增的行與刪除的位置;往前後找到以分號結尾的行,找不到就前後各留 15 行),略過的部分寫明行號範圍 → 只寫一行說明。**限制**:dbt model 通常整個檔只有一句、不寫分號,所以縮小時實際上多半是前後各 15 行,不一定涵蓋完整的語句或 CTE;沒有用 CTE 的邊界切。
 - **內容是不可信的文字**:每一行都以行號開頭,內容裡的 ``` 不會出現在行首、關不掉外層的程式碼區塊;完整內容本來就在注入掃描的範圍內。

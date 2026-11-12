@@ -83,7 +83,9 @@ def test_real模式原有欄位不變(monkeypatch):
     assert out["files"] == [{"path": "a.sql", "old_path": "a.sql", "diff": "+x",
                              "deleted": False,
                              "unreviewable": True}]
-    assert set(out) == {"title", "description", "sha", "files", "truncated", *KEYS}
+    # target_branch / source_branch:模型讀檔的範圍(目標分支、來源分支)要用
+    assert set(out) == {"title", "description", "sha", "files", "truncated", *KEYS,
+                        "target_branch", "source_branch"}
 
 
 def test_mock模式的fixture沒有diff_refs_三個都是None(monkeypatch, tmp_path):
