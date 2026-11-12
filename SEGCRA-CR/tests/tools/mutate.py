@@ -5903,6 +5903,12 @@ MUTANTS.update({
 
 # ---- 三段式表名剝成純表名(#26 第 4 點):編譯輸出的表名要對得上沙盒的測資
 MUTANTS.update({
+ '表名:跑批前的探針不用編譯輸出的形狀': ("../eval/preflight.py",
+     'PROBE_SQL_QUALIFIED = \'SELECT id FROM "PROBE_DW"."dbo"."preflight_probe" WHERE amt > 100\'',
+     'PROBE_SQL_QUALIFIED = "SELECT id FROM preflight_probe WHERE amt > 100"'),
+ '表名:探針剝不掉也說過了': ("../eval/preflight.py",
+     '    if ex.get("table_error") or ex.get("sql_error") or ex.get("testdata_error"):\n        return Check("三段式表名", "fail",',
+     '    if False:\n        return Check("三段式表名", "fail",'),
  '表名:三段式不剝(編譯輸出整個跑不進沙盒)': ("spec_exec.py",
      '    prepared, table_error = _strip_table_qualifiers(prepared, _ddl_tables(plan.get("schema_ddl")))',
      '    table_error = None'),

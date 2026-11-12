@@ -193,7 +193,7 @@ def test_送進沙盒的SQL已經剝掉限定詞(monkeypatch):
     _fake_sandbox(monkeypatch, sent)
     out = spec_exec.execute_cases('SELECT 1 FROM "D"."dbo"."t"', _PLAN)
     assert out["table_error"] is None and out["sql_error"] is None
-    ran = [s for s in sent if "FROM" in s and "SELECT 1" in s]
+    ran = [s for s in sent if "SELECT 1 FROM" in s]   # 受審 SQL 那一句
     assert ran and all('"D"' not in s for s in ran), ran
 
 
@@ -234,3 +234,42 @@ def test_撞名回報成表名對不上_不是SQL有錯(monkeypatch):
     assert all("SQL 無法在測資上執行" not in t for t in titles)
     assert r["table_error"]
     assert [f["severity"] for f in r["findings"] if "表名" in f["title"]] == ["major"]
+
+
+# ─────────────────── 跑批前的探針 ───────────────────
+#
+# 剝得對不對只有真的 SQL Server 驗得出來(單元測試只看得到字串),所以 eval/preflight.py
+# 多一條探針:同一份最小案例,SQL 的表名寫成編譯輸出的形狀。
+
+def _preflight():
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "eval"))
+    import preflight
+    return preflight
+
+
+def test_探針用的是編譯輸出的形狀():
+    pf = _preflight()
+    assert '"PROBE_DW"."dbo"."preflight_probe"' in pf.PROBE_SQL_QUALIFIED
+    # 探針的表就是那份最小 plan 建的表 —— 不然剝完一樣對不上
+    assert "preflight_probe" in _ddl_tables(pf.PROBE_PLAN["schema_ddl"])
+
+
+def test_探針送進沙盒的SQL已經剝乾淨(monkeypatch):
+    """這裡只驗「送出去的是什麼」。一正一反比對得對不對要真的 SQL Server —— 假沙盒
+    一律回傳列,反向案例必然不符;探針本身就是為了在真機上驗那件事而存在。"""
+    sent = []
+    _fake_sandbox(monkeypatch, sent)
+    chk = _preflight().check_table_names()
+    assert chk.data["table_error"] is None and chk.data["sql_error"] is None
+    ran = [s for s in sent if "amt > 100" in s]       # 受審 SQL 那一句(前面帶 SET/DECLARE)
+    assert ran and all('"PROBE_DW"' not in s for s in ran), ran
+
+
+def test_沙盒不可用時探針是skip不是fail(monkeypatch):
+    """那是環境問題,不是剝的邏輯壞了 —— 報成 fail 會讓人去查錯的地方。"""
+    pf = _preflight()
+    monkeypatch.setattr(spec_exec, "_sandbox_params",
+                        lambda: {"server": "x", "port": 1433, "user": "sa", "password": ""})
+    assert pf.check_table_names().level == "skip"

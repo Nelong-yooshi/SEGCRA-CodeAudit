@@ -195,7 +195,7 @@ def main() -> int:
 
     sql = reference_sql(code)
     ok = execute_cases(sql, plan)
-    for k in ("sandbox_error", "sql_error", "testdata_error"):
+    for k in ("sandbox_error", "sql_error", "testdata_error", "table_error"):
         if ok[k]:
             print(f"正確的 SQL 跑不起來({k}):{ok[k]}")
             return 1
