@@ -2441,7 +2441,7 @@ def enforce_hints(report: dict, pre: list[dict]) -> dict:
 
 # 預掃命中這些規則時,secure-sql skill 一律注入 system prompt(不賭模型主動載)
 _SECURE_SQL_RULES = ("R004", "R005", "H004",
-                    "R006", "R007", "R008", "R009", "R010")
+                    "R006", "R007", "R008", "R009", "R010", "R011")
 
 
 def _needs_secure_sql(pre: list[dict]) -> bool:

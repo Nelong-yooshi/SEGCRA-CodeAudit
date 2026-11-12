@@ -180,16 +180,29 @@ def test_sp_executesql不重複報(sql):
 
 @pytest.mark.parametrize("sql", [
     "EXEC sys.sp_helptext 'dbo.p'",
-    "EXEC sys.sp_addsrvrolemember 'app', 'sysadmin'",
-    "EXEC sys.sp_addrolemember 'db_owner', 'app'",
+    "EXEC sys.sp_helprotect",
 ])
 def test_沒有列到的sys預存程序照樣由系統目錄那條接住(sql):
     """只排除別的分支已經報的那幾支,不是整個 `sys.sp_` 都排除——排掉就變成一條都
-    不報。把帳號加進 sysadmin / db_owner 的那幾支,等 R008 認舊式寫法之後再歸過去
-    (#91),在那之前由這裡接住。"""
+    不報。"""
     hits = _r005(sql)
     assert len(hits) == 1, f"沒抓到:{sql}"
     assert hits[0]["severity"] == "major"
+
+
+@pytest.mark.parametrize("sql", [
+    "EXEC sys.sp_addsrvrolemember 'app', 'sysadmin'",
+    "EXEC sys.sp_addrolemember 'db_owner', 'app'",
+    "EXEC sys.sp_send_dbmail @recipients = 'a@b'",
+    "EXEC sys.sp_configure 'show advanced options', 1",
+])
+def test_危險原語清單裡的sys預存程序不重複報成讀取執行環境(sql):
+    """把帳號加進 sysadmin / db_owner 的那幾支現在由 R008(權限與帳號)報、寄信的由
+    R006 報。R005 再報一次「讀取執行環境」,看的人會以為是兩件事,類別也不對。"""
+    assert _r005(sql) == []
+    out = json.loads(run_rules(sql))
+    hits = out["hits"] if isinstance(out, dict) else out
+    assert {h["rule"] for h in hits} & {"R006", "R008", "R011"}, sql
 
 
 # 回傳執行環境的系統預存程序。寫法很多種,只認其中一種等於加三個字就繞過去。
