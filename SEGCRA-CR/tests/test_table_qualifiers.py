@@ -273,3 +273,22 @@ def test_沙盒不可用時探針是skip不是fail(monkeypatch):
     monkeypatch.setattr(spec_exec, "_sandbox_params",
                         lambda: {"server": "x", "port": 1433, "user": "sa", "password": ""})
     assert pf.check_table_names().level == "skip"
+
+
+@pytest.mark.parametrize("bad,expect", [
+    ({"table_error": "受審 SQL 用了不同資料庫下的同名表(t)…"}, "同名表"),
+    ({"sql_error": "Invalid object name 'PROBE_DW.dbo.preflight_probe'."}, "Invalid object name"),
+    ({"testdata_error": "建表/灌資料失敗於 P1:…"}, "建表/灌資料失敗"),
+])
+def test_探針剝不掉時要紅_而且說對原因(monkeypatch, bad, expect):
+    """這條探針的用處就是在真機上擋下「剝不掉」。
+
+    **原因要講對**:剝不掉時案例一個都沒跑,接著那道「比對不符」也會紅,但它說的是
+    「可能剝到別的表」—— 查錯方向。所以這裡比對 detail 裡有沒有原本的錯誤訊息。
+    """
+    base = {"case_results": [], "mismatches": [], "sql_error": None, "testdata_error": None,
+            "sandbox_error": None, "table_error": None, "engine": "stub", "timed_out": False}
+    monkeypatch.setattr(spec_exec, "execute_cases", lambda sql, plan: {**base, **bad})
+    chk = _preflight().check_table_names()
+    assert chk.level == "fail", chk.detail
+    assert expect in chk.detail, chk.detail
