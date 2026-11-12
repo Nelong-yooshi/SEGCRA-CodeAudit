@@ -18,7 +18,7 @@ import pytest
 from orchestrator import pipeline
 from toolbox.sqltools import run_rules
 
-NEW_RULES = ("R006", "R007", "R008", "R009", "R010")
+NEW_RULES = ("R006", "R007", "R008", "R009", "R010", "R011")
 
 
 def _hits(sql: str, code: str | None = None) -> list[dict]:
