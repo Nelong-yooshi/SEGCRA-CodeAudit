@@ -721,17 +721,51 @@ def _now_utc() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
-def _checked_run_started_at(value) -> datetime.datetime:
+_LOCAL_TIME = ("run_started_at 換成主機的本地時間(astimezone() 沒給時區、now()、today()、utcnow()、"
+               "fromtimestamp() 沒給時區):結果看執行那台主機的時區與時間,展開器不知道部署端的設定,不猜")
+
+
+class _RunStartedAt(datetime.datetime):
+    """run_started_at 的值。跟 dbt 一樣是帶 UTC 時區的 datetime,另外擋下看主機本地時區或現在時間的寫法:
+    `.astimezone()` 不給時區會換成執行那台主機的時區,`now()` 這類 classmethod 給的是那台主機的現在
+    時間 —— 展開器照算的話,得到的是審查機的值(dbt 執行時是部署端主機的值),而且每次展開都不同。
+    加減與 `replace()` 的結果仍是這個型別,先運算再呼叫也一樣擋得到。"""
+
+    def astimezone(self, tz=None):
+        if tz is None:
+            raise DbtRenderError(_LOCAL_TIME)
+        return super().astimezone(tz)
+
+    @classmethod
+    def _local_time(cls, *args, **kwargs):
+        raise DbtRenderError(_LOCAL_TIME)
+
+    @classmethod
+    def fromtimestamp(cls, t, tz=None):
+        if tz is None:
+            raise DbtRenderError(_LOCAL_TIME)
+        return super().fromtimestamp(t, tz)
+
+    now = today = utcnow = _local_time
+
+
+def _as_run_started_at(value: datetime.datetime) -> _RunStartedAt:
+    utc = value.astimezone(datetime.timezone.utc)
+    return _RunStartedAt(utc.year, utc.month, utc.day, utc.hour, utc.minute, utc.second,
+                         utc.microsecond, tzinfo=datetime.timezone.utc)
+
+
+def _checked_run_started_at(value) -> _RunStartedAt:
     """呼叫端給的 run_started_at(ISO 字串)要帶時區、而且是 UTC(dbt 的預設);沒給時用現在。"""
     if value is None:
-        return _now_utc()
+        return _as_run_started_at(_now_utc())
     try:
         parsed = datetime.datetime.fromisoformat(value) if isinstance(value, str) else None
     except ValueError:
         parsed = None
     if parsed is None or parsed.utcoffset() != datetime.timedelta(0):
         raise DbtRenderError("run_started_at 的格式不對(要是帶 UTC 時區的 ISO 時間)")
-    return parsed.astimezone(datetime.timezone.utc)
+    return _as_run_started_at(parsed)
 
 
 def _checked_invocation_id(value) -> str:

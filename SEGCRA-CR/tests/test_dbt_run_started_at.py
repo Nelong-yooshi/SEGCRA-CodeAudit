@@ -124,6 +124,32 @@ def test_時區物件不能直接輸出():
     assert not r.ok and "物件" in r.error
 
 
+@pytest.mark.parametrize("src", [
+    "{{ run_started_at.astimezone() }}",                         # 換成主機的時區
+    "{{ run_started_at.now() }}",                                # 主機的現在時間
+    "{{ run_started_at.today() }}",
+    "{{ run_started_at.utcnow() }}",
+    "{{ run_started_at.fromtimestamp(0) }}",                     # 沒給時區:主機的時區
+    "{{ (run_started_at + (run_started_at - run_started_at)).astimezone() }}",   # 先運算再換
+    "{{ run_started_at.replace(year=2030).astimezone() }}",
+])
+def test_看主機本地時區或現在時間的寫法_展開失敗(src):
+    """得到的是審查機的值(dbt 執行時是部署端主機的值),而且每次展開都不同。不猜。"""
+    r = _render(src)
+    assert not r.ok and "主機的本地時間" in r.error, (src, r.error)
+    # 呼叫端指定值的時候(一份審查裡的展開)也一樣
+    r = _render(src, run_started_at="2026-01-02T03:04:05+00:00")
+    assert not r.ok and "主機的本地時間" in r.error, (src, r.error)
+
+
+@pytest.mark.parametrize("src, want", [
+    ("{{ run_started_at.astimezone(run_started_at.tzinfo) }}", r"[\d\- :.]+\+00:00"),
+    ("{{ run_started_at.fromtimestamp(0, run_started_at.tzinfo) }}", r"1970-01-01 00:00:00\+00:00"),
+])
+def test_有給時區的照常可用(src, want):
+    assert re.fullmatch(want, _value(src)), src
+
+
 def test_macro不能叫這個名字(tmp_path):
     (tmp_path / "macros").mkdir()
     (tmp_path / "macros" / "m.sql").write_text(

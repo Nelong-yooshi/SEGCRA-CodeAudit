@@ -55,7 +55,10 @@
    - `run_started_at`:跟 dbt 一樣是帶 UTC 時區的 datetime(dbt-core 1.12 是 `datetime.now(tz=pytz.utc)`),
      值是審查開始的真實時間,一份審查裡的展開共用一個(見 `start_review_invocation`)。
      `.strftime()`、`.date()`、`.year`、直接輸出都跟 dbt 相同;`modules.pytz` 不提供,
-     `.astimezone(時區)` 拿不到時區物件,展開失敗。呼叫端指定的值要是帶 UTC 時區的 ISO 字串
+     `.astimezone(時區)` 拿不到時區物件,展開失敗。看主機本地時區或現在時間的寫法(`.astimezone()`
+     不給時區、`now()`、`today()`、`utcnow()`、`fromtimestamp()` 不給時區)一律展開失敗:得到的是審查機的
+     值(dbt 執行時是部署端主機的值),而且每次展開都不同;先加減或 `replace()` 再呼叫也一樣。
+     呼叫端指定的值要是帶 UTC 時區的 ISO 字串
    - `env_var` **刻意不定義**:會把審查機的環境變數寫進 SQL;未定義則由 `StrictUndefined` 大聲失敗。
      `target.database` 在未提供 database 時同理
    - **所有 macro 檔共用同一個命名空間**:dbt 解析 macro 與檔案順序無關,逐檔各自展開
