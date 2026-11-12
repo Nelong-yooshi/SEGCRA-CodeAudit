@@ -282,6 +282,9 @@ TESTGEN_SYSTEM = """你是測試資料工程師。給你一份異常交易規則
                               HAVING SUM(amount) >= 100000) THEN 1 ELSE 0 END
    限制:**單一 SELECT、不得有分號或註解、不得出現 INSERT/UPDATE/DELETE/DROP/
    CREATE/ALTER/EXEC 等會改變狀態的字**(不符會被忽略,那個條件就失去這道檢查)。
+   **日期一律寫成字面值**(例如 `tx_time >= '{win_start}'`),不要用自訂參數:
+   判斷式是單獨執行的,用了沒有宣告的變數會整條算不出來。
+   (`@start_date` / `@end_date` 這兩個會自動宣告,用它們沒問題。)
    這些查詢會在沙盒上逐條執行,用來驗:基準讓該分支每一條都成立、
    變體**只有**被指定的那一條不成立。所以變體要精準。
 8. 資料庫是 MS SQL(SQL Server),schema_ddl 一律用 T-SQL 型別
@@ -310,6 +313,27 @@ _CHECK_SQL_FORBIDDEN = re.compile(
     r"exec|execute|backup|restore|shutdown|openrowset|opendatasource|bulk|"
     r"commit|rollback|waitfor|begin|while|goto|declare|set)\b"
     r"|\b(xp_|sp_)")
+
+
+# 受審 SQL 與判斷式共用的參數宣告。規格裡的條件常常寫成「在執行窗內」,模型產生的
+# 判斷式就會直接用 @start_date / @end_date —— 而判斷式是**單獨**送進沙盒跑的,沒有
+# 宣告就回錯誤 137(Must declare the scalar variable),整個案例變成「標籤未驗證」。
+# 兩邊用同一組值,條件的語意才跟受審 SQL 執行時一致。
+_WINDOW_PARAMS = (("@start_date", f"DATE = '{WIN_START}'"),
+                  ("@end_date", f"DATE = '{WIN_END}'"))
+
+
+def _window_decls(text: str) -> str:
+    """這段 SQL 用到的執行窗參數的 DECLARE(沒用到就回空字串)。"""
+    used = [f"{name} {spec}" for name, spec in _WINDOW_PARAMS
+            if re.search(rf"{name}\b", text, re.I)]
+    return "DECLARE " + ", ".join(used) + ";\n" if used else ""
+
+
+# 判斷式用到我們不知道的參數時,SQL Server 回的是同一個錯誤 137。要分得出來:
+# 「我們沒宣告」跟「條件本身寫錯」對看報告的人是兩件事 —— 前者是我們沒驗到,
+# 後者是測資或規格有問題。
+_UNDECLARED_RE = re.compile(r'(?i)must declare the scalar variable\s+"?(@\w+)"?')
 
 
 def _wrap_check_sql(q: str) -> str:
@@ -1222,15 +1246,7 @@ def prepare_sql(sql: str) -> str:
         except Exception:
             pass
     body = _SYSDATE.sub(f"CAST('{WIN_END}' AS DATETIME2)", body)
-    decl = []
-    if re.search(r"@start_date\b", body, re.I):
-        decl.append(f"@start_date DATE = '{WIN_START}'")
-    if re.search(r"@end_date\b", body, re.I):
-        decl.append(f"@end_date DATE = '{WIN_END}'")
-    head = "SET NOCOUNT ON; SET DATEFORMAT ymd;\n"
-    if decl:
-        head += "DECLARE " + ", ".join(decl) + ";\n"
-    return head + body
+    return "SET NOCOUNT ON; SET DATEFORMAT ymd;\n" + _window_decls(body) + body
 
 
 def _drop_stale_sandbox_dbs(admin) -> None:
@@ -1293,9 +1309,14 @@ def _eval_conditions(cursor, conds: list[dict]) -> tuple[dict[str, bool] | None,
         if not q:
             return None, f"條件 {c.get('id')} 沒有判斷式(check_sql)"
         try:
-            cursor.execute(_wrap_check_sql(q))
+            cursor.execute(_window_decls(q) + _wrap_check_sql(q))
             row = cursor.fetchone()
         except Exception as e:
+            undeclared = _UNDECLARED_RE.search(str(e))
+            if undeclared:
+                return None, (f"條件 {c.get('id')} 的判斷式用了沒有宣告的參數 "
+                              f"{undeclared.group(1)}(執行窗的 @start_date / @end_date "
+                              f"已經自動宣告):這是判斷式本身的問題,不是條件不成立")
             return None, f"條件 {c.get('id')} 的判斷式執行失敗:{str(e)[:120]}"
         if not row:
             return None, f"條件 {c.get('id')} 的判斷式沒有回傳值"

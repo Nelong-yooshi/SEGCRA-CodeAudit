@@ -4312,8 +4312,8 @@ MUTANTS.update({
         "        if cofail:" + NL + "            r[\"label_cofail\"] = cofail",
         "        if False:" + NL + "            r[\"label_cofail\"] = cofail"),
     "測資:判斷式算不出來時回部分結果": (S,
-        "        except Exception as e:\n            return None, f\"條件 {c.get('id')} 的判斷式執行失敗:{str(e)[:120]}\"",
-        "        except Exception:\n            continue"),
+        "            return None, f\"條件 {c.get('id')} 的判斷式執行失敗:{str(e)[:120]}\"",
+        "            continue"),
     # 基準＋變體(測資正確率的修法)。預期值由構造決定,不由模型判斷——實測
     # 模型在 46 個案例裡填錯 12 個,其中 10 個是「只滿足一條卻說該命中」。
     "測資:基準/變體的預期值照抄模型給的": (S,
@@ -5899,6 +5899,24 @@ MUTANTS.update({
      + "        # 測試與評測會換上自己的假用戶端,不一定有 close();收尾失敗也不該讓一份"),
 })
 
+
+
+# ---- 判斷式(check_sql)的參數宣告:判斷式是單獨執行的,沒宣告就每個案例都「標籤未驗證」
+MUTANTS.update({
+ # 判斷式的參數宣告(部署端現場 S1):沒宣告就每個案例都「標籤未驗證」
+ '判斷式:執行前不宣告執行窗參數(標籤全部變成未驗證)': ("spec_exec.py",
+     '            cursor.execute(_window_decls(q) + _wrap_check_sql(q))',
+     '            cursor.execute(_wrap_check_sql(q))'),
+ '判斷式:沒宣告的參數跟條件不成立混在一起': ("spec_exec.py",
+     '            undeclared = _UNDECLARED_RE.search(str(e))',
+     '            undeclared = None'),
+ '判斷式:宣告的值跟受審 SQL 不一致': ("spec_exec.py",
+     '_WINDOW_PARAMS = (("@start_date", f"DATE = \'{WIN_START}\'"),\n                  ("@end_date", f"DATE = \'{WIN_END}\'"))',
+     '_WINDOW_PARAMS = (("@start_date", "DATE = \'1900-01-01\'"),\n                  ("@end_date", "DATE = \'1900-01-02\'"))'),
+ '判斷式:沒用到也照樣宣告': ("spec_exec.py",
+     '    return "DECLARE " + ", ".join(used) + ";\\n" if used else ""',
+     '    return "DECLARE " + ", ".join(used) + ";\\n" if True else ""'),
+})
 
 if __name__ == "__main__":
     sys.exit(main())
