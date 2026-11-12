@@ -64,6 +64,13 @@ DEBOUNCE_SECONDS = env_seconds("WEBHOOK_DEBOUNCE_SECONDS", 10)
 # 留言開頭的 /review 指令(後面是空白或結尾)。寫在內文、網址裡、或 /reviews 都不算
 _REVIEW_COMMAND = re.compile(r"\A\s*/review(?:\s|\Z)")
 
+# 機器人帳號的名稱:我們自己取的 ai- 開頭、root,以及 GitLab 替 project / group access token
+# 產生的 project_<id>_bot_<亂數>、group_<id>_bot_<亂數>。用 match 從名稱開頭比
+_BOT_NAME = re.compile(r"ai-|root|(?:project|group)_\d+_bot")
+# GITLAB_TOKEN 的帳號 id:服務啟動時向 GitLab 查一次(_learn_own_account)。webhook 請求裡不查,
+# GitLab 等 webhook 回應只等幾秒,不能為了這個多打一次 API。查不到時是 None,只靠名稱判斷
+_own_user_id: int | None = None
+
 # 每個 MR 一份進行中的紀錄:{mr_iid: (event_loop, task)}。
 # 用它做兩件事:同一 MR 推新 commit 時取消舊的那次、以及知道誰還在跑。
 _inflight: dict = {}
@@ -346,6 +353,27 @@ def _review_command(note) -> bool:
     return isinstance(note, str) and _REVIEW_COMMAND.match(note) is not None
 
 
+def _from_bot(user) -> bool:
+    """留言的人是不是機器人:審查自己(GITLAB_TOKEN 的帳號),或名稱是機器人帳號的格式。"""
+    if not isinstance(user, dict):
+        return False
+    if _BOT_NAME.match(user.get("username") or ""):
+        return True
+    uid = user.get("id")
+    if not isinstance(uid, int) or isinstance(uid, bool):        # True == 1,布林不算
+        return False
+    return _own_user_id is not None and uid == _own_user_id
+
+
+def _learn_own_account() -> None:
+    """服務啟動時查一次 GITLAB_TOKEN 是哪一個帳號,之後它留的言都不觸發審查。"""
+    global _own_user_id
+    from toolbox import gitlab
+    _own_user_id = gitlab.token_user_id()
+    if _own_user_id is None and gitlab.REAL_MODE:
+        print("[webhook] 查不到 GITLAB_TOKEN 的帳號,只用名稱判斷機器人留言", flush=True)
+
+
 def _handle(payload: dict) -> str:
     """一個 webhook 事件要不要觸發審查;回傳回給 GitLab 的文字。觸發時排一份審查(_trigger)。"""
     kind = payload.get("object_kind")
@@ -370,7 +398,7 @@ def _handle(payload: dict) -> str:
     if kind == "note":                      # 討論串留言:只有開頭的 /review 才重審(Draft 也審)
         attrs = payload.get("object_attributes", {})
         mr = payload.get("merge_request", {})
-        author_bot = payload.get("user", {}).get("username", "").startswith(("ai-", "root"))
+        author_bot = _from_bot(payload.get("user"))
         if (attrs.get("noteable_type") == "MergeRequest" and mr.get("iid")
                 and _review_command(attrs.get("note")) and not author_bot):
             return _trigger(int(mr["iid"]), head_sha=mr.get("last_commit", {}).get("id"))
@@ -432,6 +460,7 @@ def main():
     if not SECRET:
         print("⚠️ 未設 GITLAB_WEBHOOK_SECRET,所有 webhook 請求都會被拒絕(請先 export)。",
               flush=True)
+    _learn_own_account()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[webhook] 監聽 http://{args.host}:{args.port}/gitlab-webhook  profile={PROFILE}  "
           f"real_mode={'on' if os.environ.get('GITLAB_URL') else 'off(mock)'}", flush=True)
