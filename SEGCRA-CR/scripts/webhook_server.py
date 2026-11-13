@@ -203,6 +203,8 @@ def _run_review(mr_iid: int, head_sha: str | None = None, ci_ticket: str | None 
                 _inflight.pop(mr_iid, None)
             if in_ci and ci_ticket in _ci_reviews:
                 _ci_reviews[ci_ticket]["code"] = code
+                entry = _ci_reviews[ci_ticket]
+                _remember_ci_result(entry.get("key"), code, entry.get("sha"))
         _close_loop(loop, mr_iid)
 
 
@@ -264,6 +266,36 @@ def _start(mr_iid: int, head_sha: str | None) -> None:
 _ci_reviews: dict = {}
 # 最多記幾份;超過時丟掉最舊的、已經結束的(查不到的編號,job 會以 EXIT_INCOMPLETE 結束)
 MAX_CI_REVIEWS = 500
+# 每個 MR(同一個目標分支)→ (上一次 CI 審查**跑完**的結束碼, 上一次處理的 commit),給
+# CI_REVIEW_REPEAT=first 判斷要不要跳過(見 ci_gate.should_skip):上一次處理的(審過或跳過的)
+# 同一個 commit 又送來,就是有人按了 retry,要真的審。只在記憶體:服務重新啟動後忘記,下一次就照樣審 —— 出錯時往「多審」的方向走。
+# 有上限,超過時丟掉最舊的(一樣是多審)
+_ci_history: dict = {}
+MAX_CI_HISTORY = 2000
+
+
+def _remember_ci_result(key, code, sha=None) -> None:
+    """記下這個 MR 上一次 CI 審查的結束碼與處理的 commit(呼叫端持有 _lock)。"""
+    if key is None:
+        return
+    _ci_history.pop(key, None)
+    while len(_ci_history) >= MAX_CI_HISTORY:
+        _ci_history.pop(next(iter(_ci_history)))
+    _ci_history[key] = (code, sha)
+
+
+def _announce_skipped(mr_iid: int, previous: int) -> None:
+    """跳過時寫回 MR:留言說明這次的改動沒有經過 AI 審查,標籤改成交人工(不然 MR 上還掛著
+    上一次的「自動放行」)。兩個動作各自做,失敗只記種類。"""
+    from toolbox import gitlab
+    for what, send in (("留言", lambda: gitlab.post_note(str(mr_iid), ci_gate.skipped_note(previous))),
+                       ("標籤", lambda: gitlab.set_label(str(mr_iid), "ai-review::needs_human"))):
+        try:
+            failure = gitlab.write_failure(send())
+        except Exception as e:               # noqa: BLE001 — 只記種類
+            failure = type(e).__name__
+        if failure is not None:
+            print(f"[webhook] MR !{mr_iid} 跳過審查時{what}沒寫上({failure})", flush=True)
 
 
 def _ci_job(job_token):
@@ -296,12 +328,26 @@ def _ci_start(job_token, body) -> tuple[int, str]:
         print(f"[webhook] /ci/review 拒絕 MR !{mr_iid}:{reason}", flush=True)
         return 403, reason
     ticket = secrets.token_urlsafe(16)
+    key = (mr_iid, (mr or {}).get("target_branch") or "")
+    mode = ci_gate.review_repeat()
     with _lock:
         done = [t for t, e in _ci_reviews.items() if e["code"] is not None]
         while len(_ci_reviews) >= MAX_CI_REVIEWS and done:
             _ci_reviews.pop(done.pop(0), None)
-        _ci_reviews[ticket] = {"job": job["id"], "mr": mr_iid, "code": None}
-        timer = _pending.pop(mr_iid, None)
+        previous, last_sha = _ci_history.get(key, (None, None))
+        skip = ci_gate.should_skip(mode, previous, requested=last_sha == sha)
+        _ci_reviews[ticket] = {"job": job["id"], "mr": mr_iid, "key": key, "sha": sha,
+                               "code": ci_gate.EXIT_NEEDS_HUMAN if skip else None}
+        timer = None
+        if skip:
+            _remember_ci_result(key, previous, sha)
+        else:
+            timer = _pending.pop(mr_iid, None)
+    if skip:
+        print(f"[webhook] MR !{mr_iid} 已審過(CI_REVIEW_REPEAT=first,上一次結束碼 {previous}),"
+              f"這次不審、交人工(job {job['id']})", flush=True)
+        threading.Thread(target=_announce_skipped, args=(mr_iid, previous), daemon=True).start()
+        return 202, ticket
     if timer is not None:
         # webhook 那條路還在等安靜期的,不用再審一次:上面已經從 _pending 拿掉,計時器到了也不會開始
         # (見 _start 的身分比對);這裡取消只是省掉一次喚醒

@@ -4929,6 +4929,54 @@ MUTANTS.update({
 })
 
 
+# ---- CI 審查只審第一次(CI_REVIEW_REPEAT=first):設錯、記錯都要往「多審」的方向走
+W = "../scripts/webhook_server.py"
+MUTANTS.update({
+ "重審模式:不認得的值照用": ("ci_gate.py",
+     "    return value if value in (REPEAT_EVERY, REPEAT_FIRST) else REPEAT_EVERY",
+     "    return value or REPEAT_EVERY"),
+ "重審模式:不去空白、分大小寫": ("ci_gate.py",
+     'os.environ.get("CI_REVIEW_REPEAT", "every").strip().lower()',
+     'os.environ.get("CI_REVIEW_REPEAT", "every")'),
+ "重審模式:有人要求重審也跳過": ("ci_gate.py",
+     "    return (mode == REPEAT_FIRST and not requested",
+     "    return (mode == REPEAT_FIRST"),
+ "重審模式:上一次擋下或沒跑完整也跳過": ("ci_gate.py",
+     "            and previous in (EXIT_APPROVED, EXIT_NEEDS_HUMAN))",
+     "            and previous is not None)"),
+ "重審模式:要求重審不看是不是同一個 commit": (W,
+     "requested=last_sha == sha)",
+     "requested=False)"),
+ "重審模式:跳過時不記下這次的 commit": (W,
+     "        if skip:" + NL + "            _remember_ci_result(key, previous, sha)",
+     "        if False:" + NL + "            _remember_ci_result(key, previous, sha)"),
+ "重審模式:審完不記 commit": (W,
+     '                _remember_ci_result(entry.get("key"), code, entry.get("sha"))',
+     '                _remember_ci_result(entry.get("key"), code)'),
+ "重審模式:審完不記結果": (W,
+     "                entry = _ci_reviews[ci_ticket]" + NL + "                _remember_ci_result(",
+     "                entry = _ci_reviews[ci_ticket]" + NL + "                (lambda *a: None)("),
+ "重審模式:紀錄沒有上限": (W,
+     "    while len(_ci_history) >= MAX_CI_HISTORY:",
+     "    while False:"),
+ "重審模式:跳過時不寫回 MR": (W,
+     "        threading.Thread(target=_announce_skipped, args=(mr_iid, previous), daemon=True).start()",
+     "        pass"),
+ "重審模式:跳過時回放行": (W,
+     '"code": ci_gate.EXIT_NEEDS_HUMAN if skip else None}',
+     '"code": ci_gate.EXIT_APPROVED if skip else None}'),
+ "重審模式:紀錄的鍵不含目標分支": (W,
+     '    key = (mr_iid, (mr or {}).get("target_branch") or "")',
+     '    key = (mr_iid, "")'),
+ "重審模式:mr_head 不帶目標分支": ("../toolbox/gitlab.py",
+     '            "target_branch": mr.get("target_branch") or ""}',
+     '            "target_branch": ""}'),
+ "重審模式:一般留言失敗時往外丟": ("../toolbox/gitlab.py",
+     "            failure = _failure_kind(e)" + NL + "            return _write_failed(failure)",
+     "            raise"),
+})
+
+
 # ---- 主審查的輸出被截斷
 # 失效是靜默的:被切斷的 JSON 會被修補成合法物件,報告只是比較短。
 P = "pipeline.py"
