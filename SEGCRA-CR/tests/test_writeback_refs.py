@@ -449,6 +449,18 @@ def test_收掉幾個會記進報告(monkeypatch, tmp_path):
     assert report["_resolved_stale"] == 3
 
 
+@pytest.mark.parametrize("reply", [
+    json.dumps([1, 2, 3]),              # parse 得出,但不是 dict
+    json.dumps("ok"),                    # 字串
+    "不是 JSON",                          # ToolHub 把例外轉成的錯誤字串
+])
+def test_看不懂回傳就記0_不猜(monkeypatch, tmp_path, reply):
+    """`resolved` 這個數字只寫進報告給人看。看不懂回傳的時候記 0(= 不確定)比猜一個
+    數字老實——猜 1 會讓報告說「收掉了 1 個」,其實根本不知道。"""
+    report, _, _ = _review_with(monkeypatch, tmp_path, {"resolve_stale_comments": reply})
+    assert report["_resolved_stale"] == 0
+
+
 def test_commit_status_沒寫上時總結與_log_寫明(monkeypatch, tmp_path, capsys):
     report, order, bodies = _review_with(monkeypatch, tmp_path, {"set_commit_status": _FAILED})
     assert report["_writeback"] == {"unposted": 0, "commit_status": "uncertain"}
