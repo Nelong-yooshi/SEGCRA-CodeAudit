@@ -3071,7 +3071,21 @@ def enforce_dbt_unexecuted(report: dict, mr: dict, dbt_ctx: DbtContext | None,
     一樣適用:樣板檔與純 SQL 檔混在同一個 MR 時,通過的是純 SQL 檔。
 
     executed_dbt 是展開後真的送進沙盒、而且就是執行驗證跑的那個 model(見 _dbt_exec_mr)。
-    它是這個 MR 唯一改到 dbt 的檔案時,通過的就是這個 model 本身,不補(_only_dbt_file)。"""
+    它是這個 MR 唯一改到 dbt 的檔案時,通過的就是這個 model 本身,不補(_only_dbt_file)。
+
+    例外的例外:執行時 ref() 指向的上游 model 由規格的測資代替(report["_dbt_exec"] 的 stand_ins),
+    而這個 MR 也改了其中的 model 時一律補,不管那個檔案有沒有樣板標記 —— 它的改動沒有被執行,
+    純 SQL 寫成的 model 也一樣(_only_dbt_file 不會把它算成 dbt 的檔案)。"""
+    upstream = _changed_stand_ins(mr, dbt_ctx, report.get("_dbt_exec"), executed_dbt)
+    if upstream and (report.get("_spec_exec") or {}).get("passed") is True:
+        finding = {
+            "file": "(MR 內容)", "line": 0, "title": _DBT_UNEXECUTED_TITLE, "severity": "major",
+            "detail": f"這個 MR 也改了上游 model:{'、'.join(upstream[:10])}。執行驗證時它們由規格的"
+                      f"測資代替,改動本身沒有經過執行驗證,不得自動放行。",
+            "suggestion": "上游 model 另外依它自己的規格驗證,或以 dbt compile 取得展開後的 SQL 人工核對。",
+            "citations": []}
+        _put_program_finding(report, finding)
+        return report
     if not _mr_touches_dbt(mr, dbt_ctx, dbt_cfg):
         return report
     if executed_dbt is not None and _only_dbt_file(mr, dbt_ctx, executed_dbt):
@@ -3103,6 +3117,29 @@ def _only_dbt_file(mr: dict, dbt_ctx: DbtContext | None, path: str) -> bool:
     return True
 
 
+def _changed_stand_ins(mr: dict, dbt_ctx: DbtContext | None, dbt_exec, executed_dbt) -> list[str]:
+    """這個 MR 改到的檔案裡,執行驗證時由規格的測資代替的上游 model(model 名稱 = 檔名去掉
+    .sql)。只看真的展開送進沙盒、而且就是執行驗證跑的那次(executed_dbt)。"""
+    if executed_dbt is None or not isinstance(dbt_exec, dict) or dbt_exec.get("file") != executed_dbt:
+        return []
+    stand_ins = {n for n in dbt_exec.get("stand_ins") or [] if isinstance(n, str)}
+    if not stand_ins or dbt_ctx is None or dbt_ctx.project is None:
+        return []
+    project = dbt_ctx.project
+    found = []
+    for f in mr.get("files", []):
+        path = f.get("path") if isinstance(f, dict) else None
+        rel = dbt_ctx.relative(path) if isinstance(path, str) else None
+        if rel is None or not rel.endswith(".sql"):
+            continue
+        if path_kind(rel, project.model_paths, project.macro_paths, project.resource_paths) != "model":
+            continue
+        name = rel.rsplit("/", 1)[-1][:-len(".sql")]
+        if name in stand_ins and name not in found:
+            found.append(name)
+    return found
+
+
 _DBT_EXEC_NOTE_TITLE = "dbt model 沒有送進沙盒執行"
 _DBT_EXEC_STAND_IN_TITLE = "執行驗證時上游 model 由測資代替"
 
@@ -3119,7 +3156,7 @@ def enforce_dbt_exec_note(report: dict, dbt_exec: dict | None) -> dict:
     if dbt_exec.get("ok"):
         stand_ins = [n for n in dbt_exec.get("stand_ins") or [] if isinstance(n, str)]
         if stand_ins:
-            _put_program_finding(report, {
+            note = {
                 "file": dbt_exec["file"] or "(MR 內容)", "line": 0, "severity": "info",
                 "title": _DBT_EXEC_STAND_IN_TITLE,
                 "detail": f"執行驗證時,ref() 指向的上游 model 由規格「資料表定義」裡同名的測資表代替:"
@@ -3127,7 +3164,8 @@ def enforce_dbt_exec_note(report: dict, dbt_exec: dict | None) -> dict:
                           f"{f'(共 {len(stand_ins)} 個)' if len(stand_ins) > 10 else ''}。"
                           f"這些上游 model 自己的邏輯沒有在這次執行。",
                 "suggestion": "上游 model 有改動時,要另外驗證它本身。",
-                "citations": [], "_source": PROGRAM_SOURCE})
+                "citations": [], "_source": PROGRAM_SOURCE}
+            _put_program_finding(report, note)
         return report
     if not dbt_exec.get("reason"):
         return report

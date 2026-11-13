@@ -19,14 +19,15 @@ TABLES = {"transactions": "[transactions]", "stg_a": "[stg_a]", "stg_alias": "[s
 def _info(**kw) -> DbtProjectInfo:
     base = dict(project_name="sample",
                 ref_names=frozenset({"mrt_BIG", "stg_a", "stg_b", "stg_dup", "code_seed",
-                                     "stg_other"}),
+                                     "stg_other", "stg_blank"}),
                 sources={("raw", "transactions"): (None, None), ("raw", "stg_a"): (None, None)},
                 refs_complete=True, sources_complete=True,
                 naming={"mrt_BIG": {"alias": None, "schema": None, "database": None},
                         "stg_a": {"alias": None, "schema": None, "database": None},
                         "stg_b": {"alias": "stg_alias", "schema": "custom", "database": None},
                         "stg_dup": {"alias": "dup", "schema": None, "database": None},
-                        "stg_other": {"alias": "not in spec", "schema": None, "database": None}},
+                        "stg_other": {"alias": "not in spec", "schema": None, "database": None},
+                        "stg_blank": {"alias": "   ", "schema": None, "database": None}},
                 uncertain_models=frozenset({"code_seed"}))
     base.update(kw)
     return DbtProjectInfo(**base)
@@ -92,6 +93,7 @@ def test_一般展開不受影響():
 @pytest.mark.parametrize("src, why", [
     ("{{ ref('code_seed') }}", "表名無法確定"),                  # seed / snapshot
     ("{{ ref('stg_other') }}", "表名無法確定"),                  # alias 不是英數與底線
+    ("{{ ref('stg_blank') }}", "表名無法確定"),                  # alias 只有空白:dbt 去掉之後是空的
     ("{{ ref('nope') }}", "不存在"),
     ("{{ ref('pkg', 'stg_a') }}", "其他套件"),
     ("{{ ref('stg_a', version=2) }}", "關鍵字參數"),

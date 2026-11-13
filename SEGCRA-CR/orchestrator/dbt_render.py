@@ -702,7 +702,9 @@ def _stand_in_name(project: "DbtProjectInfo", name: str) -> str | None:
     naming = project.naming.get(name)
     if naming is None:
         return None
-    alias = naming["alias"].strip() if naming.get("alias") else name
+    # dbt 的 generate_alias_name:有設就去頭尾空白(只有空白的會變成空字串,不合法)
+    raw = naming.get("alias")
+    alias = raw.strip() if raw else name
     return alias if _IDENT.fullmatch(alias) else None
 
 

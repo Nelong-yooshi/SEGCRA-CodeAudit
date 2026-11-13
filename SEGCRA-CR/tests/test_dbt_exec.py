@@ -463,6 +463,56 @@ def test_ref_由測資代替時送進沙盒_並寫出上游的邏輯沒有執行
     assert note["severity"] == "info" and "stg_a" in note["detail"]
     assert "沒有在這次執行" in note["detail"]
     assert _DBT_EXEC_NOTE_TITLE not in _titles(report)
+    assert _DBT_UNEXECUTED_TITLE not in _titles(report)       # 上游沒改:通過的就是這個 model
+
+
+def _passed_with(stand_ins, file="models/mrt_BIG.sql", ok=True, passed=True):
+    return {"findings": [], "_spec_exec": {"passed": passed},
+            "_dbt_exec": {"file": file, "ok": ok, "reason": None, "stand_ins": stand_ins}}
+
+
+REF_MR = {"files": [{"path": p, "diff": "@@ -1 +1 @@\n+x", "full_content": REF_FILES[p]}
+                    for p in ("models/stg_a.sql", "models/mrt_BIG.sql")]}
+
+
+def test_改了由測資代替的上游_不管有沒有樣板都補未執行():
+    ctx = _ctx(["models/stg_a.sql", "models/mrt_BIG.sql"], REF_FILES)
+    (fd,) = enforce_dbt_unexecuted(_passed_with(["stg_a"]), REF_MR, ctx, CFG,
+                                   "models/mrt_BIG.sql")["findings"]
+    assert (fd["severity"], fd["title"]) == ("major", _DBT_UNEXECUTED_TITLE)
+    assert "stg_a" in fd["detail"] and "由規格的測資代替" in fd["detail"]
+
+
+def test_上游是樣板時也寫出是哪個上游():
+    files = dict(REF_FILES, **{"models/stg_a.sql": "SELECT account_no FROM {{ source('raw', 'transactions') }}"})
+    mr = {"files": [{"path": p, "diff": "@@ -1 +1 @@\n+x", "full_content": files[p]}
+                    for p in ("models/stg_a.sql", "models/mrt_BIG.sql")]}
+    (fd,) = enforce_dbt_unexecuted(_passed_with(["stg_a"]), mr, _ctx(list(files), files), CFG,
+                                   "models/mrt_BIG.sql")["findings"]
+    assert "stg_a" in fd["detail"]
+
+
+@pytest.mark.parametrize("report, executed", [
+    (_passed_with(["stg_a"]), None),                                  # 跑的不是展開的 model
+    (_passed_with(["stg_a"], file="models/other.sql"), "models/mrt_BIG.sql"),
+    (_passed_with(["stg_a"], passed=False), "models/mrt_BIG.sql"),    # 執行驗證沒通過:它自己會說
+    (_passed_with([]), "models/mrt_BIG.sql"),                         # 沒有代替
+    (_passed_with(["stg_b"]), "models/mrt_BIG.sql"),                  # 代替的不是 MR 改到的
+])
+def test_上游的改動沒被執行_其他情況不補(report, executed):
+    """不補「上游由測資代替」那一種;其餘照既有的判斷(例如跑的不是展開的 model 時照舊補一般的)。"""
+    ctx = _ctx(["models/stg_a.sql", "models/mrt_BIG.sql"], REF_FILES)
+    out = enforce_dbt_unexecuted(report, REF_MR, ctx, CFG, executed)
+    assert not any("上游 model" in f["detail"] for f in out["findings"])
+
+
+def test_同名但不在_model_目錄的檔案不算上游():
+    files = dict(REF_FILES, **{"sql/stg_a.sql": "SELECT 1"})
+    mr = {"files": [{"path": p, "diff": "@@ -1 +1 @@\n+x", "full_content": files[p]}
+                    for p in ("sql/stg_a.sql", "models/mrt_BIG.sql")]}
+    out = enforce_dbt_unexecuted(_passed_with(["stg_a"]), mr, _ctx(list(mr_p["path"] for mr_p in mr["files"]), files),
+                                 CFG, "models/mrt_BIG.sql")
+    assert not any("上游 model" in f["detail"] for f in out["findings"])
 
 
 def test_由測資代替的_info():
@@ -489,6 +539,16 @@ def test_模型同標題的代替說明_被程式的取代():
                                                             "reason": None, "stand_ins": ["stg_a"]})
     (fd,) = report["findings"]
     assert "上游也驗過了" not in fd["detail"] and "stg_a" in fd["detail"]
+
+
+def test_同時改了上游_model_時_通過也要補未執行(run):
+    """上游 model 由測資代替,它自己的改動沒有被執行:MR 改到 dbt 的不只這個 model。"""
+    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC_STG, encoding="utf-8")
+    report, sqls = run(["models/stg_a.sql", "models/mrt_BIG.sql"], REF_FILES)
+    assert sqls == ["SELECT account_no FROM [stg_a]"]
+    assert _DBT_UNEXECUTED_TITLE in _titles(report)
+    assert _DBT_EXEC_STAND_IN_TITLE in _titles(report)
+    assert report["decision"] == "needs_human"
 
 
 def test_同時改了_macro_時_通過也要補未執行(run):
