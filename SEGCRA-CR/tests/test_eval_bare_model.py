@@ -44,6 +44,7 @@ def test_管線的報告照用自己的決策():
 @pytest.mark.parametrize("want, got, ok", [
     ("blocked", "blocked", True), ("blocked", "needs_human", False),
     (["needs_human", "blocked"], "needs_human", True), (["needs_human", "blocked"], "auto_approved", False),
+    (["needs_human", "blocked"], "blocked", True),                 # 清單裡的每一個都算,不只第一個
     (None, "blocked", None),
 ])
 def test_決策有沒有落在預期裡(want, got, ok):
