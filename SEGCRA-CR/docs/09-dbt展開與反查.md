@@ -45,7 +45,10 @@
    - `ref()` / `source()` 展開成 `"<資料庫>"."<綱要>"."<表>"`(資料庫名由呼叫端傳入,不猜);
      沒有專案資訊時綱要固定為 `dbo`,有專案資訊時見下方「`ref()` / `source()` 的精確度」
    - `config()` 回傳空字串、`var()` 取呼叫端給的值、`execute` 為 True、
-     `is_incremental()` 預設為 False(比照 compile 期)。以 `incremental=True` 展開時回 True;
+     `is_incremental()` 預設為 False(比照 compile 期)。審查時的 `var()` 值來自設定檔的 `dbt.vars`
+     與 `dbt.run_date_vars`(見 10 篇):正式環境由排程每次傳入的變數(例如 `target_date`),審查時沒有人傳,
+     沒有預設值就展開失敗(dbt 也是);日期變數一律給執行驗證測資的日期,展開出來的 SQL 才撈得到沙盒裡的
+     測資。一份審查開始時記下這組值(`start_review_invocation`),之後的展開都帶同一組。以 `incremental=True` 展開時回 True;
      `RenderResult.incremental_checked` 說明樣板(含它呼叫的 macro)有沒有呼叫 `is_incremental()`
    - `this`:跟 dbt 一樣兩種模式都提供(這個 model 自己的表,規則與 `ref()` 相同),所以
      `{% if this is defined %}` 裡的 SQL 一般模式就展開得出來,非增量的 model 直接寫 `{{ this }}`

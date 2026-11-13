@@ -146,7 +146,8 @@ def test_review_mr_在處理_MR_之前就設好這份審查的_invocation_id(mon
     """後面的展開(預掃、受影響 model)才會共用同一個值。"""
     from orchestrator.config import load_config
     calls = []
-    monkeypatch.setattr(dbt_render, "start_review_invocation", lambda: calls.append(1))
+    monkeypatch.setattr(dbt_render, "start_review_invocation",
+                        lambda variables=None: calls.append(1))
 
     async def stop(*a, **kw):
         raise RuntimeError("停在這裡")

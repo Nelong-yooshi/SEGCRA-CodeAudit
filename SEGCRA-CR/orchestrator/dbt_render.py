@@ -428,7 +428,8 @@ def _make_var(variables: dict):
         if default is _MISSING:
             raise DbtRenderError(
                 f"var('{name}') 沒有預設值,呼叫端也沒有提供。"
-                f"dbt 在這種情況會編譯失敗,這裡同樣不猜值。")
+                f"dbt 在這種情況會編譯失敗,這裡同樣不猜值。正式環境的值由排程每次執行時傳入的話,"
+                f"在設定檔的 dbt.vars(固定值)或 dbt.run_date_vars(這次執行的日期)給值。")
         return default
 
     return var
@@ -706,14 +707,20 @@ _REVIEW_INVOCATION_ID: contextvars.ContextVar = contextvars.ContextVar(
 # 裡跑,參數要能編碼(見 isolation.run_isolated)。
 _REVIEW_RUN_STARTED_AT: contextvars.ContextVar = contextvars.ContextVar(
     "segcra_review_run_started_at", default=None)
+# 這份審查的 dbt 變數(設定檔的 dbt.vars / dbt.run_date_vars,見 pipeline._review_variables):
+# 一般、增量、插記號、受影響 model 前後、執行驗證的展開都用同一組,不用每個呼叫點各傳一次
+_REVIEW_VARIABLES: contextvars.ContextVar = contextvars.ContextVar(
+    "segcra_review_variables", default=None)
 
 
-def start_review_invocation() -> str:
-    """一份審查開始時呼叫一次:之後這份審查的展開(render_model_isolated)都用同一個 invocation_id
-    與 run_started_at。沒有呼叫時(單獨展開一個 model),每次展開產生新的值。"""
+def start_review_invocation(variables: dict | None = None) -> str:
+    """一份審查開始時呼叫一次:之後這份審查的展開(render_model_isolated)都用同一個 invocation_id、
+    run_started_at 與 dbt 變數(variables)。沒有呼叫時(單獨展開一個 model),每次展開產生新的值、
+    不帶變數。"""
     value = _invocation_id()
     _REVIEW_INVOCATION_ID.set(value)
     _REVIEW_RUN_STARTED_AT.set(_now_utc().isoformat())
+    _REVIEW_VARIABLES.set(dict(variables or {}))
     return value
 
 
@@ -1607,6 +1614,9 @@ def render_model_isolated(model_path, *, timeout_s: float = DEFAULT_ISOLATED_TIM
     started = _REVIEW_RUN_STARTED_AT.get()
     if started is not None:
         kwargs.setdefault("run_started_at", started)
+    review_vars = _REVIEW_VARIABLES.get()
+    if review_vars and kwargs.get("variables") is None:
+        kwargs["variables"] = dict(review_vars)
     result = run_isolated(render_model, (model_path,), kwargs, timeout_s=timeout_s,
                           max_memory_mb=max_memory_mb, on_failure=_render_failure,
                           types=(RenderResult, DbtProjectInfo))

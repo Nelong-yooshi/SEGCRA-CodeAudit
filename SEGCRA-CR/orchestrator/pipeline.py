@@ -704,6 +704,20 @@ class _Expanded(NamedTuple):
     syntax_line: int | None = None
 
 
+def _review_variables(dbt_cfg: dict | None) -> dict:
+    """這份審查展開時給 dbt 的變數:設定檔的 dbt.vars,加上 dbt.run_date_vars 列的變數一律設成
+    執行驗證測資的日期(spec_exec.WIN_START)。日期變數在正式環境由排程每次傳入「這次執行的日期」;
+    審查時給測資的日期,展開出來的 SQL(例如 `TABLE_DATE = '{{ target_date }}'`)才撈得到沙盒裡
+    的測資。規則層看的也是同一份,不另外給一個日期。"""
+    if not isinstance(dbt_cfg, dict):
+        return {}
+    from .spec_exec import WIN_START
+    out = dict(dbt_cfg.get("vars") or {})
+    for name in dbt_cfg.get("run_date_vars") or ():
+        out[name] = WIN_START
+    return out
+
+
 def _render_project(dbt_ctx: DbtContext | None) -> dict:
     """展開時要帶的專案資訊(macro 與 ref()/source() 的驗證);沒有專案時是空的。"""
     if dbt_ctx is None or dbt_ctx.project is None:
@@ -1952,8 +1966,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
     clock = _StageClock()
     review_deadline = clock.start + REVIEW_BUDGET_SECONDS
     skills = load_skills()
-    # 這份審查的 dbt 展開(預掃的一般與增量、受影響 model 的前後)共用一個 invocation_id
-    start_review_invocation()
+    # 這份審查的 dbt 展開(預掃的一般與增量、受影響 model 的前後、執行驗證)共用一個 invocation_id,
+    # 與同一組 dbt 變數
+    start_review_invocation(_review_variables(cfg.dbt))
 
     async with ToolHub(tool_result_max_chars=cfg.budget["tool_result_max_chars"]) as hub:
         hub.register_local(
