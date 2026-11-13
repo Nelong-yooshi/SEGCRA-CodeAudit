@@ -756,4 +756,20 @@ def mr_head(mr_id: str) -> dict | None:
     except Exception:                        # noqa: BLE001
         return None
     return {"sha": mr.get("sha") or "", "state": mr.get("state") or "",
-            "source_project_id": mr.get("source_project_id")}
+            "source_project_id": mr.get("source_project_id"),
+            "target_branch": mr.get("target_branch") or ""}
+
+
+def post_note(mr_id: str, body: str) -> str:
+    """在 MR 上留一則一般留言(不是審查總結:總結另有 post_summary,不能被這則蓋掉)。
+
+    失敗時回 `{"ok": false, "failure": 種類}`,**不重送**(理由同 post_summary)。"""
+    mr_id = _check_mr_id(mr_id)
+    if REAL_MODE:
+        try:
+            _api("POST", f"/merge_requests/{mr_id}/notes", json={"body": body})
+        except Exception as e:               # noqa: BLE001 — 種類記下來,例外訊息不往外帶
+            return _write_failed(_failure_kind(e))
+    else:
+        _mock_output(mr_id, "note", {"body": body})
+    return json.dumps({"ok": True}, ensure_ascii=False)
