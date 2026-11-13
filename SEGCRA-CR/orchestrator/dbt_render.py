@@ -56,6 +56,7 @@
     位址與內部名稱。
   * 展開器跟真正執行時分得出來的地方,樣板可以拿來把語句藏在只有真正執行時才會進的分支:
     `invocation_id` 每份審查不同、同一份審查裡共用(dbt 是一次執行一個,見 _REVIEW_INVOCATION_ID);
+    `run_started_at` 是審查開始的真實時間(UTC),同一份審查裡共用(見 _REVIEW_RUN_STARTED_AT);
     `this` / `ref()` / `source()` 在 dbt 是 Relation 物件,這裡是字串子類別(`_Relation`),型別
     判斷的結果與有哪些屬性都不一定一致,所以對它們做 `defined` / `undefined` 以外的 `is` 判斷、取
     沒有照實模擬的屬性或索引,一律展開失敗(見 _guard_relation_tests、_guard_relation_access)。
@@ -103,6 +104,7 @@
 """
 import contextvars
 import copy
+import datetime
 import difflib
 import pathlib
 import re
@@ -176,7 +178,7 @@ DEFAULT_MACRO_DIRS = ("macros",)
 # macro 不得使用的名稱:dbt 內建(含刻意不提供的 this / env_var / builtins)與 Jinja 內建。
 RESERVED_NAMES = frozenset({
     "ref", "source", "config", "return", "var", "execute", "is_incremental",
-    "invocation_id", "target", "this", "env_var", "builtins",
+    "invocation_id", "run_started_at", "target", "this", "env_var", "builtins",
 }) | frozenset(DEFAULT_NAMESPACE)
 
 # 刻意留空:不預設任何 dbt var。
@@ -187,6 +189,8 @@ _DEFAULT_VARS: dict = {}
 
 _MISSING = object()
 _PLAIN_SCALARS = (str, int, float, bool, type(None))
+# run_started_at 與從它算出來的值(`.date()`、相減)可以直接輸出:字串表示就是時間,不含記憶體位址
+_TIME_VALUES = (datetime.datetime, datetime.date, datetime.time, datetime.timedelta)
 
 # 沒有專案資訊(DbtProjectInfo)時,ref()/source() 展開出的表名有三個已知落差,
 # PR review 要求接線時要讓審查者看得到,不能只寫在模組文件裡沒人會翻:
@@ -308,7 +312,7 @@ def _finalize(value):
         return value            # 交給 StrictUndefined 大聲失敗
     if isinstance(value, _UnavailableRelation):
         value._fail()           # 錯誤訊息寫給不出值的原因,不是「輸出了物件」
-    if not _is_plain(value):
+    if not (_is_plain(value) or isinstance(value, _TIME_VALUES)):
         raise DbtRenderError(
             f"樣板直接輸出了 {type(value).__name__} 物件(例如 {{{{ ref }}}} 少了括號)。"
             f"不輸出,以免洩漏記憶體位址與內部名稱。")
@@ -696,12 +700,72 @@ _REVIEW_INVOCATION_ID: contextvars.ContextVar = contextvars.ContextVar(
     "segcra_review_invocation_id", default=None)
 
 
+# run_started_at 同理:一份審查共用一個(一般、增量兩次展開的原文才會相同)。dbt 是這次執行開始的
+# 時間(`datetime.now(tz=pytz.utc)`),這裡用審查開始的真實時間 —— 固定值的話,樣板可以拿
+# `{% if run_started_at.year > 2000 %}` 這類條件分辨自己是不是在被審查。存 ISO 字串:展開在子行程
+# 裡跑,參數要能編碼(見 isolation.run_isolated)。
+_REVIEW_RUN_STARTED_AT: contextvars.ContextVar = contextvars.ContextVar(
+    "segcra_review_run_started_at", default=None)
+
+
 def start_review_invocation() -> str:
-    """一份審查開始時呼叫一次:之後這份審查的展開(render_model_isolated)都用同一個 invocation_id。
-    沒有呼叫時(單獨展開一個 model),每次展開產生新的值。"""
+    """一份審查開始時呼叫一次:之後這份審查的展開(render_model_isolated)都用同一個 invocation_id
+    與 run_started_at。沒有呼叫時(單獨展開一個 model),每次展開產生新的值。"""
     value = _invocation_id()
     _REVIEW_INVOCATION_ID.set(value)
+    _REVIEW_RUN_STARTED_AT.set(_now_utc().isoformat())
     return value
+
+
+def _now_utc() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+_LOCAL_TIME = ("run_started_at 換成主機的本地時間(astimezone() 沒給時區、now()、today()、utcnow()、"
+               "fromtimestamp() 沒給時區):結果看執行那台主機的時區與時間,展開器不知道部署端的設定,不猜")
+
+
+class _RunStartedAt(datetime.datetime):
+    """run_started_at 的值。跟 dbt 一樣是帶 UTC 時區的 datetime,另外擋下看主機本地時區或現在時間的寫法:
+    `.astimezone()` 不給時區會換成執行那台主機的時區,`now()` 這類 classmethod 給的是那台主機的現在
+    時間 —— 展開器照算的話,得到的是審查機的值(dbt 執行時是部署端主機的值),而且每次展開都不同。
+    加減與 `replace()` 的結果仍是這個型別,先運算再呼叫也一樣擋得到。"""
+
+    def astimezone(self, tz=None):
+        if tz is None:
+            raise DbtRenderError(_LOCAL_TIME)
+        return super().astimezone(tz)
+
+    @classmethod
+    def _local_time(cls, *args, **kwargs):
+        raise DbtRenderError(_LOCAL_TIME)
+
+    @classmethod
+    def fromtimestamp(cls, t, tz=None):
+        if tz is None:
+            raise DbtRenderError(_LOCAL_TIME)
+        return super().fromtimestamp(t, tz)
+
+    now = today = utcnow = _local_time
+
+
+def _as_run_started_at(value: datetime.datetime) -> _RunStartedAt:
+    utc = value.astimezone(datetime.timezone.utc)
+    return _RunStartedAt(utc.year, utc.month, utc.day, utc.hour, utc.minute, utc.second,
+                         utc.microsecond, tzinfo=datetime.timezone.utc)
+
+
+def _checked_run_started_at(value) -> _RunStartedAt:
+    """呼叫端給的 run_started_at(ISO 字串)要帶時區、而且是 UTC(dbt 的預設);沒給時用現在。"""
+    if value is None:
+        return _as_run_started_at(_now_utc())
+    try:
+        parsed = datetime.datetime.fromisoformat(value) if isinstance(value, str) else None
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed.utcoffset() != datetime.timedelta(0):
+        raise DbtRenderError("run_started_at 的格式不對(要是帶 UTC 時區的 ISO 時間)")
+    return _as_run_started_at(parsed)
 
 
 def _checked_invocation_id(value) -> str:
@@ -999,7 +1063,8 @@ def build_env(code_root=None, variables: dict | None = None,
               macro_dirs=DEFAULT_MACRO_DIRS, adapter: str = DEFAULT_ADAPTER,
               project: DbtProjectInfo | None = None, macro_files: dict | None = None,
               model_name: str | None = None, incremental: bool = False,
-              invocation_id: str | None = None, sandbox_tables: dict | None = None):
+              invocation_id: str | None = None, sandbox_tables: dict | None = None,
+              run_started_at: str | None = None):
     """建好含 dbt 樁與 macro 的 Environment。code_root 與 macro_files 都沒給時不載入任何 macro。
 
     macro_files 專案的檔案 {相對專案根的路徑: 內容}(從 GitLab 取回、不在磁碟上的專案用)。
@@ -1011,6 +1076,7 @@ def build_env(code_root=None, variables: dict | None = None,
     incremental `is_incremental()` 的回傳值;True 時需要 model_name
     model_name  這次展開的 model 名稱({{ this }} 的表名;沒給時不提供 {{ this }})
     invocation_id 這次展開的 invocation_id(uuid4 的寫法);沒給時產生新的
+    run_started_at 這次展開的 run_started_at(帶 UTC 時區的 ISO 字串);沒給時用現在
     sandbox_tables 執行驗證用:source() 指向規格建的測資表(見 _sandbox_relations)
 
     回傳 (env, macro 名稱清單, 同名衝突清單)。
@@ -1066,6 +1132,10 @@ def build_env(code_root=None, variables: dict | None = None,
     # dbt 每次執行都會產生新的 invocation_id(uuid4)。這裡也每份審查不同(見 _REVIEW_INVOCATION_ID):
     # 固定值的話,樣板可以拿 `{% if invocation_id != '固定值' %}` 把語句藏在只有真正執行時才會進的分支。
     env.globals["invocation_id"] = _checked_invocation_id(invocation_id)
+    # dbt 的 run_started_at:這次執行開始的時間,帶 UTC 時區的 datetime(dbt-core 1.12 的
+    # tracking.User)。`.strftime()`、`.date()`、`.year` 照常可用;`modules.pytz` 不提供,
+    # `.astimezone(est)` 這類換時區的寫法拿不到時區物件,展開失敗
+    env.globals["run_started_at"] = _checked_run_started_at(run_started_at)
     _check_ident("轉接器", adapter)
     # macro 在這之後才載入,dispatch 是呼叫時才查表,所以拿得到全部 macro
     env.globals["adapter"] = _Adapter(env.globals, adapter)
@@ -1341,7 +1411,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
                  project: DbtProjectInfo | None = None,
                  macro_files: dict | None = None, incremental: bool = False,
                  invocation_id: str | None = None,
-                 sandbox_tables: dict | None = None) -> RenderResult:
+                 sandbox_tables: dict | None = None,
+                 run_started_at: str | None = None) -> RenderResult:
     """在同一行程內展開一份 dbt model。**待審的 MR 內容請改用 render_model_isolated()。**
 
     model_path  model 檔路徑(相對 code_root 或絕對路徑皆可)
@@ -1360,6 +1431,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
     incremental 以 `is_incremental()` 為 True 展開(增量分支);`{{ this }}`(這個 model
                 自己的表名,檔名去掉副檔名)。預設 False,與 dbt compile 相同
     invocation_id 這次展開的 invocation_id(uuid4 的寫法);沒給時產生新的
+    run_started_at 這次展開的 run_started_at(帶 UTC 時區的 ISO 字串);沒給時用現在
     sandbox_tables 執行驗證用的展開:{表名(小寫): 沙盒裡的寫法};source() 指向規格建的測資表,
                 ref() 與 {{ this }} 不支援(見 _sandbox_relations)
 
@@ -1382,7 +1454,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
                                                      macro_dirs, adapter, project, macro_files,
                                                      model_path.stem, incremental,
                                                      invocation_id=invocation_id,
-                                                     sandbox_tables=sandbox_tables)
+                                                     sandbox_tables=sandbox_tables,
+                                                     run_started_at=run_started_at)
         # dbt 讀檔時會去掉頭尾空白再渲染(開頭空行不會出現在編譯結果裡)
         body = source.strip()
         try:
@@ -1531,6 +1604,9 @@ def render_model_isolated(model_path, *, timeout_s: float = DEFAULT_ISOLATED_TIM
     review_id = _REVIEW_INVOCATION_ID.get()
     if review_id is not None:
         kwargs.setdefault("invocation_id", review_id)
+    started = _REVIEW_RUN_STARTED_AT.get()
+    if started is not None:
+        kwargs.setdefault("run_started_at", started)
     result = run_isolated(render_model, (model_path,), kwargs, timeout_s=timeout_s,
                           max_memory_mb=max_memory_mb, on_failure=_render_failure,
                           types=(RenderResult, DbtProjectInfo))

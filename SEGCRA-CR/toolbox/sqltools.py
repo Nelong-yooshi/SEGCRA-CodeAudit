@@ -847,12 +847,15 @@ _IN_JINJA = r"[^}]{0,200}?"
 _DBT_ENV_RE = re.compile(
     r"(?i)(?:" + _JINJA + r")" + _IN_JINJA + r"(?<![\w.])(?P<tok>target" + _GAP + r"\." + _GAP
     + r"(?:name|database|schema|type|user))(?!\w)"
+    # run_started_at:執行當下的時間。拿它跟寫死的日期比較(`run_started_at.year >= 2027`),
+    # 就是樣板版的定時炸彈(H009 只看得到 SQL 裡的 GETDATE())
+    r"|(?:" + _JINJA + r")" + _IN_JINJA + r"(?<![\w.])(?P<tok5>run_started_at)(?!\w)"
     r"|(?<![\w.])(?P<tok3>env_var)" + _GAP + r"\("
     r"|(?P<tok4>\{%" + _GAP + r"if" + _GAP + r"execute)(?!\w)")
 
 
 def _dbt_env_token(m) -> str:
-    for name in ("tok", "tok3", "tok4"):
+    for name in ("tok", "tok3", "tok4", "tok5"):
         if m.group(name):
             return " ".join(m.group(name).split())
     return m.group(0)

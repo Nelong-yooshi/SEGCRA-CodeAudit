@@ -52,6 +52,13 @@
      (例如自我 join)也不會展開失敗。沒有 database、或 model 名稱不能當表名(例如有連字號、點、數字開頭,dbt 都接受)時給不出值:仍然算有定義(`this is defined` 為 True,跟 dbt 一樣,否則寫在裡面的語句會被藏起來),但任何使用都失敗,錯誤訊息不帶檔名;沒用到的 model 照常展開。
      用到時帶表名提醒:增量模式一律算;一般模式看 model 本身有沒有寫到 `this`(只看語法樹,寫在
      沒進去的分支裡也算),或呼叫了定義裡寫到 `this` 的 macro(macro 檔最外層的程式碼不算)
+   - `run_started_at`:跟 dbt 一樣是帶 UTC 時區的 datetime(dbt-core 1.12 是 `datetime.now(tz=pytz.utc)`),
+     值是審查開始的真實時間,一份審查裡的展開共用一個(見 `start_review_invocation`)。
+     `.strftime()`、`.date()`、`.year`、直接輸出都跟 dbt 相同;`modules.pytz` 不提供,
+     `.astimezone(時區)` 拿不到時區物件,展開失敗。看主機本地時區或現在時間的寫法(`.astimezone()`
+     不給時區、`now()`、`today()`、`utcnow()`、`fromtimestamp()` 不給時區)一律展開失敗:得到的是審查機的
+     值(dbt 執行時是部署端主機的值),而且每次展開都不同;先加減或 `replace()` 再呼叫也一樣。
+     呼叫端指定的值要是帶 UTC 時區的 ISO 字串
    - `env_var` **刻意不定義**:會把審查機的環境變數寫進 SQL;未定義則由 `StrictUndefined` 大聲失敗。
      `target.database` 在未提供 database 時同理
    - **所有 macro 檔共用同一個命名空間**:dbt 解析 macro 與檔案順序無關,逐檔各自展開
@@ -213,7 +220,7 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 | 指向錯誤的關聯 | `ref('t', version=2)` 在 dbt 是另一張表,我們忽略參數 | 拒絕展開(沒有 manifest 可解析版本) |
 | 偽造行號標記 | MR 放入仿冒標記,行號對應降級 | 標記使用每次隨機產生的權杖 |
 | 資訊洩漏 | 錯誤訊息帶出審查機完整路徑;`{{ ref }}` 輸出記憶體位址 | 錯誤訊息不含路徑、不含控制字元、有長度上限;不輸出函式物件;給不出值的 `this` 連 `repr`(`pprint`)都失敗 |
-| 樣板辨認自己在展開器裡,把語句藏起來 | `{% if invocation_id != '固定值' %}`、`{% if this is not string %}`、`{% if this.keys is defined %}` 裡的 DELETE 審查時不出現、執行時照跑 | `invocation_id` 每份審查不同(格式同 dbt 的 uuid4);同一份審查裡的展開(預掃的一般與增量、受影響 model 的前後)共用一個值,跟 dbt 一次執行一個一樣,兩種模式的同一句才不會被算成兩句。`this` / `ref()` / `source()` 回傳表名物件(`_Relation`):對它們做 `defined` / `undefined` 以外的 `is` 判斷(含放在判斷的參數、清單、dict 裡),或取 `database`、`schema`、`identifier`、`name`、`table` 以外的屬性與索引(含 `attr`、`map(attribute=…)`),一律展開失敗、交人工——dbt 的 Relation 物件跟字串的型別判斷結果、有哪些屬性都不同,逐個模擬模擬不完。`string` 濾器把表名物件轉成一般字串,跟 dbt 一樣 |
+| 樣板辨認自己在展開器裡,把語句藏起來 | `{% if invocation_id != '固定值' %}`、`{% if run_started_at.year > 2000 %}`、`{% if this is not string %}`、`{% if this.keys is defined %}` 裡的 DELETE 審查時不出現、執行時照跑 | `invocation_id` 每份審查不同(格式同 dbt 的 uuid4),`run_started_at` 是真實時間(不是固定值);同一份審查裡的展開(預掃的一般與增量、受影響 model 的前後)共用一個值,跟 dbt 一次執行一個一樣,兩種模式的同一句才不會被算成兩句。`this` / `ref()` / `source()` 回傳表名物件(`_Relation`):對它們做 `defined` / `undefined` 以外的 `is` 判斷(含放在判斷的參數、清單、dict 裡),或取 `database`、`schema`、`identifier`、`name`、`table` 以外的屬性與索引(含 `attr`、`map(attribute=…)`),一律展開失敗、交人工——dbt 的 Relation 物件跟字串的型別判斷結果、有哪些屬性都不同,逐個模擬模擬不完。`string` 濾器把表名物件轉成一般字串,跟 dbt 一樣 |
 | 樣板改到呼叫端資料 | `{% do var('x').append(...) %}` 改到呼叫端的 list | 變數每次取用都給複本;`target` 唯讀 |
 | ReDoS | 內部正規表達式是平方時間,40 萬字元約 40 分鐘 | 改為線性時間掃描 |
 | 資源耗盡 | `((9**256)**256)**256`、超大字串、無窮迴圈 | 原始碼 / macro / 輸出 / 整數運算上限;子行程隔離 |
