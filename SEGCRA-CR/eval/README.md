@@ -118,6 +118,18 @@ python eval/run_eval.py --json out.json     # 另存機器可讀結果(給報告
 | `calibration_downgraded` | `_calibration.downgraded` | 校準降過嚴重度(只有「無法執行」類的指控在沙盒實際跑成功後才可以,blocker → major)。要求「沒有偷偷降級」時斷言它是 `false` |
 | `calibration_annotated` | `_calibration.annotated` | 校準加過註(規格待補、執行驗證未重現)。加註是常態動作,沒有它分不出「校準沒被走到」與「走到了但沒事可做」 |
 
+## 裸模型對照(`--baseline`)
+
+`python eval/run_eval.py --baseline --json bare.json` 用同一批題目跑**裸模型**:`review_mr` 的 baseline 模式,只給模型看 MR 的標題、描述與 diff,沒有預掃、知識庫、工具、執行驗證與後處理。跟一般模式(完整管線)的結果檔放在一起比,量的是「管線比單純問模型多做到什麼」。
+
+- **問題偵測**:兩種模式用同一套 `expected` 比對(recall / precision)。
+- **決策**:裸模型只輸出 `verdict`,對應成管線的三態再跟 `expect_decision` 比:`approve` → `auto_approved`、`needs_changes` → `needs_human`、`reject` → `blocked`;其他值記成「(無法判讀)」,不猜。結果檔的 `decision_right` / `decision_wrong` 只算有寫預期決策的題目。
+- **不該放行卻自動放行**(`missed_block`):預期的決策裡沒有一個允許放行,結果卻自動放行。最危險的錯,單獨計數。
+- **層級斷言不適用**:`_golden` 驗的是管線的各道防線,裸模型沒有那些防線,這一項不算通過也不算失敗。
+- 存檔重新評分(`--from-reports`)認得裸模型的報告(`_mode: baseline`),不用另外加旗標。
+
+模型的輸出會飄(見 BASELINE.md),兩種模式各跑兩次以上再比。
+
 ## 為什麼要 `_golden`,`expected` 不夠嗎
 
 不夠,而且是兩個具體的洞:
