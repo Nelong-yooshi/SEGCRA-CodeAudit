@@ -520,7 +520,7 @@ def _make_relations(database: str | None, schema: str, usage: dict,
       * 找得到的 model 照 dbt 的規則套用 alias 與自訂 schema(model_identity)
 
     sandbox_tables 給定時是執行驗證用的展開(見 _sandbox_relations):source() 指向規格建的
-    測資表,ref() 與 {{ this }} 不支援。
+    測資表,ref() 由規格裡同名的測資表代替上游 model,{{ this }} 不支援。
     """
     if sandbox_tables is not None:
         return _sandbox_relations(usage, project, sandbox_tables)
@@ -608,8 +608,6 @@ def _make_relations(database: str | None, schema: str, usage: dict,
     return ref, source, this
 
 
-_EXEC_NO_REF = ("執行驗證尚未支援 ref():被引用的 model 要先在沙盒建出來,"
-                "或由測資代替,目前都還沒有做")
 _EXEC_NO_THIS = "執行驗證尚未支援 {{ this }}(這個 model 自己的表不在沙盒裡)"
 _EXEC_LOADING = "載入 macro 時不提供表名"
 
@@ -623,14 +621,53 @@ def _sandbox_relations(usage: dict, project: "DbtProjectInfo | None", sandbox_ta
     來源的 schema:沙盒只有規格建的那幾張表。兩個不同的來源對到同一張測資表時無法分辨,展開失敗。
     任何一項不成立就展開失敗(錯誤訊息是原因),不猜表名:猜錯的話執行結果會被當成程式的問題。
 
-    ref() 與 {{ this }} 不支援(上游 model 與增量的目標表都不在沙盒裡)。
+    ref() 由測資代替上游 model:被引用的 model 表名確定(alias 算過之後,見 _stand_in_name),而且規格
+    裡有同名的表,就指向那張表。上游 model 自己的邏輯不在這次執行(由規格的測資當成它的輸出);
+    代替了哪些 model 記在 usage["stand_ins"],報告要寫出來。seed、snapshot、其他套件的 model、
+    表名無法確定的 model,一律展開失敗。
+    {{ this }} 不支援(增量的目標表不在沙盒裡)。
     表名物件只提供 identifier / name / table;database 與 schema 在沙盒裡跟正式環境不同,取用就失敗。"""
     seen: dict = usage.setdefault("sandbox_sources", {})
+    stand_ins: list = usage.setdefault("stand_ins", [])
+
+    def table(key, identifier: str, what: str):
+        """規格裡同名的測資表。key 用來認出「兩個不同的引用對到同一張表」。"""
+        folded = identifier.lower()
+        if folded not in sandbox_tables:
+            raise DbtRenderError(f"規格的資料表定義沒有 {what}指向的表:{identifier}")
+        if sandbox_tables[folded] is None:
+            raise DbtRenderError(f"規格的資料表定義有不只一張叫這個名稱的表:{identifier}")
+        if seen.setdefault(folded, key) != key:
+            raise DbtRenderError(f"兩個不同的 source() / ref() 都對到規格的同一張表:{identifier}")
+        return _SandboxRelation(sandbox_tables[folded], identifier)
 
     def ref(*args, **kwargs):
+        if len(args) not in (1, 2):
+            raise DbtRenderError(f"ref() 參數個數不合法:{len(args)} 個")
+        if kwargs:
+            names = ", ".join(sorted(kwargs))
+            raise DbtRenderError(
+                f"ref() 的關鍵字參數({names})會改變指向的關聯,本模組無法解析,拒絕展開。")
+        for a in args[:-1]:
+            _check_ident("套件", a)
+        name = _check_ident("表", args[-1])
         if usage.get("loading_macros"):
             return _UnavailableRelation(_EXEC_LOADING)
-        raise DbtRenderError(_EXEC_NO_REF)
+        usage["used"] = True
+        if project is None:
+            raise DbtRenderError("沒有 dbt 專案資訊,無法確定 ref() 指向的表")
+        if len(args) == 2 and args[0] != project.project_name:
+            raise DbtRenderError(f"ref() 指向其他套件的 model,不在這個專案裡:{args[0]}.{name}")
+        if name not in project.ref_names:
+            raise DbtRenderError(f"ref() 指向專案裡不存在的 model / seed / snapshot:{name}")
+        identifier = _stand_in_name(project, name)
+        if identifier is None:
+            raise DbtRenderError(
+                f"ref() 指向的表名無法確定(seed、snapshot,或 alias 等設定是樣板值):{name}")
+        relation = table(("ref", name), identifier, "ref() ")
+        if name not in stand_ins:
+            stand_ins.append(name)
+        return relation
 
     def source(source_name, table_name):
         _check_ident("來源", source_name)
@@ -646,19 +683,29 @@ def _sandbox_relations(usage: dict, project: "DbtProjectInfo | None", sandbox_ta
         elif key in project.uncertain_sources:
             raise DbtRenderError(f"source() 的表名無法確定(樣板值等):{source_name}.{table_name}")
         identifier = _check_ident("表", project.sources[key][1] or table_name)
-        folded = identifier.lower()
-        if folded not in sandbox_tables:
-            raise DbtRenderError(f"規格的資料表定義沒有 source() 指向的表:{identifier}")
-        if sandbox_tables[folded] is None:
-            raise DbtRenderError(f"規格的資料表定義有不只一張叫這個名稱的表:{identifier}")
-        if seen.setdefault(folded, key) != key:
-            raise DbtRenderError(f"兩個不同的 source() 都對到規格的同一張表:{identifier}")
-        return _SandboxRelation(sandbox_tables[folded], identifier)
+        return table(key, identifier, "source() ")
 
     def this(name: str):
         return _UnavailableRelation(_EXEC_NO_THIS)
 
     return ref, source, this
+
+
+def _stand_in_name(project: "DbtProjectInfo", name: str) -> str | None:
+    """ref() 指向的 model 在正式環境的表名(alias 算過之後);無法確定時回 None。
+
+    跟 model_identity 同一套規則,但只看表名:沙盒裡只有規格建的表,綱要與資料庫用不到,
+    所以自訂 schema 要不要串接不知道也沒關係。seed、snapshot(呼叫端提供的名稱一律列在
+    uncertain_models)與專案層級無法確定時回 None。"""
+    if project.global_uncertain or name in project.uncertain_models:
+        return None
+    naming = project.naming.get(name)
+    if naming is None:
+        return None
+    # dbt 的 generate_alias_name:有設就去頭尾空白(只有空白的會變成空字串,不合法)
+    raw = naming.get("alias")
+    alias = raw.strip() if raw else name
+    return alias if _IDENT.fullmatch(alias) else None
 
 
 def _mark_this_used(usage: dict, project: "DbtProjectInfo | None", name: str) -> None:
@@ -890,6 +937,8 @@ class RenderResult:
     # 展開出的表名不保證與 dbt 逐字相同——見下方三個已知限制;呼叫端應在報告中
     # 一併呈現,而不是讓審查者誤以為表名已經過完整驗證。
     relation_notice: str | None = None
+    # 執行驗證用的展開(sandbox_tables)裡,由規格的測資表代替的上游 model(ref() 的對象,依出現順序)
+    stand_ins: list[str] = field(default_factory=list)
     # 樣板(含它呼叫的 macro)有沒有呼叫 is_incremental();沒有就不必以增量模式再展開一次
     incremental_checked: bool = False
     # ok=False 且失敗的原因是這份樣板**自己**的 Jinja 語法錯誤(含不認得的濾器、重複定義的
@@ -1361,7 +1410,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
                 自己的表名,檔名去掉副檔名)。預設 False,與 dbt compile 相同
     invocation_id 這次展開的 invocation_id(uuid4 的寫法);沒給時產生新的
     sandbox_tables 執行驗證用的展開:{表名(小寫): 沙盒裡的寫法};source() 指向規格建的測資表,
-                ref() 與 {{ this }} 不支援(見 _sandbox_relations)
+                ref() 由同名的測資表代替上游 model,{{ this }} 不支援(見 _sandbox_relations)
 
     任何失敗都收斂成 ok=False 而不丟例外。
     """
@@ -1437,6 +1486,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
         source_lines=n_src,
         rendered_lines=n_out,
         relation_notice=_relation_notice(env.segcra_relation_usage, project),
+        stand_ins=list(env.segcra_relation_usage.get("stand_ins", [])),
         incremental_checked=incremental_checked,
     )
 
