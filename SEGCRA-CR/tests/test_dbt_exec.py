@@ -506,11 +506,16 @@ def test_上游的改動沒被執行_其他情況不補(report, executed):
     assert not any("上游 model" in f["detail"] for f in out["findings"])
 
 
-def test_同名但不在_model_目錄的檔案不算上游():
-    files = dict(REF_FILES, **{"sql/stg_a.sql": "SELECT 1"})
+@pytest.mark.parametrize("path", [
+    "sql/stg_a.sql",            # 不屬於 dbt 專案
+    "analyses/stg_a.sql",       # dbt 會讀、但不是 model 的目錄
+    "macros/stg_a.sql",
+])
+def test_同名但不在_model_目錄的檔案不算上游(path):
+    files = dict(REF_FILES, **{path: "SELECT 1"})
     mr = {"files": [{"path": p, "diff": "@@ -1 +1 @@\n+x", "full_content": files[p]}
-                    for p in ("sql/stg_a.sql", "models/mrt_BIG.sql")]}
-    out = enforce_dbt_unexecuted(_passed_with(["stg_a"]), mr, _ctx(list(mr_p["path"] for mr_p in mr["files"]), files),
+                    for p in (path, "models/mrt_BIG.sql")]}
+    out = enforce_dbt_unexecuted(_passed_with(["stg_a"]), mr, _ctx([path, "models/mrt_BIG.sql"], files),
                                  CFG, "models/mrt_BIG.sql")
     assert not any("上游 model" in f["detail"] for f in out["findings"])
 
