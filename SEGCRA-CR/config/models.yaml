@@ -143,6 +143,12 @@ policy:
 #   target 的 schema 後面。這是部署端 dbt-sqlserver 的預設值,不同版本相反,請照部署端裝的版本填。
 #   不寫時,有自訂 schema 的 model 表名記成無法確定(見 docs/09-dbt展開與反查.md)。
 #   只接受布林,字串 "false" 會在載入設定時報錯。
+#
+# vars(選填,{名稱: 值}):排程(例如 Dagster)每次執行時傳進 dbt、值固定的變數。審查時沒有人傳,
+#   model 用到沒有預設值的 var() 會展開失敗(dbt 沒傳值時也是)。值只收字串、數字、布林。
+#
+# run_date_vars(選填,名稱清單,例如 [target_date]):代表「這次執行的日期」的變數。審查時一律給
+#   執行驗證測資的日期,展開出來的 SQL 才撈得到沙盒裡的測資;同名的 vars 會被蓋掉。
 dbt:
   enabled: false
   database: ""

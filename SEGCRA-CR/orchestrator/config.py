@@ -210,10 +210,39 @@ def _load_dbt_section(raw: dict) -> dict:
         raise ValueError(
             f"設定檔 dbt.sqlserver_schema_concat 必須是布林值 true/false 或不設,目前是 {concat!r}"
             f"({type(concat).__name__})")
+    variables, run_date_vars = _dbt_variables(section)
     # 只有設了才帶這些鍵(讀的一方用 .get):沒設時回傳的內容與接線前相同
     return {"enabled": enabled, "database": database,
             **({"project_dir": project_dir} if project_dir else {}),
-            **({"sqlserver_schema_concat": concat} if concat is not None else {})}
+            **({"sqlserver_schema_concat": concat} if concat is not None else {}),
+            **({"vars": variables} if variables else {}),
+            **({"run_date_vars": run_date_vars} if run_date_vars else {})}
+
+
+def _dbt_variables(section: dict) -> tuple[dict, list]:
+    """排程(例如 Dagster)每次執行時傳進 dbt 的變數。審查時沒有人傳,沒有預設值的 `var()` 會
+    展開失敗(dbt 沒傳值時也是編譯失敗),報告多一條正式環境不會發生的 major。
+
+      vars           固定值的變數 {名稱: 字串、數字或布林}
+      run_date_vars  代表「這次執行的日期」的變數名稱(例如 target_date)。審查時一律給執行驗證
+                     測資的日期,展開出來的 SQL 跟沙盒的測資才對得上(見 pipeline._review_variables)
+
+    名稱過識別字白名單;值只收純量(清單、物件的語意要看 model 怎麼用,不猜)。"""
+    from .dbt_render import _IDENT
+    variables = section.get("vars")
+    variables = {} if variables is None else variables
+    if (not isinstance(variables, dict)
+            or not all(isinstance(k, str) and _IDENT.fullmatch(k) for k in variables)
+            or not all(isinstance(v, (str, int, float, bool)) for v in variables.values())):
+        raise ValueError("設定檔 dbt.vars 必須是 {變數名稱: 字串、數字或布林};"
+                         "名稱只接受英數與底線")
+    run_date_vars = section.get("run_date_vars")
+    run_date_vars = [] if run_date_vars is None else run_date_vars
+    if (not isinstance(run_date_vars, list)
+            or not all(isinstance(n, str) and _IDENT.fullmatch(n) for n in run_date_vars)):
+        raise ValueError("設定檔 dbt.run_date_vars 必須是變數名稱的清單(例如 [target_date]);"
+                         "名稱只接受英數與底線")
+    return dict(variables), list(dict.fromkeys(run_date_vars))
 
 
 def load_config(path: Path | None = None) -> Config:
