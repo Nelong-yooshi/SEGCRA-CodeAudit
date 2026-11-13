@@ -47,22 +47,24 @@ def review_repeat() -> str:
     return value if value in (REPEAT_EVERY, REPEAT_FIRST) else REPEAT_EVERY
 
 
-def should_skip(mode: str, previous: int | None, force: bool) -> bool:
+def should_skip(mode: str, previous: int | None, requested: bool) -> bool:
     """這次的 CI 審查要不要跳過(不呼叫模型、回 EXIT_NEEDS_HUMAN)。只有這些條件都成立才跳過:
 
-      * 模式是 first,而且這次不是手動要求重審(force)
+      * 模式是 first,而且這次不是有人要求重審(requested):上一次處理的(審過或跳過的)
+        同一個 commit 又送來,就是有人對它按了 retry 或重跑 pipeline。MR 的 pipeline 帶不了手動變數(workflow 只收
+        MR 事件,手動帶變數跑的 pipeline 不是 MR 事件),所以「重審」只能用這個方式表達
       * 審查服務自己記得這個 MR(同一個目標分支)上一次**跑完**的結果(previous)——
         只看服務自己的紀錄,不看 GitLab 的 label 或留言:那些開發者改得到
       * 上一次是放行或交人工。上一次是擋下(4)或沒跑完整(5)時照樣審:不然被擋的 MR
         推一個新 commit 就變成可以合併"""
-    return (mode == REPEAT_FIRST and not force
+    return (mode == REPEAT_FIRST and not requested
             and previous in (EXIT_APPROVED, EXIT_NEEDS_HUMAN))
 
 
 SKIPPED_NOTE = (
     "這次的改動**沒有經過 AI 審查**:部署端設定為「同一個 MR 只自動審第一次」(CI_REVIEW_REPEAT=first)。"
     "上一次 AI 審查的結論是「{previous}」,那是之前的 commit 的結論,不代表這次的改動。"
-    "合併前請有合併權限的人看過這次的改動。要重新審查:手動執行 pipeline 並帶變數 SEGCRA_REVIEW=1。")
+    "合併前請有合併權限的人看過這次的改動。要重新審查:對這個 MR 最新的 pipeline 的審查 job 按 retry(或對同一個 commit 再跑一次 pipeline)。")
 _PREVIOUS_TEXT = {EXIT_APPROVED: "自動放行", EXIT_NEEDS_HUMAN: "交人工確認"}
 
 

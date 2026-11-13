@@ -745,8 +745,8 @@ def pipeline_info(pipeline_id: int) -> dict | None:
 
 
 def mr_head(mr_id: str) -> dict | None:
-    """MR 目前的 head commit 與狀態(GET /merge_requests/:iid):{sha, state, source_project_id};
-    取不到回 None。"""
+    """MR 目前的 head commit 與狀態(GET /merge_requests/:iid):{sha, state, source_project_id,
+    target_branch};取不到回 None。"""
     mr_id = _check_mr_id(mr_id)
     if not REAL_MODE:
         mr = _mock_mr(mr_id)
@@ -769,7 +769,8 @@ def post_note(mr_id: str, body: str) -> str:
         try:
             _api("POST", f"/merge_requests/{mr_id}/notes", json={"body": body})
         except Exception as e:               # noqa: BLE001 — 種類記下來,例外訊息不往外帶
-            return _write_failed(_failure_kind(e))
+            failure = _failure_kind(e)
+            return _write_failed(failure)
     else:
         _mock_output(mr_id, "note", {"body": body})
     return json.dumps({"ok": True}, ensure_ascii=False)

@@ -138,12 +138,9 @@ webhook 那條路在審查失敗或逾時時(`_notify_incomplete`)留言並把 c
        - |
          set -u
          out=$(mktemp)
-         # 手動要求重審(執行 pipeline 時帶 SEGCRA_REVIEW=1):只送 true / false,變數的值不拼進請求
-         force=false
-         if [ "${SEGCRA_REVIEW:-}" = "1" ]; then force=true; fi
          code=$(curl -sS -o "$out" -w '%{http_code}' -X POST "$SEGCRA_URL/ci/review" \
            -H "JOB-TOKEN: $CI_JOB_TOKEN" -H "Content-Type: application/json" \
-           -d "{\"mr_iid\": $CI_MERGE_REQUEST_IID, \"sha\": \"$CI_COMMIT_SHA\", \"force\": $force}") || code=000
+           -d "{\"mr_iid\": $CI_MERGE_REQUEST_IID, \"sha\": \"$CI_COMMIT_SHA\"}") || code=000
          if [ "$code" != 202 ]; then echo "審查服務沒有開始審查(HTTP $code):$(cat "$out")"; exit 5; fi
          ticket=$(cat "$out")
          echo "審查已開始,MR 上會出現留言;這個 job 等審查結束"
@@ -179,7 +176,7 @@ webhook 那條路在審查失敗或逾時時(`_notify_incomplete`)留言並把 c
 - **重審**:在 GitLab 上 retry 這個 job(同一個 commit 再審一次)。推了新的 commit 會開新的 pipeline;舊的那份審查被取消,舊 pipeline 的 job 拿到 5。
 - **同一個 MR 要不要每次都審**(審查服務的 `CI_REVIEW_REPEAT`,由部署端的維運在服務的 `.env` 設,MR 改不到):
   - `every`(預設):每條 pipeline 都審。
-  - `first`:審過一次之後,之後的 pipeline 不呼叫模型,job 以 3 結束(交人工、可以合併),MR 上留言寫明「這次的改動沒有經過 AI 審查」並把標籤改成 `ai-review::needs_human`。要重審:手動執行 pipeline 並帶變數 `SEGCRA_REVIEW=1`(job 只送 `true` / `false` 給服務,變數的值不拼進請求)。
+  - `first`:審過一次之後,之後的 pipeline 不呼叫模型,job 以 3 結束(交人工、可以合併),MR 上留言寫明「這次的改動沒有經過 AI 審查」並把標籤改成 `ai-review::needs_human`。要重審:對這個 MR 最新的 pipeline 的審查 job 按 retry(或對同一個 commit 再跑一次 pipeline) —— 服務記得上一次處理的是哪個 commit,同一個 commit 又送來就真的審。MR 的 pipeline 帶不了手動變數:手動帶變數執行的 pipeline 不是 MR 事件,會被上面的 `workflow` 濾掉(測試 GitLab 實測)。
   - `first` 只在**審查服務自己記得**這個 MR(同一個目標分支)上一次跑完、而且結果是放行或交人工時才跳過:不看 GitLab 的 label 或留言(開發者改得到);上一次擋下或沒跑完整時照樣審(不然推一個新 commit 就繞過了擋下);服務重新啟動後忘記,照樣審。
   - **選 `first` 的代價**:第一次之後的改動不經過 AI,只靠有合併權限的人把關。「先送一個無害的版本拿到放行、再推惡意的改動」這種情況,AI 不會看到。預設的 `every` 沒有這個問題。
 - **Draft 也審**:Draft 標成 Ready 不會重跑 pipeline,Draft 時跳過的話,標成 Ready 之後那條 pipeline 裡就沒有審查。
