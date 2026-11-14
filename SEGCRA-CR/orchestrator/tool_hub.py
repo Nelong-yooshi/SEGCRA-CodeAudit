@@ -33,7 +33,7 @@ from .isolation import run_in_thread
 TOOL_GROUPS = {
     "gitlab": [gitlab.get_mr_diff, gitlab.get_mr_refs, gitlab.get_file, gitlab.post_inline_comment,
                gitlab.post_summary, gitlab.set_commit_status, gitlab.create_rule_mr,
-               gitlab.set_label],
+               gitlab.set_label, gitlab.resolve_stale_comments],
     "sqltools": [sqltools.parse_ast, sqltools.lint, sqltools.run_rules],
     "memory": [memory.retrieve_knowledge, memory.get_conventions, memory.check_style,
                memory.learn_style_from_examples, memory.lookup_similar_reviews,
@@ -43,6 +43,7 @@ TOOL_GROUPS = {
 # 審查模型可以呼叫的工具(#17):全部唯讀。用名稱逐一列出,而不是「排除寫入類」——
 # 之後新增的工具預設**不**開放給模型,要開放必須在這裡明寫並確認它不會寫入。
 # 寫入類(post_inline_comment、post_summary、set_commit_status、create_rule_mr、set_label、
+# resolve_stale_comments、
 # learn_style_from_examples、record_feedback)只由管線自己呼叫。
 MODEL_TOOLS = frozenset({
     "gitlab__get_mr_diff", "gitlab__get_file",

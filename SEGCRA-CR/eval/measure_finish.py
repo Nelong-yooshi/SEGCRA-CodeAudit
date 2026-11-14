@@ -1,4 +1,4 @@
-"""量收尾要多久:評分、決策、比對 head、逐條貼回 MR、設 label 與 commit status。
+"""量收尾要多久:評分、決策、逐條貼回 MR、設 label 與 commit status(每一步寫入前先比對 head)。
 
 整份審查的截止時間 = REVIEW_TIMEOUT_SECONDS − 收尾保留(FINISH_RESERVE_SECONDS),這支量的就是
 收尾保留該留多少。用真的 review_mr 與真的 toolbox/gitlab.py(real 模式),GitLab 換成本機的
@@ -63,6 +63,9 @@ class _FakeGitLab(BaseHTTPRequestHandler):
             items = [{"new_path": p, "old_path": p, "diff": "@@ -0,0 +1 @@\n+" + t}
                      for p, t in self.files.items()]
             body, headers = items, {"X-Next-Page": ""}
+        elif method == "GET" and rest.endswith("/discussions"):
+            # 重審會先把上一輪我們開的行內討論標成已解決。這裡一律回空清單 = 第一次審查
+            kind, body, headers = "GET 討論清單", [], {}
         elif method == "GET" and rest.startswith("/merge_requests/"):
             kind = "GET MR"
             body = {"title": "量測用", "description": "", "sha": HEAD,
@@ -143,9 +146,12 @@ def measure(files: int, model_findings: int, latency: float) -> dict:
 
     current_mr = pipeline._current_mr
     before_finish: Counter = Counter()
+    marked: list[bool] = []
 
     async def mark_then_fetch(*a, **kw):     # 收尾的第一個 GitLab 請求在這裡:先記下之前打了幾次
-        before_finish.update(_FakeGitLab.counts)
+        if not marked:                       # 收尾會查很多次(每一步寫入前一次),只記第一次
+            marked.append(True)
+            before_finish.update(_FakeGitLab.counts)
         return await current_mr(*a, **kw)
 
     originals = (pipeline.run_agent, pipeline._cold_read, pipeline.run_spec_exec)

@@ -365,6 +365,16 @@ def _superseded(now: dict, reviewed_sha: str | None) -> bool:
     return bool(current) and current != reviewed_sha
 
 
+async def _writeback_target(hub, mr_id: str, reviewed_sha: str | None) -> dict | None:
+    """這一刻還能不能把這次審查的結論寫回去?可以就回開行內討論要用的 `diff_refs`,
+    已經被新的 commit 取代就回 None。
+    """
+    now = await _current_mr(hub, mr_id)
+    if _superseded(now, reviewed_sha):
+        return None
+    return {k: str(now.get(k) or "") for k in ("base_sha", "head_sha", "start_sha")}
+
+
 # 總結裡沒有確定貼上的 finding:前幾條連標題一起列,其餘只列檔名與行號(一行一條)
 _UNPOSTED_LISTED = 20
 
@@ -395,14 +405,25 @@ def _unposted_section(unposted: list[dict]) -> str:
 
 
 # 回寫的步驟(寫進 report["_writeback"] 的鍵 → 報告與 log 上的名稱)與失敗的種類
-_WRITEBACK_STEPS = {"commit_status": "merge 閘門(commit status)", "label": "標籤",
-                    "summary": "總結留言"}
+_WRITEBACK_STEPS = {"resolve": "收掉上一輪的行內意見", "inline": "行內意見",
+                    "commit_status": "merge 閘門(commit status)",
+                    "label": "標籤", "summary": "總結留言"}
 _WRITE_FAILURE_TEXT = {
     WRITE_REJECTED: "GitLab 拒絕了這個請求",
     WRITE_UNCERTAIN: "連線中斷、逾時或 GitLab 回應錯誤,不確定有沒有寫上",
     WRITE_NO_SHA: "沒有 commit 的 sha",
     WRITE_FAILED: "寫入工具出錯",
 }
+
+
+def _resolved_count(result) -> int:
+    """`resolve_stale_comments` 標掉了幾個。看不懂它回什麼就當成 0:這個數字只寫進報告
+    給人看,猜一個數字比寫 0 糟。"""
+    try:
+        got = json.loads(result)
+        return int(got.get("resolved", 0)) if isinstance(got, dict) else 0
+    except Exception:                        # noqa: BLE001 — ToolHub 把例外轉成錯誤字串
+        return 0
 
 
 def _record_writeback(writeback: dict, mr_id: str, step: str, result: str) -> str | None:
@@ -2275,27 +2296,51 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             report["decision"] = "needs_human"
             report.setdefault("decision_reason", "決策閘門未完成,一律交人工")
 
-        # 回寫之前先確認這次審查還是最新的那次。
+        # 每一步寫回 GitLab 之前,都重新確認這次審查還是最新的那次。
         #
         # 取消只會在下一個真正的等待點生效,而貼留言、加 label、設狀態都是同步的工具
         # 呼叫——所以舊的那次有機會一路走到這裡。它較晚結束時,MR 上的 label 與總結
         # 會變成**舊 commit 的結論**(commit status 是跟 sha 走的,那個本來就沒問題)。
-        # 比對 MR 目前的 head sha:不一樣就不貼,報告照樣回傳給呼叫端(給 eval 與
-        # 測試用),只是不寫回 GitLab。
+        #
+        # 回寫前只查一次不夠:回寫本身要花上幾十秒(一條 finding 一個請求),新的
+        # commit 常常就是在這段時間裡推上來的——結果前面的行內意見貼得還算合理,最後
+        # 那句總結與 label 卻是舊結論。所以改成每一步都查:發現被取代就停在那裡,
+        # 已經貼出去的收不回來,但後面的不會再寫。多出來的成本是每次寫入前一個唯讀
+        # 請求(`get_mr_refs`)。
         # head_sha 是 real 模式帶的;mock 模式(eval / 測試)只有 sha,一樣拿來比
-        now = await _current_mr(hub, mr_id)
-        if _superseded(now, mr.get("head_sha") or mr.get("sha")):
-            report["writeback_skipped"] = "已有更新的 commit,這次審查的結論不再回寫"
-            print(f"[pipeline] MR !{mr_id} 已有更新的 commit,略過回寫", flush=True)
-            clock.finish()
-            if capture is not None:
-                capture["report"] = report
-            return report
+        reviewed_sha = mr.get("head_sha") or mr.get("sha")
+        wrote: list[str] = []            # 已經送出去的步驟(用來分「整次沒回寫」與「停在中途」)
+        stopped: list[str] = []
 
-        # 開行內討論的位置用剛取回的 diff_refs,不再每條重取
-        refs = {k: str(now.get(k) or "") for k in ("base_sha", "head_sha", "start_sha")}
+        async def writable(step: str) -> dict | None:
+            """這一步還能不能寫?可以就回開行內討論要用的 diff_refs。"""
+            if stopped:
+                return None
+            refs = await _writeback_target(hub, mr_id, reviewed_sha)
+            if refs is None:
+                stopped.append(step)
+                report["writeback_skipped"] = (
+                    f"回寫到「{step}」時 MR 已有更新的 commit,之後的步驟不再回寫"
+                    if wrote else "已有更新的 commit,這次審查的結論不再回寫")
+                print(f"[pipeline] MR !{mr_id} 已有更新的 commit,略過回寫"
+                      + (f"(停在:{step})" if wrote else ""), flush=True)
+            else:
+                wrote.append(step)
+            return refs
+
+        # 貼這一輪的行內意見之前,先把上一輪我們開的那些標成已解決:總結只有一則,
+        # 行內意見卻是每次 N 條重貼一遍 —— 不收掉的話同一行會疊好幾輪的意見,看 MR 的
+        # 人分不出哪些還有效。標不掉不影響這次審查(舊意見留著,新的照樣貼),所以只
+        # 記個數字,不當成回寫失敗。
+        if await writable(_WRITEBACK_STEPS["resolve"]) is not None:
+            report["_resolved_stale"] = _resolved_count(
+                await hub.call("gitlab__resolve_stale_comments", {"mr_id": mr_id}))
+
         unposted = []
         for fd in report.get("findings", []):
+            refs = await writable(_WRITEBACK_STEPS["inline"])
+            if refs is None:
+                break
             result = await hub.call("gitlab__post_inline_comment", {
                 "mr_id": mr_id, "file": fd.get("file", ""), "line": int(fd.get("line") or 0),
                 "severity": fd.get("severity", "info"),
@@ -2311,24 +2356,28 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         label = f"ai-review::{decision}"
         # commit status 與標籤先設、總結最後貼:這兩步沒寫上時要在總結寫明(看 MR 的人看得到)。
         # commit status 回寫:CE 的 merge 閘門靠它(Pipelines must succeed)
-        _record_writeback(writeback, mr_id, "commit_status", await hub.call(
-            "gitlab__set_commit_status", {
-                "mr_id": mr_id, "sha": mr.get("sha", ""),
-                "state": "success" if decision == "auto_approved" else "failed",
-                "name": "segcra/review",
-                "description": f"{decision}:{report.get('summary', '')[:180]}",
-            }))
-        _record_writeback(writeback, mr_id, "label", await hub.call(
-            "gitlab__set_label", {"mr_id": mr_id, "label": label}))
+        if await writable(_WRITEBACK_STEPS["commit_status"]) is not None:
+            _record_writeback(writeback, mr_id, "commit_status", await hub.call(
+                "gitlab__set_commit_status", {
+                    "mr_id": mr_id, "sha": mr.get("sha", ""),
+                    "state": "success" if decision == "auto_approved" else "failed",
+                    "name": "segcra/review",
+                    "description": f"{decision}:{report.get('summary', '')[:180]}",
+                }))
+        if await writable(_WRITEBACK_STEPS["label"]) is not None:
+            _record_writeback(writeback, mr_id, "label", await hub.call(
+                "gitlab__set_label", {"mr_id": mr_id, "label": label}))
         decision_text = {"auto_approved": "✅ 小幅變更且無實質問題,自動放行",
                          "needs_human": "👤 請人工確認後裁決",
                          "blocked": "⛔ 有 blocker 級問題,修正前不得合入"}[decision]
-        _record_writeback(writeback, mr_id, "summary", await hub.call("gitlab__post_summary", {
-            "mr_id": mr_id,
-            "body": f"**決策:{decision_text}**\n\n{report.get('summary', '')}"
-                    + _unposted_section(unposted) + _writeback_section(writeback, label),
-            "score": int(report.get("score", 0)), "verdict": report.get("verdict", "needs_changes"),
-        }))
+        if await writable(_WRITEBACK_STEPS["summary"]) is not None:
+            _record_writeback(writeback, mr_id, "summary", await hub.call("gitlab__post_summary", {
+                "mr_id": mr_id,
+                "body": f"**決策:{decision_text}**\n\n{report.get('summary', '')}"
+                        + _unposted_section(unposted) + _writeback_section(writeback, label),
+                "score": int(report.get("score", 0)),
+                "verdict": report.get("verdict", "needs_changes"),
+            }))
         clock.finish()
         if capture is not None:
             capture["report"] = report
