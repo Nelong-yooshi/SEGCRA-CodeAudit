@@ -41,6 +41,7 @@ from .dbt_hidden_writes import MODELS_CHECKED, UNREACHED_OUTPUT, find_hidden_wri
 from .dbt_render import (MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, MACRO_SYNTAX,
                          check_macro_files_isolated)
 from .security import scan_mr
+from .mr_identifiers import extract as extract_identifiers
 from toolbox.gitlab import (WRITE_FAILED, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UNCERTAIN,
                             write_failure)
 from .skills_loader import always_skills, load_skills, skills_index
@@ -1218,6 +1219,7 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
             sql, dbt_error, in_project = _dbt_head_source(f, sql, dbt_ctx)
         rule_sql = sql
         incremental_sql = None
+        _attach_identifiers(entry, f, sql, dbt_ctx)
         if is_macro:
             entry["dbt_macro"] = True
             hidden = _macro_hidden_writes(f.get("path", ""), dbt_cfg, dbt_ctx)
@@ -1287,6 +1289,29 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
         progress["phase"] = _PHASE_CALLED_MACROS
     await _macro_scan(hub, used_macros, dbt_ctx, {e["path"] for e in results}, results)
     return results
+
+
+def _attach_identifiers(entry: dict, f: dict, sql: str, dbt_ctx: DbtContext | None) -> None:
+    """MR 裡取名的識別字(欄位別名、CTE、macro 名稱…,見 mr_identifiers),給注入掃描用。
+
+    `identifiers` 每筆 `{kind, name, file, line}`;`line` 只在拿到的是檔案變更後的完整內容時給
+    (只有 diff 片段時,行號是片段裡的行號,不是檔案的)。超過上限沒收的筆數記在
+    `identifiers_skipped`。沒有抽到時兩個鍵都不放。**不進 prompt**(見 _prescan_for_prompt)。"""
+    items, skipped = extract_identifiers(sql, with_lines=_is_full_text(f, sql, dbt_ctx))
+    if items:
+        entry["identifiers"] = [dict(item, file=f.get("path")) for item in items]
+    if skipped:
+        entry["identifiers_skipped"] = skipped
+
+
+# 預掃結果裡不放進 prompt 的鍵:MR 取的名稱是 MR 決定的文字,放在「程式的檢查結果」那一段,
+# 模型會把夾帶的指示當成程式說的話。模型在 diff 裡本來就看得到原文,這份只給注入掃描用
+_PROMPT_HIDDEN_KEYS = ("identifiers", "identifiers_skipped")
+
+
+def _prescan_for_prompt(pre: list) -> list:
+    return [{k: v for k, v in entry.items() if k not in _PROMPT_HIDDEN_KEYS}
+            if isinstance(entry, dict) else entry for entry in pre]
 
 
 def _merge_env_hits(hits: list, raw) -> list:
@@ -2117,7 +2142,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         user = USER_TEMPLATE.format(
             title=mr["title"], description=mr.get("description", ""),
             diff_section=build_diff_section(code_files, cfg.budget["diff"]) + full_text,
-            prescan=json.dumps(pre, ensure_ascii=False),
+            prescan=json.dumps(_prescan_for_prompt(pre), ensure_ascii=False),
             spec_section=spec_section + spec_changes,
         )
         # 給程式補的 finding 寫行號;prompt 已組好,不受影響。出錯時記一條未完整、行號維持 0

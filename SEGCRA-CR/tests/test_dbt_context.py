@@ -434,7 +434,9 @@ def test_沒開dbt時_不看dbt_ctx():
         for cfg in (None, {}, {"enabled": False, "database": DB}):
             pre, hub = _prescan(files, cfg=cfg, ctx=ctx)
             assert _model_rules(hub) == [MODEL] and hub.lint == [MODEL]
-            assert pre == [{"path": "models/mrt_big.sql", "rules": [], "lint": []}]
+            # 識別字(給注入掃描用)跟 dbt 開不開無關;其他鍵不能多出 dbt 的欄位
+            got = [{k: v for k, v in e.items() if k != "identifiers"} for e in pre]
+            assert got == [{"path": "models/mrt_big.sql", "rules": [], "lint": []}]
 
 
 def test_沒有dbt_ctx時_開了dbt的行為與接線前相同():
