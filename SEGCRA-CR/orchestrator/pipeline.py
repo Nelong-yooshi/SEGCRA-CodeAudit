@@ -324,7 +324,7 @@ def _incomplete_finding(stage: str, exc: BaseException | None = None,
         detail = (f"{stage} 執行時發生 {type(exc).__name__},已跳過。"
                   f"這一環節的結果不在本報告內。")
         title = f"[{stage}] {INCOMPLETE_TITLE_PREFIX}"
-    return {"file": "", "line": 0, "severity": "major", "title": title,
+    return {"file": "(MR 內容)", "line": 0, "severity": "major", "title": title,
             "detail": detail, "stage": stage,
             "suggestion": "請人工確認這一環節原本要檢查的內容;其餘環節的結果仍然有效。",
             "citations": []}
@@ -1969,6 +1969,12 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         mr = await hub.call_json("gitlab__get_mr_diff", {"mr_id": mr_id})
         if not mr:
             raise RuntimeError(f"無法取得 MR {mr_id}")
+
+        # 標題與說明後面一律當字串用(組 prompt、抽規則碼、注入掃描)。GitLab 對沒填說明的 MR
+        # 回 null;不論 MR 從哪裡來(mock、評測),不是字串的都換成空字串
+        for key in ("title", "description"):
+            if not isinstance(mr.get(key), str):
+                mr[key] = ""
 
         # 把這次審查釘在 MR 的 head commit 上:之後 get_file 不指定 ref 時讀的就是
         # 「正在審的那一版」,而不是目標分支的現況(目標分支讀到的是**改之前**的
@@ -4199,6 +4205,8 @@ _EXHAUSTED_TITLE = "審查模型用完工具呼叫回合,沒有產出審查結�
 _EXHAUSTED_SUMMARY = "審查模型用完工具呼叫回合、沒有產出審查結果;以下只有程式確定性檢查的結果。"
 _FAILED_TITLE = "審查模型沒有完成,這次只有程式確定性檢查的結果"
 _FAILED_SUMMARY = "呼叫審查模型失敗、沒有產出審查結果;以下只有程式確定性檢查的結果。"
+# 沒有呼叫模型(剩的時間不夠)不是「呼叫失敗」:寫成失敗,看的人會以為模型那邊出錯
+_NO_TIME_SUMMARY = "整份審查剩下的時間不夠,沒有呼叫審查模型;以下只有程式確定性檢查的結果。"
 # 模型呼叫失敗的問題類型 → 給人看的說明。只有這幾種固定文字,不放例外訊息(含主機位址、端點回應)
 _MODEL_FAILURE_TEXT = {
     "timeout": "等待審查模型的回應逾時",
@@ -4298,6 +4306,8 @@ def _parse_model_output(raw: str | None, meta: dict, max_output_tokens: int) -> 
 
     沒有截斷卻解析不出來時回 None,由呼叫端丟例外。
     """
+    if _failure_kind(meta) == _NO_TIME_KIND:
+        return {"summary": _NO_TIME_SUMMARY, "findings": []}
     if _failure_kind(meta) is not None:
         return {"summary": _FAILED_SUMMARY, "findings": []}
     if meta.get("exhausted"):
