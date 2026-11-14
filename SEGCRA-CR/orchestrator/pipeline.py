@@ -4198,6 +4198,7 @@ _TRUNCATED_SUMMARY = "審查模型的輸出被截斷、無法解析;以下只有
 _EXHAUSTED_TITLE = "審查模型用完工具呼叫回合,沒有產出審查結果"
 _EXHAUSTED_SUMMARY = "審查模型用完工具呼叫回合、沒有產出審查結果;以下只有程式確定性檢查的結果。"
 _FAILED_TITLE = "審查模型沒有完成,這次只有程式確定性檢查的結果"
+_INPUT_TRUNCATED_TITLE = "審查模型送出的 prompt 可能被端點截掉開頭,讀到的內容不完整"
 _FAILED_SUMMARY = "呼叫審查模型失敗、沒有產出審查結果;以下只有程式確定性檢查的結果。"
 # 模型呼叫失敗的問題類型 → 給人看的說明。只有這幾種固定文字,不放例外訊息(含主機位址、端點回應)
 _MODEL_FAILURE_TEXT = {
@@ -4273,6 +4274,9 @@ def _output_meta_record(meta: dict, max_output_tokens: int) -> dict:
         # 模型呼叫失敗時沒有最終輸出:meta 裡的用量是前幾輪的,不算截斷
         "truncated": _failure_kind(meta) is None and output_truncated(meta, max_output_tokens),
         "exhausted": bool(meta.get("exhausted")),
+        # 輸入被端點靜默截掉開頭(見 agent.run_agent);跟 truncated / exhausted 一樣記下來,
+        # 評測存檔才統計得出這種「prompt 太長被截」發生幾次
+        "input_truncated": bool(meta.get("input_truncated")),
         # 模型呼叫失敗時的問題類型(見 _MODEL_FAILURE_TEXT);沒有失敗是 None
         "failed": _failure_kind(meta),
     }
@@ -4338,6 +4342,19 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
         _put_program_finding(report, model_failed)
         # 沒有最終輸出:meta 裡的結束原因與用量是前幾輪的,不能拿來判斷截斷或用完回合
         return report
+    # 輸入側被端點靜默截斷(見 agent.run_agent):送出的 prompt 超過 context 上限時,
+    # 端點不報錯、默默截掉開頭再生成,回報讀到的量遠少於送出的量。被截掉的可能是規格或
+    # 程式開頭,這次主審查看的是不完整的輸入,結果不可信——跟輸出截斷一樣補 major、交人工。
+    # 跟 exhausted / 輸出截斷各自獨立,可以同時成立(所以不 return,繼續往下檢查)。
+    if meta.get("input_truncated"):
+        _put_program_finding(report, {
+            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _INPUT_TRUNCATED_TITLE,
+            "detail": "送出的 prompt 超過審查模型端點的 context 上限時,端點不會報錯,只會默默截掉"
+                      "開頭再生成(端點回報讀到的量遠少於送出的量)。被截掉的可能是規格或程式"
+                      "開頭,這次主審查是看著不完整的輸入做的,結果不可信。程式的確定性檢查照常報出。",
+            "suggestion": "請人工審查這個 MR;MR 很大時可以拆小後重新觸發,或調高審查模型的 "
+                          "context(num_ctx)上限。",
+            "citations": []})
     if meta.get("exhausted"):
         exhausted = {
             "file": "(MR 內容)", "line": 0, "severity": "major", "title": _EXHAUSTED_TITLE,

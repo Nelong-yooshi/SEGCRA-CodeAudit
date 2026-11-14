@@ -905,6 +905,10 @@ MUTANTS.update({
      "cold.locations[:MAX_COLD_READ_LISTED]", "cold.locations"),
  "冷讀:檔名不經 _code_span": ("pipeline.py",
      '        return f"{_code_span(path)} 的檔名"', '        return f"{path} 的檔名"'),
+ "輸入截斷:讀到的遠少於估計不當成截斷": ("agent.py",
+     "            if prompt_tokens < sent_estimate * 0.5:", "            if False:"),
+ "輸入截斷:prompt 被端點截掉開頭不交人工": ("pipeline.py",
+     '    if meta.get("input_truncated"):', "    if False:"),
 })
 
 
@@ -1961,8 +1965,10 @@ MUTANTS.update({
      "        if not notice:\n            continue\n        _put_program_finding(report, {",
      "        if False:\n            continue\n        _put_program_finding(report, {"),
  "提醒:改回直接附加(不取代模型同標題、也不去重)": ("pipeline.py",
-     "        _put_program_finding(report, {",
-     '        report.setdefault("findings", []).append({'),
+     '        _put_program_finding(report, {\n'
+     '            "file": entry["path"], "line": 0, "severity": "info",',
+     '        report.setdefault("findings", []).append({\n'
+     '            "file": entry["path"], "line": 0, "severity": "info",'),
  "提醒:嚴重度升高(改變決策)": ("pipeline.py",
      '            "file": entry["path"], "line": 0, "severity": "info",\n'
      '            "title": _DBT_NOTICE_TITLE,',
