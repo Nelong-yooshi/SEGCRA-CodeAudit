@@ -81,12 +81,49 @@ def _run(monkeypatch, rounds, use_tools=True):
     return meta
 
 
+def _run_user(monkeypatch, user, rounds, use_tools=False):
+    """送指定的 user 內容(拿來撐大估計的送出量),其餘跟 _run 一樣。"""
+    monkeypatch.setattr(agent, "AsyncOpenAI", _client_with(rounds))
+    cfg = Config(endpoint="http://x/v1", api_key="k", default_profile="review",
+                 profiles={}, roles={}, budget={"diff": 8000}, policy={})
+    profile = ModelProfile(model="m", num_ctx=32768, temperature=0, max_output_tokens=8192)
+    meta: dict = {}
+    asyncio.run(agent.run_agent(cfg, profile, "sys", user, _hub() if use_tools else None,
+                                meta=meta, verbose=False, use_tools=use_tools))
+    return meta
+
+
 def test_單輪_最後一次與總量相同(monkeypatch):
     meta = _run(monkeypatch, [(1200, 80, False)], use_tools=False)
     assert meta["prompt_tokens"] == 1200
     assert meta["completion_tokens"] == 80
     assert meta["prompt_tokens_total"] == 1200
     assert meta["completion_tokens_total"] == 80
+
+
+def test_端點回報讀到的遠少於估計_標成輸入被截斷(monkeypatch):
+    # 送出估計約 1000 tokens("x"*3000 → len/3),端點卻只讀到 50 → prompt 開頭被靜默截掉
+    meta = _run_user(monkeypatch, "x" * 3000, [(50, 20, False)])
+    assert meta["input_truncated"] is True
+
+
+def test_讀到的量正常_不算輸入截斷(monkeypatch):
+    # 送出估計約 1000,端點讀到 1200(中文真實 token 常多於 len/3,正常現象)→ 不標
+    meta = _run_user(monkeypatch, "x" * 3000, [(1200, 20, False)])
+    assert meta["input_truncated"] is False
+
+
+def test_沒碰到截斷時是False不是缺鍵(monkeypatch):
+    # 跟 exhausted 一樣:False=跑完沒截斷,缺鍵=舊版程式,呼叫端要分得出來
+    meta = _run(monkeypatch, [(1200, 80, False)], use_tools=False)
+    assert meta["input_truncated"] is False
+
+
+def test_任何一輪被截就sticky_最後一輪讀全了也不翻回(monkeypatch):
+    # 第一輪 prompt 開頭被截(50 ≪ 估計),模型已帶著被截的脈絡呼叫工具;最後一輪讀全了
+    # 也救不回來——input_truncated 要維持 True
+    meta = _run_user(monkeypatch, "x" * 3000, [(50, 20, True), (9000, 40, False)], use_tools=True)
+    assert meta["input_truncated"] is True
 
 
 def test_有工具呼叫時總量是每一輪的加總(monkeypatch):

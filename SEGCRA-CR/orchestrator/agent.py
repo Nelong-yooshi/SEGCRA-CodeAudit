@@ -162,6 +162,8 @@ async def _run_agent(client, cfg: Config, profile: ModelProfile, system: str, us
         # 一開始就寫 False:呼叫端用 meta.get("exhausted") 時,「沒有這個 key」
         # (舊版程式)與「跑完沒用光輪次」要分得出來。
         meta["exhausted"] = False
+        # input_truncated 同理:「沒這個 key」=舊版,False=跑完沒碰到輸入被截斷。
+        meta["input_truncated"] = False
     for i in range(MAX_ITERATIONS):
         dump_path = _dump(profile.model, messages, i)
         resp = await client.chat.completions.create(
@@ -182,6 +184,11 @@ async def _run_agent(client, cfg: Config, profile: ModelProfile, system: str, us
                 print(f"[agent] 警告:估計送出 prompt ≈{sent_estimate} tokens,"
                       f"但端點回報只讀到 {prompt_tokens} tokens——context 可能被靜默截斷,"
                       f"這次生成結果可能不可信。")
+                if meta is not None:
+                    # sticky:任何一輪讀到被截斷的 prompt,這次審查就污染了——後面幾輪
+                    # 接著用被截的脈絡推理、呼叫工具,最後一輪就算讀全了也救不回來。
+                    # 只設 True、不翻回 False,呼叫端據此交人工(見 pipeline.enforce_truncation)。
+                    meta["input_truncated"] = True
         completion = getattr(usage, "completion_tokens", None) if usage else None
         if meta is not None:
             # 每一輪都覆寫:呼叫端關心的是**最後一次**回應有沒有被截斷,
