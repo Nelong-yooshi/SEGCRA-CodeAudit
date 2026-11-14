@@ -214,6 +214,13 @@ def test_模型失敗時不另補輸入截斷_失敗那條已交人工():
     assert _failed(report) != []
 
 
+def test_輸入截斷記進_output_meta():
+    # 跟 truncated / exhausted 一樣進稽核欄位,評測存檔才統計得出發生幾次;沒碰到是 False 不是缺鍵
+    rec = pipeline._output_meta_record({"input_truncated": True, "finish_reason": "stop"}, 8192)
+    assert rec["input_truncated"] is True
+    assert pipeline._output_meta_record({"finish_reason": "stop"}, 8192)["input_truncated"] is False
+
+
 # ─────────────────── 主審查的時間上限、端點無法使用時後面不再呼叫模型 ───────────────────
 
 @pytest.fixture

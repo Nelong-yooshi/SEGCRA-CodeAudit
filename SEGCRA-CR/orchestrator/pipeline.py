@@ -4274,6 +4274,9 @@ def _output_meta_record(meta: dict, max_output_tokens: int) -> dict:
         # 模型呼叫失敗時沒有最終輸出:meta 裡的用量是前幾輪的,不算截斷
         "truncated": _failure_kind(meta) is None and output_truncated(meta, max_output_tokens),
         "exhausted": bool(meta.get("exhausted")),
+        # 輸入被端點靜默截掉開頭(見 agent.run_agent);跟 truncated / exhausted 一樣記下來,
+        # 評測存檔才統計得出這種「prompt 太長被截」發生幾次
+        "input_truncated": bool(meta.get("input_truncated")),
         # 模型呼叫失敗時的問題類型(見 _MODEL_FAILURE_TEXT);沒有失敗是 None
         "failed": _failure_kind(meta),
     }
