@@ -328,6 +328,12 @@ def _mock_output(mr_id: str, kind: str, payload: dict):
     f.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _text_field(obj: dict, key: str) -> str:
+    """GitLab 回應裡的文字欄位;沒有、是 null 或不是字串時給空字串。"""
+    value = obj.get(key)
+    return value if isinstance(value, str) else ""
+
+
 def _check_mr_id(mr_id) -> str:
     """MR 編號只接受 1–10 位的 ASCII 數字(GitLab 的 MR iid 本來就是整數)。
 
@@ -362,6 +368,10 @@ def get_mr_diff(mr_id: str) -> str:
     if REAL_MODE:
         mr = _api("GET", f"/merge_requests/{mr_id}")
         changes, truncated = _api_pages(f"/merge_requests/{mr_id}/diffs")
+        # GitLab 對沒填說明的 MR 回 `"description": null`(鍵在、值是 null):`.get(鍵, 預設)`
+        # 拿到的是 None,後面當字串用就會出錯。標題與 sha 一樣處理
+        for key in ("title", "description", "sha"):
+            mr[key] = _text_field(mr, key)
         files = [{"path": c["new_path"], "old_path": c.get("old_path"),
                   "diff": c.get("diff") or "",
                   "deleted": bool(c.get("deleted_file")),
