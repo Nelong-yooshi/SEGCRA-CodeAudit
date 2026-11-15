@@ -101,3 +101,30 @@ def test_兩組各自彙總_互不影響():
     b = tcs._summarize_reports([_report(om=_om(p_tot=900))])
     assert a["prompt_total"]["sum"] == 100
     assert b["prompt_total"]["sum"] == 900
+
+
+def test_路徑打錯_stderr警告路徑不存在(tmp_path, capsys, monkeypatch):
+    # 跑 E1 對照時最容易踩的坑:--dump-reports 路徑打錯,工具卻只印「0 份、
+    # 沒回填 token」,會被誤讀成「這批真的跑出空報告」。空組要講清楚是路徑問題。
+    monkeypatch.setattr(sys, "argv", ["prog", str(tmp_path / "typo-不存在")])
+    tcs.main()
+    err = capsys.readouterr().err
+    assert "路徑不存在" in err
+
+
+def test_目錄存在但沒報告_stderr講清楚不是舊報告(tmp_path, capsys, monkeypatch):
+    (tmp_path / "result.json").write_text('{"recall": 0.9}', encoding="utf-8")  # 不是報告
+    monkeypatch.setattr(sys, "argv", ["prog", str(tmp_path)])
+    tcs.main()
+    err = capsys.readouterr().err
+    assert "找不到任何報告" in err
+    assert "不是「舊報告" in err
+
+
+def test_有報告的組不會誤報空組警告(tmp_path, capsys, monkeypatch):
+    (tmp_path / "mr_1.json").write_text('{"summary":"s","findings":[],"_output_meta":%s}'
+                                        % tcs.json.dumps(_om()), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["prog", str(tmp_path)])
+    tcs.main()
+    err = capsys.readouterr().err
+    assert "路徑不存在" not in err and "找不到任何報告" not in err

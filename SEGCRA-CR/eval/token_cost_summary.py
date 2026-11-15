@@ -201,6 +201,15 @@ def main() -> None:
 
     labels = [Path(p).name or str(p) for p in args.paths]
     groups = [summarize([p]) for p in args.paths]
+    # 空組要分清兩種原因:路徑打錯 vs 真的沒有報告。不然下面只會印「0 份、
+    # 沒有回填 token」,很容易被誤讀成「這批真的跑出空報告」而下錯結論。警告走
+    # stderr,不污染給人看/轉貼的統計本體。
+    for p, s in zip(args.paths, groups):
+        if not Path(p).exists():
+            print(f"⚠ 路徑不存在:{p}(當成空組——是不是打錯了?)", file=sys.stderr)
+        elif s["reports"] == 0:
+            print(f"⚠ {p} 底下找不到任何報告 JSON(要有 findings 欄位才算);"
+                  f"這組是空的,不是「舊報告沒回報用量」", file=sys.stderr)
     for label, s in zip(labels, groups):
         _print_group(label, s)
     if len(groups) > 1:
