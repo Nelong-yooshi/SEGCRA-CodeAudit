@@ -1,8 +1,8 @@
 """評測報告的主審查 token 成本統計,以及兩批報告(例如 main 與關掉全文的對照組)的對照。
 
-背景:把變更檔的完整內容放進 prompt 之後,黑盒量到主審查讀入的 prompt 大約翻倍、生成多約兩成。
+背景:把變更檔的完整內容放進 prompt 之後,主審查讀入的 prompt 會明顯變大、生成也略增。
 要判斷這筆開銷值不值,得用「端點回報、回填進報告的真實 token 數」來比,不用字元估計,也不用
-時間(評測機負載會晃,時間不可比)。時間看 stage_time_summary.py,token 看這支。
+時間(機器負載會晃,時間不可比)。實際幅度就用這支在自己的報告上量;時間看 stage_time_summary.py。
 
     python eval/token_cost_summary.py <報告目錄或檔> [<第二批> ...]
 
@@ -13,7 +13,7 @@
 用的是報告 `_output_meta` 的回填值,**只含主審查**(測資生成、仲裁、風格基準各自呼叫模型,
 不在這裡;見 pipeline._output_meta_record):
 
-    prompt_tokens            主審查最後一次呼叫讀入的 token —— 對應黑盒說的「主審查 prompt 中位數」
+    prompt_tokens            主審查最後一次呼叫讀入的 token
     completion_tokens        主審查最後一次呼叫生成的 token
     prompt_tokens_total      主審查這次 run_agent 每一輪的加總(有工具呼叫時每輪重讀整串對話,
                              所以遠大於最後一次)—— 讀入的實際成本
