@@ -212,8 +212,9 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
    ```
 
    endpoint 在別處時:`export OLLAMA_URL=http://<host>:11434/v1`。OpenAI 相容的端點(例如 vLLM)也一樣用
-   `OLLAMA_URL` 指定;要 API key 的端點,key 用環境變數 `LLM_API_KEY` 給,**不要寫進 `config/models.yaml`**
-   (那個檔案會進版控與離線包):
+   `OLLAMA_URL` 指定;要 API key 的端點,key **只能**用環境變數 `LLM_API_KEY` 給:`config/models.yaml` 的
+   `api_key` 寫了 `ollama` 以外的值,載入設定就報錯(那個檔案會進版控與離線包)。變數設了但是空的也會報錯。
+   設定檔與所在目錄的權限要求見 docs/10「設定檔的權限」,太寬時服務起不來:
 
    ```bash
    read -rs -p "LLM_API_KEY: " LLM_API_KEY && export LLM_API_KEY && echo
@@ -416,6 +417,7 @@ ssh -L 8929:localhost:8929 <your-user>@<your-server>
 
 | 症狀 | 檢查 / 處置 |
 |---|---|
+| 啟動時報「權限太寬」、「有設定但是空的」、「api_key 只能不寫或寫 ollama」、「GitLab 的設定只給了…」 | 設定不安全或不完整,刻意停下來、不退回別的做法。照訊息裡的 `chmod`、補上或拿掉那個變數、把金鑰改用 `LLM_API_KEY` 給(見 docs/10) |
 | 模型連不上(connection refused / timeout) | `curl $OLLAMA_URL` 的主機端(如 `curl http://127.0.0.1:11434/api/tags`)。經反向 tunnel 掛進來的 endpoint，確認 tunnel 活著;模型名不存在時先 `ollama pull` |
 | 審查極慢或 OOM | 換小模型:`--profile fast`，或把 `config/models.yaml` 的 fast 換成更小的模型 |
 | LLM 請求逾時(`APITimeoutError`) | 單次 LLM 請求上限預設 3600 秒、不自動重試;硬體更慢時以環境變數 `LLM_TIMEOUT`(秒)調高。測資生成/仲裁的 LLM 失敗不會中斷管線——降級為 major「執行驗證無法完成」轉 needs_human |

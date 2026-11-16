@@ -111,7 +111,8 @@ def test_背景執行緒裡的例外照樣變成錯誤字串():
 
     hub._functions["sqltools__run_rules"] = broken
     out = _run(hub.call("sqltools__run_rules", {"sql": "x"}))
-    assert out == "Error executing tool sqltools__run_rules: boom"
+    # 只有例外型別:原文會回給模型,模型可能照抄進 finding(見 orchestrator/error_text.py)
+    assert out == "Error executing tool sqltools__run_rules: ValueError"
 
 
 def test_本地工具的例外照樣往外丟():

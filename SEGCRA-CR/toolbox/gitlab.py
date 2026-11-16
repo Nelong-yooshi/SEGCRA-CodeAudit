@@ -17,12 +17,45 @@ PKG_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = Path(os.environ.get("FIXTURES_DIR", PKG_ROOT / "fixtures"))
 OUTPUT_DIR = Path(os.environ.get("REVIEW_OUTPUT", PKG_ROOT / "review_output"))
 
-GITLAB_URL = os.environ.get("GITLAB_URL", "")          # e.g. http://localhost:8929
-GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "")
-GITLAB_PROJECT = os.environ.get("GITLAB_PROJECT", "")  # project id 或 URL-encoded path
+class GitLabConfigError(ValueError):
+    """GitLab 的設定不完整:停下來,不悄悄改走 mock 模式。"""
+
+
+_REAL_MODE_VARS = ("GITLAB_URL", "GITLAB_TOKEN", "GITLAB_PROJECT")
+
+
+def _env_text(name: str, unset: str) -> str:
+    """沒設回 `unset`;**設了但去掉前後空白後是空的,直接報錯並寫出變數名**(同
+    orchestrator/config.py 的 _env_text;這個模組不 import orchestrator)。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return unset
+    value = raw.strip()
+    if not value:
+        raise GitLabConfigError(f"環境變數 {name} 有設定但是空的;要用就給值,不用就把這個變數拿掉")
+    return value
+
+
+def _real_mode_settings() -> tuple[str, str, str]:
+    """real 模式的三個設定。**只給了其中幾個時停下來**:以前任一個沒給就悄悄改走 mock 模式,
+    部署時漏設一個(或部署腳本沒把值帶進來),服務照常起來、審的卻是測試資料。三個都不設才是
+    mock 模式(離線開發與評測)。"""
+    # 一個一個寫出名稱(不用迴圈):設定參數的檢查(env_registry)靠字面的名稱找讀法
+    values = {"GITLAB_URL": _env_text("GITLAB_URL", ""), "GITLAB_TOKEN": _env_text("GITLAB_TOKEN", ""),
+              "GITLAB_PROJECT": _env_text("GITLAB_PROJECT", "")}
+    given = [name for name, v in values.items() if v]
+    if given and len(given) != len(_REAL_MODE_VARS):
+        missing = [name for name in _REAL_MODE_VARS if not values[name]]
+        raise GitLabConfigError(
+            f"GitLab 的設定只給了 {'、'.join(given)},還缺 {'、'.join(missing)}:"
+            f"三個都要設才會連 GitLab(三個都不設是離線的 mock 模式)")
+    return values["GITLAB_URL"], values["GITLAB_TOKEN"], values["GITLAB_PROJECT"]
+
+
+GITLAB_URL, GITLAB_TOKEN, GITLAB_PROJECT = _real_mode_settings()   # URL 例如 http://localhost:8929
 REAL_MODE = bool(GITLAB_URL and GITLAB_TOKEN and GITLAB_PROJECT)
 # 專案層級的唯讀 token(read_api,角色 Reporter),只給打包下載用(#15 條件 1)
-GITLAB_READ_TOKEN = os.environ.get("GITLAB_READ_TOKEN", "")
+GITLAB_READ_TOKEN = _env_text("GITLAB_READ_TOKEN", "")
 
 
 
