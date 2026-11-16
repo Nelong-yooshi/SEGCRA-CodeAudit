@@ -2627,12 +2627,9 @@ MUTANTS.update({
  "檢核點:嚴重度差一級也算回應(不認得的也算)": ("pipeline.py",
      '            if i not in covered and rank >= need[i]:',
      '            if i not in covered and rank >= need[i] - 1:'),
- "規則補報:summary 提到也算報過": ("pipeline.py",
-     '        text = " ".join(str(f.get(k) or "") for k in ("title", "detail", "suggestion"))',
-     "        text = json.dumps(report, ensure_ascii=False)"),
- "規則補報:檔名也拿來比對關鍵詞": ("pipeline.py",
-     '        text = " ".join(str(f.get(k) or "") for k in ("title", "detail", "suggestion"))',
-     "        text = json.dumps(f, ensure_ascii=False)"),
+ # 「summary 提到也算」「檔名也拿來比對」改掛在 _is_hint_reply(下面「檢核點:」那幾個):
+ # _coverage 收到的已經是標題帶代碼的回應,它比關鍵詞那一步對檢核點永遠成立,在這裡
+ # 突變是等價的。
 
  # ---- 同一個檔案有多處相同規則的命中(#28 review)
  "規則補報:同檔有一條報過就全部不補(一條抵多處)": ("pipeline.py",
@@ -2667,14 +2664,31 @@ MUTANTS.update({
      '        if f.get("file") != path:\n            continue\n',
      ""),
  "檢核點:比對報告全文(summary 也算回應)": ("pipeline.py",
-     '            missing, exact = _coverage(before, entry["path"], _HINT_KEYWORDS.get(code, [code]),\n                                       [{**h, "severity": "info"} for h in hits])',
-     '            missing, exact = ([] if any(k in json.dumps(report, ensure_ascii=False)\n                                        for k in _HINT_KEYWORDS.get(code, [code])) else hits), True'),
+     '            missing, exact = _coverage(replies, entry["path"], [tag],\n                                       [{**h, "severity": "info"} for h in hits])',
+     '            missing, exact = ([] if tag in json.dumps(report, ensure_ascii=False) else hits), True'),
  "檢核點:回應要求同等嚴重(info 不算)": ("pipeline.py",
      '                                      [{**h, "severity": "info"} for h in hits])',
      '                                      [{**h, "severity": "minor"} for h in hits])'),
- "檢核點:拿自己補的來比對(吞掉同檔其他檢核點)": ("pipeline.py",
-     '            missing, exact = _coverage(before, entry["path"], _HINT_KEYWORDS.get(code, [code]),',
-     '            missing, exact = _coverage(report.get("findings", []), entry["path"], _HINT_KEYWORDS.get(code, [code]),'),
+ # 「拿自己補的來比對」不再單獨列:程式補的 finding 由 _is_hint_reply 以 _source 排除
+ # (下面「不排除程式補的」),比對範圍換成整份報告是等價的。
+ "檢核點:不排除程式補的(程式補的標題也帶代碼)": ("pipeline.py",
+     '    if _is_program_finding(f) or tag not in str(f.get("title") or ""):',
+     '    if tag not in str(f.get("title") or ""):'),
+ "檢核點:不看代碼(同檔任何 finding 都算回應)": ("pipeline.py",
+     '    if _is_program_finding(f) or tag not in str(f.get("title") or ""):',
+     '    if _is_program_finding(f):'),
+ "檢核點:代碼寫在內文或建議也算": ("pipeline.py",
+     '    if _is_program_finding(f) or tag not in str(f.get("title") or ""):',
+     '    if _is_program_finding(f) or tag not in _finding_text(f):'),
+ "檢核點:代碼不加方括號(「H001 …」也算)": ("pipeline.py",
+     '    return f"[{code}]"',
+     '    return code'),
+ "檢核點:照抄檢核點訊息也算回應": ("pipeline.py",
+     "    return bool(_claim_key(rest))",
+     "    return True"),
+ "檢核點:照抄時只拿掉代碼、不拿掉訊息": ("pipeline.py",
+     '            rest = rest.replace(message, " ")',
+     "            pass"),
  "檢核點:同檔同代碼只看第一處(其餘不補)": ("pipeline.py",
      '                                      [{**h, "severity": "info"} for h in hits])',
      '                                      [{**hits[0], "severity": "info"}])'),
@@ -4716,10 +4730,10 @@ MUTANTS.update({
      '            core = _NAME_SUFFIX.sub("", a.strip()) or a.strip()',
      "            core = a.strip()"),
  "待補:回到字詞重疊的比對": ("pipeline.py",
-     "        hit = next((name for name, parts in items" + NL
-     + "                    if all(any(a in claim for a in alts) for alts in parts)), None)",
-     "        hit = next((name for name, parts in items" + NL
-     + "                    if any(t and t in claim for t in _distinct_tokens(name))), None)"),
+     "            hit = next((name for name, parts in items" + NL
+     + "                        if all(any(a in claim for a in alts) for alts in parts)), None)",
+     "            hit = next((name for name, parts in items" + NL
+     + "                        if any(t and t in claim for t in _distinct_tokens(name))), None)"),
  "待補:比對不抹掉反引號與粗體": ("pipeline.py",
      "    return _NAME_NOISE.sub(\"\", str(text or \"\")).lower()",
      "    return str(text or \"\").lower()"),
@@ -4727,15 +4741,15 @@ MUTANTS.update({
      "        if _SECURITY_CLAIM.search(text):\n            continue",
      "        if False:\n            continue"),
  "待補:加註時順手降成 info": ("pipeline.py",
-     '        note = (f"(這條提到的「{hit}」,規格把它列在「待補 / 未載明」。"',
-     '        f["severity"] = "info"\n'
-     '        note = (f"(這條提到的「{hit}」,規格把它列在「待補 / 未載明」。"'),
+     '            note = (f"(這條提到的「{hit}」,規格把它列在「待補 / 未載明」。"',
+     '            f["severity"] = "info"\n'
+     '            note = (f"(這條提到的「{hit}」,規格把它列在「待補 / 未載明」。"'),
  "待補:加註寫成已經判定是同一件事": ("pipeline.py",
-     '                f"**如果講的就是這件事**,規格沒有寫這項要求,嚴重度不因此調整,"',
-     '                f"規格沒有寫這項要求,嚴重度不因此調整,"'),
+     '                    f"**如果講的就是這件事**,規格沒有寫這項要求,嚴重度不因此調整,"',
+     '                    f"規格沒有寫這項要求,嚴重度不因此調整,"'),
  "待補:不記要人看": ("pipeline.py",
-     '        _mark_needs_human(report, f"規格未載明:{hit}")',
-     "        pass"),
+     "    _mark_needs_human(report, reason)",
+     "    pass"),
  # 嚴重度只能被「執行出來的證據」調整:沙盒真的跑完、而且沒有 SQL 錯誤
  "證據:沒跑成功也照樣降級": ("pipeline.py",
      '    ran_ok = bool(se.get("case_results")) and not se.get("sql_error")',
@@ -5736,6 +5750,38 @@ MUTANTS.update({
      "    if not spec_text and unavailable:",
      "    if False:"),
 })
+
+# ---- 規格待補:模型標了項目名的只驗證那一項存在,沒照格式的退回用字比對;prompt 規定格式
+MUTANTS.update({
+ "待補:標了項目名的也退回用字比對": ("pipeline.py",
+     "        if tagged is not None:",
+     "        if False:"),
+ "待補:標的項目名不在清單裡就不交人工": ("pipeline.py",
+     "            if hit is None:" + NL + "                _annotate_pending(",
+     "            if hit is None:" + NL + "                continue" + NL + "                _annotate_pending("),
+ "待補:沒照格式的不退回用字比對": ("pipeline.py",
+     "            hit = next((name for name, parts in items",
+     "            hit = None and next((name for name, parts in items"),
+ "待補:沒有規格時也處理標了名稱的": ("pipeline.py",
+     "    if not spec_text:" + NL + "        return report       # 沒有規格是另一件事",
+     "    if False:" + NL + "        return report       # 沒有規格是另一件事"),
+ "待補:標的項目名不截長度": ("pipeline.py",
+     "m.group(1).strip()[:_PENDING_TAG_MAX]",
+     "m.group(1).strip()"),
+ "待補:標的項目名比對前不正規化": ("pipeline.py",
+     "            hit = listed.get(_claim_key(tagged))",
+     "            hit = listed.get(tagged)"),
+ "待補:格式的冒號只認半形(全形的認不出來)": ("pipeline.py",
+     '_PENDING_TAG = re.compile(r"規格未載明\\s*[:\\uff1a]\\s*(\\S.*)")',
+     '_PENDING_TAG = re.compile(r"規格未載明\\s*[:]\\s*(\\S.*)")'),
+ "prompt:檢核點的回應格式沒有舉例": ("pipeline.py",
+     "例如「[H003] 已與規格 R-201",
+     "例如「已與規格 R-201"),
+ "prompt:待補事項沒規定標題格式": ("pipeline.py",
+     "標題寫成「規格未載明:<項目名>」",
+     "標題自由寫"),
+})
+
 
 # ---- 回寫 MR:diff_refs 只取一次;行內討論失敗時分清楚「被拒絕」與「不知道有沒有建立」
 MUTANTS.update({

@@ -53,7 +53,7 @@ MODEL_REPORT = {
 # 只寫在 summary 不算回應(#16 review),自動放行要靠這種 info finding
 RESPONDED_REPORT = {**MODEL_REPORT, "findings": [{
     "file": "sql/maintenance/x.sql", "line": 1, "severity": "info",
-    "title": "已與核定規格 R-201 逐項核對",
+    "title": "[H003] 已與核定規格 R-201 逐項核對",
     "detail": "門檻 >= 100000 與規格「達」一致;時間窗與通報粒度相符。",
     "suggestion": "", "citations": []}]}
 
@@ -192,6 +192,7 @@ FROM accounts a JOIN regions c ON a.region_id = c.id GROUP BY a.owner_id, c.regi
 
 
 def _h002_reply(text, title="通報粒度"):
+    title = "[H002] " + title
     return {"file": "sql/maintenance/x.sql", "line": 1, "severity": "info",
             "title": title, "detail": text, "suggestion": "", "citations": []}
 
@@ -387,8 +388,8 @@ def test_檢核點只在_summary_回應不能自動放行(run):
 
 
 def test_程式補的規則命中不能當成模型對檢核點的回應(run):
-    """R004 與 H004 同時命中:程式補的 R004 內文含「憑證」「密碼」(H004 的關鍵詞)。
-    檢核點排在程式補報之前,H004 仍要補上(只認模型自己的回應)。"""
+    """R004 與 H004 同時命中:程式補的 R004 內文含「憑證」「密碼」。檢核點排在程式補報
+    之前、只認模型自己寫的回應,H004 仍要補上。"""
     report, _, _ = run(_mr("SELECT id FROM users WHERE password = 'abc123';"), MODEL_REPORT)
     titles = [f["title"] for f in report["findings"]]
     assert any(t.startswith("[R004]") for t in titles)
@@ -495,7 +496,7 @@ def test_只靠needs_human擋住自動放行(run):
     sql = CLEAN_SQL.replace("R-201", "R-410")
     mr = {**_mr(sql), "title": "R-410 例行調整"}
     info = {"file": "sql/maintenance/x.sql", "line": 1, "severity": "info",
-            "title": "已與核定規格 R-410 逐項核對",
+            "title": "[H003] 已與核定規格 R-410 逐項核對",
             # R-410 的待補段列著「金額欄位的幣別/單位」,這條 info 講的就是那一項
             "detail": "門檻與時間窗相符;金額的幣別程式自己決定了一種處理方式。",
             "suggestion": "", "citations": []}
