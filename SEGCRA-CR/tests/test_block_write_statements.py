@@ -127,7 +127,8 @@ def test_剝完解析得過但寫入語句仍然不見時也要說沒看():
     跟剝不開一樣不可以回報成沒有命中 —— 兩條路都要記成解析失敗。"""
     hits, error = _out("SET XACT_ABORT ON DELETE FROM t")
     assert [h for h in hits if h["rule"] == "R001"] == []
-    assert error and "程序性區塊" in error
+    # 記成無法解析,但沒有 BEGIN/IF,說明不該叫人去找不存在的程序性區塊
+    assert error and "程序性區塊" not in error
 
 
 # ─────────────────── 6. 沒有分號、前面有宣告或設定(#105 的完成條件)───────────────────
@@ -172,4 +173,82 @@ def test_關鍵字切完也要檢查寫入語句有沒有回來():
     不然就是把「沒看到」包裝成「沒問題」。"""
     hits, error = _out("DECLARE @x INT\nSET XACT_ABORT ON DELETE FROM t")
     assert [h for h in hits if h["rule"] == "R001"] == []
-    assert error and "程序性區塊" in error
+    # 沒有 BEGIN/IF,說明不該寫成程序性區塊
+    assert error and "程序性區塊" not in error
+
+
+# ─────────────────── 7. #138 review 的四點修正 ───────────────────
+#
+# 要修 2:`UPDATE t` 換行接 `SET … WHERE …` 是最常見的 T-SQL 排版;`SET` 也是語句關鍵字,
+# 原本會把它切成兩句、`UPDATE` 變成「沒有 WHERE」而誤報 R001。改成「先確認合起來是不是
+# 一句合法語句」再切:是續行就黏回去。
+
+@pytest.mark.parametrize("sql,label", [
+    ("DECLARE @c DATE = '2026-01-01'\nUPDATE dbo.accounts\nSET status = 'X'\nWHERE created < @c",
+     "UPDATE 的 SET/WHERE 換行"),
+    ("DECLARE @c DATE = '2026-01-01'\nUPDATE a\nSET a.x = s.x\nFROM a JOIN s ON a.id = s.id\nWHERE a.created < @c",
+     "UPDATE…SET…FROM…WHERE"),
+    ("SET NOCOUNT ON\nUPDATE dbo.accounts\nSET status = 'X'\nWHERE created < '2026-01-01'",
+     "前面接 SET NOCOUNT"),
+    ("EXEC dbo.log 'start'\nUPDATE dbo.accounts\nSET status = 'X'\nWHERE id = 2",
+     "前面接 EXEC"),
+    ("CREATE PROCEDURE dbo.p AS BEGIN\nSET NOCOUNT ON\nUPDATE dbo.accounts\nSET status = 'X'\nWHERE created < '2026-01-01'\nEND",
+     "放在 BEGIN…END 裡"),
+    ("DECLARE @x INT\nINSERT INTO t (a)\nSELECT a FROM s", "INSERT…SELECT 是一句"),
+])
+def test_同句的續行不切開也不誤報R001(sql, label):
+    hits, _ = _out(sql)
+    assert [h for h in hits if h["rule"] == "R001"] == [], label
+
+
+def test_沒有WHERE的UPDATE換行寫SET仍然報R001():
+    """續行黏回去之後仍然是一句沒有 WHERE 的 UPDATE —— 這條照樣要擋。"""
+    assert _rules("DECLARE @x INT\nUPDATE t\nSET a = 1") == ["R001"]
+
+
+def test_EXEC併吞DELETE時寫入語句不被悄悄吃掉():
+    """sqlglot 會把 `EXEC dbo.p` 換行接 `DELETE t` 併成 `EXECUTE … DELETE AS t`、DELETE
+    消失。合併判斷要擋住這種合併,DELETE 要嘛被看到(報 R001)、要嘛記成無法解析,不可以
+    悄悄變成沒有命中。"""
+    hits, error = _out("EXEC dbo.p\nDELETE t")
+    assert [h for h in hits if h["rule"] == "R001"] or error
+
+
+# 要修 1:沒有寫入字樣、但看起來是多句的 Command 也要切開跑規則,不能原樣採用
+
+@pytest.mark.parametrize("sql,code", [
+    ("DECLARE @x INT\nSELECT * FROM t", "R002"),
+    ("SET NOCOUNT ON\nSELECT a FROM t WHERE id NOT IN (SELECT id FROM s)", "R003"),
+])
+def test_沒寫入字樣的多句Command也要跑規則(sql, code):
+    assert _rules(sql, code) == [code]
+
+
+@pytest.mark.parametrize("sql", ["SET NOCOUNT ON", "PRINT 1", "DECLARE @x INT"])
+def test_單獨一句的設定或宣告不受影響(sql):
+    """只有一行關鍵字的良性 Command 本來就是一句,不當多句、不記成無法解析。"""
+    _, error = _out(sql)
+    assert error is None, sql
+
+
+# 要修 3:開頭有註解、單獨一行的 GO 也要救得到(都報 R001)
+
+@pytest.mark.parametrize("sql,label", [
+    ("-- 每日結算\nDECLARE @d DATE = GETDATE()\nUPDATE t SET a = 1", "行註解開頭"),
+    ("/* 每日結算 */\nDECLARE @d DATE = GETDATE()\nUPDATE t SET a = 1", "區塊註解開頭"),
+    ("SELECT 1;\n-- 第二段\nDECLARE @d DATE = GETDATE()\nUPDATE t SET a = 1", "分號後再接註解"),
+    ("UPDATE t SET a = 1 WHERE id = 1\nGO\nDELETE FROM t", "GO 分批後的 DELETE 沒有 WHERE"),
+    ("DELETE FROM t WHERE id = 1\nGO\nUPDATE t SET a = 1", "GO 分批後的 UPDATE 沒有 WHERE"),
+])
+def test_註解開頭與GO分批也要救得到(sql, label):
+    assert _rules(sql) == ["R001"], label
+
+
+# 要修 4:前面有空行/註解時,切出來的段落 start 指向該段第一個字元(行內留言行號才不偏)
+
+def test_前面有空行時切出段落的start指向該段第一個字元():
+    from toolbox.sqltools import parsed_chunks
+    sql = "SELECT 1;\n" + "\n" * 12 + "DECLARE @x INT\nDELETE t\nPRINT 1"
+    starts = [c.start for c, _, _ in parsed_chunks(sql, catch=Exception)
+              if c.text.strip().upper().startswith("DELETE")]
+    assert starts and sql[starts[0]:].startswith("DELETE"), starts
