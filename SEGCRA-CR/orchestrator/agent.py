@@ -23,7 +23,7 @@ def output_truncated(meta: dict, max_output_tokens: int) -> bool:
     任一成立就算:不是每個端點碰到上限都照規格回 `length`,而用量達到上限本身就代表輸出被
     切斷。兩者都沒回報時判成沒有截斷——沒有依據就報,每一次呼叫都會被當成截斷。
 
-    主審查與測資生成都用這一個判斷。"""
+    主審查、測資生成、仲裁、知識起草、裸模型對照組都用這一個判斷。"""
     if meta.get("finish_reason") == "length":
         return True
     used = meta.get("completion_tokens")

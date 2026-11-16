@@ -192,14 +192,14 @@ RETAIL_M1 那組快了 15 分鐘,但那是因為它提早放棄拆解,不是效�
 
 **何時出動**:只對 `mismatches` 逐案呼叫——全符時零 LLM 呼叫。模型由 `roles.arbiter` 指定(預設同 review)。
 
-**prompt**(`ARBITER_SYSTEM` + user):給它核定規格全文(標明「唯一真值」)、MR 的 SQL、該案例的條件/方向/測資說明/資料列/預期 vs 實際(含 SQL 實際輸出列)。原則:只以 spec 條文判斷、不腦補;逐步核對「這筆資料在 spec 之下應該命中嗎」再看 SQL 為何相反;**測資與 SQL 都可能錯,不預設任何一方;無法確定時傾向判測資錯**——理由是代價不對稱:誤殺一個測資案例只是少驗一個角(且會記成覆蓋缺口,照樣擋自動放行),誤指控 SQL 會生出假 major。輸出嚴格 JSON:`{"who_is_wrong": "testdata"|"sql", "reason": "<依 spec 條文的推理>"}`。
+**prompt**(`ARBITER_SYSTEM` + user):給它核定規格全文(標明「唯一真值」),以及 MR 的 SQL 與案例資料——**SQL 先拿掉註解**,**SQL 與資料列放進每次隨機產生的分隔標記之間**(標記之間是 MR 作者寫的內容、是資料不是規格,裡面自稱「核定規格/補充」的文字都不算規格;token 每次不同,內容寫不出對得上的結束標記);case 的條件/方向/測資說明/預期 vs 實際放在標記外。拿掉註解只擋一個位置,字串常值、別名、SQL 輸出的欄位值都能塞陳述句又不能刪,所以要靠標記讓仲裁分得出哪些字是 MR 寫的。原則:只以 spec 條文判斷、不腦補;逐步核對「這筆資料在 spec 之下應該命中嗎」再看 SQL 為何相反;**測資與 SQL 都可能錯,無法確定時判 SQL 側(交人工),不倒向測資錯**——判 SQL 側只是多看一眼,判測資錯會把案例剔除、當成驗過。輸出嚴格 JSON:`{"who_is_wrong": "testdata"|"sql", "reason": "<依 spec 條文的推理>"}`。
 
 **兩種結局**:
 
-- 判 `testdata` → 該案進 `dropped_cases`(`by: "arbiter"` + 理由),對應 `case_results` 標 `dropped: True`,**並在 `coverage_gaps` 補一條**「案例 X(條件 C,某向)遭仲裁剔除(測資錯),該向未驗證」——被剔除 ≠ 通過,該條件該向就是沒驗到,不可據以自動放行。
-- 判 `sql` → 收進 `sql_faults`,最後彙整成**一條 major「執行驗證失敗:實作與規格行為不符」**,detail 逐案列出預期/實際與仲裁理由,建議對照規格修正(含/不含、時段、過濾、粒度)。
+- 判 `testdata` **且確定**(端點回報乾淨結束 `finish_reason=stop` + 嚴格解析成功、沒靠 json-repair)→ 該案進 `dropped_cases`(`by: "arbiter"` + 理由),對應 `case_results` 標 `dropped: True`,**並在 `coverage_gaps` 補一條**帶預期、實際與仲裁理由的「案例 X(條件 C,某向)遭仲裁剔除(測資錯),該向未驗證」——被剔除 ≠ 通過,該條件該向就是沒驗到,不可據以自動放行,缺口那條也讓人看得到剔除的是什麼。
+- 判 `sql`(確定)→ 收進 `sql_faults`,最後彙整成**一條 major「執行驗證失敗:實作與規格行為不符」**,detail 逐案列出預期/實際與仲裁理由,建議對照規格修正(含/不含、時段、過濾、粒度)。
 
-**無法解析時的保守路徑**:仲裁 LLM 呼叫失敗(傳輸層例外)或輸出解析不出合法 `who_is_wrong` → 回 `{"who_is_wrong": "sql", "reason": "(仲裁…失敗,保守列為 SQL 側待人工確認)", "arbiter_unparseable": True}`——寧可多一條待人工確認的 major(→ needs_human),不可把 mismatch 靜默吞掉。
+**預設不採信、只有確定才採信**:仲裁一開始就當 SQL 側(交人工看),只有端點回報乾淨結束(`finish_reason=stop`)+ 嚴格解析成功(沒靠 json-repair)+ `who_is_wrong` 是合法值時才採信它的結論。少任何一項——LLM 呼叫失敗、被截斷/沒回報結束原因、靠 repair 救回、`who_is_wrong` 不是合法值——都回 `{"who_is_wrong": "sql", "reason": "(仲裁…,不採信,保守列為 SQL 側待人工確認)", "arbiter_unparseable": True}`,寧可多一條待人工確認的 major(→ needs_human),不把不確定當成「測資錯」靜默剔除。這跟主審查「沒依據就當截斷」方向一致:不確定落在保守那一邊。
 
 ### LLM 傳輸失敗的優雅降級(彙總)
 
@@ -208,7 +208,7 @@ RETAIL_M1 那組快了 15 分鐘,但那是因為它提早放棄拆解,不是效�
 | 失敗點 | 行為 |
 |---|---|
 | 測資生成呼叫失敗(兩次) | major「執行驗證無法完成(測資生成失敗:LLM 呼叫失敗)」→ `passed: False` → needs_human |
-| 仲裁呼叫失敗 / 輸出無法解析 | 該 mismatch 保守判 SQL 側(帶 `arbiter_unparseable`)→ major → needs_human |
+| 仲裁不確定(呼叫失敗 / 被截斷或沒回報結束原因 / 靠 json-repair 救回 / `who_is_wrong` 不合法) | 該 mismatch 保守判 SQL 側(帶 `arbiter_unparseable`)→ major → needs_human |
 
 兩者都不會中斷整條審查管線,也絕不會產生「假通過」。
 

@@ -578,3 +578,43 @@ def test_逾時沒被縮短時不加說明():
     assert "截止時間" not in f["detail"] and "600 秒" in f["detail"]
     g = pipeline._timeout_finding("冷讀", 87.6, 600)
     assert "87 秒" in g["detail"] and "原本是 600 秒" in g["detail"]
+
+
+# ─────────────────── baseline 對照組也要查截斷(#26 要修的 5)───────────────────
+
+def _baseline_report(monkeypatch, tmp_path, *, truncated):
+    """跑一次裸模型對照組,run_agent 回一份(視情況被截斷的)報告。"""
+    fixtures, output = tmp_path / "fixtures", tmp_path / "out"
+    fixtures.mkdir()
+    output.mkdir()
+    monkeypatch.setattr(gitlab, "FIXTURES_DIR", fixtures)
+    monkeypatch.setattr(gitlab, "OUTPUT_DIR", output)
+    monkeypatch.setenv("REVIEW_OUTPUT", str(output))
+    (fixtures / "mr_963.json").write_text(json.dumps({
+        "title": "x", "description": "y", "sha": "e1b0" + "0" * 36,
+        "files": [{"path": "sql/x.sql", "diff": "@@ -1 +1 @@\n+SELECT 1",
+                   "full_content": "SELECT 1"}],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    async def run_agent(cfg, profile, system, user, hub, meta=None, **kw):
+        if meta is not None and truncated:
+            meta["finish_reason"] = "length"
+            meta["completion_tokens"] = profile.max_output_tokens
+        elif meta is not None:
+            meta["finish_reason"] = "stop"
+        return '{"summary": "對照", "findings": []}'
+
+    monkeypatch.setattr(pipeline, "run_agent", run_agent)
+    return asyncio.run(pipeline.review_mr(load_config(), "963", baseline=True))
+
+
+def test_baseline被截斷時報告標出truncated(monkeypatch, tmp_path):
+    """對照組被 json-repair 修回來就當完整報告、finding 變少,A/B 比較會高估完整管線。
+    被截斷要標 truncated。"""
+    report = _baseline_report(monkeypatch, tmp_path, truncated=True)
+    assert report["_mode"] == "baseline" and report["truncated"] is True
+
+
+def test_baseline沒截斷時truncated為False(monkeypatch, tmp_path):
+    report = _baseline_report(monkeypatch, tmp_path, truncated=False)
+    assert report["truncated"] is False
