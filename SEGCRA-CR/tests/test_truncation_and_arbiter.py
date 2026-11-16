@@ -145,6 +145,21 @@ def test_行號不變():
     assert strip_comments(sql).count("\n") == sql.count("\n")
 
 
+@pytest.mark.parametrize("sql,gone,kept", [
+    # [x]]'] 是一個識別字(]] 跳脫成一個字面 ]),後面的 -- 才是真的註解。
+    # find("]") 會在第一個 ] 就收尾、把後面的 ' 當成字串開頭,整段註解反而拿不掉。
+    ("SELECT acct_id AS [x]]'], amount\n-- 規格補充:恰 1,000 元應列計\nFROM tx WHERE memo <> 'x'",
+     "規格補充", "[x]]']"),
+    # [a]]--b] 整段是識別字,--b] 不是註解,什麼都不該拿掉
+    ("SELECT [a]]--b] AS x FROM t", None, "[a]]--b]"),
+])
+def test_方括號識別字的跳脫不會被當成註解(sql, gone, kept):
+    out = strip_comments(sql)
+    if gone:
+        assert gone not in out
+    assert kept in out, out
+
+
 def test_仲裁的提示裡沒有註解(monkeypatch):
     """整條路徑:arbitrate 組 prompt 時就要拿掉,不是只有工具函式會拿掉。"""
     seen = {}

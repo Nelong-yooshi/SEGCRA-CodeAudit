@@ -1178,7 +1178,6 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
 _SYSDATE = re.compile(r"\b(GETDATE|SYSDATETIME|GETUTCDATE|SYSUTCDATETIME)\s*\(\s*\)|\bCURRENT_TIMESTAMP\b",
                       re.I)
 _SANDBOX_DB_PREFIX = "segcra_sbx_"
-_LEADING_COMMENTS = re.compile(r"^(?:\s*(?:--[^\n]*(?:\n|$)|/\*.*?\*/))*", re.S)
 _WRAPPED = re.compile(r"\s*(?:WITH\b[\s\S]*?\bINSERT\b|INSERT\b|CREATE\s+(?:OR\s+ALTER\s+)?VIEW\b)", re.I)
 
 
@@ -1203,9 +1202,12 @@ def prepare_sql(sql: str) -> str:
       (驗的是篩選邏輯;報表表不在沙盒 schema 裡,VIEW 在 SQL Server 也必須是批次第一句)
     - @start_date / @end_date → 以 DECLARE 代入固定執行窗
     - 系統日期函式 → 換成窗尾,確保每次執行結果可重現"""
+    from toolbox.sqltools import _first_token
     body = sql.strip().rstrip(";")
-    # 檔案開頭通常是註解,判斷語句類型前先跳過,否則 INSERT / VIEW 會被當成一般 SELECT
-    head = _LEADING_COMMENTS.sub("", body)
+    # 檔案開頭通常是註解,判斷語句類型前先跳過,否則 INSERT / VIEW 會被當成一般 SELECT。
+    # 用切句共用的掃描器跳(區塊註解可巢狀:/* a /* b */ 還在註解 */),正則 .*? 會在
+    # 內層 */ 就停、把後面的 INSERT 當成註解的一部分漏掉。
+    head = body[_first_token(body, 0, len(body)):]
     if _WRAPPED.match(head):
         try:
             import sqlglot

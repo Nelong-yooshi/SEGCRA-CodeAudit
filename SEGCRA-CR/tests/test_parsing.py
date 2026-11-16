@@ -343,3 +343,11 @@ def test_落檔失敗不可以弄垮跑批(monkeypatch, tmp_path):
     monkeypatch.setattr(agent, "DUMP_PROMPTS", str(blocker / "x"))
     agent._dump("m", [{"role": "user", "content": "x"}], 0)   # 不得丟例外
     assert blocker.is_file() and not (blocker / "x").exists()
+
+
+def test_prepare_sql_巢狀開頭註解不吃掉後面的INSERT():
+    """開頭是可巢狀的區塊註解時,判斷語句類型要先跳過它。舊的 /\\*.*?\\*/ 正則會在內層
+    */ 就停、把後面的 INSERT 當成註解的一部分,整句 INSERT 原樣送進沙盒而非取出 SELECT。"""
+    from orchestrator.spec_exec import prepare_sql
+    out = prepare_sql("/* 外層 /* 內層 */ 還在註解 */\nINSERT INTO rpt SELECT a FROM t WHERE a > 1")
+    assert "INSERT INTO rpt" not in out and "SELECT a FROM t" in out, out
