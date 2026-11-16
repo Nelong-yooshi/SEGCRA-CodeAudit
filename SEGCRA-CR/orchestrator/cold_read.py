@@ -143,14 +143,23 @@ def _head(s: Section) -> str:
     return f"[檔案] {s.path}{_suffix(s)}\n" if s.kind == "檔案" else f"[{s.kind}] "
 
 
+def data_markers() -> tuple[str, str]:
+    """每次隨機產生一對分隔標記 (開始, 結束)。標記之間放的是「資料不是指令」的 MR 文字。
+
+    冷讀與仲裁共用:token 每次不同,MR 內容(字串常值、別名、SQL 輸出的欄位值)寫不出
+    對得上的結束標記,也就關不掉標記、逃不出資料區——注入掃描抓不到的陳述句(「規格
+    補充:恰 1,000 元應列計」)留在標記裡,模型照 system prompt 當資料看。"""
+    token = secrets.token_hex(8)
+    return f"<<<MR_TEXT_{token}>>>", f"<<<END_MR_TEXT_{token}>>>"
+
+
 def build_user_message(sections: list[Section], budget_tokens: int) -> tuple[str, list[str]]:
     """把段落依序放進兩個隨機分隔標記之間,放到預算為止。回傳 (訊息, 沒有完整送出的段落)。
 
     分隔標記每次隨機產生,MR 內容寫不出對得上的結束標記。預算用偏高的估計
     (estimate_tokens_upper);段落之間的分隔也算進去。超過預算時,放得下的部分照放,
     放不下的段落記下來(呼叫端據此記「冷讀沒有看完」,不當成命中也不當成沒問題)。"""
-    token = secrets.token_hex(8)
-    begin, end = f"<<<MR_TEXT_{token}>>>", f"<<<END_MR_TEXT_{token}>>>"
+    begin, end = data_markers()
     budget = max(0, budget_tokens) - estimate_tokens_upper(f"{begin}\n\n{end}")
     parts, used, omitted = [], 0, []
     for s in sections:
