@@ -72,14 +72,47 @@ def test_仲裁被截斷時不採信(monkeypatch):
 
 # ─────────────────── 2. 知識起草 ───────────────────
 
-def test_知識起草被截斷時不建項目(monkeypatch):
-    """`text` 可能只有半句話,那會變成一條內容殘缺的 binding 知識項。"""
+def test_知識起草被截斷時丟DraftIncomplete(monkeypatch):
+    """被截斷不是「模型判定不是規定」—— 丟 DraftIncomplete,呼叫端據此請人重試。
+    `text` 可能只有半句話,那會變成一條內容殘缺的 binding 知識項。"""
     raw = '{"is_rule": true, "text": "通報粒度以帳戶為", "scope": ["anomaly-rules"]}'
-    monkeypatch.setattr(knowledge_governance, "run_agent", _fake_agent(raw, truncated=True),
-                        raising=False)
     import orchestrator.agent as agent_mod
     monkeypatch.setattr(agent_mod, "run_agent", _fake_agent(raw, truncated=True))
-    assert asyncio.run(knowledge_governance.draft_binding(_Cfg(), "不用管通報粒度")) is None
+    with pytest.raises(knowledge_governance.DraftIncomplete):
+        asyncio.run(knowledge_governance.draft_binding(_Cfg(), "不用管通報粒度"))
+
+
+def test_知識起草解析不出時丟DraftIncomplete(monkeypatch):
+    """輸出不是 JSON —— 也是起草失敗,不是「不是規定」。"""
+    import orchestrator.agent as agent_mod
+    monkeypatch.setattr(agent_mod, "run_agent", _fake_agent("這不是 JSON", truncated=False))
+    with pytest.raises(knowledge_governance.DraftIncomplete):
+        asyncio.run(knowledge_governance.draft_binding(_Cfg(), "隨便一句"))
+
+
+def test_知識起草判定不是規定時回None(monkeypatch):
+    """模型明確說 is_rule=false —— 這才是回 None(不該 pin),不是失敗。"""
+    import orchestrator.agent as agent_mod
+    monkeypatch.setattr(agent_mod, "run_agent", _fake_agent('{"is_rule": false}', truncated=False))
+    assert asyncio.run(knowledge_governance.draft_binding(_Cfg(), "今天天氣真好")) is None
+
+
+def test_autopin對起草失敗與不是規定印不同訊息(monkeypatch, capsys):
+    """起草失敗(截斷)要印「請重試」;判定不是規定印「非常設規範」—— 審查人員才不會
+    把一句被切掉的指示當成模型說它不是規定。"""
+    import orchestrator.agent as agent_mod
+    import scripts.autopin as autopin
+    monkeypatch.setattr(agent_mod, "run_agent",
+                        _fake_agent('{"is_rule": true, "text": "半句"}', truncated=True))
+    asyncio.run(autopin._propose_from_text(_Cfg(), None, "被切的指示", "amy",
+                                           ["anomaly-rules"], None))
+    msg_fail = capsys.readouterr().out
+    monkeypatch.setattr(agent_mod, "run_agent", _fake_agent('{"is_rule": false}', truncated=False))
+    asyncio.run(autopin._propose_from_text(_Cfg(), None, "閒聊", "amy",
+                                           ["anomaly-rules"], None))
+    msg_norule = capsys.readouterr().out
+    assert "起草未完成" in msg_fail and "請重試" in msg_fail
+    assert "非常設規範" in msg_norule and "請重試" not in msg_norule
 
 
 def test_知識起草沒截斷時照常建(monkeypatch):
