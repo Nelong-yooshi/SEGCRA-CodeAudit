@@ -1985,12 +1985,16 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             user = BASELINE_USER.format(
                 title=mr["title"], description=mr.get("description", ""),
                 diff_section=build_diff_section(mr["files"], cfg.budget["diff"]))
+            meta: dict = {}
             raw = await run_agent(cfg, profile, BASELINE_SYSTEM, user, hub,
-                                  use_tools=False)
+                                  use_tools=False, meta=meta)
             report = extract_json(raw)
             if not report:
                 raise RuntimeError(f"baseline 輸出無法解析為 JSON:\n{raw[:2000]}")
             report["_mode"] = "baseline"
+            # 對照組也要查截斷:被切的輸出被 json-repair 修回來就當成完整報告,finding 會
+            # 變少,A/B 比較就會高估完整管線。標在報告裡,比較時不把它當成完整的一份。
+            report["truncated"] = bool(output_truncated(meta, profile.max_output_tokens))
             return report
 
         # dbt 專案的取回也要隔離:它自己有 catch-all,但讀 dbt_project.yml 判斷專案

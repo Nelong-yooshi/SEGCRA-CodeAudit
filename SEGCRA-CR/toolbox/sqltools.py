@@ -52,37 +52,72 @@ def _skip_block_comment(sql: str, i: int, end: int) -> int:
     return i
 
 
+def _segments(sql: str):
+    """把 SQL 掃成一段一段,吐出 `(種類, 起, 迄)`。種類:
+    `code` / `string` / `ident` / `line_comment` / `block_comment`。
+
+    **字串/識別字/註解的跳過規則只留這一份**:字串 `''` 跳脫、`[...]` 裡的 `]]` 與
+    `"..."` 裡的 `""` 是跳脫(代表一個字面 `]`/`"`,不是結束)、行註解停在換行前、區塊
+    註解可巢狀、沒收尾的吃到檔尾。`_scan_code`、切句、`strip_comments`、`prepare_sql` 的
+    開頭註解都走它——各寫一份就會像以前那樣:`find("]")` 不認 `]]`,`[a]]--b]` 的
+    識別字被攔腰當成註解、`[a]];b]` 的分號被當成切點。
+    """
+    i, n, code = 0, len(sql), 0
+    while i < n:
+        ch = sql[i]
+        if ch == "'":                        # 字串
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":   # '' 跳脫
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            else:
+                j = n
+            kind, end = "string", j
+        elif ch in '"[':                     # 以引號或方括號包起來的識別字
+            close = '"' if ch == '"' else "]"
+            j = i + 1
+            while j < n:
+                if sql[j] == close:
+                    if j + 1 < n and sql[j + 1] == close:  # ]] 或 "" 跳脫
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            else:
+                j = n
+            kind, end = "ident", j
+        elif sql.startswith("--", i):        # 行註解:停在換行前(換行屬於 code)
+            j = sql.find("\n", i)
+            kind, end = "line_comment", (n if j < 0 else j)
+        elif sql.startswith("/*", i):        # 區塊註解(T-SQL 可巢狀)
+            kind, end = "block_comment", _skip_block_comment(sql, i, n)
+        else:
+            i += 1
+            continue
+        if code < i:
+            yield "code", code, i
+        yield kind, i, end
+        i = code = end
+    if code < n:
+        yield "code", code, n
+
+
 def _scan_code(sql: str):
     """逐一吐出「不在字串、識別字、註解裡」的位置與字元:`(位置, 字元)`。
 
-    切句的兩個掃描器(分號、行首關鍵字)共用這一份:字串常值、`[...]`/`"..."` 識別字、
-    行註解與可巢狀的區塊註解整段跳過,沒收尾的就吃到檔尾。各寫一份的話,補了一邊的
-    跳脫規則就會漏掉另一邊。
+    切句的兩個掃描器(分號、行首關鍵字)共用這一份(底層是 `_segments`);對外的樣子
+    不變:只吐 code 段的每個字元。
     """
-    i, n = 0, len(sql)
-    while i < n:
-        ch = sql[i]
-        if ch == "'":                        # 字串('' 是跳脫,不是結束)
-            i += 1
-            while i < n:
-                if sql[i] == "'":
-                    if i + 1 < n and sql[i + 1] == "'":
-                        i += 2
-                        continue
-                    i += 1
-                    break
-                i += 1
-        elif ch in '"[':                     # 以引號或方括號包起來的識別字
-            j = sql.find('"' if ch == '"' else "]", i + 1)
-            i = n if j < 0 else j + 1
-        elif sql.startswith("--", i):        # 行註解:停在換行上,換行本身還要看得到
-            j = sql.find("\n", i)
-            i = n if j < 0 else j
-        elif sql.startswith("/*", i):        # 區塊註解(T-SQL 可以巢狀)
-            i = _skip_block_comment(sql, i, n)
-        else:
-            yield i, ch
-            i += 1
+    for kind, a, b in _segments(sql):
+        if kind == "code":
+            for i in range(a, b):
+                yield i, sql[i]
 
 
 def _semicolon_cuts(sql: str) -> list[int]:
@@ -125,6 +160,24 @@ def _first_token(sql: str, i: int, end: int) -> int:
             return i
     return end
 
+
+def strip_comments(sql: str) -> str:
+    """把註解換成等長的空白,**字串常值與識別字原樣保留**;換行留著,行號不變。
+
+    用途是「送出去的內容不該帶註解」(例如送仲裁:註解不影響執行結果,仲裁也用不到,
+    但 MR 作者可以在裡面寫陳述句影響判斷)。
+
+    跟切句共用同一份跳過規則(`_segments`):字串裡的 `--` 不是註解開頭、區塊註解可
+    巢狀、`[a]]--b]` 的 `--b]` 在識別字裡不是註解。各寫一份的話,一邊補了跳脫規則
+    另一邊沒補,就會有一種寫法在某一條路上被當成註解切掉。
+    """
+    out = list(sql)
+    for kind, a, b in _segments(sql):
+        if kind in ("line_comment", "block_comment"):
+            for k in range(a, b):
+                if out[k] != "\n":          # 換行留著,行號不變
+                    out[k] = " "
+    return "".join(out)
 
 def statement_chunks(sql: str) -> list[Chunk]:
     """依分號切成一句一句。
