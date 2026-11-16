@@ -28,6 +28,27 @@ GITLAB_READ_TOKEN = os.environ.get("GITLAB_READ_TOKEN", "")
 
 # --- real mode helpers ---------------------------------------------------
 
+class NotAnMR(Exception):
+    """GitLab 回了 200 的 JSON,內容卻不是 MR(GITLAB_URL 指到別的服務、代理…)。
+
+    跟「回的不是 JSON」(json.JSONDecodeError)分開:兩者都是 200,但後者多半是網頁或
+    登入頁。管線據此說出原因(orchestrator/mr_fetch_error.py),不必比對錯誤訊息。"""
+
+
+def _as_mr(mr):
+    """GitLab 回的 MR:不是 MR 的資料就丟 NotAnMR(原本會在後面變成看不出原因的 KeyError)。"""
+    if not isinstance(mr, dict) or "title" not in mr:
+        raise NotAnMR("MR 的回應不是 MR 的資料")
+    return mr
+
+
+def _as_changes(changes):
+    """MR 的變更清單:每一項都要有 new_path,不對就丟 NotAnMR。"""
+    if not all(isinstance(c, dict) and "new_path" in c for c in changes):
+        raise NotAnMR("MR 的變更清單不是預期的形狀")
+    return changes
+
+
 def _api(method: str, path: str, **kwargs):
     import httpx
     r = httpx.request(
@@ -360,13 +381,13 @@ def get_mr_diff(mr_id: str) -> str:
     """
     mr_id = _check_mr_id(mr_id)
     if REAL_MODE:
-        mr = _api("GET", f"/merge_requests/{mr_id}")
+        mr = _as_mr(_api("GET", f"/merge_requests/{mr_id}"))
         changes, truncated = _api_pages(f"/merge_requests/{mr_id}/diffs")
         files = [{"path": c["new_path"], "old_path": c.get("old_path"),
                   "diff": c.get("diff") or "",
                   "deleted": bool(c.get("deleted_file")),
                   "unreviewable": bool(c.get("too_large") or c.get("collapsed"))}
-                 for c in changes]
+                 for c in _as_changes(changes)]
         refs = _diff_refs(mr)
         # **預掃與執行驗證要的是整份新檔,不是 diff 裡那幾行**。大檔小改的 MR,
         # 從 diff 還原出來的 SQL 可能只剩一行,sqlglot 解析不了、沙盒也沒東西可跑
