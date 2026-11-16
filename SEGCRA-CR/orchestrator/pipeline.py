@@ -15,7 +15,7 @@ from typing import NamedTuple
 from pathlib import Path
 
 
-from .agent import MAX_ITERATIONS, extract_json, output_truncated, run_agent
+from .agent import MAX_ITERATIONS, extract_json, llm_deadline, output_truncated, run_agent
 from .config import (DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, env_seconds,
                      estimate_tokens)
 from .dbt_affected import (
@@ -1502,8 +1502,10 @@ async def _run_main_review(cfg: Config, profile, system: str, user: str, hub, tr
         print(f"[pipeline] MR !{mr_id} 整份審查剩下的時間不夠,沒有呼叫主審查模型", flush=True)
         return None
     try:
-        return await asyncio.wait_for(
-            run_agent(cfg, profile, system, user, hub, trace=trace, meta=meta), limit)
+        # 每次請求等多久跟這個上限一致(見 agent.llm_deadline):外層取消時,閘道也不再多等
+        with llm_deadline(limit):
+            return await asyncio.wait_for(
+                run_agent(cfg, profile, system, user, hub, trace=trace, meta=meta), limit)
     except Exception as e:
         meta["failed"] = _model_failure_kind(e)
         print(f"[pipeline] MR !{mr_id} 主審查模型呼叫失敗({meta['failed']})", flush=True)
@@ -1533,7 +1535,8 @@ async def _run_cold_read(cfg: Config, mr: dict, dbt_ctx: DbtContext | None, dead
     if limit is None:
         return None, _incomplete_finding("冷讀", reason=_NO_TIME_REASON)
     try:
-        return await asyncio.wait_for(_cold_read_stage(cfg, mr, dbt_ctx), limit)
+        with llm_deadline(limit):
+            return await asyncio.wait_for(_cold_read_stage(cfg, mr, dbt_ctx), limit)
     except asyncio.TimeoutError:
         return None, _timeout_finding("冷讀", limit, COLD_READ_TIMEOUT_SECONDS)
 
@@ -2221,10 +2224,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             exec_code, exec_text = _spec_for_exec(spec_code, spec_text, affected_specs, exec_mr)
             exec_mr, dbt_exec = _dbt_exec_mr(exec_mr, exec_text, spec_text, affected_specs,
                                              dbt_ctx, cfg.dbt)
-            spec_result = await asyncio.wait_for(
-                run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text,
-                              progress=progress, deadline=deadline),
-                timeout=spec_limit)
+            # 執行驗證裡有好幾次模型呼叫(測資生成、重試、仲裁),越後面的剩的時間越少:
+            # 每一次各自用那一刻剩下的(見 agent.llm_deadline / request_timeout)
+            with llm_deadline(spec_limit):
+                spec_result = await asyncio.wait_for(
+                    run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text,
+                                  progress=progress, deadline=deadline),
+                    timeout=spec_limit)
         except _SpecExecSkipped as skipped:
             report.setdefault("findings", []).append(
                 _incomplete_finding("執行驗證", reason=str(skipped)))

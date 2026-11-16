@@ -589,12 +589,12 @@ MUTANTS.update({
      '        injection_hits = _step(report_stub, "注入掃描", scan_mr, [], scan_target)',
      "        injection_hits = scan_mr(scan_target)"),
  "隔離:執行驗證不設時間上限": ("pipeline.py",
-     "            spec_result = await asyncio.wait_for(" + NL
-     + "                run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text," + NL
-     + "                              progress=progress, deadline=deadline)," + NL
-     + "                timeout=spec_limit)",
-     "            spec_result = await run_spec_exec(" + NL
-     + "                cfg, hub, exec_mr, exec_code, exec_text)"),
+     "                spec_result = await asyncio.wait_for(" + NL
+     + "                    run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text," + NL
+     + "                                  progress=progress, deadline=deadline)," + NL
+     + "                    timeout=spec_limit)",
+     "                spec_result = await run_spec_exec(" + NL
+     + "                    cfg, hub, exec_mr, exec_code, exec_text)"),
 })
 
 # ---- #53 review:時間上限要擋得住同步卡住的沙盒、未完成是硬條件、階段要分得出來
@@ -4175,20 +4175,51 @@ MUTANTS.update({
 # ---- 閘道的請求上限:開啟時請求內容帶 timeout,預設不送
 MUTANTS.update({
  "閘道上限:開啟了也不送": ("agent.py",
-     '    timeout_kwargs = {"extra_body": {"timeout": REQUEST_TIMEOUT}} if SEND_TIMEOUT else {}',
-     "    timeout_kwargs = {}"),
+     '        timeout_kwargs = {"extra_body": {"timeout": wait}} if SEND_TIMEOUT else {}',
+     "        timeout_kwargs = {}"),
  "閘道上限:沒開也送": ("agent.py",
-     '    timeout_kwargs = {"extra_body": {"timeout": REQUEST_TIMEOUT}} if SEND_TIMEOUT else {}',
-     '    timeout_kwargs = {"extra_body": {"timeout": REQUEST_TIMEOUT}}'),
- "閘道上限:送的不是 LLM_TIMEOUT 的值": ("agent.py",
-     '    timeout_kwargs = {"extra_body": {"timeout": REQUEST_TIMEOUT}} if SEND_TIMEOUT else {}',
-     '    timeout_kwargs = {"extra_body": {"timeout": 30}} if SEND_TIMEOUT else {}'),
+     '        timeout_kwargs = {"extra_body": {"timeout": wait}} if SEND_TIMEOUT else {}',
+     '        timeout_kwargs = {"extra_body": {"timeout": wait}}'),
+ "閘道上限:送給閘道的跟用戶端等的不一樣(送 LLM_TIMEOUT)": ("agent.py",
+     '        timeout_kwargs = {"extra_body": {"timeout": wait}} if SEND_TIMEOUT else {}',
+     '        timeout_kwargs = {"extra_body": {"timeout": REQUEST_TIMEOUT}} if SEND_TIMEOUT else {}'),
  "閘道上限:沒有傳進請求": ("agent.py",
      "            **seed_kwargs, **effort_kwargs, **timeout_kwargs,",
      "            **seed_kwargs, **effort_kwargs,"),
  "閘道上限:讀不懂的值也當成開啟": ("agent.py",
-     '    return raw.strip().lower() in ("1", "true", "yes", "on")',
-     '    return raw.strip().lower() not in ("", "0", "false", "no", "off")'),
+     "    if value not in _FLAG_OFF:",
+     "    if value not in _FLAG_OFF:" + NL + "        return True"),
+ "閘道上限:讀不懂的開關值不警告": ("agent.py",
+     '        print(f"[agent] 警告:環境變數 {name} 的值讀不懂({raw!r}),當成沒開;"',
+     '        pass' + NL + '    if False:' + NL + '        print(f"[agent] 警告:環境變數 {name} 的值讀不懂({raw!r}),當成沒開;"'),
+ "閘道上限:LLM_TIMEOUT 接受 inf / nan / 0": ("agent.py",
+     "    if not (math.isfinite(value) and value > 0):",
+     "    if False:"),
+ "閘道上限:用戶端不用這一環節剩的時間": ("agent.py",
+     "            timeout=wait," + NL,
+     ""),
+ "閘道上限:不看這一環節的截止時間": ("agent.py",
+     "    end = _DEADLINE.get()" + NL + "    if end is None:",
+     "    end = None" + NL + "    if end is None:"),
+ "閘道上限:巢狀時取較晚的(截止時間被延後)": ("agent.py",
+     "    token = _DEADLINE.set(end if current is None else min(current, end))",
+     "    token = _DEADLINE.set(end)"),
+ "閘道上限:時間到了送 0 或負數": ("agent.py",
+     "    return max(1.0, min(REQUEST_TIMEOUT, end - time.monotonic()))",
+     "    return min(REQUEST_TIMEOUT, end - time.monotonic())"),
+ "閘道上限:主審查不設截止時間": ("pipeline.py",
+     "        with llm_deadline(limit):" + NL + "            return await asyncio.wait_for(" + NL
+     + "                run_agent(",
+     "        with llm_deadline(None):" + NL + "            return await asyncio.wait_for(" + NL
+     + "                run_agent("),
+ "閘道上限:冷讀不設截止時間": ("pipeline.py",
+     "        with llm_deadline(limit):" + NL
+     + "            return await asyncio.wait_for(_cold_read_stage(",
+     "        with llm_deadline(None):" + NL
+     + "            return await asyncio.wait_for(_cold_read_stage("),
+ "閘道上限:執行驗證不設截止時間": ("pipeline.py",
+     "            with llm_deadline(spec_limit):",
+     "            with llm_deadline(None):"),
 })
 
 

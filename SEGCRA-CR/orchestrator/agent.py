@@ -1,7 +1,11 @@
 """Agent loop — 本地模型(OpenAI-compatible)+ ToolHub 工具呼叫迴圈。"""
+import contextlib
+import contextvars
 import json
+import math
 import os
 import re
+import time
 
 from openai import AsyncOpenAI
 
@@ -10,22 +14,87 @@ from .tool_hub import ToolHub
 
 MAX_ITERATIONS = 12
 
+def _env_timeout(name: str, default: float) -> float:
+    """讀「單次請求等多久」:要是有限的正數。讀不懂、`inf`、`nan`、0 或負數都退回預設並
+    印一行警告 —— 這個值會放進請求內容(LLM_SEND_TIMEOUT),`inf` 連 JSON 都轉不出來,
+    每次模型呼叫都會在送出前失敗。"""
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not (math.isfinite(value) and value > 0):
+        print(f"[agent] 警告:環境變數 {name} 的值不是有限的正數秒數({raw!r}),"
+              f"改用預設 {default:g} 秒", flush=True)
+        return default
+    return value
+
+
 # 本地大模型單次生成可能超過 10 分鐘(openai client 預設 timeout 600s 且自動重試
 # 2 次——對本地推理只是把同一個慢請求連跑三遍再炸 Timeout)。改為:單次請求
 # 上限 1 小時、不自動重試;可用環境變數 LLM_TIMEOUT(秒)覆蓋。
-REQUEST_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "3600"))
+REQUEST_TIMEOUT = _env_timeout("LLM_TIMEOUT", 3600)
+
+_FLAG_ON = ("1", "true", "yes", "on")
+_FLAG_OFF = ("0", "false", "no", "off")
 
 
-def _flag_on(raw: str) -> bool:
-    """只有明確開啟才算;讀不懂的值當成沒開(跟預設一樣,不會多送端點不認得的欄位)。"""
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+def _env_flag(name: str, unset: str) -> bool:
+    """開關型的環境變數。沒設就是關;`1/true/yes/on` 開、`0/false/no/off` 關;**其他值
+    (打錯字、設了但是空的)印一行警告並當成關**:打錯一個字就跟沒設一樣、又沒有任何輸出的話,
+    症狀(長請求被切斷)看起來跟這個設定無關。當成關 = 跟沒有這個設定一樣,不是改走別的路。
+    `unset` 是沒設時的值(寫在呼叫端,docs/10 的預設值欄對照得到)。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return unset.strip().lower() in _FLAG_ON
+    value = raw.strip().lower()
+    if value in _FLAG_ON:
+        return True
+    if value not in _FLAG_OFF:
+        print(f"[agent] 警告:環境變數 {name} 的值讀不懂({raw!r}),當成沒開;"
+              f"要開請設 1、true、yes 或 on", flush=True)
+    return False
 
 
 # LLM_TIMEOUT 是用戶端願意等多久。端點前面若有模型閘道(例如 LiteLLM),閘道對每次請求另有
 # 自己的上限(可能只有幾十秒),超過就切斷,用戶端等再久也沒用。LiteLLM 會照請求
-# 內容裡的 `timeout` 改用那個上限,所以 LLM_SEND_TIMEOUT=1 時把同一個值放進請求
+# 內容裡的 `timeout` 改用那個上限,所以 LLM_SEND_TIMEOUT=1 時把這次請求會等的時間放進請求
 # 內容。預設不送,理由同 reasoning_effort:不認得這個欄位的端點可能整個退回請求。
-SEND_TIMEOUT = _flag_on(os.environ.get("LLM_SEND_TIMEOUT", ""))
+SEND_TIMEOUT = _env_flag("LLM_SEND_TIMEOUT", "")
+
+
+# 這一環節的截止時間(time.monotonic())。主審查、冷讀、執行驗證外面各有自己的上限
+# (`asyncio.wait_for`,見 pipeline._stage_limit),時間到是外層先取消,run_agent 不知道。
+# 請求送出去的 timeout 若比剩下的時間長,用戶端斷線走了、閘道還照收到的值等,模型繼續生成
+# 一個沒有人要的答案;端點一次只處理一個請求時,下一份審查就排在它後面。
+_DEADLINE: contextvars.ContextVar = contextvars.ContextVar("segcra_llm_deadline", default=None)
+
+
+@contextlib.contextmanager
+def llm_deadline(seconds: float | None):
+    """在這個區塊裡呼叫的模型,每次請求最多等到「現在 + seconds」。巢狀時取較早的。
+    `asyncio.wait_for` 建的 task 與 `run_in_thread` 都會帶上這個值,所以要在呼叫它們**之前**設。"""
+    if seconds is None:
+        yield
+        return
+    end = time.monotonic() + seconds
+    current = _DEADLINE.get()
+    token = _DEADLINE.set(end if current is None else min(current, end))
+    try:
+        yield
+    finally:
+        _DEADLINE.reset(token)
+
+
+def request_timeout() -> float:
+    """這一次請求會等多久:LLM_TIMEOUT 與這一環節剩下的時間取小的,至少 1 秒。
+    用戶端(openai 套件)與送給閘道的(LLM_SEND_TIMEOUT)用同一個值,兩邊同時到。"""
+    end = _DEADLINE.get()
+    if end is None:
+        return REQUEST_TIMEOUT
+    return max(1.0, min(REQUEST_TIMEOUT, end - time.monotonic()))
 
 
 def output_truncated(meta: dict, max_output_tokens: int) -> bool:
@@ -170,18 +239,21 @@ async def _run_agent(client, cfg: Config, profile: ModelProfile, system: str, us
     # 請求被退回,比多花一點 token 嚴重得多,所以預設不送而不是預設關閉思考。
     effort_kwargs = ({"reasoning_effort": profile.reasoning_effort}
                      if profile.reasoning_effort else {})
-    # 閘道的請求上限(見 SEND_TIMEOUT):放在 extra_body,openai 套件會原樣併進請求內容
-    timeout_kwargs = {"extra_body": {"timeout": REQUEST_TIMEOUT}} if SEND_TIMEOUT else {}
     if meta is not None:
         # 一開始就寫 False:呼叫端用 meta.get("exhausted") 時,「沒有這個 key」
         # (舊版程式)與「跑完沒用光輪次」要分得出來。
         meta["exhausted"] = False
     for i in range(MAX_ITERATIONS):
         dump_path = _dump(profile.model, messages, i)
+        # 每一輪都重算:這一環節剩下的時間越來越少(見 request_timeout)。用戶端的 timeout
+        # 與送給閘道的(放在 extra_body,openai 套件會原樣併進請求內容)是同一個值
+        wait = request_timeout()
+        timeout_kwargs = {"extra_body": {"timeout": wait}} if SEND_TIMEOUT else {}
         resp = await client.chat.completions.create(
             model=profile.model, messages=messages, **tool_kwargs,
             temperature=profile.temperature,
             max_tokens=profile.max_output_tokens,
+            timeout=wait,
             **seed_kwargs, **effort_kwargs, **timeout_kwargs,
         )
         msg = resp.choices[0].message
