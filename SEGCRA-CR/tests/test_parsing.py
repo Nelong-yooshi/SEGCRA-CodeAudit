@@ -239,7 +239,9 @@ def test_仲裁輸出無法解析時也倒向_SQL_錯(monkeypatch, raw):
 
 @pytest.mark.parametrize("who", ["testdata", "sql"])
 def test_合法的仲裁判定原樣返回(monkeypatch, who):
-    async def fake(*a, **kw):
+    async def fake(*a, meta=None, **kw):
+        if meta is not None:           # 乾淨結束才採信(見 #26 要修的 1)
+            meta["finish_reason"] = "stop"
         return f'{{"who_is_wrong": "{who}", "reason": "理由"}}'
 
     monkeypatch.setattr(spec_exec, "run_agent", fake)
