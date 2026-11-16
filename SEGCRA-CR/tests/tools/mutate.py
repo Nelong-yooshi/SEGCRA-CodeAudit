@@ -2576,9 +2576,12 @@ MUTANTS.update({
 # ---- 注入掃描的總量上限:放得下一份展開結果
 MUTANTS.update({
  # 其他 LLM 呼叫的截斷偵測與送仲裁前去註解(#26 第 1、6 點)
- '仲裁:輸出被截斷也照樣採信': ('spec_exec.py',
-     '    if output_truncated(meta, profile.max_output_tokens):\n        return {"who_is_wrong": "sql", "reason": "(仲裁輸出被截斷,保守列為 SQL 側待人工確認)",',
-     '    if False:\n        return {"who_is_wrong": "sql", "reason": "(仲裁輸出被截斷,保守列為 SQL 側待人工確認)",'),
+ '仲裁:不要求乾淨結束就採信(被截斷/沒回報結束原因也採信)': ('spec_exec.py',
+     '    if finish == "stop" and not repaired and who in ("testdata", "sql"):',
+     '    if not repaired and who in ("testdata", "sql"):'),
+ '仲裁:靠 json-repair 救回也採信(語意可能已變)': ('spec_exec.py',
+     '    if finish == "stop" and not repaired and who in ("testdata", "sql"):',
+     '    if finish == "stop" and who in ("testdata", "sql"):'),
  '仲裁:送出去的 SQL 帶著註解': ('spec_exec.py',
      '            f"## MR 的 SQL\\n```sql\\n{_without_comments(sql)}\\n```\\n\\n"',
      '            f"## MR 的 SQL\\n```sql\\n{sql}\\n```\\n\\n"'),

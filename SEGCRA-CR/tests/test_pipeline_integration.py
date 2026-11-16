@@ -135,6 +135,8 @@ def run(monkeypatch, tmp_path):
                     "mismatches": mismatches}
 
         async def fake_arbitrate(cfg, spec_text, sql, mm, profile_name=None):
+            if spec_exec_kind == "arbiter_testdata":
+                return {"who_is_wrong": "testdata", "reason": "測資把邊界算錯了"}
             return {"who_is_wrong": "sql", "reason": "閾值與規格不符"}
 
         monkeypatch.setattr(spec_exec, "generate_cases", fake_generate)
@@ -180,6 +182,16 @@ def test_執行驗證抓到不符時要變成_major_並擋下自動放行(run):
     assert report["_spec_exec"]["passed"] is False
     assert any(f["severity"] == "major" and "執行驗證失敗" in f["title"]
                for f in report["findings"]), "spec_exec 的 finding 沒有併進報告"
+
+
+def test_仲裁剔除案例時覆蓋缺口寫出預期實際與理由(run):
+    """被剔除的案例要讓人看得到剔除的是什麼、憑什麼剔除:覆蓋缺口那條要帶預期、實際、
+    仲裁理由,不是只有一句「遭仲裁剔除」。"""
+    report, _, _ = run(_mr(CLEAN_SQL), spec_exec_kind="arbiter_testdata")
+    joined = " ".join(report["_spec_exec"]["coverage_gaps"])
+    assert "遭仲裁剔除" in joined
+    assert "測資預期" in joined and "SQL 實際" in joined
+    assert "測資把邊界算錯了" in joined   # 仲裁理由
     assert report["decision"] == "needs_human"
 
 

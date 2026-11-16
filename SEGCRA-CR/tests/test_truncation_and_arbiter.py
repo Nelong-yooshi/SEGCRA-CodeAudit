@@ -40,11 +40,19 @@ _MISMATCH = {"case_id": "c1", "condition_id": "1", "direction": "正",
              "actual_rows": 0}
 
 
-def _fake_agent(raw, *, truncated):
+def _fake_agent(raw, *, truncated, finish=None):
+    """假的 run_agent。truncated=True → finish_reason=length;否則乾淨結束 stop。
+    finish 可明確指定(例如測「端點沒回報 finish_reason」就傳 finish="")。"""
     async def run(cfg, profile, system, user, hub=None, meta=None, **kw):
-        if meta is not None and truncated:
-            meta["finish_reason"] = "length"
-            meta["completion_tokens"] = profile.max_output_tokens
+        if meta is not None:
+            if truncated:
+                meta["finish_reason"] = "length"
+                meta["completion_tokens"] = profile.max_output_tokens
+            elif finish is not None:
+                if finish:
+                    meta["finish_reason"] = finish
+            else:
+                meta["finish_reason"] = "stop"
         return raw
     return run
 
@@ -62,12 +70,44 @@ def test_仲裁沒截斷時照常採用(monkeypatch):
 
 def test_仲裁被截斷時不採信(monkeypatch):
     """被硬切的 JSON 會被修補成合法物件,who_is_wrong 可能剛好補出一個值 —— 看起來
-    有結論,其實推理只寫了一半。跟解析失敗一樣保守:列為 SQL 側待人工確認。"""
+    有結論,其實推理只寫了一半。只有乾淨結束(stop)才採信:列為 SQL 側待人工確認。"""
     monkeypatch.setattr(spec_exec, "run_agent", _fake_agent(_GOOD, truncated=True))
     out = asyncio.run(spec_exec.arbitrate(_Cfg(), "規格", "SELECT 1", dict(_MISMATCH)))
-    assert out["who_is_wrong"] == "sql"
-    assert out["arbiter_unparseable"] is True
-    assert "截斷" in out["reason"]
+    assert out["who_is_wrong"] == "sql" and out["arbiter_unparseable"] is True
+    assert "不採信" in out["reason"]
+
+
+def test_仲裁沒回報結束原因時不採信(monkeypatch):
+    """端點沒回報 finish_reason —— 不知道有沒有被切,落在保守那一邊(SQL 側)。"""
+    monkeypatch.setattr(spec_exec, "run_agent", _fake_agent(_GOOD, truncated=False, finish=""))
+    out = asyncio.run(spec_exec.arbitrate(_Cfg(), "規格", "SELECT 1", dict(_MISMATCH)))
+    assert out["who_is_wrong"] == "sql" and out["arbiter_unparseable"] is True
+
+
+def test_仲裁靠json_repair救回時不採信(monkeypatch):
+    """輸出要靠 json-repair 補才成合法 JSON —— repair 可能補成語意已變的物件,不採信。
+    用單引號:嚴格解析失敗、repair 救回成 who=testdata(repaired=True),正好走這條。"""
+    broken = "{'who_is_wrong': 'testdata', 'reason': '規格第 3 條'}"
+    monkeypatch.setattr(spec_exec, "run_agent", _fake_agent(broken, truncated=False))
+    out = asyncio.run(spec_exec.arbitrate(_Cfg(), "規格", "SELECT 1", dict(_MISMATCH)))
+    assert out["who_is_wrong"] == "sql" and out["arbiter_unparseable"] is True
+
+
+def test_仲裁who不是合法值時不採信(monkeypatch):
+    monkeypatch.setattr(spec_exec, "run_agent",
+                        _fake_agent('{"who_is_wrong": "maybe"}', truncated=False))
+    out = asyncio.run(spec_exec.arbitrate(_Cfg(), "規格", "SELECT 1", dict(_MISMATCH)))
+    assert out["who_is_wrong"] == "sql" and out["arbiter_unparseable"] is True
+
+
+def test_仲裁確定判SQL錯時是major不是交人工(monkeypatch):
+    """乾淨結束 + 嚴格解析 + 明確說 sql —— 這是確定的 SQL 錯,不標 arbiter_unparseable
+    (會變成 major finding,不是交人工)。"""
+    monkeypatch.setattr(spec_exec, "run_agent",
+                        _fake_agent('{"who_is_wrong": "sql", "reason": "少了排除條件"}',
+                                    truncated=False))
+    out = asyncio.run(spec_exec.arbitrate(_Cfg(), "規格", "SELECT 1", dict(_MISMATCH)))
+    assert out["who_is_wrong"] == "sql" and not out.get("arbiter_unparseable")
 
 
 # ─────────────────── 2. 知識起草 ───────────────────
