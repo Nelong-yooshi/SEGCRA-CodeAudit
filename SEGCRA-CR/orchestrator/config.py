@@ -121,10 +121,73 @@ def _env_seed(name: str) -> int | None:
     return v
 
 
+class ConfigError(ValueError):
+    """設定不安全或不完整:停下來交給人處理,不退回別的做法(見 _env_text、check_config_file)。"""
+
+
+def _env_text(name: str) -> str | None:
+    """文字型的環境變數:沒設回 None;**設了但去掉前後空白後是空的,直接報錯**。
+
+    設了變數就表示要用它;變數是空的,多半是部署腳本沒把值帶進來(例如 `read` 時直接按了
+    Enter)。這時改用設定檔或預設值,等於用一份沒有人指定的設定繼續跑,而症狀(端點回 401、
+    連線錯誤)看不出是哪個變數。前後的空白去掉。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        raise ConfigError(f"環境變數 {name} 有設定但是空的;要用就給值,不用就把這個變數拿掉")
+    return value
+
+
+# 模型設定檔裡 api_key 唯一接受的值(或不寫):Ollama 不驗證,這只是佔位
+_API_KEY_PLACEHOLDER = "ollama"
+
+
+def check_config_file(path: Path, *, secret: bool) -> None:
+    """讀設定檔前檢查權限,太寬就停(照 ssh 的做法)。**只看權限位元,不看擁有者**:設定檔
+    掛進容器時擁有者是主機的 uid,比對擁有者會誤判。
+
+    - `secret=True`(gitlab.env、sandbox.env:裡面是密碼):群組或其他人**可讀或可寫**就停
+      (像 ssh 私鑰要 600)
+    - `secret=False`(模型設定檔:不放金鑰,但別人改得到的話,端點換掉 → 金鑰與每個 MR 的
+      程式碼都送到他指定的地方;或把 policy 改寬):群組或其他人**可寫**就停
+    - 所在的目錄:群組或其他人可寫就停(目錄可寫就能把整個檔案換掉)
+
+    檔案不存在就不檢查(呼叫端各自處理「沒有這個檔」)。Windows 沒有 POSIX 的權限位元
+    (st_mode 只反映唯讀屬性),不檢查;部署端是 Linux。"""
+    if os.name != "posix" or not path.exists():
+        return
+    import stat
+    for target, is_dir in ((path, False), (path.parent, True)):
+        problem = _permission_problem(stat.S_IMODE(target.stat().st_mode), target,
+                                      secret=secret, is_dir=is_dir)
+        if problem:
+            raise ConfigError(problem)
+
+
+def _permission_problem(mode: int, target, *, secret: bool, is_dir: bool) -> str | None:
+    """權限位元 → 太寬時的說明(含路徑、目前的權限、要執行的 chmod);沒問題回 None。
+
+    跟讀檔分開,所以不在 POSIX 上也測得到每一種權限值。"""
+    if is_dir:
+        mask, need, what, how = 0o022, "755", "目錄", "改得到"
+    elif secret:
+        mask, need, what, how = 0o077, "600", "檔案(含密碼)", "讀得到或改得到"
+    else:
+        mask, need, what, how = 0o022, "644", "設定檔", "改得到"
+    if not mode & mask:
+        return None
+    return (f"{what} {target} 的權限太寬({mode:o}):群組或其他帳號{how},"
+            f"不往下跑。請執行:chmod {need} {target}")
+
+
 @dataclass
 class Config:
-    endpoint: str
-    # 不放進 repr:Config 被印出來或寫進例外訊息時,金鑰不跟著出去
+    # 都不放進 repr(str 也是用 repr):Config 被印出來、寫進例外訊息、pytest 斷言失敗印出來時,
+    # 金鑰與端點都不跟著出去 —— 端點網址也可能帶通行碼(`gpu run` 設的 OLLAMA_URL、
+    # 閘道常用的 http://user:pass@host/v1)
+    endpoint: str = field(repr=False)
     api_key: str = field(repr=False)
     default_profile: str
     profiles: dict
@@ -180,7 +243,9 @@ def _load_dbt_section(raw: dict) -> dict:
             f"設定檔 dbt.enabled 必須是布林值 true/false,目前是 {enabled!r}"
             f"({type(enabled).__name__})。字串 \"false\" 在 Python 裡會被當成"
             f"真值,為避免誤開,一律不接受字串。")
-    database = os.environ.get("SEGCRA_DBT_DATABASE", section.get("database", ""))
+    # 設了但是空的一樣停下來(見 _env_text):空的時改用設定檔的值,等於用沒人指定的設定跑
+    env_database = _env_text("SEGCRA_DBT_DATABASE")
+    database = env_database if env_database is not None else section.get("database", "")
     if not isinstance(database, str):
         raise ValueError(f"設定檔 dbt.database 必須是字串,目前是 {database!r}")
     if database:
@@ -217,24 +282,47 @@ def _load_dbt_section(raw: dict) -> dict:
             **({"sqlserver_schema_concat": concat} if concat is not None else {})}
 
 
+def _yaml_api_key(raw: dict) -> str:
+    """設定檔的 api_key 只接受不寫或佔位的 `ollama`,其他值一律停下來。
+
+    那個檔案會進版控與離線包。以前照收:部署端忘了把金鑰拿掉時,服務照常運作、沒有任何提示,
+    金鑰就一直留在檔案裡。訊息不寫出金鑰本身。"""
+    value = raw.get("api_key", _API_KEY_PLACEHOLDER)
+    if value != _API_KEY_PLACEHOLDER:
+        raise ConfigError(
+            "模型設定檔的 api_key 只能不寫或寫 ollama(佔位):金鑰改用環境變數 LLM_API_KEY 給,"
+            "設定檔會進版控與離線包。改完把寫過金鑰的備份檔一起刪掉;"
+            "金鑰曾經寫在檔案裡的話,換一把新的")
+    return value
+
+
+# 其他會讀的設定檔(有的話):密碼類,群組與其他人不能讀寫。load_config 是服務啟動時就會
+# 呼叫的,在這裡一起檢查,權限不對時服務起不來,而不是等到第一份審查用到才失敗
+_SECRET_FILES = ("gitlab.env", "sandbox.env")
+
+
 def models_config_path() -> Path:
-    """要讀的模型設定檔:環境變數 SEGCRA_MODELS_CONFIG 指定的檔案;沒設、空字串或只有空白時是
-    repo 的 config/models.yaml。
+    """要讀的模型設定檔:環境變數 SEGCRA_MODELS_CONFIG 指定的檔案;沒設時是 repo 的 config/models.yaml。
+    **設了但是空的就停**(見 _env_text):不改讀 repo 那份 —— 那等於用一份沒有人指定的設定跑。
 
     部署端要改模型、上下文長度這些設定時,複製一份放在程式目錄以外,用這個變數指過去。直接改 repo
-    裡那份的話,換新版程式碼時會被蓋掉。"""
-    custom = os.environ.get("SEGCRA_MODELS_CONFIG", "").strip()
+    裡那份的話,換新版程式碼時會被蓋掉。指到的檔案一樣在 load_config 檢查權限。"""
+    custom = _env_text("SEGCRA_MODELS_CONFIG")
     return Path(custom) if custom else PKG_ROOT / "config" / "models.yaml"
 
 
 def load_config(path: Path | None = None) -> Config:
     """path 有給時讀那個檔案(測試用),沒給時讀 models_config_path()。"""
-    raw = yaml.safe_load((path or models_config_path()).read_text(encoding="utf-8"))
+    path = path or models_config_path()
+    check_config_file(path, secret=False)
+    for name in _SECRET_FILES:
+        check_config_file(PKG_ROOT / "config" / name, secret=True)
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     # endpoint 可用環境變數覆蓋(如 Ollama 掛在遠端或 tunnel 上;OpenAI 相容的端點都可以)
-    endpoint = os.environ.get("OLLAMA_URL", raw.get("endpoint", "http://localhost:11434/v1"))
-    # 端點要驗證時,金鑰用環境變數給,不寫進 models.yaml:那個檔案在共用的主機上,會進版控與
-    # 離線包。順序是環境變數 > models.yaml > 預設;前後的空白不算,空字串或只有空白當成沒設定。
-    api_key = os.environ.get("LLM_API_KEY", "").strip() or raw.get("api_key", "ollama")
+    endpoint = _env_text("OLLAMA_URL") or raw.get("endpoint", "http://localhost:11434/v1")
+    # 端點要驗證時,金鑰用環境變數給,不寫進設定檔(會進版控與離線包;見 _yaml_api_key)
+    yaml_key = _yaml_api_key(raw)
+    api_key = _env_text("LLM_API_KEY") or yaml_key
     return Config(
         endpoint=endpoint, api_key=api_key,
         default_profile=raw["default_profile"], profiles=raw["profiles"],

@@ -19,7 +19,7 @@ from pathlib import Path
 
 import httpx
 
-from .config import PKG_ROOT
+from .config import PKG_ROOT, check_config_file
 
 sys.path.insert(0, str(PKG_ROOT))
 from toolbox.knowledge_store import Item, dumps, load_items  # noqa: E402
@@ -28,6 +28,7 @@ from toolbox.knowledge_store import Item, dumps, load_items  # noqa: E402
 def _load_gitlab_env() -> dict:
     env = {}
     f = PKG_ROOT / "config" / "gitlab.env"
+    check_config_file(f, secret=True)      # 含 token:群組或其他人讀得到就停
     if f.exists():
         for line in f.read_text(encoding="utf-8").splitlines():
             line = line.strip()

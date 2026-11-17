@@ -14,7 +14,26 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${SANDBOX_ENV_FILE:-$HERE/../config/sandbox.env}"
-if [ -f "$ENV_FILE" ]; then set -a; . "$ENV_FILE"; set +a; fi
+
+# 讀密碼檔前先檢查權限,太寬就停(跟 orchestrator/config.py:check_config_file 同一套規則):
+# 檔案群組或其他人可讀、可寫,或所在目錄群組或其他人可寫(可以把檔案整個換掉)。只看權限
+# 位元,不看擁有者(掛進容器時擁有者是主機的 uid)。
+check_secret_file() {
+  local f="$1" d mode
+  d="$(dirname "$f")"
+  mode="$(stat -c %a "$f")"
+  if [ $(( 8#$mode & 8#077 )) -ne 0 ]; then
+    echo "檔案(含密碼)$f 的權限太寬($mode):群組或其他帳號讀得到或改得到,不往下跑。請執行:chmod 600 $f" >&2
+    exit 1
+  fi
+  mode="$(stat -c %a "$d")"
+  if [ $(( 8#$mode & 8#022 )) -ne 0 ]; then
+    echo "目錄 $d 的權限太寬($mode):群組或其他帳號改得到,不往下跑。請執行:chmod 755 $d" >&2
+    exit 1
+  fi
+}
+
+if [ -f "$ENV_FILE" ]; then check_secret_file "$ENV_FILE"; set -a; . "$ENV_FILE"; set +a; fi
 
 NAME="${SANDBOX_MSSQL_CONTAINER:-segcra-sandbox}"
 IMAGE="${SANDBOX_MSSQL_IMAGE:-mcr.microsoft.com/mssql/server:2022-CU25-ubuntu-22.04}"

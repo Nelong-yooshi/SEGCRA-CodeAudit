@@ -3,9 +3,11 @@
 部署端要換模型、上下文長度時,如果直接改 repo 裡的 config/models.yaml,換新版程式碼就會被蓋掉。
 所以讓部署端把自己的設定檔放在程式目錄以外,用環境變數指過去;repo 那份維持開發用的預設值。
 """
+import os
+
 import pytest
 
-from orchestrator.config import PKG_ROOT, load_config, models_config_path
+from orchestrator.config import PKG_ROOT, ConfigError, load_config, models_config_path
 
 REPO_YAML = PKG_ROOT / "config" / "models.yaml"
 
@@ -39,9 +41,13 @@ def test_設了就讀那個檔案(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("raw", ["", "   "])
-def test_空字串或只有空白當成沒設(monkeypatch, raw):
+def test_設了但是空的要停下來_不改讀_repo_那份(monkeypatch, raw):
+    """空的多半是部署腳本沒把值帶進來;改讀 repo 那份等於用開發用的設定打部署端的端點。"""
     monkeypatch.setenv("SEGCRA_MODELS_CONFIG", raw)
-    assert models_config_path() == REPO_YAML
+    with pytest.raises(ConfigError, match="SEGCRA_MODELS_CONFIG"):
+        models_config_path()
+    with pytest.raises(ConfigError, match="SEGCRA_MODELS_CONFIG"):
+        load_config()
 
 
 def test_前後的空白不算(monkeypatch, tmp_path):
@@ -65,3 +71,17 @@ def test_指定的檔案不存在時報錯_不退回_repo_的設定(monkeypatch,
     with pytest.raises(FileNotFoundError) as info:
         load_config()
     assert "nope.yaml" in str(info.value)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="要真的 POSIX 權限位元(部署端是 Linux)")
+def test_指到的檔案也檢查權限(monkeypatch, tmp_path):
+    """部署端自己那份跟 repo 那份一樣:別人改得到就能把端點換掉。"""
+    d = tmp_path / "deploy"
+    d.mkdir(mode=0o755)
+    path = _deploy_yaml(d)
+    path.chmod(0o664)
+    monkeypatch.setenv("SEGCRA_MODELS_CONFIG", str(path))
+    with pytest.raises(ConfigError, match="chmod 644"):
+        load_config()
+    path.chmod(0o644)
+    assert load_config().profile("review").model == "deploy-model"
