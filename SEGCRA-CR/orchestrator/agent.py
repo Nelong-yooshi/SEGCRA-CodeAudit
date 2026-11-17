@@ -6,6 +6,7 @@ import re
 from openai import AsyncOpenAI
 
 from .config import Config, ModelProfile, estimate_tokens
+from .error_text import error_label
 from .tool_hub import ToolHub
 
 MAX_ITERATIONS = 12
@@ -230,7 +231,8 @@ async def _run_agent(client, cfg: Config, profile: ModelProfile, system: str, us
                 # 模型要求的只走白名單入口:寫入類工具不執行(#17,見 tool_hub.MODEL_TOOLS)
                 result = await hub.call_from_model(tc.function.name, args)
             except Exception as e:
-                result = f"(工具執行失敗:{e})"
+                # 工具結果會進模型的對話,模型可能照抄進 finding 貼到 MR:不放例外原文(見 error_text)
+                result = f"(工具執行失敗:{error_label(e)})"
             if trace is not None:
                 trace.append({"step": i, "tool": tc.function.name, "args": args,
                               "result_preview": (result or "")[:400]})
