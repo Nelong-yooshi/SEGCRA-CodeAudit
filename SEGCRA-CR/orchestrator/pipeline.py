@@ -24,7 +24,8 @@ from .dbt_affected import (
 from .change_view import build_full_text_section
 from .cold_read import (UNREAD_NEAR_LIMIT, UNREAD_NO_USAGE, UNREAD_TOO_FEW, ColdRead,
                         cold_read as _cold_read, record as _cold_read_record)
-from .isolation import run_isolated
+from .isolation import run_in_thread, run_isolated
+from .mr_fetch_error import mr_fetch_reason
 from .dbt_impact import DEFAULT_ISOLATED_MEMORY_MB, DEFAULT_ISOLATED_TIMEOUT_S, macros_referenced
 from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_exec import render_for_exec
@@ -43,6 +44,7 @@ from .dbt_render import (MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, M
 from .security import scan_mr
 from toolbox.gitlab import (WRITE_FAILED, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UNCERTAIN,
                             write_failure)
+from toolbox import gitlab as _gitlab
 from .skills_loader import always_skills, load_skills, skills_index
 from .dbt_context import PROJECT_FILE_REMOVED, PROJECT_YAML_INVALID, check_yaml_files_isolated
 from .dbt_project import YAML_MODELS_NOT_LIST, YAML_SYNTAX
@@ -1966,9 +1968,17 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
              "required": ["name"]},
         )
 
-        mr = await hub.call_json("gitlab__get_mr_diff", {"mr_id": mr_id})
-        if not mr:
-            raise RuntimeError(f"無法取得 MR {mr_id}")
+        # 取 MR **不經過 ToolHub**:ToolHub 是給模型用的,工具丟的例外在那裡被轉成一行字串,
+        # 型別、TLS 的驗證代碼、errno、HTTP 狀態碼都沒了,取不到時只能比對字串猜原因。直接
+        # 呼叫拿得到原本的例外,照失敗的階段分類(orchestrator/mr_fetch_error.py)。跟 ToolHub
+        # 一樣丟到背景執行緒跑,外層的時間上限插得進來。
+        # `from None`:例外鏈裡 httpx 的訊息帶完整網址,不跟著進 log;原因已經分類寫在訊息裡。
+        try:
+            mr = json.loads(await run_in_thread(_gitlab.get_mr_diff, mr_id, name="segcra-tool"))
+        except Exception as e:                   # noqa: BLE001 — 每一種都要說出原因
+            raise RuntimeError(f"無法取得 MR {mr_id}:{mr_fetch_reason(e)}") from None
+        if not isinstance(mr, dict) or not mr:
+            raise RuntimeError(f"無法取得 MR {mr_id}:回應不是預期的 MR 資料")
 
         # 把這次審查釘在 MR 的 head commit 上:之後 get_file 不指定 ref 時讀的就是
         # 「正在審的那一版」,而不是目標分支的現況(目標分支讀到的是**改之前**的
@@ -1977,7 +1987,6 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # **釘在這裡而不是 get_mr_diff 裡**:那個函式在模型的工具清單上,模型若被
         # MR 描述引導去呼叫別的 MR,釘住的版本就會被換掉,之後讀到的是別人的檔案。
         # 拿不到 head sha 時釘 None——get_file 會明講取不到,不會退回舊版。
-        from toolbox import gitlab as _gitlab
         _gitlab.pin_review_ref(mr.get("head_sha"))
 
         if baseline:
