@@ -827,6 +827,25 @@ MUTANTS.update({
      "    return type(e).__name__"),
 })
 
+# ---- 模型設定檔的位置:部署端用 SEGCRA_MODELS_CONFIG 指到程式目錄以外的那份
+MUTANTS.update({
+ "模型設定檔:不看環境變數": ("config.py",
+     '    return Path(custom) if custom else PKG_ROOT / "config" / "models.yaml"',
+     '    return PKG_ROOT / "config" / "models.yaml"'),
+ "模型設定檔:設了但是空的改讀 repo 那份": ("config.py",
+     '    custom = _env_text("SEGCRA_MODELS_CONFIG")',
+     '    custom = os.environ.get("SEGCRA_MODELS_CONFIG", "").strip()'),
+ "模型設定檔:載入時不用": ("config.py",
+     '    path = path or models_config_path()',
+     '    path = path or PKG_ROOT / "config" / "models.yaml"'),
+ "模型設定檔:直接給的路徑被環境變數蓋掉": ("config.py",
+     '    path = path or models_config_path()',
+     '    path = models_config_path() if os.environ.get("SEGCRA_MODELS_CONFIG") else path or models_config_path()'),
+ "模型設定檔:指定的不存在時退回 repo 那份": ("config.py",
+     '    return Path(custom) if custom else PKG_ROOT / "config" / "models.yaml"',
+     '    return Path(custom) if custom and Path(custom).exists() else PKG_ROOT / "config" / "models.yaml"'),
+})
+
 
 # ---- 冷讀:另一支只看 MR 文字的模型呼叫(只能加擋)
 MUTANTS.update({

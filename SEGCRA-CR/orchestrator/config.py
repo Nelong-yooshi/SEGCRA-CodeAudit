@@ -301,8 +301,19 @@ def _yaml_api_key(raw: dict) -> str:
 _SECRET_FILES = ("gitlab.env", "sandbox.env")
 
 
+def models_config_path() -> Path:
+    """要讀的模型設定檔:環境變數 SEGCRA_MODELS_CONFIG 指定的檔案;沒設時是 repo 的 config/models.yaml。
+    **設了但是空的就停**(見 _env_text):不改讀 repo 那份 —— 那等於用一份沒有人指定的設定跑。
+
+    部署端要改模型、上下文長度這些設定時,複製一份放在程式目錄以外,用這個變數指過去。直接改 repo
+    裡那份的話,換新版程式碼時會被蓋掉。指到的檔案一樣在 load_config 檢查權限。"""
+    custom = _env_text("SEGCRA_MODELS_CONFIG")
+    return Path(custom) if custom else PKG_ROOT / "config" / "models.yaml"
+
+
 def load_config(path: Path | None = None) -> Config:
-    path = path or PKG_ROOT / "config" / "models.yaml"
+    """path 有給時讀那個檔案(測試用),沒給時讀 models_config_path()。"""
+    path = path or models_config_path()
     check_config_file(path, secret=False)
     for name in _SECRET_FILES:
         check_config_file(PKG_ROOT / "config" / name, secret=True)
