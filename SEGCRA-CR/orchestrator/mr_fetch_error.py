@@ -39,6 +39,9 @@ _NAME_TEXT = ("HTTPS 憑證上的名稱跟 GITLAB_URL 的主機不符:GITLAB_URL
               "(不能用 IP 或別名),或請 GitLab 管理者換一張包含這個名稱的憑證")
 _EXPIRED_TEXT = ("HTTPS 憑證已過期或還沒生效:請 GitLab 管理者更新憑證;"
                  "也確認執行環境的系統時間是對的")
+# https 打到講 http 的埠時,OpenSSL 回的原因代碼隨版本不同:部署的映像(OpenSSL 3.5)是
+# WRONG_VERSION_NUMBER,CI 的環境是 RECORD_LAYER_FAILURE,更舊的版本有 PACKET_LENGTH_TOO_LONG。
+_NOT_TLS_REASONS = frozenset({"WRONG_VERSION_NUMBER", "RECORD_LAYER_FAILURE", "PACKET_LENGTH_TOO_LONG"})
 _WRONG_VERSION_TEXT = ("GITLAB_URL 寫的是 https,但那個埠回的不是 HTTPS(通常是 http):"
                        "改成 http://,或改成 GitLab 的 https 埠")
 
@@ -98,7 +101,7 @@ def _tls_reason(exc: BaseException) -> str | None:
         return f"HTTPS 憑證驗證失敗(驗證代碼 {code}):請 GitLab 管理者確認憑證"
     tls = _first(exc, ssl.SSLError)
     if tls is not None:
-        if getattr(tls, "reason", None) == "WRONG_VERSION_NUMBER":
+        if getattr(tls, "reason", None) in _NOT_TLS_REASONS:
             return _WRONG_VERSION_TEXT
         reason = getattr(tls, "reason", None)
         return f"跟 GitLab 建立 HTTPS 連線失敗({reason or type(tls).__name__})"

@@ -188,6 +188,17 @@ def test_其他憑證驗證代碼_說出代碼():
     assert "驗證代碼 23" in msg, msg
 
 
+@pytest.mark.parametrize("reason", ["WRONG_VERSION_NUMBER", "RECORD_LAYER_FAILURE",
+                                    "PACKET_LENGTH_TOO_LONG"])
+def test_https打到http的埠_各版本OpenSSL的原因代碼都認得(reason):
+    """同一件事,OpenSSL 的原因代碼隨版本不同(部署的映像是 WRONG_VERSION_NUMBER,CI 是
+    RECORD_LAYER_FAILURE):上面那條真的連線只驗得到這台機器的版本。"""
+    tls = ssl.SSLError(1, f"[SSL: {reason}] x")
+    tls.reason = reason
+    msg = mr_fetch_reason(_connect_error(tls))
+    assert "回的不是 HTTPS" in msg and "憑證" not in msg, msg
+
+
 def test_其他TLS錯誤_說出OpenSSL的原因代碼():
     tls = ssl.SSLError(1, "[SSL: UNSUPPORTED_PROTOCOL] unsupported protocol")
     tls.reason = "UNSUPPORTED_PROTOCOL"
