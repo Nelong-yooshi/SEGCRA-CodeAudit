@@ -1,25 +1,8 @@
-"""ci_gate — 審查做成部署端 CI 的最後一個 stage:審查結果換成 job 的結束碼、確認呼叫者。
+"""ci_gate — 審查做成 CI 的最後一個 stage 時用的兩件事:審查結果換成 job 的結束碼(exit_code)、
+確認 /ci/review 的呼叫者(check_request)。
 
-部署端要掛審查的 repo 有自己的 MR pipeline,而且設定了 pipeline 要過才能合併。審查做成那條
-pipeline 裡的一個 job,pipeline 會等它跑完,結果就在同一條上,既有的合併設定直接用。這條路上
-**不寫 commit status**:job 的結果就是閘門。
-
-job 不在 runner 上直接跑審查,而是呼叫審查服務(scripts/webhook_server.py 的 /ci/review)
-等結果。理由:CI 設定檔放在 MR 改不到的專案,但部署端既有的 job 會執行 repo 裡 MR 改得到的東西,
-而且改得到同一台 runner 上後面 job 的執行環境(shell executor 用同一個帳號與家目錄,`.profile`
-會載入);審查需要的 GitLab token 與模型端點的通行碼若放在 runner 上,前面的 job 就拿得到。審查
-服務那台機器上才有這些秘密,job 只帶自己的 CI_JOB_TOKEN;審查 job 本身跑在專用的 runner
-(docs/06 第 4 節第 5 點)。
-
-| 審查結果 | 結束碼 | job / pipeline |
-|---|---|---|
-| auto_approved | 0 | 成功 / 綠燈,可以合併 |
-| needs_human(審完了,交給人判斷) | 3 | 失敗但 `allow_failure: exit_codes: [3]` 允許 / passed with warnings |
-| blocked | 4 | 失敗 / 紅燈,鎖住 |
-| 審查沒跑完整(報告裡有環節未完整、整份失敗或逾時、被新的 commit 取代) | 5 | 失敗 / 紅燈,鎖住;重審就是 retry 那個 job |
-
-needs_human 用 3:1 與 2 是程式異常結束時常見的結束碼(Python 沒接住的例外是 1、參數錯誤是 2),
-允許失敗的那個碼不能跟它們重疊,否則 job 自己出錯也會被當成「審完了、交給人判斷」。
+結束碼的對照與理由、為什麼 job 呼叫審查服務而不在 runner 上跑審查,見 docs/06 第 4 節;
+接上去的步驟見 README §7。
 """
 from __future__ import annotations
 

@@ -4926,6 +4926,13 @@ MUTANTS.update({
         "    if False:" + NL + '        print(f"[webhook] MR !{mr_iid} 取消進行中的舊審查,改審 CI 這次的", flush=True)'),
     "CI:body 不限大小": (W,
         "            if length > 4096:", "            if False:"),
+    "CI:沒設 webhook 密鑰時不說明": (W,
+        "    if not SECRET:" + NL + "        lines.append(", "    if False:" + NL + "        lines.append("),
+    "CI:監聽那行不列 /ci/review": (W,
+        "入口:/ci/review(CI 的審查 job)、{hook}", "入口:{hook}"),
+    "CI:mock 模式沒有 fixture 時丟例外": ("../toolbox/gitlab.py",
+        "        except FileNotFoundError:            # 沒有這個 MR 的 fixture",
+        "        except ZeroDivisionError:            # 沒有這個 MR 的 fixture"),
 })
 
 

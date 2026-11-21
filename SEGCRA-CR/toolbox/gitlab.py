@@ -749,7 +749,10 @@ def mr_head(mr_id: str) -> dict | None:
     取不到回 None。"""
     mr_id = _check_mr_id(mr_id)
     if not REAL_MODE:
-        mr = _mock_mr(mr_id)
+        try:
+            mr = _mock_mr(mr_id)
+        except FileNotFoundError:            # 沒有這個 MR 的 fixture:跟 real 模式取不到一樣回 None
+            return None
         return {"sha": mr.get("sha", f"mock-{mr_id}"), "state": "opened", "source_project_id": None}
     try:
         mr = _api("GET", f"/merge_requests/{mr_id}")

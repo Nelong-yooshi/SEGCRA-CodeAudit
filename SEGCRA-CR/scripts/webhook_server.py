@@ -424,17 +424,26 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def _startup_lines(host, port) -> list:
+    """啟動時印的說明。只走 CI 那條路(/ci/review)的部署不設 GITLAB_WEBHOOK_SECRET,
+    不能叫他去設;兩個入口都列出來。"""
+    hook = "/gitlab-webhook" if SECRET else "/gitlab-webhook(停用)"
+    lines = [f"[webhook] 監聽 http://{host}:{port}  入口:/ci/review(CI 的審查 job)、{hook}  "
+             f"profile={PROFILE}  real_mode={'on' if os.environ.get('GITLAB_URL') else 'off(mock)'}"]
+    if not SECRET:
+        lines.append("[webhook] 沒設 GITLAB_WEBHOOK_SECRET:webhook 那條路停用,webhook 請求一律回 401;"
+                     "CI 那條路(/ci/review)不受影響。要用 webhook 時才需要設")
+    return lines
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args()
-    if not SECRET:
-        print("⚠️ 未設 GITLAB_WEBHOOK_SECRET,所有 webhook 請求都會被拒絕(請先 export)。",
-              flush=True)
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"[webhook] 監聽 http://{args.host}:{args.port}/gitlab-webhook  profile={PROFILE}  "
-          f"real_mode={'on' if os.environ.get('GITLAB_URL') else 'off(mock)'}", flush=True)
+    for line in _startup_lines(args.host, args.port):
+        print(line, flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
