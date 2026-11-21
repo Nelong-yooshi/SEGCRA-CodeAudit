@@ -229,7 +229,7 @@ async def draft_binding(cfg, directive_text: str, profile_name: str | None = Non
 
     回 None = 模型判定這句不是常設規範。起草**失敗**(截斷/解析不出/判是規範卻沒內容)
     丟 `DraftIncomplete`,讓呼叫端請人重試,不要跟「不是規定」混為一談。"""
-    from .agent import extract_json, output_truncated, run_agent
+    from .agent import output_completeness, run_agent, strict_json_object
     from .tool_hub import ToolHub
     profile = cfg.profile(profile_name)
     meta: dict = {}
@@ -237,16 +237,26 @@ async def draft_binding(cfg, directive_text: str, profile_name: str | None = Non
         raw = await run_agent(cfg, profile, DRAFT_SYSTEM,
                               f"審查人員留言:「{directive_text}」\n請判斷並輸出 JSON。",
                               hub, use_tools=False, verbose=False, meta=meta)
-    # 被截斷的輸出不採信:json-repair 會把斷掉的 JSON 補成合法物件,`text` 可能只有
-    # 半句話 —— 那會變成一條內容殘缺的 binding 知識項。這是起草失敗,不是「不是規定」。
-    if output_truncated(meta, profile.max_output_tokens):
-        raise DraftIncomplete("審查模型輸出被截斷,起草未完成")
-    d = extract_json(raw)
+    # 起草跟仲裁用同一套「確定才採信」:乾淨結束 + 沒截斷(連「沒回報結束原因」都不採信)
+    # + 嚴格解析(整段剛好一個 JSON 物件、沒有重複鍵、不走 json-repair)。少任何一項都是
+    # 起草失敗(DraftIncomplete,請人重試),不是「不是規定」(回 None)——不然一句被切掉
+    # 的指示、或靠 repair 補出半句話的輸出,會變成一條內容殘缺的 binding。
+    completeness = output_completeness(meta, profile.max_output_tokens)
+    if completeness != "complete":
+        raise DraftIncomplete(
+            "審查模型輸出被截斷,起草未完成" if completeness == "truncated"
+            else "審查模型沒有回報結束原因,無法確認輸出完整,起草未完成")
+    d = strict_json_object(raw)
     if d is None:
-        raise DraftIncomplete("審查模型輸出無法解析為 JSON,起草未完成")
-    if not d.get("is_rule"):
-        return None                       # 模型判定這句不是常設規範
-    if not d.get("text"):
+        raise DraftIncomplete(
+            "審查模型輸出不是乾淨的單一 JSON 物件(前後有雜訊/多個物件/重複鍵/無法解析),起草未完成")
+    is_rule = d.get("is_rule")
+    if is_rule is False:
+        return None                       # 模型明確判定這句不是常設規範
+    if is_rule is not True:
+        # 缺 is_rule、或不是布林(例如字串 "false" 是真值會被誤判)→ 不確定,請重試
+        raise DraftIncomplete("模型沒有明確回報 is_rule 的布林值,起草未完成")
+    if not isinstance(d.get("text"), str) or not d["text"].strip():
         raise DraftIncomplete("模型判定是規範,但沒有給出內容,起草未完成")
     scope = d.get("scope") or default_scope or ["anomaly-rules"]
     if isinstance(scope, str):

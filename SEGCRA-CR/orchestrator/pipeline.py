@@ -15,7 +15,8 @@ from typing import NamedTuple
 from pathlib import Path
 
 
-from .agent import MAX_ITERATIONS, extract_json, output_truncated, run_agent
+from .agent import (MAX_ITERATIONS, extract_json, output_completeness,
+                    output_truncated, run_agent)
 from .config import (DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, env_seconds,
                      estimate_tokens)
 from .dbt_affected import (
@@ -1992,9 +1993,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             if not report:
                 raise RuntimeError(f"baseline 輸出無法解析為 JSON:\n{raw[:2000]}")
             report["_mode"] = "baseline"
-            # 對照組也要查截斷:被切的輸出被 json-repair 修回來就當成完整報告,finding 會
-            # 變少,A/B 比較就會高估完整管線。標在報告裡,比較時不把它當成完整的一份。
-            report["truncated"] = bool(output_truncated(meta, profile.max_output_tokens))
+            # 對照組也要查完整度:被切的輸出被 json-repair 修回來就當成完整報告,finding 會
+            # 變少,A/B 比較就會高估完整管線。用三態判斷,「被截斷」與「端點沒回報結束原因
+            # (無法確認)」都標成不完整(truncated=True),比較時不把它當成完整的一份;
+            # completeness 另外記是哪一種。
+            completeness = output_completeness(meta, profile.max_output_tokens)
+            report["completeness"] = completeness
+            report["truncated"] = completeness != "complete"
             return report
 
         # dbt 專案的取回也要隔離:它自己有 catch-all,但讀 dbt_project.yml 判斷專案
@@ -4199,6 +4204,7 @@ def enforce_unreviewable(report: dict, mr: dict) -> dict:
 
 _TRUNCATED_TITLE = "審查模型的輸出被截斷,審查結果可能不完整"
 _TRUNCATED_SUMMARY = "審查模型的輸出被截斷、無法解析;以下只有程式確定性檢查的結果。"
+_UNKNOWN_FINISH_TITLE = "審查模型沒有回報結束原因,無法確認輸出完整"
 _EXHAUSTED_TITLE = "審查模型用完工具呼叫回合,沒有產出審查結果"
 _EXHAUSTED_SUMMARY = "審查模型用完工具呼叫回合、沒有產出審查結果;以下只有程式確定性檢查的結果。"
 _FAILED_TITLE = "審查模型沒有完成,這次只有程式確定性檢查的結果"
@@ -4276,6 +4282,9 @@ def _output_meta_record(meta: dict, max_output_tokens: int) -> dict:
         "max_output_tokens": max_output_tokens,
         # 模型呼叫失敗時沒有最終輸出:meta 裡的用量是前幾輪的,不算截斷
         "truncated": _failure_kind(meta) is None and output_truncated(meta, max_output_tokens),
+        # 完整度三態(complete / truncated / unknown);呼叫失敗時沒有最終輸出,記 None
+        "completeness": (None if _failure_kind(meta) is not None
+                         else output_completeness(meta, max_output_tokens)),
         "exhausted": bool(meta.get("exhausted")),
         # 模型呼叫失敗時的問題類型(見 _MODEL_FAILURE_TEXT);沒有失敗是 None
         "failed": _failure_kind(meta),
@@ -4307,7 +4316,9 @@ def _parse_model_output(raw: str | None, meta: dict, max_output_tokens: int) -> 
     if meta.get("exhausted"):
         return {"summary": _EXHAUSTED_SUMMARY, "findings": []}
     report = extract_json(raw)
-    if not report and output_truncated(meta, max_output_tokens):
+    # 沒解析出報告,而且輸出不是「完整」(被截斷,或端點沒回報結束原因無法確認)→
+    # 用空報告走完後處理,原因由 enforce_truncation 補一條 major。
+    if not report and output_completeness(meta, max_output_tokens) != "complete":
         return {"summary": _TRUNCATED_SUMMARY, "findings": []}
     return report
 
@@ -4351,15 +4362,26 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
                           "或模型的輸出上限是否被思考用完。",
             "citations": []}
         _put_program_finding(report, exhausted)
-    if not output_truncated(meta, max_output_tokens):
+    completeness = output_completeness(meta, max_output_tokens)
+    if completeness == "complete":
         return report
-    _put_program_finding(report, {
-        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _TRUNCATED_TITLE,
-        "detail": f"審查模型的輸出達到長度上限({max_output_tokens} tokens)而被切斷,"
-                  "切斷之後的內容沒有產出。已解析出來的 finding 予以保留,但可能有缺漏,"
-                  "這次的審查結果需人工確認。",
-        "suggestion": "重新觸發審查;若持續發生,請拆分 MR,或調高審查模型的輸出上限。",
-        "citations": []})
+    if completeness == "truncated":
+        _put_program_finding(report, {
+            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _TRUNCATED_TITLE,
+            "detail": f"審查模型的輸出達到長度上限({max_output_tokens} tokens)而被切斷,"
+                      "切斷之後的內容沒有產出。已解析出來的 finding 予以保留,但可能有缺漏,"
+                      "這次的審查結果需人工確認。",
+            "suggestion": "重新觸發審查;若持續發生,請拆分 MR,或調高審查模型的輸出上限。",
+            "citations": []})
+    else:   # unknown:端點沒回報結束原因 → 無法確認完整,比照截斷不採信(不安靜放行)
+        _put_program_finding(report, {
+            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _UNKNOWN_FINISH_TITLE,
+            "detail": "審查模型的端點沒有回報結束原因(finish_reason),也沒有回報用量,"
+                      "無法確認這次輸出是否完整。沒有依據說它完整,就不當它完整——已解析出來的"
+                      "finding 予以保留,但可能有缺漏,這次的審查結果需人工確認。",
+            "suggestion": "請通知維運確認審查模型端點是否正常回報 finish_reason 與 usage;"
+                          "若持續發生,這一條會在每份審查出現。",
+            "citations": []})
     return report
 
 

@@ -33,7 +33,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from toolbox.gitlab import UNAVAILABLE_TEXT, fetch_file
-from .agent import extract_json, output_truncated, run_agent
+from .agent import extract_json, output_completeness, run_agent, strict_json_object
 from .config import Config, PKG_ROOT
 from .isolation import run_in_thread
 
@@ -1049,7 +1049,9 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
         # 它其實是被硬切的殘骸。實測 RETAIL_M1:finish_reason=length、
         # completion_tokens 剛好 8192、輸出斷在一個數字中間,但照樣解析成功,
         # 案例從應有的 46 個掉到 9 個——而那 9 個會被當成正常結果收下。
-        if output_truncated(meta, profile.max_output_tokens):
+        # 被截斷,或端點沒回報結束原因(無法確認完整)→ 這次結果一律不可信,重試。
+        # 「無法確認」比照截斷:沒有依據說它完整就不收,不然沒回報的端點會讓殘骸被收下。
+        if output_completeness(meta, profile.max_output_tokens) != "complete":
             truncated += 1
             if filling and best is not None:
                 # **補缺的回應被截斷 → 這一批要得太多,下次少要一點。**
@@ -1463,6 +1465,17 @@ def _without_comments(sql: str) -> str:
     return strip_comments(sql)
 
 
+def _arbiter_inconclusive(why: str, kind: str) -> dict:
+    """仲裁「沒有結論」:不是 testdata、也不是 sql,而是第三種狀態。
+
+    `who_is_wrong` 給 None(不借用 sql);`inconclusive` 為旗標;`why_kind` 記是哪一種
+    不確定(truncated / unknown / not_single_object / bad_verdict / missing_reason /
+    call_failed),留在回傳結果與報告裡,不只剩說明文字。run_spec_exec 收到這種會落成
+    帶 stage 的 review_incomplete finding(標題跟「確定 SQL 錯」分開),決策交人工。"""
+    return {"who_is_wrong": None, "inconclusive": True, "why_kind": kind,
+            "reason": f"仲裁沒有結論:{why}"}
+
+
 async def arbitrate(cfg: Config, spec_text: str, sql: str, mismatch: dict,
                     profile_name: str | None = None) -> dict:
     from .cold_read import data_markers
@@ -1490,33 +1503,39 @@ async def arbitrate(cfg: Config, spec_text: str, sql: str, mismatch: dict,
     try:
         raw = await run_agent(cfg, profile, ARBITER_SYSTEM, user, hub=None,
                               use_tools=False, verbose=False, meta=meta)
-    except Exception as e:   # LLM 傳輸層失敗 → 與「輸出無法解析」同樣保守處理,不炸管線
-        return {"who_is_wrong": "sql",
-                "reason": f"(仲裁 LLM 呼叫失敗:{type(e).__name__},保守列為 SQL 側待人工確認)",
-                "arbiter_unparseable": True}
-    # 仲裁**預設不採信**:一開始就是 SQL 側(交人工看),只有**確定**才採信它的結論——
-    # 端點回報乾淨結束(finish_reason=stop)+ 嚴格解析成功(沒靠 json-repair 補)+
-    # who_is_wrong 是合法值。少任何一項都不採信、列為 SQL 側:
-    #   - 被截斷 / 沒回報結束原因 → finish_reason 不是 "stop"
-    #   - json-repair 會把斷掉的 JSON 補成合法物件,who_is_wrong 可能剛好補出一個值,
-    #     看起來有結論其實推理只寫一半
-    # 這跟主審查「沒依據就當截斷」方向一致:不確定的狀態落在保守那一邊,不是反過來
-    # 「看到截斷的訊號才不採信」(那會讓「不知道」落在採信那一邊)。
-    parse_meta: dict = {}
-    d = extract_json(raw, parse_meta) or {}
-    who, finish = d.get("who_is_wrong"), meta.get("finish_reason")
-    repaired = bool(parse_meta.get("repaired"))
-    if finish == "stop" and not repaired and who in ("testdata", "sql"):
-        return d                      # 確定:testdata → 剔除案例、sql → major finding
-    if who not in ("testdata", "sql"):
-        why = "輸出無法解析"
-    elif finish != "stop":
-        why = f"輸出未乾淨結束(finish_reason={finish!r})"
+    except Exception as e:   # LLM 傳輸層失敗 → 沒有結論(交人工),不炸管線
+        return _arbiter_inconclusive(f"仲裁 LLM 呼叫失敗:{type(e).__name__}", "call_failed")
+    # 仲裁結果分三種:**testdata(確定)**、**sql(確定)**、**沒有結論**。
+    # 只有「確定」才採信 testdata/sql 的結論,確定要同時滿足:
+    #   1. 輸出完整(output_completeness 是 "complete":乾淨結束、用量沒到頂;
+    #      被截斷或「沒回報結束原因」都不算)
+    #   2. 整段剛好是一個 JSON 物件、沒有重複鍵(strict_json_object;不走 json-repair,
+    #      前後有字、兩個物件、重複鍵、靠 repair 補回來都不算)
+    #   3. who_is_wrong 是 testdata/sql,reason 是非空字串
+    # 少任何一項都是「沒有結論」:不借用 sql、也不剔除案例,而是自成一種狀態(見
+    # run_spec_exec:落成帶 stage 的 review_incomplete finding,跟「確定 SQL 錯」分開)。
+    # 剔除案例是仲裁唯一會拿掉證據的結論,不確定時倒向剔除等於悄悄放過,所以只有確定
+    # 判 testdata 才剔除;其餘一律交人工。
+    completeness = output_completeness(meta, profile.max_output_tokens)
+    d = strict_json_object(raw)
+    who = d.get("who_is_wrong") if d else None
+    reason = d.get("reason") if d else None
+    if (completeness == "complete" and d is not None
+            and who in ("testdata", "sql")
+            and isinstance(reason, str) and reason.strip()):
+        return {"who_is_wrong": who, "reason": reason}   # 確定:testdata→剔除、sql→major
+    # 沒有結論:分出是哪一種不確定(留在回傳結果與報告裡,不要只剩說明文字)
+    if completeness == "truncated":
+        why, kind = "輸出被長度上限切斷", "truncated"
+    elif completeness == "unknown":
+        why, kind = "端點沒有回報結束原因,無法確認輸出完整", "unknown"
+    elif d is None:
+        why, kind = "輸出不是乾淨的單一 JSON 物件(前後有雜訊/多個物件/重複鍵/無法解析)", "not_single_object"
+    elif who not in ("testdata", "sql"):
+        why, kind = f"who_is_wrong 不是合法值({who!r})", "bad_verdict"
     else:
-        why = "輸出靠 json-repair 救回、語意可能已變"
-    return {"who_is_wrong": "sql",
-            "reason": f"(仲裁{why},不採信,保守列為 SQL 側待人工確認)",
-            "arbiter_unparseable": True}
+        why, kind = "缺少 reason 或 reason 為空", "missing_reason"
+    return _arbiter_inconclusive(why, kind)
 
 
 # ------------------------------------------------------------------ 主流程
@@ -2050,28 +2069,58 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                 "case_results": ex["case_results"], "dropped_cases": dropped_cases,
                 "stage_seconds": stage_seconds, "findings": findings}
 
-    # 角色三:仲裁(只對 mismatch 逐案出動)
+    # 角色三:仲裁(只對 mismatch 逐案出動)。結果分三種:
+    #   testdata(確定)→ 剔除案例、列覆蓋缺口
+    #   sql(確定)     → sql_fault,後面彙整成一條 major
+    #   沒有結論        → inconclusive:不剔除、不當 SQL 錯,落成帶 stage 的 finding(交人工)
     sql_faults = []
+    inconclusive = []
     _t = _enter(STAGE_ARBITRATE)
     for mm in ex["mismatches"]:
         verdict = await arbitrate(cfg, spec_text, sql, mm)
-        if verdict["who_is_wrong"] == "testdata":
+        who = verdict.get("who_is_wrong")
+        reason = verdict.get("reason", "")   # 防呆:確定結論一定帶非空 reason,這裡仍用 .get 不炸
+        if who == "testdata":
             dropped_cases.append({"case_id": mm["case_id"], "by": "arbiter",
-                                  "reason": verdict["reason"]})
+                                  "reason": reason})
             # 被剔除的案例 = 該條件該向未經驗證 → 列入覆蓋缺口(不可據以自動放行)。
             # 寫出預期、實際與仲裁理由,讓看的人知道剔除的是什麼、憑什麼剔除。
             coverage_gaps.append(
                 f"案例 {mm['case_id']}(條件 {mm['condition_id']} {mm['direction']} 向)"
                 f"遭仲裁剔除(測資錯),該向未驗證。測資預期"
                 f"{'命中' if mm['expect_flagged'] else '不命中'}、SQL 實際"
-                f"{'命中' if mm['actual_flagged'] else '未命中'};仲裁理由:{verdict['reason']}")
+                f"{'命中' if mm['actual_flagged'] else '未命中'};仲裁理由:{reason}")
             for r in ex["case_results"]:
                 if r["case_id"] == mm["case_id"]:
                     r["dropped"] = True
-        else:
-            sql_faults.append({**mm, "arbiter_reason": verdict["reason"],
-                               "arbiter_unparseable": verdict.get("arbiter_unparseable", False)})
+        elif who == "sql":
+            sql_faults.append({**mm, "arbiter_reason": reason})
+        else:   # 沒有結論:這個 mismatch 既沒剔除也沒確定是 SQL 錯 → 待驗證(交人工)
+            inconclusive.append({"case_id": mm["case_id"],
+                                 "condition_id": mm["condition_id"],
+                                 "direction": mm["direction"],
+                                 "why_kind": verdict.get("why_kind"), "reason": reason})
+            # 該向沒被確定過 → 也列覆蓋缺口,passed 才會是 False、不可自動放行
+            coverage_gaps.append(
+                f"案例 {mm['case_id']}(條件 {mm['condition_id']} {mm['direction']} 向)"
+                f"仲裁沒有結論,該向未驗證。{reason}")
     _leave(STAGE_ARBITRATE, _t)
+
+    if inconclusive:
+        # 仲裁沒有結論 = 這一環節沒跑完,不是「確定 SQL 錯」。帶 stage 欄位,
+        # review_incomplete 認得到 → 決策交人工(CI 拿 5,不是當成審完的 3)。標題跟
+        # 「執行驗證失敗:實作與規格行為不符」分開,看的人才不會以為是 SQL 確定錯了。
+        detail = ";".join(
+            f"案例 {c['case_id']}(條件 {c['condition_id']} {c['direction']} 向):{c['reason']}"
+            for c in inconclusive)
+        findings.append({
+            "file": path, "line": 0, "severity": "major", "stage": STAGE_ARBITRATE,
+            "title": "測資與 SQL 的結果不一致,仲裁沒有結論",
+            "detail": f"規則 {spec_code}:下列案例的測資預期與 SQL 實際不符,仲裁無法確定是"
+                      f"測資錯還是 SQL 錯(見理由),這一環節未得出結論,需人工確認:{detail}",
+            "suggestion": "請人工比對規格、測資與 SQL 實際輸出,確認是測資錯(可剔除)還是"
+                          "實作錯(需修 SQL);必要時重新觸發審查。",
+            "citations": []})
 
     coverage_gaps, passed = gaps_and_passed(plan, ex, coverage_gaps, sql_faults)
     if sql_faults:
@@ -2101,6 +2150,7 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
             "executed_file": executed_file,
             "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
             "case_results": ex["case_results"], "dropped_cases": dropped_cases,
+            "inconclusive_cases": inconclusive,   # 仲裁沒有結論的案例(待驗證,見報告)
             "label_unverified": _unverified(ex["case_results"]),
             "stage_seconds": stage_seconds, "findings": findings}
 

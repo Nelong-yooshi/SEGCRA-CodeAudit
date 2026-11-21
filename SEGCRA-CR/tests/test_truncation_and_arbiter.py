@@ -40,19 +40,22 @@ _MISMATCH = {"case_id": "c1", "condition_id": "1", "direction": "正",
              "actual_rows": 0}
 
 
-def _fake_agent(raw, *, truncated, finish=None):
-    """假的 run_agent。truncated=True → finish_reason=length;否則乾淨結束 stop。
-    finish 可明確指定(例如測「端點沒回報 finish_reason」就傳 finish="")。"""
+def _fake_agent(raw, *, truncated=False, finish="stop", completion=None):
+    """假的 run_agent。預設乾淨結束(finish_reason=stop)。
+
+    - truncated=True → finish_reason=length、completion_tokens=上限(相容舊呼叫)。
+    - finish 設成空字串/None → 不寫 finish_reason(測「端點沒回報結束原因」=無法確認)。
+    - completion 明確給 → 寫 completion_tokens(測「stop 但用量到頂」也算截斷)。"""
     async def run(cfg, profile, system, user, hub=None, meta=None, **kw):
         if meta is not None:
             if truncated:
                 meta["finish_reason"] = "length"
                 meta["completion_tokens"] = profile.max_output_tokens
-            elif finish is not None:
+            else:
                 if finish:
                     meta["finish_reason"] = finish
-            else:
-                meta["finish_reason"] = "stop"
+                if completion is not None:
+                    meta["completion_tokens"] = completion
         return raw
     return run
 
@@ -62,52 +65,96 @@ def _fake_agent(raw, *, truncated, finish=None):
 _GOOD = '{"who_is_wrong": "testdata", "reason": "規格第 3 條寫明含兩端"}'
 
 
-def test_仲裁沒截斷時照常採用(monkeypatch):
-    monkeypatch.setattr(spec_exec, "run_agent", _fake_agent(_GOOD, truncated=False))
-    out = asyncio.run(spec_exec.arbitrate(_Cfg(), "規格", "SELECT 1", dict(_MISMATCH)))
-    assert out["who_is_wrong"] == "testdata" and not out.get("arbiter_unparseable")
+def _arb(monkeypatch, raw, **fake_kw):
+    monkeypatch.setattr(spec_exec, "run_agent", _fake_agent(raw, **fake_kw))
+    return asyncio.run(spec_exec.arbitrate(_Cfg(), "規格", "SELECT 1", dict(_MISMATCH)))
 
 
-def test_仲裁被截斷時不採信(monkeypatch):
-    """被硬切的 JSON 會被修補成合法物件,who_is_wrong 可能剛好補出一個值 —— 看起來
-    有結論,其實推理只寫了一半。只有乾淨結束(stop)才採信:列為 SQL 側待人工確認。"""
-    monkeypatch.setattr(spec_exec, "run_agent", _fake_agent(_GOOD, truncated=True))
-    out = asyncio.run(spec_exec.arbitrate(_Cfg(), "規格", "SELECT 1", dict(_MISMATCH)))
-    assert out["who_is_wrong"] == "sql" and out["arbiter_unparseable"] is True
-    assert "不採信" in out["reason"]
+# 仲裁結果三種:testdata(確定)、sql(確定)、沒有結論(inconclusive)。
+# 確定要同時滿足:輸出完整(completeness=complete)+ 整段剛好一個 JSON 物件無重複鍵
+# + who 合法 + reason 非空。少任何一項都是「沒有結論」(who=None、inconclusive=True)。
+
+def test_仲裁確定判測資錯時採用並剔除(monkeypatch):
+    out = _arb(monkeypatch, _GOOD)
+    assert out["who_is_wrong"] == "testdata" and not out.get("inconclusive")
+    assert out["reason"]
 
 
-def test_仲裁沒回報結束原因時不採信(monkeypatch):
-    """端點沒回報 finish_reason —— 不知道有沒有被切,落在保守那一邊(SQL 側)。"""
-    monkeypatch.setattr(spec_exec, "run_agent", _fake_agent(_GOOD, truncated=False, finish=""))
-    out = asyncio.run(spec_exec.arbitrate(_Cfg(), "規格", "SELECT 1", dict(_MISMATCH)))
-    assert out["who_is_wrong"] == "sql" and out["arbiter_unparseable"] is True
+def test_仲裁確定判SQL錯時採用(monkeypatch):
+    """乾淨結束 + 嚴格解析 + 明確 sql + reason —— 確定的 SQL 錯(會變 major,不是沒結論)。"""
+    out = _arb(monkeypatch, '{"who_is_wrong": "sql", "reason": "少了排除條件"}')
+    assert out["who_is_wrong"] == "sql" and not out.get("inconclusive")
 
 
-def test_仲裁靠json_repair救回時不採信(monkeypatch):
-    """輸出要靠 json-repair 補才成合法 JSON —— repair 可能補成語意已變的物件,不採信。
-    用單引號:嚴格解析失敗、repair 救回成 who=testdata(repaired=True),正好走這條。"""
+def _assert_inconclusive(out, kind):
+    assert out["who_is_wrong"] is None and out["inconclusive"] is True
+    assert out["why_kind"] == kind
+    assert "仲裁沒有結論" in out["reason"]
+
+
+def test_仲裁被截斷時沒有結論(monkeypatch):
+    """finish=length —— 被切的 JSON 會被 repair 補成合法物件、看起來有結論其實只寫一半。
+    不採信,也不當 SQL 錯,而是『沒有結論』。"""
+    _assert_inconclusive(_arb(monkeypatch, _GOOD, truncated=True), "truncated")
+
+
+def test_仲裁stop但用量到頂也算截斷(monkeypatch):
+    """finish=stop 但 completion_tokens 到上限 —— 用量到頂本身就代表被切,算截斷,沒有結論。
+    (舊版會採信並剔除,跟 output_truncated 自相矛盾。)"""
+    _assert_inconclusive(_arb(monkeypatch, _GOOD, finish="stop", completion=100), "truncated")
+
+
+def test_仲裁沒回報結束原因時沒有結論(monkeypatch):
+    """端點沒回報 finish_reason —— 無法確認完整,比照截斷,沒有結論(不是倒向某一側)。"""
+    _assert_inconclusive(_arb(monkeypatch, _GOOD, finish=""), "unknown")
+
+
+def test_仲裁靠json_repair救回時沒有結論(monkeypatch):
+    """單引號 JSON:嚴格解析失敗(strict_json_object 不走 repair)→ 沒有結論。"""
     broken = "{'who_is_wrong': 'testdata', 'reason': '規格第 3 條'}"
-    monkeypatch.setattr(spec_exec, "run_agent", _fake_agent(broken, truncated=False))
+    _assert_inconclusive(_arb(monkeypatch, broken), "not_single_object")
+
+
+def test_仲裁前後有多餘文字時沒有結論(monkeypatch):
+    """前面先假設一個結論、後面才更正 —— extract_json 會取第一個物件(錯),嚴格解析
+    看到兩個物件 → 沒有結論。"""
+    two = ('{"who_is_wrong": "testdata", "reason": "若含兩端"}'
+           '{"who_is_wrong": "sql", "reason": "規格第 3 條寫明不含兩端"}')
+    _assert_inconclusive(_arb(monkeypatch, two), "not_single_object")
+
+
+def test_仲裁重複鍵時沒有結論(monkeypatch):
+    """同一個鍵寫兩次 —— json.loads 預設取最後一個,看起來像單一結論;擋成沒有結論。"""
+    dup = '{"who_is_wrong": "sql", "reason": "x", "who_is_wrong": "testdata"}'
+    _assert_inconclusive(_arb(monkeypatch, dup), "not_single_object")
+
+
+def test_仲裁缺reason時沒有結論而不是KeyError(monkeypatch):
+    """`{"who_is_wrong": "testdata"}` 沒有 reason —— 舊版 return d 後下游讀 reason 會
+    KeyError 害整段執行驗證連同其他案例一起不見。改成『沒有結論』。"""
+    _assert_inconclusive(_arb(monkeypatch, '{"who_is_wrong": "testdata"}'), "missing_reason")
+
+
+@pytest.mark.parametrize("raw", [
+    '{"who_is_wrong": "maybe", "reason": "x"}',
+    '{"who_is_wrong": "both", "reason": "x"}',
+    '{"who_is_wrong": "TESTDATA", "reason": "x"}',   # 大小寫不算合法值
+])
+def test_仲裁who不是合法值時沒有結論(monkeypatch, raw):
+    _assert_inconclusive(_arb(monkeypatch, raw), "bad_verdict")
+
+
+def test_仲裁空reason時沒有結論(monkeypatch):
+    _assert_inconclusive(_arb(monkeypatch, '{"who_is_wrong": "sql", "reason": "  "}'),
+                         "missing_reason")
+
+
+def test_仲裁LLM呼叫失敗時沒有結論(monkeypatch):
+    async def boom(*a, **kw):
+        raise RuntimeError("端點掛了")
+    monkeypatch.setattr(spec_exec, "run_agent", boom)
     out = asyncio.run(spec_exec.arbitrate(_Cfg(), "規格", "SELECT 1", dict(_MISMATCH)))
-    assert out["who_is_wrong"] == "sql" and out["arbiter_unparseable"] is True
-
-
-def test_仲裁who不是合法值時不採信(monkeypatch):
-    monkeypatch.setattr(spec_exec, "run_agent",
-                        _fake_agent('{"who_is_wrong": "maybe"}', truncated=False))
-    out = asyncio.run(spec_exec.arbitrate(_Cfg(), "規格", "SELECT 1", dict(_MISMATCH)))
-    assert out["who_is_wrong"] == "sql" and out["arbiter_unparseable"] is True
-
-
-def test_仲裁確定判SQL錯時是major不是交人工(monkeypatch):
-    """乾淨結束 + 嚴格解析 + 明確說 sql —— 這是確定的 SQL 錯,不標 arbiter_unparseable
-    (會變成 major finding,不是交人工)。"""
-    monkeypatch.setattr(spec_exec, "run_agent",
-                        _fake_agent('{"who_is_wrong": "sql", "reason": "少了排除條件"}',
-                                    truncated=False))
-    out = asyncio.run(spec_exec.arbitrate(_Cfg(), "規格", "SELECT 1", dict(_MISMATCH)))
-    assert out["who_is_wrong"] == "sql" and not out.get("arbiter_unparseable")
+    _assert_inconclusive(out, "call_failed")
 
 
 # ─────────────────── 2. 知識起草 ───────────────────
@@ -161,6 +208,43 @@ def test_知識起草沒截斷時照常建(monkeypatch):
     monkeypatch.setattr(agent_mod, "run_agent", _fake_agent(raw, truncated=False))
     item = asyncio.run(knowledge_governance.draft_binding(_Cfg(), "通報粒度以帳戶為單位"))
     assert item is not None and "帳戶" in item.text
+
+
+def _draft(monkeypatch, raw, **fake_kw):
+    import orchestrator.agent as agent_mod
+    monkeypatch.setattr(agent_mod, "run_agent", _fake_agent(raw, **fake_kw))
+    return asyncio.run(knowledge_governance.draft_binding(_Cfg(), "一句指示"))
+
+
+def test_知識起草沒回報結束原因時丟DraftIncomplete(monkeypatch):
+    """端點沒回報 finish_reason —— 無法確認完整,比照截斷,起草失敗(不是「不是規定」)。"""
+    raw = '{"is_rule": true, "text": "通報粒度以帳戶為單位"}'
+    with pytest.raises(knowledge_governance.DraftIncomplete):
+        _draft(monkeypatch, raw, finish="")
+
+
+def test_知識起草靠repair救回時丟DraftIncomplete(monkeypatch):
+    """單引號 JSON 要靠 repair 才合法 —— 嚴格解析不收,起草失敗。"""
+    with pytest.raises(knowledge_governance.DraftIncomplete):
+        _draft(monkeypatch, "{'is_rule': true, 'text': '通報粒度以帳戶為單位'}")
+
+
+def test_知識起草is_rule是字串false時丟DraftIncomplete(monkeypatch):
+    """`"is_rule": "false"` 是字串(真值),不是布林 false —— 不能當成「不是規定」回 None,
+    這是不確定,丟 DraftIncomplete。"""
+    with pytest.raises(knowledge_governance.DraftIncomplete):
+        _draft(monkeypatch, '{"is_rule": "false", "text": "x"}')
+
+
+def test_知識起草缺is_rule時丟DraftIncomplete(monkeypatch):
+    """沒有 is_rule —— 舊版 `not d.get("is_rule")` 會當成「不是規定」回 None;改成不確定。"""
+    with pytest.raises(knowledge_governance.DraftIncomplete):
+        _draft(monkeypatch, '{"text": "通報粒度以帳戶為單位"}')
+
+
+def test_知識起草判是規範但text空時丟DraftIncomplete(monkeypatch):
+    with pytest.raises(knowledge_governance.DraftIncomplete):
+        _draft(monkeypatch, '{"is_rule": true, "text": "   "}')
 
 
 # ─────────────────── 3. 送仲裁前拿掉註解 ───────────────────

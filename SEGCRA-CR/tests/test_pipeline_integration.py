@@ -98,6 +98,11 @@ def run(monkeypatch, tmp_path):
         async def fake_run_agent(cfg, profile, system, user, hub, meta=None,
                                  verbose=True, use_tools=True, trace=None):
             systems.append(system)
+            # 模擬正常端點:回報乾淨結束(finish_reason=stop)。不設的話完整度會是
+            # "unknown",主審查會(正確地)補一條「沒回報結束原因」的 major —— 那是給
+            # 不回報的端點用的,這裡要測的是正常回報下的流程。
+            if meta is not None:
+                meta["finish_reason"] = "stop"
             return report_json
 
         monkeypatch.setattr(pipeline, "run_agent", fake_run_agent)

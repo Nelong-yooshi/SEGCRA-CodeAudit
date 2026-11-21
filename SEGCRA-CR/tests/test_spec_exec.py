@@ -135,6 +135,8 @@ def test_第一次覆蓋不完整_補齊後就採用補齊的那版(monkeypatch)
     calls = [_raw(incomplete), _raw(complete)]
 
     async def fake_run_agent(*a, **kw):
+        if kw.get("meta") is not None:      # 模擬正常乾淨結束(非截斷)
+            kw["meta"]["finish_reason"] = "stop"
         return calls.pop(0)
 
     monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
@@ -153,6 +155,8 @@ def test_多次都沒抽到完整覆蓋時保留覆蓋最多的一版(monkeypatc
     calls = [_raw(worse), _raw(better), _raw(worse)]
 
     async def fake_run_agent(*a, **kw):
+        if kw.get("meta") is not None:      # 模擬正常乾淨結束(非截斷)
+            kw["meta"]["finish_reason"] = "stop"
         return calls.pop(0)
 
     monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
@@ -184,6 +188,8 @@ def test_LLM_呼叫失敗後仍能在下次成功時採用完整結果(monkeypat
         nxt = calls.pop(0)
         if isinstance(nxt, Exception):
             raise nxt
+        if kw.get("meta") is not None:      # 模擬正常乾淨結束(非截斷)
+            kw["meta"]["finish_reason"] = "stop"
         return nxt
 
     monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
@@ -213,6 +219,8 @@ def test_挑最佳版本看覆蓋數_不被拆得少的0缺口版本騙走(monke
     calls = [_raw(first), _raw(second), _raw(third)]
 
     async def fake_run_agent(*a, **kw):
+        if kw.get("meta") is not None:      # 模擬正常乾淨結束(非截斷)
+            kw["meta"]["finish_reason"] = "stop"
         return calls.pop(0)
 
     monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
@@ -232,6 +240,8 @@ def test_0缺口且條件數不少於之前的最大值才提前結束(monkeypat
              "不該被呼叫到"]
 
     async def fake_run_agent(*a, **kw):
+        if kw.get("meta") is not None:      # 模擬正常乾淨結束(非截斷)
+            kw["meta"]["finish_reason"] = "stop"
         return calls.pop(0)
 
     monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
@@ -256,6 +266,8 @@ def test_重試的prompt帶上一次的缺口_每次都不同(monkeypatch):
 
     async def fake_run_agent(cfg, profile, system, user, **kw):
         users.append(user)
+        if kw.get("meta") is not None:      # 模擬正常乾淨結束(非截斷)
+            kw["meta"]["finish_reason"] = "stop"
         return calls.pop(0)
 
     monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
@@ -281,6 +293,8 @@ def test_重試的prompt指出條件拆得比之前少(monkeypatch):
 
     async def fake_run_agent(cfg, profile, system, user, **kw):
         users.append(user)
+        if kw.get("meta") is not None:      # 模擬正常乾淨結束(非截斷)
+            kw["meta"]["finish_reason"] = "stop"
         return calls.pop(0)
 
     monkeypatch.setattr(spec_exec, "run_agent", fake_run_agent)
@@ -508,15 +522,17 @@ def test_全部嘗試都被截斷時的失敗原因要指出是長度問題(monk
     assert "max_output_tokens" in gaps[0], "要指出可以調哪個設定"
 
 
-def test_沒給meta的呼叫端不受影響(monkeypatch):
-    """meta 是選用參數,既有的 5 個呼叫點都沒傳——不能因為加了它就改變行為。"""
+def test_完整回應_乾淨結束時照常採用(monkeypatch):
+    """generate_cases 會傳 meta 給 run_agent;端點回報乾淨結束(stop)、覆蓋完整時,
+    照常收下、沒有缺口。"""
     complete = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)])
 
-    async def fake_no_meta(*a, **kw):
+    async def fake(*a, **kw):
         assert "meta" in kw, "generate_cases 應該要傳 meta"
+        kw["meta"]["finish_reason"] = "stop"
         return _raw(complete)
 
-    monkeypatch.setattr(spec_exec, "run_agent", fake_no_meta)
+    monkeypatch.setattr(spec_exec, "run_agent", fake)
     plan, gaps, _ = asyncio.run(generate_cases(_FakeCfg(), "R-999", "規格內容"))
     assert gaps == [] and len(plan["cases"]) == 2
 
