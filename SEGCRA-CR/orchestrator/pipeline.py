@@ -395,6 +395,23 @@ def _unposted_section(unposted: list[dict]) -> str:
             f"回應錯誤;為了不重複貼,沒有改貼成一般留言):\n" + "\n".join(lines))
 
 
+_PENDING_LISTED = 10
+
+
+def _pending_section(report: dict) -> str:
+    """總結裡把『待驗證』單獨列一段:仲裁沒有結論、某一環節未完成這類帶 stage 的 finding。
+
+    它們不是確定的缺陷、也沒有計入分數(見 apply_rubric),所以不混在缺陷裡列——看的人才
+    不會把一份其實沒問題、只是某一步沒得出結論的 MR 當成有錯。"""
+    pending = [fd for fd in report.get("findings", []) if _is_pending(fd)]
+    if not pending:
+        return ""
+    lines = [f"- {_place(fd)} {fd.get('title', '')}" for fd in pending[:_PENDING_LISTED]]
+    lines += [f"- {_place(fd)}" for fd in pending[_PENDING_LISTED:]]
+    return (f"\n\n**另有 {len(pending)} 項待驗證**(仲裁沒有結論,或某一環節未完成;"
+            f"不是確定的缺陷、未計入分數,需人工確認):\n" + "\n".join(lines))
+
+
 # 回寫的步驟(寫進 report["_writeback"] 的鍵 → 報告與 log 上的名稱)與失敗的種類
 _WRITEBACK_STEPS = {"commit_status": "merge 閘門(commit status)", "label": "標籤",
                     "summary": "總結留言"}
@@ -2335,6 +2352,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         _record_writeback(writeback, mr_id, "summary", await hub.call("gitlab__post_summary", {
             "mr_id": mr_id,
             "body": f"**決策:{decision_text}**\n\n{report.get('summary', '')}"
+                    + _pending_section(report)
                     + _unposted_section(unposted) + _writeback_section(writeback, label),
             "score": int(report.get("score", 0)), "verdict": report.get("verdict", "needs_changes"),
         }))
@@ -4385,12 +4403,29 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
     return report
 
 
+def _is_pending(fd: dict) -> bool:
+    """「待驗證」的 finding:帶 stage 欄位的那種(環節沒跑完、仲裁沒有結論)。
+
+    待驗證不是成功、也不是**確定**的缺陷——只是某一步沒得出結論,需人工確認。
+    判斷靠 stage 欄位(跟 review_incomplete 同一個依據),不比對標題。"""
+    return isinstance(fd, dict) and bool(fd.get("stage"))
+
+
 @_isolated_stage("評分")
 def apply_rubric(report: dict) -> dict:
     """評分與 verdict 由管線按 rubric 從 severity 確定性計算——
-    實測同一 MR 模型自評分數逐輪漂移(50 vs 10),裁決權不交給模型。"""
+    實測同一 MR 模型自評分數逐輪漂移(50 vs 10),裁決權不交給模型。
+
+    **待驗證(帶 stage 的 finding)不計分**:它不是確定的缺陷,拿它扣分會讓一份 SQL
+    其實沒問題、只是某一步沒跑完的 MR 被打成低分、讓作者以為自己錯了。分數只算確定的
+    結果;有待驗證時 verdict 不給 approve(改記「未完成」),決策另由 review_incomplete
+    的硬條件擋住自動放行(不靠分數)。"""
     counts = {"blocker": 0, "major": 0, "minor": 0, "info": 0}
+    pending = 0
     for fd in report.get("findings", []):
+        if _is_pending(fd):
+            pending += 1
+            continue                      # 待驗證不計分(不加也不扣)
         sev = fd.get("severity", "info")
         counts[sev] = counts.get(sev, 0) + 1
     score = max(0, 100 - 40 * counts["blocker"] - 15 * counts["major"]
@@ -4399,8 +4434,10 @@ def apply_rubric(report: dict) -> dict:
         score = min(score, 59)
     verdict = ("approve" if score >= 80 and not counts["blocker"] and not counts["major"]
                else "reject" if score < 20 else "needs_changes")
+    if pending and verdict == "approve":
+        verdict = "incomplete"            # 有待驗證 → 不是成功,但也沒有確定缺陷
     report["_model_score"] = report.get("score")
-    report["score"], report["verdict"] = score, verdict
+    report["score"], report["verdict"], report["_pending"] = score, verdict, pending
     return report
 
 

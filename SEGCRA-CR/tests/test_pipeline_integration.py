@@ -142,6 +142,9 @@ def run(monkeypatch, tmp_path):
         async def fake_arbitrate(cfg, spec_text, sql, mm, profile_name=None):
             if spec_exec_kind == "arbiter_testdata":
                 return {"who_is_wrong": "testdata", "reason": "測資把邊界算錯了"}
+            if spec_exec_kind == "arbiter_inconclusive":
+                return {"who_is_wrong": None, "inconclusive": True, "why_kind": "unknown",
+                        "reason": "仲裁沒有結論:端點沒有回報結束原因,無法確認輸出完整"}
             return {"who_is_wrong": "sql", "reason": "閾值與規格不符"}
 
         monkeypatch.setattr(spec_exec, "generate_cases", fake_generate)
@@ -198,6 +201,29 @@ def test_仲裁剔除案例時覆蓋缺口寫出預期實際與理由(run):
     assert "測資預期" in joined and "SQL 實際" in joined
     assert "測資把邊界算錯了" in joined   # 仲裁理由
     assert report["decision"] == "needs_human"
+
+
+def test_仲裁沒有結論是待驗證_不扣分不當缺陷(run):
+    """要修 5:仲裁沒有結論(帶 stage 的 finding)是『待驗證』,不是確定缺陷:
+    - 分數只算確定的結果 → SQL 本身沒問題時仍是 100,作者不會以為自己錯了
+    - verdict 不給 approve(記「未完成」)
+    - 決策不自動放行(靠 review_incomplete 的硬條件,不靠分數)
+    - 總評把待驗證單獨列一段"""
+    report, output, mr_id = run(_mr(CLEAN_SQL), RESPONDED_REPORT,
+                                spec_exec_kind="arbiter_inconclusive")
+    # 只有待驗證、沒有確定缺陷 → 滿分、但不是 approve、也不自動放行
+    assert report["score"] == 100, [f["title"] for f in report["findings"]
+                                    if f.get("severity") in ("major", "blocker")]
+    assert report["verdict"] != "approve" and report["verdict"] == "incomplete"
+    assert report["_pending"] == 1
+    assert report["decision"] != "auto_approved"
+    # 待驗證那條帶 stage,被 review_incomplete 認到
+    assert any(f.get("stage") and "仲裁沒有結論" in f.get("title", "")
+               for f in report["findings"])
+    # 總評把待驗證單獨列一段(看 MR 的人看得到)
+    summary = "".join(p.read_text(encoding="utf-8") for p in output.iterdir()
+                      if p.is_file() and "raw" not in p.name)
+    assert "待驗證" in summary
 
 
 # ─────────────────── 後處理 enforce 鏈真的在管線裡跑 ───────────────────
