@@ -348,7 +348,8 @@ def _stub_spec_exec(monkeypatch, verdict, mismatch_case="C1-T"):
             "mismatches": [{
                 "case_id": mismatch_case, "condition_id": "C1", "direction": "true",
                 "note": "邊界案例", "rows": [["transactions", 1]],
-                "expect_flagged": True, "actual_flagged": False, "actual_rows": 0,
+                "expect_flagged": True, "actual_flagged": False,
+                "actual_rows": [["transactions", "1"]],   # 實際輸出的列(不是列數)
             }],
         }
 

@@ -122,7 +122,8 @@ def run(monkeypatch, tmp_path):
         mismatches = [] if spec_exec_kind == "pass" else [{
             "case_id": "C1-T", "condition_id": "C1", "direction": "true",
             "note": "邊界案例", "rows": [["transactions", 1]],
-            "expect_flagged": True, "actual_flagged": False, "actual_rows": 0}]
+            "expect_flagged": True, "actual_flagged": False,
+            "actual_rows": [["transactions", "1"]]}]      # 實際輸出的列(不是列數)
 
         async def fake_generate(cfg, code, text, profile_name=None):
             return plan, [], []
