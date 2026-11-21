@@ -5,9 +5,11 @@ pipeline 裡的一個 job,pipeline 會等它跑完,結果就在同一條上,既�
 **不寫 commit status**:job 的結果就是閘門。
 
 job 不在 runner 上直接跑審查,而是呼叫審查服務(scripts/webhook_server.py 的 /ci/review)
-等結果。理由:runner 上跑的 job 由 MR 的 pipeline 設定決定,MR 可以加一個指定同一台 runner 的
-job;審查需要的 GitLab token 與模型端點的通行碼若放在 runner 上,這種 job 讀得到。審查服務
-那台機器上才有這些秘密,job 只帶自己的 CI_JOB_TOKEN。
+等結果。理由:CI 設定檔放在 MR 改不到的專案,但部署端既有的 job 會執行 repo 裡 MR 改得到的東西,
+而且改得到同一台 runner 上後面 job 的執行環境(shell executor 用同一個帳號與家目錄,`.profile`
+會載入);審查需要的 GitLab token 與模型端點的通行碼若放在 runner 上,前面的 job 就拿得到。審查
+服務那台機器上才有這些秘密,job 只帶自己的 CI_JOB_TOKEN;審查 job 本身跑在專用的 runner
+(docs/06 第 4 節第 5 點)。
 
 | 審查結果 | 結束碼 | job / pipeline |
 |---|---|---|

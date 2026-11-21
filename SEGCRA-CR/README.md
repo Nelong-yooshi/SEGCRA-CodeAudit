@@ -316,8 +316,10 @@ MR 看的同一條 pipeline 上,專案既有的「Pipelines must succeed」直�
 | 審查沒跑完整(環節未完整、整份失敗或逾時) | 失敗(結束碼 5) | 紅燈 | 鎖住;重審就是 retry 那個 job |
 
 job 不在 runner 上跑審查,而是帶 `CI_JOB_TOKEN` 呼叫審查服務(`scripts/webhook_server.py` 的
-`/ci/review`)等結果:審查要用的 GitLab token 與模型通行碼只放在審查服務那台機器,MR 自己加的
-job 讀不到。審查服務會向 GitLab 確認呼叫者是這個專案、這個 MR 的 MR pipeline 裡正在跑的 job。
+`/ci/review`)等結果:審查要用的 GitLab token 與模型通行碼只放在審查服務那台機器。部署端既有的
+job 會執行 repo 裡 MR 改得到的東西,也改得到同一台 runner 上後面 job 的執行環境(家目錄的
+`.profile` 等),秘密放在 runner 上就拿得到;審查 job 本身也要跑在專用的 runner(job 帶 `tags`)。
+審查服務會向 GitLab 確認呼叫者是這個專案、這個 MR 的 MR pipeline 裡正在跑的 job。
 
 設定步驟、要加的 job(YAML)、為什麼 CI 設定檔要放在 MR 改不到的專案,見
 **[docs/06 第 4 節](docs/06-決策與merge閘門.md)**。另外兩件 GitLab 專案設定:
