@@ -191,6 +191,8 @@ def test_執行驗證抓到不符時要變成_major_並擋下自動放行(run):
     assert report["_spec_exec"]["passed"] is False
     assert any(f["severity"] == "major" and "執行驗證失敗" in f["title"]
                for f in report["findings"]), "spec_exec 的 finding 沒有併進報告"
+    # 這條名字裡的「擋下自動放行」要真的驗到:major + 執行驗證未通過 → 不得自動放行
+    assert report["decision"] != "auto_approved"
 
 
 def test_仲裁剔除案例時覆蓋缺口寫出預期實際與理由(run):

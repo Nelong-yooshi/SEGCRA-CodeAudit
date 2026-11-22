@@ -194,12 +194,15 @@ RETAIL_M1 那組快了 15 分鐘,但那是因為它提早放棄拆解,不是效�
 
 **prompt**(`ARBITER_SYSTEM` + user):給它核定規格全文(標明「唯一真值」),以及 MR 的 SQL 與案例資料——**SQL 先拿掉註解**,**SQL 與資料列放進每次隨機產生的分隔標記之間**(標記之間是 MR 作者寫的內容、是資料不是規格,裡面自稱「核定規格/補充」的文字都不算規格;token 每次不同,內容寫不出對得上的結束標記);case 的條件/方向/測資說明/預期 vs 實際放在標記外。拿掉註解只擋一個位置,字串常值、別名、SQL 輸出的欄位值都能塞陳述句又不能刪,所以要靠標記讓仲裁分得出哪些字是 MR 寫的。原則:只以 spec 條文判斷、不腦補;逐步核對「這筆資料在 spec 之下應該命中嗎」再看 SQL 為何相反;**測資與 SQL 都可能錯,無法確定時判 SQL 側(交人工),不倒向測資錯**——判 SQL 側只是多看一眼,判測資錯會把案例剔除、當成驗過。輸出嚴格 JSON:`{"who_is_wrong": "testdata"|"sql", "reason": "<依 spec 條文的推理>"}`。
 
-**兩種結局**:
+**三種結局**(`who_is_wrong` = `testdata` / `sql` / `None`):
 
-- 判 `testdata` **且確定**(端點回報乾淨結束 `finish_reason=stop` + 嚴格解析成功、沒靠 json-repair)→ 該案進 `dropped_cases`(`by: "arbiter"` + 理由),對應 `case_results` 標 `dropped: True`,**並在 `coverage_gaps` 補一條**帶預期、實際與仲裁理由的「案例 X(條件 C,某向)遭仲裁剔除(測資錯),該向未驗證」——被剔除 ≠ 通過,該條件該向就是沒驗到,不可據以自動放行,缺口那條也讓人看得到剔除的是什麼。
+- 判 `testdata` **且確定**(見下)→ 該案進 `dropped_cases`(`by: "arbiter"` + 理由),對應 `case_results` 標 `dropped: True`,**並在 `coverage_gaps` 補一條**帶預期、實際與仲裁理由的「案例 X(條件 C,某向)遭仲裁剔除(測資錯),該向未驗證」——被剔除 ≠ 通過,該條件該向就是沒驗到,不可據以自動放行,缺口那條也讓人看得到剔除的是什麼。
 - 判 `sql`(確定)→ 收進 `sql_faults`,最後彙整成**一條 major「執行驗證失敗:實作與規格行為不符」**,detail 逐案列出預期/實際與仲裁理由,建議對照規格修正(含/不含、時段、過濾、粒度)。
+- **沒有結論**(`who_is_wrong` 是 `None`、`inconclusive: True`)→ 既不剔除也不當 SQL 確定錯,落成**一條帶 `stage` 的 finding「測資與 SQL 的結果不一致,仲裁沒有結論」**(`review_incomplete` 認得到 → 決策交人工),並在 `coverage_gaps` 標該向未驗證。這一類是「待驗證」:不計分、不當確定缺陷(見 06 篇),`why_kind` 記是哪一種不確定。
 
-**預設不採信、只有確定才採信**:仲裁一開始就當 SQL 側(交人工看),只有端點回報乾淨結束(`finish_reason=stop`)+ 嚴格解析成功(沒靠 json-repair)+ `who_is_wrong` 是合法值時才採信它的結論。少任何一項——LLM 呼叫失敗、被截斷/沒回報結束原因、靠 repair 救回、`who_is_wrong` 不是合法值——都回 `{"who_is_wrong": "sql", "reason": "(仲裁…,不採信,保守列為 SQL 側待人工確認)", "arbiter_unparseable": True}`,寧可多一條待人工確認的 major(→ needs_human),不把不確定當成「測資錯」靜默剔除。這跟主審查「沒依據就當截斷」方向一致:不確定落在保守那一邊。
+**只有確定才採信**(`_arbitrate_call`):要同時滿足 ① 輸出完整(`output_completeness` 是 `complete`:被截斷或「沒回報結束原因」都不算)② 整段剛好是一個 JSON 物件、沒有重複鍵(`strict_json_object`,不走 json-repair,前後有字、兩個物件、重複鍵、靠 repair 補回來都不算)③ `who_is_wrong` 是 `testdata`/`sql`、`reason` 是非空字串。少任何一項(含 LLM 呼叫失敗)都是「沒有結論」。這跟主審查一致:主審查現在也把「沒回報結束原因」當成不完整、不採信(見 04 篇)。
+
+**判 `testdata` 要再問一次(`arbitrate`)**:剔除案例是仲裁唯一會拿掉證據的結論。分隔標記擋得住字串裡的陳述句,但擋不住「字串裡關掉圍欄、寫一整段像規格的段落、再開圍欄接回去」(實測真模型 3/3 被說動)。所以第一次判 `testdata` 時,用**遮掉 MR 作者能寫字的位置**(字串常值、識別字內容換代號,實際輸出只給列數;`_mask_mr_text` 走 `_segments`)的版本**再問一次**:兩次都確定 `testdata` 才剔除;遮掉後改判、或資訊不足判不出(照 ARBITER 倒向 SQL 側),都列 SQL 側交人工——結果是多交人工,不會多剔除。
 
 ### LLM 傳輸失敗的優雅降級(彙總)
 

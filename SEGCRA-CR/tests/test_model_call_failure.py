@@ -580,7 +580,7 @@ def test_逾時沒被縮短時不加說明():
     assert "87 秒" in g["detail"] and "原本是 600 秒" in g["detail"]
 
 
-# ─────────────────── baseline 對照組也要查截斷(#26 要修的 5)───────────────────
+# ─────────────── baseline 對照組也要查完整度(被切也當完整會高估完整管線)───────────────
 
 def _baseline_report(monkeypatch, tmp_path, *, truncated):
     """跑一次裸模型對照組,run_agent 回一份(視情況被截斷的)報告。"""
