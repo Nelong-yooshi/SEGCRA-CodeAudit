@@ -23,7 +23,7 @@ from time import monotonic
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PKG_ROOT))
 
-from orchestrator.cold_read import OUTPUT_TRUNCATED, ColdReadError, cold_read  # noqa: E402
+from orchestrator.cold_read import ColdReadTruncated, cold_read  # noqa: E402
 from orchestrator.config import load_config  # noqa: E402
 
 CASES_DIR = PKG_ROOT / "eval" / "cold_read"
@@ -90,7 +90,7 @@ def main(argv=None) -> int:
             result = asyncio.run(cold_read(cfg, case))
         except Exception as e:              # noqa: BLE001 — 一題失敗不影響其他題
             seconds.append(monotonic() - start)
-            cut_output = isinstance(e, ColdReadError) and str(e) == OUTPUT_TRUNCATED
+            cut_output = isinstance(e, ColdReadTruncated)       # 看型別,不比對訊息
             output_cut += cut_output
             errors += not cut_output
             reason = "輸出被截斷" if cut_output else f"失敗({type(e).__name__})"
