@@ -55,13 +55,19 @@
      (例如自我 join)也不會展開失敗。沒有 database、或 model 名稱不能當表名(例如有連字號、點、數字開頭,dbt 都接受)時給不出值:仍然算有定義(`this is defined` 為 True,跟 dbt 一樣,否則寫在裡面的語句會被藏起來),但任何使用都失敗,錯誤訊息不帶檔名;沒用到的 model 照常展開。
      用到時帶表名提醒:增量模式一律算;一般模式看 model 本身有沒有寫到 `this`(只看語法樹,寫在
      沒進去的分支裡也算),或呼叫了定義裡寫到 `this` 的 macro(macro 檔最外層的程式碼不算)
-   - `run_started_at`:跟 dbt 一樣是帶 UTC 時區的 datetime(dbt-core 1.12 是 `datetime.now(tz=pytz.utc)`),
-     值是審查開始的真實時間,一份審查裡的展開共用一個(見 `start_review_invocation`)。
-     `.strftime()`、`.date()`、`.year`、直接輸出都跟 dbt 相同;`modules.pytz` 不提供,
-     `.astimezone(時區)` 拿不到時區物件,展開失敗。看主機本地時區或現在時間的寫法(`.astimezone()`
-     不給時區、`now()`、`today()`、`utcnow()`、`fromtimestamp()` 不給時區)一律展開失敗:得到的是審查機的
-     值(dbt 執行時是部署端主機的值),而且每次展開都不同;先加減或 `replace()` 再呼叫也一樣。
-     呼叫端指定的值要是帶 UTC 時區的 ISO 字串
+   - `run_started_at`:帶 UTC 時區的 datetime,值是審查開始的真實時間,一份審查裡的展開共用一個
+     (見 `start_review_invocation`)。dbt-core 1.12 是 `datetime.now(tz=pytz.utc)`,時區物件是 pytz 的
+     `UTC`,這裡是 `datetime.timezone.utc`:兩者的屬性與部分方法的結果不同,所以**它與從它算出來的值
+     (date / time / timedelta)只放行照實模擬、結果跟 dbt 相同的屬性與方法**(`_TIME_ATTRS_ALLOWED`:年月日
+     時分秒、`weekday()`、`isoformat()`、`strftime()`、`date()`、`time()`、`timestamp()`、`utcoffset()`、
+     `tzname()`、`replace()`、相減得到的 timedelta 的 `days` / `seconds` / `total_seconds()` 等),直接輸出也
+     跟 dbt 相同。其他一律展開失敗、交人工(`is defined` 也是,比照表名物件),例如 `tzinfo`、`dst()`、
+     `timetuple()`、`min` / `max`、`now()` / `today()` / `utcnow()` / `fromtimestamp()` 這類類別方法、
+     `astimezone()`(不給時區時換成主機的時區;給時區要有時區物件,拿不到)。`pprint` 遇到時間值也展開
+     失敗(帶出的 repr 跟 dbt 不同)。防線在沙箱取屬性那一層(`_guard_time_access`),所以從
+     `run_started_at.min`、`.date()` 這類拿到的值也擋得到。呼叫端指定的值要是帶 UTC 時區的 ISO 字串。
+     **執行驗證不用它**:model(含它呼叫的 macro)寫到 `run_started_at` 時不送沙盒,記成無法驗證
+     (`RenderResult.run_started_at_used`,見「執行驗證」與下方已知限制);規則層的展開照舊用審查開始的時間
    - `env_var` **刻意不定義**:會把審查機的環境變數寫進 SQL;未定義則由 `StrictUndefined` 大聲失敗。
      `target.database` 在未提供 database 時同理
    - **所有 macro 檔共用同一個命名空間**:dbt 解析 macro 與檔案順序無關,逐檔各自展開
@@ -223,7 +229,7 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 | 指向錯誤的關聯 | `ref('t', version=2)` 在 dbt 是另一張表,我們忽略參數 | 拒絕展開(沒有 manifest 可解析版本) |
 | 偽造行號標記 | MR 放入仿冒標記,行號對應降級 | 標記使用每次隨機產生的權杖 |
 | 資訊洩漏 | 錯誤訊息帶出審查機完整路徑;`{{ ref }}` 輸出記憶體位址 | 錯誤訊息不含路徑、不含控制字元、有長度上限;不輸出函式物件;給不出值的 `this` 連 `repr`(`pprint`)都失敗 |
-| 樣板辨認自己在展開器裡,把語句藏起來 | `{% if invocation_id != '固定值' %}`、`{% if run_started_at.year > 2000 %}`、`{% if this is not string %}`、`{% if this.keys is defined %}` 裡的 DELETE 審查時不出現、執行時照跑 | `invocation_id` 每份審查不同(格式同 dbt 的 uuid4),`run_started_at` 是真實時間(不是固定值);同一份審查裡的展開(預掃的一般與增量、受影響 model 的前後)共用一個值,跟 dbt 一次執行一個一樣,兩種模式的同一句才不會被算成兩句。`this` / `ref()` / `source()` 回傳表名物件(`_Relation`):對它們做 `defined` / `undefined` 以外的 `is` 判斷(含放在判斷的參數、清單、dict 裡),或取 `database`、`schema`、`identifier`、`name`、`table` 以外的屬性與索引(含 `attr`、`map(attribute=…)`),一律展開失敗、交人工——dbt 的 Relation 物件跟字串的型別判斷結果、有哪些屬性都不同,逐個模擬模擬不完。`string` 濾器把表名物件轉成一般字串,跟 dbt 一樣 |
+| 樣板辨認自己在展開器裡,把語句藏起來 | `{% if invocation_id != '固定值' %}`、`{% if run_started_at.year > 2000 %}`、`{% if run_started_at.tzinfo.zone is defined %}`、`{% if this is not string %}`、`{% if this.keys is defined %}` 裡的 DELETE 審查時不出現、執行時照跑 | `invocation_id` 每份審查不同(格式同 dbt 的 uuid4),`run_started_at` 是真實時間(不是固定值),時間值只放行結果跟 dbt 相同的屬性與方法(時區物件、`dst()` 這類跟 dbt 不同的一律展開失敗,見上面 `run_started_at` 那段);同一份審查裡的展開(預掃的一般與增量、受影響 model 的前後)共用一個值,跟 dbt 一次執行一個一樣,兩種模式的同一句才不會被算成兩句。`this` / `ref()` / `source()` 回傳表名物件(`_Relation`):對它們做 `defined` / `undefined` 以外的 `is` 判斷(含放在判斷的參數、清單、dict 裡),或取 `database`、`schema`、`identifier`、`name`、`table` 以外的屬性與索引(含 `attr`、`map(attribute=…)`),一律展開失敗、交人工——dbt 的 Relation 物件跟字串的型別判斷結果、有哪些屬性都不同,逐個模擬模擬不完。`string` 濾器把表名物件轉成一般字串,跟 dbt 一樣 |
 | 樣板改到呼叫端資料 | `{% do var('x').append(...) %}` 改到呼叫端的 list | 變數每次取用都給複本;`target` 唯讀 |
 | ReDoS | 內部正規表達式是平方時間,40 萬字元約 40 分鐘 | 改為線性時間掃描 |
 | 資源耗盡 | `((9**256)**256)**256`、超大字串、無窮迴圈 | 原始碼 / macro / 輸出 / 整數運算上限;子行程隔離 |
@@ -264,6 +270,14 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 - 對照專案的連線設定預設**驗證伺服器憑證**,不信任自簽憑證
 
 ### 已知限制
+
+- **`run_started_at` 只照實模擬了常用的屬性與方法**:時區物件(`tzinfo`)、`dst()`、`timetuple()`、
+  `min` / `max` 等沒有照實模擬,用到就展開失敗、交人工(不會展開成功卻跟 dbt 不同)。之後要補的話一處
+  一處對 dbt(pytz 的 UTC)實測後再放行。
+- **用到 `run_started_at` 的 model 不做執行驗證**:展開時的值是審查開始的時間,測資固定在 `WIN_START`,
+  排程拿 `run_started_at` 當資料日還是資料日的隔天,各個 model 不同,審查猜不到;換成固定值也一樣猜。
+  所以記成無法驗證(「model 用到 run_started_at,審查不知道排程時間跟資料日期的關係」)。要補的方向:
+  部署端在設定寫出排程時間跟資料日期的關係(像 `run_date_vars`),有設就照它換算,沒設才記無法驗證。
 
 **本模組是審查輔助,不是資安邊界。** dbt 執行樣板時不在沙箱內,刻意以 Python 物件內省
 在多層資料流中隱藏呼叫(例如把 macro 當參數傳給另一個 macro,再以執行期組出的名稱取
@@ -589,7 +603,8 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 
 下列情況不展開,執行驗證照舊回「尚未支援」major,另外補一條 info「dbt model 沒有送進沙盒執行」
 寫出原因:上面任一項不成立、規格裡同名的表不只一張、兩個不同的來源對到同一張表、呼叫了
-`is_incremental()`(增量那段要先放一份上一次執行後的目標表,還沒做)、專案有同名的 macro、展開後
+`is_incremental()`(增量那段要先放一份上一次執行後的目標表,還沒做)、寫到 `run_started_at`(含它呼叫的
+macro;審查不知道排程時間跟資料日期的關係,見上方已知限制)、專案有同名的 macro、展開後
 仍有樣板標記、MR 沒有自己的規格而借來的受影響 model 規格不是這個 model 的、資料庫名稱不是約定的假名。
 不猜表名:猜錯的話執行失敗或結果不符,會被說成程式的問題。
 
