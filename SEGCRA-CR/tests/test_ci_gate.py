@@ -119,10 +119,11 @@ def ws(monkeypatch):
     importlib.reload(mod)
     from toolbox import gitlab
     jobs = {"tok-900": _job(), "tok-901": _job(id=901)}
+    monkeypatch.setattr(gitlab, "REAL_MODE", True)
     monkeypatch.setattr(gitlab, "GITLAB_PROJECT", PROJECT)
     monkeypatch.setattr(gitlab, "job_from_token", lambda t: jobs.get(t))
-    monkeypatch.setattr(gitlab, "pipeline_info", lambda pid: _pipeline() if pid == 77 else None)
-    monkeypatch.setattr(gitlab, "mr_head", lambda iid: _mr() if iid == "5" else None)
+    monkeypatch.setattr(gitlab, "pipeline_info", lambda pid: _pipeline() if pid == 77 else {"id": pid})
+    monkeypatch.setattr(gitlab, "mr_head", lambda iid: _mr() if iid == "5" else {"state": "merged"})
     mod._test_jobs = jobs
     yield mod
     # 開始了的審查要等它結束:背景執行緒在替身還原之後才跑的話,會用到真的程式
@@ -367,3 +368,26 @@ def test_沒完成時只留言_不寫_commit_status(ws, monkeypatch):
     assert posted and status == []
     ws._notify_incomplete(5, "逾時", SHA)
     assert len(status) == 1                 # webhook 那條路照樣寫
+
+# ─────────────────── 啟動時的說明 ───────────────────
+
+def test_啟動說明_沒設密鑰時寫明只停用_webhook_不叫人去設(ws, monkeypatch):
+    monkeypatch.setattr(ws, "SECRET", "")
+    text = "\n".join(ws._startup_lines("0.0.0.0", 8000))
+    assert "/ci/review" in text and "/gitlab-webhook(停用)" in text
+    assert "不受影響" in text
+    assert "請先 export" not in text and "都會被拒絕" not in text
+
+
+def test_啟動說明_有密鑰時兩個入口都在_沒有停用字樣(ws, monkeypatch):
+    monkeypatch.setattr(ws, "SECRET", "s")
+    lines = ws._startup_lines("0.0.0.0", 8000)
+    assert "/ci/review" in lines[0] and "/gitlab-webhook" in lines[0]
+    assert not any("停用" in line for line in lines)
+
+def test_mock_模式查不到_MR_時回_None_不丟例外(monkeypatch, tmp_path):
+    # /ci/review 在本機(mock 模式)驗擋人的那幾步時,沒有 fixture 的 MR 要回 403,不能讓連線斷掉
+    from toolbox import gitlab
+    monkeypatch.setattr(gitlab, "REAL_MODE", False)
+    monkeypatch.setattr(gitlab, "FIXTURES_DIR", tmp_path)
+    assert gitlab.mr_head("1") is None

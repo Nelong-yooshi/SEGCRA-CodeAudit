@@ -52,6 +52,10 @@ class ColdReadError(Exception):
     """冷讀沒有得到可用的結果(模型輸出被截斷、解析不了、格式不對)。訊息是固定文字。"""
 
 
+class ColdReadTruncated(ColdReadError):
+    """冷讀的輸出被長度上限切斷。用型別分辨(評測要分開統計),不比對訊息。"""
+
+
 @dataclass(frozen=True)
 class Section:
     kind: str               # "標題" / "說明" / "檔案"
@@ -264,7 +268,7 @@ async def cold_read(cfg: Config, mr: dict, head_texts: dict | None = None) -> Co
     raw = await run_agent(cfg, profile, SYSTEM_PROMPT, user, None, verbose=False,
                           use_tools=False, meta=meta)
     if output_truncated(meta, profile.max_output_tokens):
-        raise ColdReadError(OUTPUT_TRUNCATED)
+        raise ColdReadTruncated(OUTPUT_TRUNCATED)
     flagged, quotes = parse_output(raw)
     unread = unread_reason(meta, profile, SYSTEM_PROMPT + user)
     return ColdRead(flagged=flagged,

@@ -2,11 +2,12 @@
 
 ## 在幹嘛(一段白話)
 
-`scripts/webhook_server.py` 是一個純 Python 標準庫寫成的 HTTP 服務,跑在能連到 GitLab 的內網主機上。GitLab 專案一有 MR 動作(開新 MR、重開、推新 commit、從 Draft 標成 Ready)就打一個 webhook 過來,server 驗完密鑰後在背景執行整條審查管線(`orchestrator/pipeline.py:review_mr`),審完把行內留言、總評分數、`ai-review::<decision>` label 與 commit status 回寫到 GitLab。開發者留言 `/review` 也能手動觸發重審。Draft 的 MR 不審,Draft 期間要看就留 `/review`。搭配 GitLab 專案設定「Pipelines must succeed」+ protected branch,commit status(`segcra/review`)就成了 CE 版的 merge 閘門——不必等人手動跑指令,MR 進來自動被審。
+`scripts/webhook_server.py` 是一個純 Python 標準庫寫成的 HTTP 服務,跑在能連到 GitLab 的內網主機上,有兩個入口:**CI 的審查 job 呼叫的 `/ci/review`**(部署端用這一條,見下面「CI 的 job 呼叫的那條路」與 06 篇第 4 節),以及不接 CI 時的 **webhook `/gitlab-webhook`**。webhook 那條:GitLab 專案一有 MR 動作(開新 MR、重開、推新 commit、從 Draft 標成 Ready)就打一個 webhook 過來,server 驗完密鑰後在背景執行整條審查管線(`orchestrator/pipeline.py:review_mr`),審完把行內留言、總評分數、`ai-review::<decision>` label 與 commit status 回寫到 GitLab。開發者留言 `/review` 也能手動觸發重審。Draft 的 MR 不審,Draft 期間要看就留 `/review`。不接 CI 時,搭配 GitLab 專案設定「Pipelines must succeed」+ protected branch,commit status(`segcra/review`)就是 merge 閘門;接 CI 時閘門是審查 job 的結束碼,不寫 commit status。
 
 ## 防的是什麼
 
 - **防「忘了審」**:審查若靠人手動觸發,漏跑一次就等於該 MR 完全沒有 AI 防線(漏報的最上游形態)。webhook 把觸發變成事件驅動,MR 一動就審。
+- **防別的 job 冒用 `/ci/review`**:這個入口只認這個專案、這個 MR 的 MR pipeline 正在跑的 job(拿 job 的 `JOB-TOKEN` 向 GitLab 查,再確認 ref、sha 與 MR 目前的 head,`ci_gate.check_request`),不符回 403、向 GitLab 查不到回 502(原因寫出是哪一個查詢、為什麼)、mock 模式或 `GITLAB_PROJECT` 不是數字回 503,三種都不開始審查;查詢編號只有開始那份審查、還在執行中的 job 查得到。
 - **防外部亂打**:server 監聽 `0.0.0.0`,任何能連到這台機器的人都打得到 endpoint。沒有 token 驗證的話,攻擊者可以偽造 payload 對任意 MR 觸發審查(浪費 GPU 資源)、甚至藉由灌事件干擾正常審查節奏。這裡用密鑰比對確定性擋掉,不是靠「應該沒人知道這個 URL」。
 - **防自我觸發迴圈**:審查完成會回寫留言,留言又會發 note webhook——若 note 事件無條件重審,就是無限迴圈燒 GPU。所以 note 事件只認寫在留言開頭的 `/review` 指令(網址、內文裡的 `/review`、`/reviews` 都不算),且 bot 帳號(username 以 `ai-` 或 `root` 開頭)的留言一律忽略。這是機制擋,不是期待模型或人「小心一點」。
 - **防重複觸發**:GitLab 對同一 MR 短時間可能連發多個 update 事件。只有**真的推了新 commit**(事件帶 `oldrev`)才會重審,其餘 update(改 label、標題、描述、指派人 —— 包括審查自己最後加 label 那一下)一律忽略。推了新 commit 時取消進行中的那次、改審新的:舊的那次審的是舊程式,結論貼到新 commit 上是錯的。
@@ -19,7 +20,7 @@
 
 核心程式全在 `scripts/webhook_server.py`,單檔、無第三方依賴。
 
-**Token 驗證(`Handler.do_POST`)**:GitLab webhook 會把專案設定裡填的 Secret token 原文放在 `X-Gitlab-Token` header。server 讀環境變數 `GITLAB_WEBHOOK_SECRET`,用 `hmac.compare_digest(token, SECRET)` 做常數時間比對(防 timing attack;注意這是明文密鑰比對,不是 HMAC 簽章——GitLab CE 的 webhook 就是送原文)。`SECRET` 未設或比對失敗一律回 401。啟動時若沒 export 密鑰,`main()` 會印警告「所有 webhook 請求都會被拒絕」。
+**Token 驗證(`Handler.do_POST`)**:GitLab webhook 會把專案設定裡填的 Secret token 原文放在 `X-Gitlab-Token` header。server 讀環境變數 `GITLAB_WEBHOOK_SECRET`,用 `hmac.compare_digest(token, SECRET)` 做常數時間比對(防 timing attack;注意這是明文密鑰比對,不是 HMAC 簽章——GitLab CE 的 webhook 就是送原文)。`SECRET` 未設或比對失敗一律回 401。沒設密鑰時 webhook 那條路等於停用,啟動時 `main()` 印一行說明;CI 那條路(`/ci/review`)不看這個密鑰,不受影響。
 
 **事件路由(`_handle`,`Handler.do_POST` 驗完 token 後呼叫)**:只收 `POST /gitlab-webhook`(其他路徑 404),依 payload 的 `object_kind` 分流:
 
@@ -46,7 +47,7 @@
 ### CI 的 job 呼叫的那條路(`/ci/review`,部署端用這一條)
 
 部署端不設 webhook:審查做成 MR pipeline 最後一個 stage 的 job,job 呼叫同一支服務的
-`POST /ci/review` 與 `GET /ci/review/<編號>`(設定步驟與 job 的 YAML 見 06 篇第 4 節)。跟 webhook
+`POST /ci/review` 與 `GET /ci/review/<編號>`(設定步驟與 job 的 YAML 見 README §7,機制見 06 篇第 4 節)。跟 webhook
 那條路的差別:
 
 | | webhook(`/gitlab-webhook`) | CI(`/ci/review`) |
@@ -59,11 +60,11 @@
 
 兩條路共用 `_run_review`(同一個 MR 有進行中的審查就取消、改審新的)與 `REVIEW_TIMEOUT_SECONDS`。
 進行中的 CI 審查記在記憶體(`_ci_reviews`,最多 `MAX_CI_REVIEWS` 份,超過時丟掉最舊的、已經結束的),
-服務重新啟動就沒了:job 查不到狀態,連續 10 次後以 5 結束,retry job 重審。
+服務重新啟動就沒了(影響見 06 篇「擴充與注意」)。
 
 ## 對決策的影響
 
-webhook server 本身不產生 finding、不動 severity、不參與三態決策的任何條件——它是觸發器與回寫通道。決策(`auto_approved` / `needs_human` / `blocked`)完全由管線的 `apply_policy`(`orchestrator/pipeline.py`)確定性計算。webhook 的貢獻在**決策的落地**:把決策轉成 commit status(只有 `auto_approved` 是 success),配合「Pipelines must succeed」讓 `needs_human` 與 `blocked` 的 MR 在 GitLab 上實際按不下 merge。換句話說,它讓三態決策從「一段報告文字」變成「merge 按鈕的狀態」。
+webhook server 本身不產生 finding、不動 severity、不參與三態決策的任何條件——它是觸發器與回寫通道。決策(`auto_approved` / `needs_human` / `blocked`)完全由管線的 `apply_policy`(`orchestrator/pipeline.py`)確定性計算。服務的貢獻在**決策的落地**:CI 那條路把決策轉成審查 job 的結束碼(06 篇第 4 節),不接 CI 時 webhook 那條路把決策轉成 commit status(只有 `auto_approved` 是 success);兩種都配合「Pipelines must succeed」,讓不該合併的 MR 在 GitLab 上實際按不下 merge。
 
 ## 怎麼驗證它在動
 
@@ -105,6 +106,25 @@ curl -s -X POST http://127.0.0.1:8000/gitlab-webhook \
 ```
 
 步驟 3 的背景審查在 mock 模式會去讀 `fixtures/mr_1.json`——該檔不存在,所以 server 會印「MR !1 審查失敗:...」後把 iid 從 `_inflight` 移除,這同時驗證了 graceful 失敗與 `_inflight` 的清理(再發一次事件又能觸發)。要跑完整審查:`cp fixtures/mr_001.json fixtures/mr_1.json` 且模型 profile 可用,審完 stdout 會印「MR !1 審完:決策=... 分數=... findings=...」,結果落在 `review_output/mr_1_review.json`。接真 GitLab 則用 webhook 設定頁的 Test 按鈕。
+
+`/ci/review` 在本機(mock 模式)驗得到的只有「不開始審查」:mock 模式沒有 GitLab,驗不了呼叫者,參數對的請求一律回 503(服務照上面啟動):
+
+```bash
+# 7. body 不對 → 400
+curl -s -w ' %{http_code}\n' -X POST http://127.0.0.1:8000/ci/review -H 'JOB-TOKEN: x' -d '{"mr_iid": 1}'
+# → mr_iid 要是正整數、sha 要是 40 碼的 commit 400
+
+# 8. mock 模式:驗不了呼叫者,一律不開始 → 503
+curl -s -w ' %{http_code}\n' -X POST http://127.0.0.1:8000/ci/review -H 'JOB-TOKEN: x' \
+  -d '{"mr_iid": 1, "sha": "0000000000000000000000000000000000000000"}'
+# → 審查服務在 mock 模式(GITLAB_URL、GITLAB_TOKEN、GITLAB_PROJECT 沒有設齊),沒有 GitLab,CI 那條路驗不了呼叫者,一律不開始審查 503
+
+# 9. 查不存在的編號 → 404
+curl -s -w ' %{http_code}\n' http://127.0.0.1:8000/ci/review/nope -H 'JOB-TOKEN: x'
+# → 查不到這份審查(編號不對,或審查服務重新啟動過) 404
+```
+
+完整的檢查(專案、MR pipeline、ref、sha、MR 的 head)由 `tests/test_ci_gate.py` 驗,向 GitLab 查不到時的說法(連不上、非 2xx、內容不對)由 `tests/test_ci_lookup.py` 對假的 GitLab 驗;實際接 GitLab 見 06 篇「怎麼驗證它在動」(c)。
 
 ## 時間上限與未完成的處理(#45 / #53 review)
 
@@ -194,7 +214,8 @@ python eval/stage_time_summary.py out/          # 各階段耗時,與照正式�
 審查沒跑完時,webhook 會做兩件事(`_notify_incomplete`):在 MR 上留言,**並把
 `segcra/review` 這個 commit status 設成失敗**。留言只是給人看的,擋合併的是 commit
 status(專案設定「Pipelines must succeed」);只留言不設狀態,等於審查沒跑完卻沒有
-東西擋著合併。
+東西擋著合併。CI 那條路(`/ci/review`)只留言、不設 commit status,擋合併的是 job 拿到的 5
+(見 06 篇第 4 節)。
 
 審查模型的端點連不上、逾時或回錯誤時,管線**不會**丟例外到這裡:它照常產出報告(程式確定性檢查的
 結果加上一條「審查模型沒有完成」的 major),照常回寫,決策是交人工,commit status 一樣是失敗

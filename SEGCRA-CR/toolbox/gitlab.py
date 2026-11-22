@@ -19,7 +19,7 @@ OUTPUT_DIR = Path(os.environ.get("REVIEW_OUTPUT", PKG_ROOT / "review_output"))
 
 GITLAB_URL = os.environ.get("GITLAB_URL", "")          # e.g. http://localhost:8929
 GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "")
-GITLAB_PROJECT = os.environ.get("GITLAB_PROJECT", "")  # project id 或 URL-encoded path
+GITLAB_PROJECT = os.environ.get("GITLAB_PROJECT", "")  # 專案的數字 id(CI 那條路拿它跟 job 的專案比對)
 REAL_MODE = bool(GITLAB_URL and GITLAB_TOKEN and GITLAB_PROJECT)
 # 專案層級的唯讀 token(read_api,角色 Reporter),只給打包下載用(#15 條件 1)
 GITLAB_READ_TOKEN = os.environ.get("GITLAB_READ_TOKEN", "")
@@ -28,8 +28,73 @@ GITLAB_READ_TOKEN = os.environ.get("GITLAB_READ_TOKEN", "")
 
 # --- real mode helpers ---------------------------------------------------
 
+class NotAnMR(Exception):
+    """GitLab 回了 200 的 JSON,內容卻不是 MR(GITLAB_URL 指到別的服務、代理…)。
+
+    跟「回的不是 JSON」(json.JSONDecodeError)分開:兩者都是 200,但後者多半是網頁或
+    登入頁。管線據此說出原因(orchestrator/mr_fetch_error.py),不必比對錯誤訊息。"""
+
+
+class MockFixtureMissing(FileNotFoundError):
+    """mock 模式找不到這個 MR 編號的測試資料。用自己的型別:其他來源的 FileNotFoundError(例如
+    SSL_CERT_FILE 指到不存在的檔)不能被說成 mock 模式。繼承 FileNotFoundError,接 FileNotFoundError 的地方照樣接得到。"""
+
+
+class InvalidMrId(ValueError):
+    """MR 編號不是 1–10 位的 ASCII 數字。用型別分辨,不比對訊息。繼承 ValueError。"""
+
+
+class SslCertFileError(Exception):
+    """環境變數 SSL_CERT_FILE 有設,但載入不了(不存在、是目錄、不是 PEM)。訊息是固定文字。"""
+
+
+_SSL_CERT_FILE_OK: set = set()
+
+
+def check_ssl_cert_file() -> None:
+    """SSL_CERT_FILE 有設時先自己載入一次,載入不了就丟 SslCertFileError 說出是這個變數。
+
+    httpx 每個請求都照 SSL_CERT_FILE 建 TLS 設定(GITLAB_URL 是 http 也會),載入失敗時丟的是
+    沒有檔名的 FileNotFoundError、IsADirectoryError 或 ssl.SSLError,從那裡反推不出來源。
+    同一個值載入成功過就不再試。"""
+    raw = os.environ.get("SSL_CERT_FILE")
+    if raw is None or raw in _SSL_CERT_FILE_OK:
+        return
+    import ssl
+    if not raw.strip():
+        raise SslCertFileError("環境變數 SSL_CERT_FILE 有設定但是空的:要指到 CA 檔(PEM),不用就把它拿掉")
+    # 先看路徑本身:檔案不存在時各平台丟的例外不一樣(Linux 是 FileNotFoundError、Windows 是 OSError)
+    if not os.path.exists(raw):
+        raise SslCertFileError("環境變數 SSL_CERT_FILE 指到的檔案不存在(容器有沒有把 CA 檔掛進去)")
+    if os.path.isdir(raw):
+        raise SslCertFileError("環境變數 SSL_CERT_FILE 指到的是目錄,不是讀得到的檔案:要指到 CA 檔(PEM)")
+    try:
+        ssl.create_default_context(cafile=raw)
+    except ssl.SSLError:
+        raise SslCertFileError("環境變數 SSL_CERT_FILE 指到的檔案不是 PEM 格式的 CA 憑證") from None
+    except OSError as e:
+        raise SslCertFileError(f"環境變數 SSL_CERT_FILE 指到的不是讀得到的檔案({type(e).__name__},"
+                               "例如是目錄或沒有讀取權限)") from None
+    _SSL_CERT_FILE_OK.add(raw)
+
+
+def _as_mr(mr):
+    """GitLab 回的 MR:不是 MR 的資料就丟 NotAnMR(原本會在後面變成看不出原因的 KeyError)。"""
+    if not isinstance(mr, dict) or "title" not in mr:
+        raise NotAnMR("MR 的回應不是 MR 的資料")
+    return mr
+
+
+def _as_changes(changes):
+    """MR 的變更清單:每一項都要有 new_path,不對就丟 NotAnMR。"""
+    if not all(isinstance(c, dict) and "new_path" in c for c in changes):
+        raise NotAnMR("MR 的變更清單不是預期的形狀")
+    return changes
+
+
 def _api(method: str, path: str, **kwargs):
     import httpx
+    check_ssl_cert_file()
     r = httpx.request(
         method, f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}{path}",
         headers={"PRIVATE-TOKEN": GITLAB_TOKEN}, timeout=30, **kwargs)
@@ -51,13 +116,18 @@ def _api_pages(path: str, params: dict | None = None) -> tuple[list, bool]:
     進去,MR 可能因此被誤判成小改而自動放行。
     """
     import httpx
+    check_ssl_cert_file()
     items, page = [], 1
     while page and page <= MAX_DIFF_PAGES:
         r = httpx.get(f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}{path}",
                       headers={"PRIVATE-TOKEN": GITLAB_TOKEN}, timeout=30,
                       params={**(params or {}), "per_page": 100, "page": page})
         r.raise_for_status()
-        items.extend(r.json())
+        data = r.json()
+        if not isinstance(data, list):
+            # 每一頁都要是清單:null、數字、dict 都不是(dict 會被 extend 成它的 key 字串)
+            raise NotAnMR("分頁的回應不是清單")
+        items.extend(data)
         nxt = r.headers.get("X-Next-Page", "").strip()
         page = int(nxt) if nxt else 0
     return items, bool(page)
@@ -306,7 +376,7 @@ def _read_only_get(endpoint: str, params: dict, max_bytes: int, what: str) -> by
 def _mock_mr(mr_id: str) -> dict:
     f = FIXTURES_DIR / f"mr_{_check_mr_id(mr_id)}.json"
     if not f.exists():
-        raise FileNotFoundError(f"fixture 不存在: {f.name};現有: "
+        raise MockFixtureMissing(f"fixture 不存在: {f.name};現有: "
                                 + ", ".join(p.name for p in FIXTURES_DIR.glob('mr_*.json')))
     return json.loads(f.read_text(encoding="utf-8"))
 
@@ -336,7 +406,7 @@ def _check_mr_id(mr_id) -> str:
     token 去讀別的 API 端點或別的檔案。不用 isdigit() 單獨判斷:它也接受「²」等 Unicode 數字。"""
     mr_id = str(mr_id)
     if not (mr_id.isascii() and mr_id.isdigit() and len(mr_id) <= 10):
-        raise ValueError("MR 編號必須是數字")
+        raise InvalidMrId("MR 編號必須是數字")
     return mr_id
 
 
@@ -360,13 +430,13 @@ def get_mr_diff(mr_id: str) -> str:
     """
     mr_id = _check_mr_id(mr_id)
     if REAL_MODE:
-        mr = _api("GET", f"/merge_requests/{mr_id}")
+        mr = _as_mr(_api("GET", f"/merge_requests/{mr_id}"))
         changes, truncated = _api_pages(f"/merge_requests/{mr_id}/diffs")
         files = [{"path": c["new_path"], "old_path": c.get("old_path"),
                   "diff": c.get("diff") or "",
                   "deleted": bool(c.get("deleted_file")),
                   "unreviewable": bool(c.get("too_large") or c.get("collapsed"))}
-                 for c in changes]
+                 for c in _as_changes(changes)]
         refs = _diff_refs(mr)
         # **預掃與執行驗證要的是整份新檔,不是 diff 裡那幾行**。大檔小改的 MR,
         # 從 diff 還原出來的 SQL 可能只剩一行,sqlglot 解析不了、沙盒也沒東西可跑
@@ -441,9 +511,25 @@ _PROSE = {
 }
 _ABSENT_PROSE = "(repo 內無 {path})"
 _MOCK_ABSENT_PROSE = "(mock 模式無 {path} 的完整內容,請依 diff 判斷)"
-# GitLab 的 404 分得出是哪一種:檔案不存在才是「確實沒有」,專案或 commit 找不到是
-# 環境的問題(權限不足時 GitLab 也回 404 而不是 403)。
-_FILE_NOT_FOUND = "file not found"
+# GitLab 的 404 分不出是哪一種:檔案不存在、專案或 commit 找不到、token 沒有權限(GitLab 也回 404)
+# 都是 404,代理或別的服務回的 404 頁也是。所以 404 時再確認那個 commit 取得到(回 200),
+# 才算「這個檔案確實不存在」;其他一律算取不到。不看內文:內文的寫法由對方決定。
+
+
+def _commit_exists(ref: str, token: str) -> bool:
+    """這個 commit 取得到:回 200,而且內容是 commit 的資料(有 `id`)。
+
+    只看 200 不夠:代理或登入頁也可能回 200 的網頁,那時說「檔案確實不存在」就是猜的。
+    解析不了、不是 commit 的資料一律算取不到(丟的例外由 fetch_file 收成 fetch_failed)。"""
+    import urllib.parse
+    import httpx
+    r = httpx.get(f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}/repository/commits/"
+                  f"{urllib.parse.quote(ref, safe='')}",
+                  headers={"PRIVATE-TOKEN": token}, timeout=30)
+    if r.status_code != 200:
+        return False
+    data = r.json()
+    return isinstance(data, dict) and isinstance(data.get("id"), str) and bool(data["id"])
 
 
 def fetch_file(path: str, ref: str = "", mr_id: str = "") -> tuple[str | None, str | None]:
@@ -476,9 +562,8 @@ def fetch_file(path: str, ref: str = "", mr_id: str = "") -> tuple[str | None, s
             f"{urllib.parse.quote(path, safe='')}/raw",
             headers={"PRIVATE-TOKEN": token}, params={"ref": ref}, timeout=30)
         if r.status_code == 404:
-            # 只有「檔案不存在」算確實沒有;專案/commit 找不到、權限不足都是環境問題
-            body = (r.text or "").lower()
-            return (None, None) if _FILE_NOT_FOUND in body else (None, "not_found")
+            # 只有 commit 取得到時才算檔案確實不存在;專案/commit 找不到、權限不足都是環境問題
+            return (None, None) if _commit_exists(ref, token) else (None, "not_found")
         r.raise_for_status()
         if len(r.content) > MAX_FILE_BYTES:
             return None, "too_large"
@@ -646,7 +731,7 @@ def post_summary(mr_id: str, body: str, score: int, verdict: str) -> str:
 def set_commit_status(sha: str, state: str, name: str = "segcra/review",
                       description: str = "", mr_id: str = "") -> str:
     """回寫 commit status(external pipeline)。state: success | failed | pending。
-    CE 的 merge 閘門靠它:專案設定「Pipelines must succeed」後,
+    不接 CI 時(webhook 那條路)merge 閘門靠它:專案設定「Pipelines must succeed」後,
     failed 的 commit 無法 merge。
 
     失敗時重送(同一個 sha 與 name 重送只會更新同一個 status,不會重複),最多
@@ -715,46 +800,77 @@ def set_label(mr_id: str, label: str) -> str:
 # 審查做成部署端 CI 的一個 job 時(見 orchestrator/ci_gate.py),審查服務要確認呼叫它的是
 # 這個專案、這個 MR 的 pipeline 裡正在跑的 job。
 
+class GitLabLookupFailed(Exception):
+    """CI 那條路向 GitLab 查 job、pipeline、MR 取不到(連不上、逾時、非 2xx、內容不對)。
+
+    跟「查到了、但不符合」分開:查不到時不能說成 job token 無效或 MR 不是開啟中。底下的例外放在
+    `__cause__`,說法由 ci_gate.lookup_failure_text 照型別與狀態碼給(不帶例外原文)。"""
+
+    def __init__(self, what: str):
+        super().__init__(what)
+        self.what = what
+
+
+# GET /job 帶的是 job 的 token:GitLab 拒絕這把 token 時回的狀態碼。在測試 GitLab 上量過:亂打的 token
+# 與 job 已經結束後的 token 都是 401(執行中是 200)。其他狀態碼(包括 403)沒量到過,算取不到,不說成 token 無效
+JOB_TOKEN_REJECTED_STATUS = frozenset({401})
+
+
 def job_from_token(job_token: str) -> dict | None:
     """用 CI job 的 CI_JOB_TOKEN 向 GitLab 查它是哪一個 job(GET /job,帶 JOB-TOKEN)。
 
-    token 無效、job 已經結束、或 GitLab 回錯誤時回 None。只在 real 模式有意義;mock 模式回 None。
+    GitLab 拒絕這把 token(JOB_TOKEN_REJECTED_STATUS)、或 token 是空的 / 太長 / 不是 ASCII 可印字元時
+    回 None(確定不符)。
+    連不上、其他狀態碼、內容不是物件時丟 GitLabLookupFailed(取不到)。只在 real 模式呼叫。
     token 是呼叫端送來的(不可信),只放在 header,不記 log。"""
-    if not REAL_MODE or not isinstance(job_token, str) or not job_token or len(job_token) > 512:
+    # GitLab 發的 job token 是 ASCII 可印字元;其他的不用問 GitLab 就知道不是(放進 header 也會丟例外)
+    if (not isinstance(job_token, str) or not job_token or len(job_token) > 512
+            or not job_token.isascii() or not job_token.isprintable()):
         return None
     import httpx
     try:
+        check_ssl_cert_file()
         r = httpx.get(f"{GITLAB_URL}/api/v4/job", headers={"JOB-TOKEN": job_token}, timeout=30)
-        if r.status_code != 200:
+        if r.status_code in JOB_TOKEN_REJECTED_STATUS:
             return None
+        r.raise_for_status()
         job = r.json()
-    except Exception:                        # noqa: BLE001 — 查不到就是驗證失敗
-        return None
-    return job if isinstance(job, dict) else None
+        if not isinstance(job, dict):
+            raise NotAnMR("GET /job 的回應不是物件")
+    except Exception as e:                   # noqa: BLE001 — 取不到,原因由呼叫端照型別說
+        raise GitLabLookupFailed("job(用 job token)") from e
+    return job
 
 
-def pipeline_info(pipeline_id: int) -> dict | None:
-    """這個專案的某條 pipeline(GET /projects/:id/pipelines/:pipeline_id);取不到回 None。"""
-    if not REAL_MODE or not isinstance(pipeline_id, int) or isinstance(pipeline_id, bool):
-        return None
+def pipeline_info(pipeline_id: int) -> dict:
+    """這個專案的某條 pipeline(GET /projects/:id/pipelines/:pipeline_id)。取不到丟 GitLabLookupFailed。"""
     try:
+        if not isinstance(pipeline_id, int) or isinstance(pipeline_id, bool):
+            raise NotAnMR("pipeline 的 id 不是整數")
         info = _api("GET", f"/pipelines/{pipeline_id}")
-    except Exception:                        # noqa: BLE001
-        return None
-    return info if isinstance(info, dict) else None
+        if not isinstance(info, dict):
+            raise NotAnMR("pipeline 的回應不是物件")
+    except Exception as e:                   # noqa: BLE001
+        raise GitLabLookupFailed("job 所在的 pipeline") from e
+    return info
 
 
 def mr_head(mr_id: str) -> dict | None:
     """MR 目前的 head commit 與狀態(GET /merge_requests/:iid):{sha, state, source_project_id,
-    target_branch};取不到回 None。"""
+    target_branch}。
+
+    real 模式取不到丟 GitLabLookupFailed;mock 模式沒有這個 MR 的 fixture 時回 None。"""
     mr_id = _check_mr_id(mr_id)
     if not REAL_MODE:
-        mr = _mock_mr(mr_id)
+        try:
+            mr = _mock_mr(mr_id)
+        except FileNotFoundError:            # 沒有這個 MR 的 fixture
+            return None
         return {"sha": mr.get("sha", f"mock-{mr_id}"), "state": "opened", "source_project_id": None}
     try:
-        mr = _api("GET", f"/merge_requests/{mr_id}")
-    except Exception:                        # noqa: BLE001
-        return None
+        mr = _as_mr(_api("GET", f"/merge_requests/{mr_id}"))
+    except Exception as e:                   # noqa: BLE001
+        raise GitLabLookupFailed("MR") from e
     return {"sha": mr.get("sha") or "", "state": mr.get("state") or "",
             "source_project_id": mr.get("source_project_id"),
             "target_branch": mr.get("target_branch") or ""}

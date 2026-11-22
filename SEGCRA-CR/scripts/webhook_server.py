@@ -6,7 +6,7 @@ commit status)。
 
 啟動:
   export GITLAB_URL=http://localhost:8929 GITLAB_TOKEN=<token> GITLAB_PROJECT=<id>
-  export GITLAB_WEBHOOK_SECRET=<自訂密鑰>   # 與 GitLab webhook 的 Secret token 一致
+  export GITLAB_WEBHOOK_SECRET=<自訂密鑰>   # 只在用 webhook 時設;與 GitLab webhook 的 Secret token 一致
   export REVIEW_PROFILE=review               # 用哪個模型 profile 審
   .venv/bin/python scripts/webhook_server.py --port 8000
 
@@ -21,9 +21,9 @@ commit,每推一次就整份審一次);Draft 期間要看,留言 /review。/revi
 
 審查完成後管線會回寫 commit status(name=segcra/review):
 auto_approved → success;needs_human / blocked → failed(description 帶原因)。
-搭配專案設定「Pipelines must succeed」+ protected branch,即為 CE 的 merge 閘門。
+不接 CI 時,搭配專案設定「Pipelines must succeed」+ protected branch,就是 merge 閘門。
 
-**部署端用的是另一條:CI 的 job 呼叫 /ci/review**(見 orchestrator/ci_gate.py、docs/06)。
+**部署端用的是另一條:CI 的 job 呼叫 /ci/review**(見 docs/06 第 4 節、README §7)。
 審查做成 MR pipeline 最後一個 stage 的 job:job 帶自己的 CI_JOB_TOKEN 呼叫
 `POST /ci/review`(body:{"mr_iid": ..., "sha": ...}),服務向 GitLab 確認它是這個專案、這個 MR
 的 MR pipeline 裡正在跑的 job,開始審查並回一個查詢用的編號;job 每隔一段時間
@@ -203,8 +203,7 @@ def _run_review(mr_iid: int, head_sha: str | None = None, ci_ticket: str | None 
                 _inflight.pop(mr_iid, None)
             if in_ci and ci_ticket in _ci_reviews:
                 _ci_reviews[ci_ticket]["code"] = code
-                entry = _ci_reviews[ci_ticket]
-                _remember_ci_result(entry.get("key"), code, entry.get("sha"))
+                _remember_ci_result(ci_ticket, code)
         _close_loop(loop, mr_iid)
 
 
@@ -262,33 +261,46 @@ def _start(mr_iid: int, head_sha: str | None) -> None:
     threading.Thread(target=_run_review, args=(mr_iid, head_sha), daemon=True).start()
 
 
-# CI 的 job 呼叫的審查:{編號: {"job": job id, "mr": MR iid, "code": 結束碼或 None(還在跑)}}
+# CI 的 job 呼叫的審查:{編號: {"job": job id, "mr": MR iid, "sha": 這次的 commit, "branch": 目標分支,
+#   "code": 結束碼或 None(還在跑)}}
 _ci_reviews: dict = {}
 # 最多記幾份;超過時丟掉最舊的、已經結束的(查不到的編號,job 會以 EXIT_INCOMPLETE 結束)
 MAX_CI_REVIEWS = 500
-# 每個 MR(同一個目標分支)→ (上一次 CI 審查**跑完**的結束碼, 上一次處理的 commit),給
-# CI_REVIEW_REPEAT=first 判斷要不要跳過(見 ci_gate.should_skip):上一次處理的(審過或跳過的)
-# 同一個 commit 又送來,就是有人按了 retry,要真的審。只在記憶體:服務重新啟動後忘記,下一次就照樣審 —— 出錯時往「多審」的方向走。
-# 有上限,超過時丟掉最舊的(一樣是多審)
+# 每個 MR 一筆:{"code": 上一次**真的審完**的結束碼, "branch": 那次的目標分支, "reviewed_sha": 那次審的 commit,
+# "last_sha": 上一次處理的(審過或跳過的)commit, "latest": 最後一份 CI 審查的編號},給 CI_REVIEW_REPEAT=first
+# 判斷要不要跳過(見 ci_gate.should_skip)。只在記憶體:服務重新啟動後忘記,下一次就照樣審 —— 出錯時往
+# 「多審」的方向走。有上限,超過時丟掉最舊的(一樣是多審)
 _ci_history: dict = {}
 MAX_CI_HISTORY = 2000
+# CI_REVIEW_REPEAT:服務啟動時讀一次(main;測試直接設)
+REVIEW_REPEAT = ci_gate.REPEAT_EVERY
 
 
-def _remember_ci_result(key, code, sha=None) -> None:
-    """記下這個 MR 上一次 CI 審查的結束碼與處理的 commit(呼叫端持有 _lock)。"""
-    if key is None:
-        return
-    _ci_history.pop(key, None)
+def _history_put(mr_iid: int, **fields) -> None:
+    """更新這個 MR 的紀錄(呼叫端持有 _lock)。"""
+    record = dict(_ci_history.pop(mr_iid, None) or {})
+    record.update(fields)
     while len(_ci_history) >= MAX_CI_HISTORY:
         _ci_history.pop(next(iter(_ci_history)))
-    _ci_history[key] = (code, sha)
+    _ci_history[mr_iid] = record
 
 
-def _announce_skipped(mr_iid: int, previous: int) -> None:
-    """跳過時寫回 MR:留言說明這次的改動沒有經過 AI 審查,標籤改成交人工(不然 MR 上還掛著
+def _remember_ci_result(ticket: str, code: int) -> None:
+    """CI 審查真的審完:記下結果(呼叫端持有 _lock)。只有這個 MR 最後一份 CI 審查的結果才記 —— 比較晚
+    結束的舊審查(例如 retry 那份)不能把紀錄蓋回舊的 commit。"""
+    entry = _ci_reviews.get(ticket) or {}
+    mr_iid = entry.get("mr")
+    if mr_iid is None or (_ci_history.get(mr_iid) or {}).get("latest") != ticket:
+        return
+    _history_put(mr_iid, code=code, branch=entry.get("branch") or "", reviewed_sha=entry.get("sha"))
+
+
+def _announce_skipped(mr_iid: int, previous: int, reviewed_sha: str) -> None:
+    """跳過時寫回 MR:留言說明從哪個 commit 之後沒有經過審查,標籤改成交人工(不然 MR 上還掛著
     上一次的「自動放行」)。兩個動作各自做,失敗只記種類。"""
     from toolbox import gitlab
-    for what, send in (("留言", lambda: gitlab.post_note(str(mr_iid), ci_gate.skipped_note(previous))),
+    note = ci_gate.skipped_note(previous, reviewed_sha)
+    for what, send in (("留言", lambda: gitlab.post_note(str(mr_iid), note)),
                        ("標籤", lambda: gitlab.set_label(str(mr_iid), "ai-review::needs_human"))):
         try:
             failure = gitlab.write_failure(send())
@@ -299,9 +311,43 @@ def _announce_skipped(mr_iid: int, previous: int) -> None:
 
 
 def _ci_job(job_token):
-    """job token → GitLab 上的 job;查不到回 None。"""
+    """job token → GitLab 上的 job;GitLab 拒絕這把 token 時回 None,取不到丟 gitlab.GitLabLookupFailed。"""
     from toolbox import gitlab
     return gitlab.job_from_token(job_token)
+
+
+def _ci_unavailable() -> str | None:
+    """服務本身驗不了呼叫者的原因(mock 模式、GITLAB_PROJECT 不是數字);可以驗時回 None。"""
+    from toolbox import gitlab
+    if not gitlab.REAL_MODE:
+        return ci_gate.MOCK_MODE_TEXT
+    if not (isinstance(gitlab.GITLAB_PROJECT, str) and gitlab.GITLAB_PROJECT.isascii()
+            and gitlab.GITLAB_PROJECT.isdigit()):
+        return ci_gate.PROJECT_NOT_NUMBER_TEXT
+    return None
+
+
+def _ci_check(job_token, mr_iid: int, sha: str):
+    """確認呼叫者。回 (None, job, mr) 表示通過;不通過回 ((HTTP 狀態碼, 原因), None, None)。
+
+    三步依序,前一步確定符合才查下一個(job 不屬於這個專案時,不去查這個專案的 pipeline:
+    那會變成「查不到」而不是「不符」)。查不到回 502,確定不符回 403。"""
+    from toolbox import gitlab
+    try:
+        job = _ci_job(job_token)
+        reason = ci_gate.check_job(job, project_id=gitlab.GITLAB_PROJECT)
+        if reason is None:
+            pipeline = gitlab.pipeline_info(job["pipeline"]["id"])
+            reason = ci_gate.check_pipeline(job, pipeline, mr_iid=mr_iid, sha=sha)
+        mr = None
+        if reason is None:
+            mr = gitlab.mr_head(str(mr_iid))
+            reason = ci_gate.check_mr(mr, sha=sha)
+    except gitlab.GitLabLookupFailed as e:
+        return (ci_gate.STATUS_LOOKUP_FAILED, ci_gate.lookup_failure_text(e.what, e.__cause__ or e)), None, None
+    if reason:
+        return (ci_gate.STATUS_REJECTED, reason), None, None
+    return None, job, mr
 
 
 def _ci_start(job_token, body) -> tuple[int, str]:
@@ -313,40 +359,38 @@ def _ci_start(job_token, body) -> tuple[int, str]:
     if not isinstance(body, dict):
         return 400, "body 要是 JSON 物件"
     mr_iid, sha = body.get("mr_iid"), body.get("sha")
-    if isinstance(mr_iid, str) and mr_iid.isdigit():
+    if isinstance(mr_iid, str) and mr_iid.isascii() and mr_iid.isdigit():     # 「²」也算 isdigit
         mr_iid = int(mr_iid)
     if not isinstance(mr_iid, int) or isinstance(mr_iid, bool) or mr_iid <= 0 \
             or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
         return 400, "mr_iid 要是正整數、sha 要是 40 碼的 commit"
-    job = _ci_job(job_token)
-    jp = job.get("pipeline") if isinstance(job, dict) else None
-    pipeline = gitlab.pipeline_info(jp.get("id")) if isinstance(jp, dict) else None
-    mr = gitlab.mr_head(str(mr_iid))
-    reason = ci_gate.check_request(job, pipeline, mr, project_id=gitlab.GITLAB_PROJECT,
-                                   mr_iid=mr_iid, sha=sha)
-    if reason:
-        print(f"[webhook] /ci/review 拒絕 MR !{mr_iid}:{reason}", flush=True)
-        return 403, reason
+    unavailable = _ci_unavailable()
+    if unavailable:
+        print(f"[webhook] /ci/review 不開始 MR !{mr_iid}:{unavailable}", flush=True)
+        return ci_gate.STATUS_UNAVAILABLE, unavailable
+    failed, job, mr = _ci_check(job_token, mr_iid, sha)
+    if failed:
+        print(f"[webhook] /ci/review 不開始 MR !{mr_iid}(HTTP {failed[0]}):{failed[1]}", flush=True)
+        return failed
     ticket = secrets.token_urlsafe(16)
-    key = (mr_iid, (mr or {}).get("target_branch") or "")
-    mode = ci_gate.review_repeat()
+    branch = (mr or {}).get("target_branch") if isinstance(mr, dict) else ""
+    branch = branch if isinstance(branch, str) else ""
     with _lock:
         done = [t for t, e in _ci_reviews.items() if e["code"] is not None]
         while len(_ci_reviews) >= MAX_CI_REVIEWS and done:
             _ci_reviews.pop(done.pop(0), None)
-        previous, last_sha = _ci_history.get(key, (None, None))
-        skip = ci_gate.should_skip(mode, previous, requested=last_sha == sha)
-        _ci_reviews[ticket] = {"job": job["id"], "mr": mr_iid, "key": key, "sha": sha,
+        record = _ci_history.get(mr_iid)
+        running = any(e.get("mr") == mr_iid and e["code"] is None for e in _ci_reviews.values())
+        skip = ci_gate.should_skip(REVIEW_REPEAT, record, sha=sha, target_branch=branch, running=running)
+        _ci_reviews[ticket] = {"job": job["id"], "mr": mr_iid, "sha": sha, "branch": branch,
                                "code": ci_gate.EXIT_NEEDS_HUMAN if skip else None}
-        timer = None
-        if skip:
-            _remember_ci_result(key, previous, sha)
-        else:
-            timer = _pending.pop(mr_iid, None)
+        _history_put(mr_iid, last_sha=sha, latest=ticket)
+        timer = None if skip else _pending.pop(mr_iid, None)
     if skip:
-        print(f"[webhook] MR !{mr_iid} 已審過(CI_REVIEW_REPEAT=first,上一次結束碼 {previous}),"
+        print(f"[webhook] MR !{mr_iid} 已審過(CI_REVIEW_REPEAT=first,上一次結束碼 {record['code']}),"
               f"這次不審、交人工(job {job['id']})", flush=True)
-        threading.Thread(target=_announce_skipped, args=(mr_iid, previous), daemon=True).start()
+        threading.Thread(target=_announce_skipped, args=(mr_iid, record["code"], record.get("reviewed_sha")),
+                         daemon=True).start()
         return 202, ticket
     if timer is not None:
         # webhook 那條路還在等安靜期的,不用再審一次:上面已經從 _pending 拿掉,計時器到了也不會開始
@@ -366,9 +410,15 @@ def _ci_status(job_token, ticket) -> tuple[int, str]:
         entry = dict(_ci_reviews.get(ticket) or {})
     if not entry:
         return 404, "查不到這份審查(編號不對,或審查服務重新啟動過)"
-    job = _ci_job(job_token)
-    if not isinstance(job, dict) or job.get("id") != entry["job"] or job.get("status") != "running":
-        return 403, "只有開始這份審查、而且還在執行中的 job 查得到"
+    from toolbox import gitlab
+    try:
+        job = _ci_job(job_token)
+    except gitlab.GitLabLookupFailed as e:
+        return ci_gate.STATUS_LOOKUP_FAILED, ci_gate.lookup_failure_text(e.what, e.__cause__ or e)
+    if not isinstance(job, dict):
+        return ci_gate.STATUS_REJECTED, ci_gate.JOB_TOKEN_REJECTED
+    if job.get("id") != entry["job"] or job.get("status") != "running":
+        return ci_gate.STATUS_REJECTED, "只有開始這份審查、而且還在執行中的 job 查得到"
     return 200, "running" if entry["code"] is None else f"done {entry['code']}"
 
 
@@ -470,17 +520,38 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def _startup_lines(host, port) -> list:
+    """啟動時印的說明。只走 CI 那條路(/ci/review)的部署不設 GITLAB_WEBHOOK_SECRET,
+    不能叫他去設;兩個入口都列出來。"""
+    from toolbox import gitlab
+    hook = "/gitlab-webhook" if SECRET else "/gitlab-webhook(停用)"
+    ci = "/ci/review(CI 的審查 job)" if gitlab.REAL_MODE else "/ci/review(mock 模式,停用)"
+    lines = [f"[webhook] 監聽 http://{host}:{port}  入口:{ci}、{hook}  "
+             f"profile={PROFILE}  real_mode={'on' if os.environ.get('GITLAB_URL') else 'off(mock)'}"]
+    if not SECRET:
+        lines.append("[webhook] 沒設 GITLAB_WEBHOOK_SECRET:webhook 那條路停用,webhook 請求一律回 401;"
+                     "CI 那條路(/ci/review)不受影響。要用 webhook 時才需要設")
+    if not gitlab.REAL_MODE:
+        lines.append(f"[webhook] {ci_gate.MOCK_MODE_TEXT}(請求回 {ci_gate.STATUS_UNAVAILABLE})")
+    lines.append(f"[webhook] {ci_gate.REPEAT_ENV}={REVIEW_REPEAT}"
+                 + ("(同一個 MR 只自動審第一次,之後的 pipeline 不審、交人工)" if REVIEW_REPEAT == ci_gate.REPEAT_FIRST
+                    else "(每個 pipeline 都審)"))
+    return lines
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args()
-    if not SECRET:
-        print("⚠️ 未設 GITLAB_WEBHOOK_SECRET,所有 webhook 請求都會被拒絕(請先 export)。",
-              flush=True)
+    global REVIEW_REPEAT
+    try:
+        REVIEW_REPEAT = ci_gate.review_repeat()
+    except ci_gate.ReviewRepeatError as e:
+        sys.exit(f"[webhook] {e}")
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"[webhook] 監聽 http://{args.host}:{args.port}/gitlab-webhook  profile={PROFILE}  "
-          f"real_mode={'on' if os.environ.get('GITLAB_URL') else 'off(mock)'}", flush=True)
+    for line in _startup_lines(args.host, args.port):
+        print(line, flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
