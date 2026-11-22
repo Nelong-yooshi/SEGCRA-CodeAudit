@@ -64,12 +64,16 @@ DEBOUNCE_SECONDS = env_seconds("WEBHOOK_DEBOUNCE_SECONDS", 10)
 # 留言開頭的 /review 指令(後面是空白或結尾)。寫在內文、網址裡、或 /reviews 都不算
 _REVIEW_COMMAND = re.compile(r"\A\s*/review(?:\s|\Z)")
 
-# 機器人帳號的名稱:我們自己取的 ai- 開頭、root,以及 GitLab 替 project / group access token
-# 產生的 project_<id>_bot_<亂數>、group_<id>_bot_<亂數>。用 match 從名稱開頭比
-_BOT_NAME = re.compile(r"ai-|root|(?:project|group)_\d+_bot")
-# GITLAB_TOKEN 的帳號 id:服務啟動時向 GitLab 查一次(_learn_own_account)。webhook 請求裡不查,
-# GitLab 等 webhook 回應只等幾秒,不能為了這個多打一次 API。查不到時是 None,只靠名稱判斷
-_own_user_id: int | None = None
+# GitLab 替 project / group access token 產生的帳號名稱:project_<id>_bot_<亂數>、group_<id>_bot_<亂數>。
+# 用 match 從名稱開頭比。這種名稱一律當成機器人(不一定是審查自己,但不會是真人)
+_TOKEN_BOT_NAME = re.compile(r"(?:project|group)_\d+_bot")
+# 查不到自己的帳號時才用的退路:我們自己取的 ai- 開頭,以及整個名稱是 root。
+# 認得自己的帳號時不用它們:ai-ling、rootlee 這種真人的 /review 會被靜靜忽略
+_FALLBACK_BOT_PREFIX = "ai-"
+_FALLBACK_BOT_NAMES = frozenset({"root"})
+# GITLAB_TOKEN 的帳號查不到時,背景隔多久重查一次(秒)。帳號 id 記在 toolbox/gitlab.py(只有一份)。
+# webhook 請求裡不查:GitLab 等 webhook 回應只等幾秒,不能為了這個多打一次 API
+OWN_ACCOUNT_RETRY_SECONDS = 30
 
 # 每個 MR 一份進行中的紀錄:{mr_iid: (event_loop, task)}。
 # 用它做兩件事:同一 MR 推新 commit 時取消舊的那次、以及知道誰還在跑。
@@ -354,24 +358,58 @@ def _review_command(note) -> bool:
 
 
 def _from_bot(user) -> bool:
-    """留言的人是不是機器人:審查自己(GITLAB_TOKEN 的帳號),或名稱是機器人帳號的格式。"""
+    """留言的人是不是機器人:GitLab 產生的 access token 帳號名稱,或審查自己(GITLAB_TOKEN 的帳號)。
+
+    認得自己的帳號時只看這兩樣;查不到時退回名稱(ai- 開頭、名稱就是 root)。"""
     if not isinstance(user, dict):
         return False
-    if _BOT_NAME.match(user.get("username") or ""):
+    name = user.get("username")
+    name = name if isinstance(name, str) else ""
+    if _TOKEN_BOT_NAME.match(name):
         return True
-    uid = user.get("id")
-    if not isinstance(uid, int) or isinstance(uid, bool):        # True == 1,布林不算
-        return False
-    return _own_user_id is not None and uid == _own_user_id
-
-
-def _learn_own_account() -> None:
-    """服務啟動時查一次 GITLAB_TOKEN 是哪一個帳號,之後它留的言都不觸發審查。"""
-    global _own_user_id
     from toolbox import gitlab
-    _own_user_id = gitlab.token_user_id()
-    if _own_user_id is None and gitlab.REAL_MODE:
-        print("[webhook] 查不到 GITLAB_TOKEN 的帳號,只用名稱判斷機器人留言", flush=True)
+    own = gitlab.own_user_id()
+    if own is None:
+        return name.startswith(_FALLBACK_BOT_PREFIX) or name in _FALLBACK_BOT_NAMES
+    uid = user.get("id")
+    return isinstance(uid, int) and not isinstance(uid, bool) and uid == own   # True == 1,布林不算
+
+
+def _own_account_line() -> str:
+    from toolbox import gitlab
+    return (f"[webhook] GITLAB_TOKEN 的帳號:{gitlab.own_username() or '(沒有名稱)'}(id {gitlab.own_user_id()})。"
+            "這個帳號留的 /review 不觸發審查;用的是某個人的 token 時,那個人的 /review 也會被忽略")
+
+
+def _learn_own_account() -> str | None:
+    """服務啟動時查 GITLAB_TOKEN 是哪一個帳號,之後它留的言都不觸發審查。回要印的那一行(mock 模式 None)。
+
+    查不到時開一條背景執行緒每 OWN_ACCOUNT_RETRY_SECONDS 秒重查,查到為止:啟動時 GitLab 剛好連不上
+    (主機重開時審查服務先起來),不能就一直認不得自己到下次重啟。"""
+    from toolbox import gitlab
+    if not gitlab.REAL_MODE:
+        return None
+    reason = gitlab.learn_own_user()
+    if reason is None:
+        return _own_account_line()
+    threading.Thread(target=_retry_own_account, args=(reason,), daemon=True).start()
+    return (f"[webhook] 查不到 GITLAB_TOKEN 的帳號:{reason}。先只用名稱判斷機器人留言,"
+            f"每 {OWN_ACCOUNT_RETRY_SECONDS} 秒重查")
+
+
+def _retry_own_account(reason: str, stop: threading.Event | None = None) -> None:
+    """背景重查,查到就印一行並結束。同一個原因不重複印,原因變了才印。"""
+    from toolbox import gitlab
+    stop = stop or threading.Event()
+    last = reason
+    while not stop.wait(OWN_ACCOUNT_RETRY_SECONDS):
+        reason = gitlab.learn_own_user()
+        if reason is None:
+            print(_own_account_line(), flush=True)
+            return
+        if reason != last:
+            print(f"[webhook] 還是查不到 GITLAB_TOKEN 的帳號:{reason}", flush=True)
+            last = reason
 
 
 def _handle(payload: dict) -> str:
@@ -452,18 +490,27 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def _startup_lines(host, port) -> list:
+    """啟動時印的說明。只走 CI 那條路(/ci/review)的部署不設 GITLAB_WEBHOOK_SECRET,
+    不能叫他去設;兩個入口都列出來。"""
+    hook = "/gitlab-webhook" if SECRET else "/gitlab-webhook(停用)"
+    lines = [f"[webhook] 監聽 http://{host}:{port}  入口:/ci/review(CI 的審查 job)、{hook}  "
+             f"profile={PROFILE}  real_mode={'on' if os.environ.get('GITLAB_URL') else 'off(mock)'}"]
+    if not SECRET:
+        lines.append("[webhook] 沒設 GITLAB_WEBHOOK_SECRET:webhook 那條路停用,webhook 請求一律回 401;"
+                     "CI 那條路(/ci/review)不受影響。要用 webhook 時才需要設")
+    return lines
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="0.0.0.0")
     args = ap.parse_args()
-    if not SECRET:
-        print("⚠️ 未設 GITLAB_WEBHOOK_SECRET,所有 webhook 請求都會被拒絕(請先 export)。",
-              flush=True)
-    _learn_own_account()
+    account = _learn_own_account()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"[webhook] 監聽 http://{args.host}:{args.port}/gitlab-webhook  profile={PROFILE}  "
-          f"real_mode={'on' if os.environ.get('GITLAB_URL') else 'off(mock)'}", flush=True)
+    for line in _startup_lines(args.host, args.port) + ([account] if account else []):
+        print(line, flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
