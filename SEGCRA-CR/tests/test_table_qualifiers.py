@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.spec_exec import (_cte_names, _ddl_tables, _ident_spans,
+from orchestrator.spec_exec import (_ddl_tables, _ident_spans,
                                    _strip_table_qualifiers)
 
 COMPILED = (Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "dbt_compiled"
@@ -22,23 +22,44 @@ def _strip(sql, tables=("t",)):
     return _strip_table_qualifiers(sql, set(tables))
 
 
-# ─────────────────── 剝哪些 ───────────────────
+# ─────────────────── 剝哪些(剝成 dbo.<表>,不是純 <表>)───────────────────
+# 剝成兩段式 `dbo.<表>`:SQL Server 不會把它解成 CTE,沙盒的表就在 dbo,所以不必再
+# 維護一份 CTE 名單(註解一夾 regex 就抓不到,反而把同名引入判成 SQL 錯)。
 
 @pytest.mark.parametrize("sql,want", [
-    ('SELECT 1 FROM "D"."dbo"."t"', "SELECT 1 FROM t"),
-    ("SELECT 1 FROM [D].[dbo].[t]", "SELECT 1 FROM t"),
-    ("SELECT 1 FROM D.dbo.t", "SELECT 1 FROM t"),
+    ('SELECT 1 FROM "D"."dbo"."t"', "SELECT 1 FROM dbo.t"),
+    ("SELECT 1 FROM D.dbo.t", "SELECT 1 FROM dbo.t"),
+    ("SELECT 1 FROM D..t", "SELECT 1 FROM dbo.t"),          # 省略 schema(T-SQL 允許)
     ('SELECT 1 FROM "D"."dbo"."t" x JOIN "D"."dbo"."t" y ON 1=1',
-     "SELECT 1 FROM t x JOIN t y ON 1=1"),
+     "SELECT 1 FROM dbo.t x JOIN dbo.t y ON 1=1"),
 ])
-def test_三段式剝成純表名(sql, want):
+def test_三段式剝成dbo表名(sql, want):
     assert _strip(sql)[0] == want
+
+
+@pytest.mark.parametrize("sql,want", [
+    # 方括號識別字(有空白、跳脫的 ]):要修的 3,T-SQL tokenizer 整段認得出來;表名
+    # 本身是單純識別字時裸寫 dbo.t
+    ("SELECT 1 FROM [my db].[dbo].[t]", "SELECT 1 FROM dbo.t"),
+    ("SELECT 1 FROM [d]]b].[dbo].[t]", "SELECT 1 FROM dbo.t"),
+    # 表名本身含空白 → 用方括號包回去
+    ("SELECT 1 FROM [db].[dbo].[my t]", "SELECT 1 FROM dbo.[my t]"),
+])
+def test_方括號識別字也剝得對(sql, want):
+    assert _strip(sql, ("t", "my t"))[0] == want
+
+
+def test_四段式記待驗證():
+    """四段式(跨 linked server)對應不到沙盒的一份測資 → 不剝、記待驗證,不是說 SQL 有錯。"""
+    out, why = _strip("SELECT 1 FROM srv.db.dbo.t")
+    assert out == "SELECT 1 FROM srv.db.dbo.t"
+    assert why and "四段式" in why and "需人工執行驗證" in why
 
 
 def test_大小寫不同也剝():
     """編譯輸出與規格 DDL 的大小寫常常不一樣,而 SQL Server 預設的定序不分大小寫。"""
     out, why = _strip('SELECT 1 FROM "D"."dbo"."TXN_LOG_NET"', {"txn_log_net"})
-    assert out == "SELECT 1 FROM TXN_LOG_NET" and why is None
+    assert out == "SELECT 1 FROM dbo.TXN_LOG_NET" and why is None
 
 
 def test_兩段式不動():
@@ -52,21 +73,39 @@ def test_不是測資裡的表就不剝():
     assert _strip(sql)[0] == sql
 
 
-def test_剝完會撞到CTE的不剝():
-    """那會悄悄換成另一份資料 —— 查詢照樣跑得過,結果卻不是在驗這份 SQL。"""
+def test_同名CTE的三段式剝成dbo表名():
+    """要修的 2:剝成 `dbo.t` 之後,就算有同名 CTE `t`,`FROM dbo.t` 讀的仍是沙盒的表。
+    CTE 名字前夾註解也不影響(不再用 regex 抓 CTE 名)。"""
+    # 同名 CTE + 三段式引用 → 剝成 dbo.t(讀真實表),CTE 的無限定引用留著
     sql = 'WITH t AS (SELECT 1 c) SELECT 1 FROM "D"."dbo"."t"'
-    assert _strip(sql)[0] == sql
+    assert _strip(sql)[0] == 'WITH t AS (SELECT 1 c) SELECT 1 FROM dbo.t'
+    # CTE 名字前有行註解:regex 版會抓不到 CTE、把 FROM txn 當 CTE;現在剝成 dbo.txn
+    sql2 = ("WITH a AS (SELECT 1 c),\n-- 第二步\ntxn AS (SELECT 1 id)\n"
+            "SELECT * FROM db.dbo.txn")
+    assert _strip(sql2, ("txn",))[0].endswith("FROM dbo.txn")
+    # CTE 名字後夾區塊註解
+    sql3 = "WITH txn /* 篩過 */ AS (SELECT 1 id) SELECT * FROM db.dbo.txn"
+    assert _strip(sql3, ("txn",))[0].endswith("FROM dbo.txn")
+
+
+def test_CTE內部引用真實表也剝():
+    """`WITH txn AS (SELECT * FROM "DW"."dbo"."txn") SELECT * FROM txn`:CTE 裡面引用的
+    三段式真實表要剝成 dbo.txn,外層無限定的 FROM txn 是 CTE、留著。"""
+    sql = 'WITH txn AS (SELECT * FROM "DW"."dbo"."txn") SELECT * FROM txn'
+    out, why = _strip(sql, ("txn",))
+    assert why is None
+    assert 'FROM dbo.txn)' in out and out.rstrip().endswith("SELECT * FROM txn")
 
 
 def test_字串常值裡的點不當成表名():
     sql = """SELECT 1 FROM "D"."dbo"."t" WHERE note = 'x.y.t'"""
-    assert _strip(sql)[0] == "SELECT 1 FROM t WHERE note = 'x.y.t'"
+    assert _strip(sql)[0] == "SELECT 1 FROM dbo.t WHERE note = 'x.y.t'"
 
 
 def test_註解裡的點不當成表名():
     sql = '-- 參考 "D"."dbo"."t"\nSELECT 1 FROM "D"."dbo"."t"'
     out, why = _strip(sql)
-    assert out == '-- 參考 "D"."dbo"."t"\nSELECT 1 FROM t' and why is None
+    assert out == '-- 參考 "D"."dbo"."t"\nSELECT 1 FROM dbo.t' and why is None
 
 
 def test_沒有測資表名時整段不動():
@@ -119,17 +158,13 @@ def test_DDL不是字串也不會爆():
 # ─────────────────── 真的編譯輸出 ───────────────────
 
 def test_真的編譯輸出剝完沒有限定名():
+    """真實形狀的 dbt compile 輸出(與 ATM_C2 同家族):三段式表名剝成 dbo.<表>,
+    沒有殘留的庫名,沒有撞名/四段式。"""
     tables = {"txn_log_net", "retail_m1_earlyjob"}
     out, why = _strip_table_qualifiers(COMPILED.read_text(encoding="utf-8"), tables)
     assert why is None
     assert '"SAMPLE_DW"' not in out
-    assert "FROM txn_log_net" in out and "FROM retail_m1_earlyjob e" in out
-
-
-def test_編譯輸出的CTE名字都認得出來():
-    """CTE 認不出來的話,剛好與測資同名的那個 CTE 會被換掉。"""
-    assert _cte_names(COMPILED.read_text(encoding="utf-8")) == {
-        "t_txn_base", "t_txn_agg1", "t_txn_agg2", "t_txn_full", "t_txn_final"}
+    assert "FROM dbo.txn_log_net" in out and "FROM dbo.retail_m1_earlyjob e" in out
 
 
 # ─────────────────── 串進 execute_cases ───────────────────
@@ -268,7 +303,13 @@ def test_探針送進沙盒的SQL已經剝乾淨(monkeypatch):
 
 
 def test_沙盒不可用時探針是skip不是fail(monkeypatch):
-    """那是環境問題,不是剝的邏輯壞了 —— 報成 fail 會讓人去查錯的地方。"""
+    """那是環境問題,不是剝的邏輯壞了 —— 報成 fail 會讓人去查錯的地方。
+
+    CI 刻意不裝 pymssql,`execute_cases` 第一行的 `import pymssql` 會丟
+    `ModuleNotFoundError`,被 `check_table_names` 的 except 收成 fail。放一個空的假
+    pymssql 讓 import 過:空密碼在用到 `.connect` 之前就先回 sandbox_error,所以假模組
+    不需要有 connect。"""
+    monkeypatch.setitem(sys.modules, "pymssql", types.ModuleType("pymssql"))
     pf = _preflight()
     monkeypatch.setattr(spec_exec, "_sandbox_params",
                         lambda: {"server": "x", "port": 1433, "user": "sa", "password": ""})

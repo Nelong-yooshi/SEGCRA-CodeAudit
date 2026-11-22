@@ -1235,75 +1235,93 @@ def _ddl_tables(schema_ddl) -> set[str]:
 
 
 def _ident_spans(sql: str):
-    """SQL 裡的識別字與點號位置:[(種類, 文字, 起, 迄)];`[x]` 折成一段。
+    """SQL 裡的識別字與點號位置:[(種類, 文字, 起, 迄)]。`end` 是最後一個字元的位置(含)。
 
-    用 sqlglot 的 tokenizer 而不是自己寫 regex:字串常值與註解裡的 `a.b.c`
-    不可以被當成表名(`WHERE note = 'a.b.c'`)。tokenize 失敗時回 None,呼叫端就不剝。
+    用 **T-SQL 的 tokenizer**(`sqlglot.Dialect.get_or_raise("tsql").tokenize`)而不是通用的
+    `Tokenizer(dialect="tsql")`——後者的 `dialect` 參數不會換成 T-SQL 的規則,方括號被切成
+    `L_BRACKET`,只折得了中間剛好一個 token 的,`[my db]`(有空白)、`[d]]b]`(跳脫的 `]`)
+    都認不出來。T-SQL tokenizer 直接切出 `IDENTIFIER('my db')`、`IDENTIFIER('d]b')`,整個
+    方括號/雙引號識別字是一個 token,start/end 含界定符。字串常值與註解裡的 `a.b.c` 是
+    STRING/COMMENT,不會被當成表名。tokenize 失敗時回 None,呼叫端就不剝。
     """
+    import sqlglot
     from sqlglot import TokenType
-    from sqlglot.tokens import Tokenizer
     try:
-        toks = Tokenizer(dialect="tsql").tokenize(sql)
+        toks = sqlglot.Dialect.get_or_raise("tsql").tokenize(sql)
     except Exception:                        # noqa: BLE001 — 切不出 token 就不動這段 SQL
         return None
-    out, i = [], 0
-    while i < len(toks):
-        t = toks[i]
-        if (t.token_type == TokenType.L_BRACKET and i + 2 < len(toks)
-                and toks[i + 2].token_type == TokenType.R_BRACKET):
-            out.append(("ident", toks[i + 1].text, t.start, toks[i + 2].end))
-            i += 3
-            continue
+    out = []
+    for t in toks:
         kind = ("ident" if t.token_type in (TokenType.VAR, TokenType.IDENTIFIER)
                 else "dot" if t.token_type == TokenType.DOT else "other")
         out.append((kind, t.text, t.start, t.end))
-        i += 1
     return out
 
 
-_CTE_NAME = re.compile(
-    r"""(?:\bWITH\b|,)\s*(?:\[([^\]]+)\]|"([^"]+)"|([A-Za-z_@#][\w@#$]*))"""
-    r"""\s*(?:\([^)]*\)\s*)?AS\s*\(""", re.I)
-
-
-def _cte_names(sql: str) -> set[str]:
-    """這段 SQL 自己定義的 CTE 名稱(小寫)。"""
-    return {g.lower() for m in _CTE_NAME.finditer(sql) for g in m.groups() if g}
+def _quote_ident(text: str) -> str:
+    """把識別字還原成可直接寫進 SQL 的樣子:單純識別字裸寫,含空白/特殊字元的才用
+    方括號包(`]` 跳脫成 `]]`)。token 的 text 是去掉界定符後的內容(`[my t]`→`my t`)。"""
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_@#$]*$", text):
+        return text
+    return "[" + text.replace("]", "]]") + "]"
 
 
 def _strip_table_qualifiers(sql: str, tables: set[str]) -> tuple[str, str | None]:
-    """把三段式表名剝成純表名。回 (剝過的 SQL, 無法處理的原因或 None)。"""
+    """把三段式表名(`<庫>.<schema>.<表>`、含 `<庫>..<表>` 省略 schema)剝成 `dbo.<表>`。
+    回 (剝過的 SQL, 無法處理的原因或 None)。
+
+    **剝成兩段式 `dbo.<表>`、不是純 `<表>`**:兩段式 SQL Server 不會解成 CTE,所以就算
+    SQL 裡有同名 CTE,`FROM dbo.txn` 讀到的仍是沙盒的表(沙盒的表由建庫的登入建、都在
+    dbo;規格沒寫 schema 的表一定在 dbo)。這樣就不必再維護一份 CTE 名單——用 regex 抓
+    CTE 名碰到 `WITH a AS (…), /* c */ txn AS (…)` 的註解就抓不到,反而把同名引入判成錯。
+
+    對應不到沙盒一份測資的,記待驗證(回傳第二個值,呼叫端轉成帶 stage 的待驗證):
+    - 同一個表名出現在不同庫/schema 下(剝完會撞成同一張);
+    - 四段式(跨 linked server)。
+    """
     spans = _ident_spans(sql)
     if spans is None or not tables:
         return sql, None
-    ctes = _cte_names(sql)
     cuts: list[tuple[int, int, str]] = []      # (起, 迄, 換成什麼)
     seen: dict[str, set[str]] = {}             # {表名: 它前面出現過哪些限定詞}
+    four_part: set[str] = set()                # 四段式命中測資表的名稱
     i = 0
     while i < len(spans):
         if spans[i][0] != "ident":
             i += 1
             continue
-        parts, j = [spans[i]], i
-        while j + 2 < len(spans) and spans[j + 1][0] == "dot" and spans[j + 2][0] == "ident":
-            parts.append(spans[j + 2])
-            j += 2
-        if len(parts) == 3:
-            name = parts[2][1].lower()
-            if name in tables and name not in ctes:
-                seen.setdefault(name, set()).add(".".join(x[1].lower() for x in parts[:2]))
-                cuts.append((parts[0][2], parts[2][3], parts[2][1]))
+        first, quals, j = spans[i], [spans[i]], i
+        # 收集 `ident ( . ident? )*`,`.` 後面沒有 ident 就是空段(`db..t`)
+        while j + 1 < len(spans) and spans[j + 1][0] == "dot":
+            if j + 2 < len(spans) and spans[j + 2][0] == "ident":
+                quals.append(spans[j + 2])
+                j += 2
+            else:
+                quals.append(None)             # 空段
+                j += 1
+        last = quals[-1]
+        if last is not None and last[1].lower() in tables:
+            name = last[1].lower()
+            if len(quals) == 3:                # 三段式 → 剝成 dbo.<表>
+                seen.setdefault(name, set()).add(
+                    ".".join((q[1].lower() if q else "") for q in quals[:2]))
+                cuts.append((first[2], last[3], "dbo." + _quote_ident(last[1])))
+            elif len(quals) >= 4:              # 四段式(跨 linked server)→ 待驗證
+                four_part.add(name)
         i = j + 1
     clashed = sorted(n for n, quals in seen.items() if len(quals) > 1)
     if clashed:
         return sql, ("受審 SQL 用了不同資料庫/schema 下的同名表(" + "、".join(clashed)
                      + "),沙盒的測資只有一份,無法對應:需人工執行驗證")
-    out, last = [], 0
+    if four_part:
+        return sql, ("受審 SQL 用了四段式(跨 linked server)表名(" + "、".join(sorted(four_part))
+                     + "),對應不到沙盒的測資:需人工執行驗證")
+    out, prev = [], 0
     for start, end, text in cuts:
-        out.append(sql[last:start])
+        out.append(sql[prev:start])
         out.append(text)
-        last = end + 1
-    out.append(sql[last:])
+        prev = end + 1
+    out.append(sql[prev:])
     return "".join(out), None
 
 
