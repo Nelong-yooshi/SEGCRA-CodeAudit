@@ -68,9 +68,9 @@ def test_指定的檔案不存在時報錯_不退回_repo_的設定(monkeypatch,
     """打錯路徑時悄悄改用開發用的設定,會拿開發用的模型名稱去打部署端的端點,看不出原因。"""
     missing = tmp_path / "nope.yaml"
     monkeypatch.setenv("SEGCRA_MODELS_CONFIG", str(missing))
-    with pytest.raises(FileNotFoundError) as info:
+    with pytest.raises(ConfigError) as info:
         load_config()
-    assert "nope.yaml" in str(info.value)
+    assert "nope.yaml" in str(info.value) and "SEGCRA_MODELS_CONFIG" in str(info.value)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="要真的 POSIX 權限位元(部署端是 Linux)")
@@ -85,3 +85,103 @@ def test_指到的檔案也檢查權限(monkeypatch, tmp_path):
         load_config()
     path.chmod(0o644)
     assert load_config().profile("review").model == "deploy-model"
+
+
+def _expect(monkeypatch, value, *fragments):
+    monkeypatch.setenv("SEGCRA_MODELS_CONFIG", str(value))
+    with pytest.raises(ConfigError) as info:
+        load_config()
+    for f in ("SEGCRA_MODELS_CONFIG",) + fragments:
+        assert f in str(info.value), (f, str(info.value))
+    return str(info.value)
+
+
+def test_指到目錄時報錯_寫出變數名與路徑(monkeypatch, tmp_path):
+    d = tmp_path / "cfgdir"
+    d.mkdir()
+    _expect(monkeypatch, d, str(d), "讀不到")
+
+
+@pytest.mark.parametrize("value", ["cfgdir/models.yaml", "config/models.yaml", "./models.yaml"])
+def test_相對路徑報錯_不跟著啟動目錄走(monkeypatch, value):
+    _expect(monkeypatch, value, "絕對路徑")
+
+
+def test_波浪號先展開(monkeypatch, tmp_path):
+    """寫在 docker -e 或 systemd 裡、加了引號時,shell 不會展開 ~。"""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    msg = _expect(monkeypatch, "~/segcra-config/models.yaml", "讀不到")
+    assert "絕對路徑" not in msg and str(tmp_path) in msg
+
+
+def test_空檔報錯_寫出變數名與路徑(monkeypatch, tmp_path):
+    p = tmp_path / "empty.yaml"
+    p.write_text("", encoding="utf-8")
+    _expect(monkeypatch, p, str(p), "空的")
+
+
+def test_YAML_格式錯報錯_寫出變數名與路徑_不寫出內容(monkeypatch, tmp_path):
+    p = tmp_path / "bad.yaml"
+    p.write_text("profiles: [sk-secret-in-yaml, {\n", encoding="utf-8")
+    msg = _expect(monkeypatch, p, str(p), "YAML")
+    assert "sk-secret-in-yaml" not in msg
+
+
+def test_缺少必要的鍵報錯(monkeypatch, tmp_path):
+    p = tmp_path / "partial.yaml"
+    p.write_text("endpoint: http://localhost:11434/v1\n", encoding="utf-8")
+    _expect(monkeypatch, p, str(p), "default_profile")
+
+
+def test_內容不合規時也寫出是哪個檔案(monkeypatch, tmp_path):
+    text = REPO_YAML.read_text(encoding="utf-8").replace("api_key: ollama", "api_key: EMPTY")
+    p = tmp_path / "key.yaml"
+    p.write_text(text, encoding="utf-8")
+    _expect(monkeypatch, p, str(p), "api_key")
+
+
+def test_直接給路徑時不寫環境變數名(tmp_path):
+    p = tmp_path / "empty.yaml"
+    p.write_text("", encoding="utf-8")
+    with pytest.raises(ConfigError) as info:
+        load_config(p)
+    assert str(p) in str(info.value) and "SEGCRA_MODELS_CONFIG" not in str(info.value)
+
+
+def test_設定記下讀的是哪一份與內容的雜湊(monkeypatch, tmp_path):
+    import hashlib
+    path = _deploy_yaml(tmp_path)
+    monkeypatch.setenv("SEGCRA_MODELS_CONFIG", str(path))
+    src = load_config().source
+    assert src == {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def test_報告記下這次用的是哪一份設定(monkeypatch, tmp_path):
+    import asyncio
+    import json
+
+    import openai
+    import httpx
+
+    from orchestrator import pipeline
+    from toolbox import gitlab
+    fixtures, output = tmp_path / "fixtures", tmp_path / "out"
+    fixtures.mkdir()
+    output.mkdir()
+    monkeypatch.setattr(gitlab, "FIXTURES_DIR", fixtures)
+    monkeypatch.setattr(gitlab, "OUTPUT_DIR", output)
+    monkeypatch.setenv("REVIEW_OUTPUT", str(output))
+    (fixtures / "mr_971.json").write_text(json.dumps({
+        "title": "t", "description": "d", "sha": "c0ff" + "0" * 36,
+        "files": [{"path": "sql/x.sql", "diff": "@@ -1 +1 @@\n+SELECT 1", "full_content": "SELECT 1"}],
+    }), encoding="utf-8")
+
+    async def failing(*a, **k):
+        raise openai.APIConnectionError(request=httpx.Request("POST", "http://m.invalid/v1"))
+    monkeypatch.setattr(pipeline, "run_agent", failing)
+    path = _deploy_yaml(tmp_path)
+    cfg = load_config(path)
+    report = asyncio.run(pipeline.review_mr(cfg, "971"))
+    assert report["_models_config"]["path"] == str(path)
+    assert len(report["_models_config"]["sha256"]) == 64

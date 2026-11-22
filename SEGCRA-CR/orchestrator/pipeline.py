@@ -2251,6 +2251,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 模型自己輸出的同名欄位在這裡被蓋掉
         report["_stage_seconds"] = clock.seconds
         report["_review_deadline_seconds"] = REVIEW_BUDGET_SECONDS   # 評測看得出這輪用的是哪一種截止時間
+        # 這次用的是哪一份模型設定檔(路徑與內容的雜湊):放行門檻在那份檔案裡,事後對得回是哪一版
+        report["_models_config"] = dict(getattr(cfg, "source", None) or {})
         # 報告裡同名的欄位(模型可能自己輸出)一律蓋掉
         report["_dbt_exec"] = dbt_exec
         executed_dbt = (dbt_exec["file"] if dbt_exec and dbt_exec["ok"] and spec_result is not None
