@@ -2556,9 +2556,9 @@ MUTANTS.update({
  "R006:四段式名稱只認方括號(雙引號識別字漏抓)": ("../toolbox/sqltools.py",
      r"""_IDENT = r'(?:\[[^\]]+\]|"[^"]+"|[A-Za-z_]\w*)'""",
      r"""_IDENT = r'(?:\[[^\]]+\]|[A-Za-z_]\w*)'"""),
- "R005:函式名與括號之間只容許空白(夾註解就漏抓)": ("../toolbox/sqltools.py",
-     r'_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/)){0,500}\*/|--[^\n]*\n){0,30}"',
-     r'_GAP = r"\s*"'),
+ "規則:用到_GAP的規則不先去註解就比對(巢狀註解/超長空白繞過)": ("../toolbox/sqltools.py",
+     "    no_comments = strip_comments(sql)",
+     "    no_comments = sql"),
  "R005:不抓不帶括號的身分函式": ("../toolbox/sqltools.py",
      r'(SYSTEM_USER|CURRENT_USER|SESSION_USER)\b"',
      r'(SYSTEM_USER)\b"'),
@@ -2577,7 +2577,7 @@ MUTANTS.update({
 
 # ---- 注入掃描的總量上限:放得下一份展開結果
 MUTANTS.update({
- # 其他 LLM 呼叫的截斷偵測與送仲裁前去註解(#26 第 1、6 點)
+ # 仲裁/知識起草的三態採信、送仲裁前去註解與遮掉 MR 文字
  '仲裁:不要求輸出完整就採信(被截斷/沒回報結束原因也採信)': ('spec_exec.py',
      '    if (completeness == "complete" and d is not None',
      '    if (d is not None'),
@@ -4171,21 +4171,15 @@ MUTANTS.update({
 
 # ---- 註解抽取改成線性時間,而且不能因此縮小掃描範圍(#33 review 第 3 點)
 MUTANTS.update({
- "註解:改回平方時間的正規式": ("security.py",
-     "    out: list[str] = []" + NL + "    i, n = 0, len(code)",
-     "    import re" + NL
-     + "    return [m.group(0) for m in re.finditer(r\"--[^\\n]*|/\\*.*?\\*/\", code, re.S)]" + NL
-     + "    out: list[str] = []" + NL + "    i, n = 0, len(code)"),
- "註解:沒有結尾的區塊註解不關掉(回到反覆回溯)": ("security.py",
-     "        if close == -1:" + NL + "            next_block = -1" + NL + "            continue",
-     "        if close == -1:" + NL + "            i = next_block + 2" + NL + "            continue"),
- "註解:先截到最後一個結尾(會漏掉跨過它的行註解)": ("security.py",
-     "    i, n = 0, len(code)",
-     '    code = code[:code.rfind("*/") + 2] if "*/" in code else code' + NL
-     + "    i, n = 0, len(code)"),
- "註解:行註解只到換行前一格": ("security.py",
-     '            end = code.find("\\n", next_line)',
-     '            end = code.find("\\n", next_line) - 1'),
+ "註解抽取:漏掉字串常值的內容(字串裡的注入掃不到)": ("security.py",
+     '            if kind in ("line_comment", "block_comment", "string")]',
+     '            if kind in ("line_comment", "block_comment")]'),
+ "註解抽取:漏掉行註解": ("security.py",
+     '            if kind in ("line_comment", "block_comment", "string")]',
+     '            if kind in ("block_comment", "string")]'),
+ "註解抽取:漏掉區塊註解(巢狀註解裡的注入掃不到)": ("security.py",
+     '            if kind in ("line_comment", "block_comment", "string")]',
+     '            if kind in ("line_comment", "string")]'),
  "掃描:欄位的值型別不對也直接用(整份審查中斷)": ("security.py",
      "    return value if isinstance(value, str) else \"\"",
      "    return value"),
@@ -5451,9 +5445,9 @@ MUTANTS.update({
      + "            bodies.update({index[n][0]: index[n][1] for n in names if n in index})",
      "        bodies.update(macro_files)"),
  # 特製內容不得讓規則層變成平方時間(內容由 MR 決定)
- "上限:函式名與括號之間的空白/註解不設上限": (T,
-     r'_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/)){0,500}\*/|--[^\n]*\n){0,30}"',
-     r'_GAP = r"(?:\s|/\*(?:[^*]|\*(?!/))*\*/|--[^\n]*\n)*"'),
+ "間隔:關鍵字與括號之間不容許空白(有空白/去掉的註解就漏抓)": (T,
+     r'_GAP = r"\s*"',
+     r'_GAP = r""'),
  "上限:Jinja 區段裡往後找的範圍不設上限": (T,
      r'_IN_JINJA = r"[^}]{0,200}?"',
      r'_IN_JINJA = r"[^}]*?"'),
@@ -5464,10 +5458,10 @@ MUTANTS.update({
      '        hits.append(("H006", "hint",',
      '        hits.append(("H006", "major",'),
  "提醒:整組不接進規則層": (T,
-     "    hits += _env_hints(sql)",
+     "    hits += _env_hints(no_comments)",
      "    hits += []"),
  "原語:整組不接進規則層": ("../toolbox/sqltools.py",
-     "    hits += _dangerous_primitives(sql)",
+     "    hits += _dangerous_primitives(no_comments)",
      "    hits += []"),
  "原語:sp_executesql 的比對排除限定名稱(sys.sp_executesql 漏掉)": (T,
      r'    r"|(?<![\w@])\[?sp_executesql\]?(?!\w)"',
