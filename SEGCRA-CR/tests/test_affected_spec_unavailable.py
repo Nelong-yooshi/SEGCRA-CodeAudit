@@ -12,7 +12,8 @@ import httpx
 import pytest
 
 from orchestrator import pipeline
-from orchestrator.dbt_affected import AffectedCheck, impact_finding
+from orchestrator.dbt_affected import AffectedCheck
+from tests.test_dbt_affected import impact_finding   # 兩條合起來看(見那個檔)
 from orchestrator.spec_exec import SpecLookup as _Lookup
 from tests.test_dbt_affected import _check, _cm, _macro_ctx, _only
 from toolbox import gitlab

@@ -1082,12 +1082,11 @@ def build_env(code_root=None, variables: dict | None = None,
 
     macros: list[str] = []
     conflicts: list[str] = []
-    problems: list[str] = []
     # 載入失敗的 macro 檔只記分類(見 macro_issue);回傳的說明文字(macro_problems)由分類
     # 產生,不另外記一份 —— 兩份各自 append,改了一邊就會跟另一邊對不上
     env.segcra_macro_issues = []
     if code_root is None and macro_files is None:
-        return env, macros, conflicts, problems
+        return env, macros, conflicts, []
     if code_root is not None and macro_files is not None:
         raise DbtRenderError("code_root 與 macro_files 只能擇一")
 
@@ -1109,7 +1108,7 @@ def build_env(code_root=None, variables: dict | None = None,
     # 只載入一次,否則它定義的每個 macro 都會被記成「與自己同名」
     files = list(dict(files).items())
     if not files:
-        return env, macros, conflicts, problems
+        return env, macros, conflicts, []
     if len(files) > MAX_MACRO_FILES:
         raise DbtRenderError(f"macro 檔案數超過 {MAX_MACRO_FILES} 個上限")
     total = 0
@@ -1478,11 +1477,13 @@ def macro_issue(rel: str, error: BaseException) -> dict:
     return {"path": rel, "kind": kind, "line": line}
 
 
-_MACRO_KIND_TEXT = {
-    MACRO_SYNTAX: "Jinja 語法錯誤",
-    MACRO_UNSUPPORTED: "用到不認得的濾器或重複定義的 block",
-    MACRO_TOO_DEEP: "巢狀太深",
-    MACRO_LOAD_FAILED: "載入失敗",
+# 每個分類的說明只有這一份:macro_problem_text(展開結果的 macro_problems)與 pipeline 補的 finding
+# 都引用它。新增分類只改這裡
+MACRO_KIND_TEXT = {
+    MACRO_SYNTAX: "有 Jinja 語法錯誤(區塊沒有閉合、運算式寫錯等)",
+    MACRO_UNSUPPORTED: "用到不認得的濾器,或重複定義了同名的 block(dbt 解析得過,呼叫到這個 macro 時才會失敗)",
+    MACRO_TOO_DEEP: "巢狀太深(超過展開器的遞迴上限,dbt 不一定會失敗)",
+    MACRO_LOAD_FAILED: "解析得過,但載入時失敗(檔案開頭用到展開器沒有提供的東西,或讀不到內容)",
 }
 
 
@@ -1490,7 +1491,7 @@ def macro_problem_text(issue: dict) -> str:
     """macro_issue 的分類寫成一行(`路徑:原因(第 N 行)`)。只用分類與行號,不帶錯誤訊息:
     錯誤訊息可能含樣板內容,而這段文字會進報告。"""
     line = f"(第 {issue['line']} 行)" if issue.get("line") else ""
-    return f"{issue['path']}:{_MACRO_KIND_TEXT.get(issue['kind'], '載入失敗')}{line}"
+    return f"{issue['path']}:{MACRO_KIND_TEXT.get(issue['kind'], MACRO_KIND_TEXT[MACRO_LOAD_FAILED])}{line}"
 
 
 @dataclass(frozen=True)

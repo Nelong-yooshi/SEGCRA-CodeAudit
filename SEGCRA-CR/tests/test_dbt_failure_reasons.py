@@ -14,6 +14,7 @@ from orchestrator import dbt_impact, dbt_render
 from orchestrator.dbt_impact import SCAN_SYNTAX, SCAN_TOO_DEEP, analyze_macro_impact
 from orchestrator.dbt_render import (
     MACRO_LOAD_FAILED, MACRO_SYNTAX, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, build_env,
+    MACRO_KIND_TEXT,
     macro_problem_text,
 )
 
@@ -137,14 +138,14 @@ def test_說明文字由分類產生_一筆失敗只有一筆(tmp_path):
 def test_說明文字寫出路徑_原因與行號(tmp_path):
     _write(tmp_path, "bad.sql", "\n\n{% macro broken() %} {% endfor %}")
     _, _, _, problems = build_env(tmp_path)
-    assert problems == ["macros/bad.sql:Jinja 語法錯誤(第 3 行)"]
+    assert problems == [f"macros/bad.sql:{MACRO_KIND_TEXT[MACRO_SYNTAX]}(第 3 行)"]
 
 
 @pytest.mark.parametrize("kind,word", [
     (MACRO_SYNTAX, "語法錯誤"),
     (MACRO_UNSUPPORTED, "不認得的濾器"),
     (MACRO_TOO_DEEP, "巢狀太深"),
-    (MACRO_LOAD_FAILED, "載入失敗"),
+    (MACRO_LOAD_FAILED, "載入時失敗"),
 ])
 def test_每一種分類都有說明(kind, word):
     text = macro_problem_text({"path": "macros/x.sql", "kind": kind, "line": 0})
@@ -164,4 +165,19 @@ def test_展開結果的macro_problems跟build_env的一致(tmp_path):
     r = dbt_render.render_model(tmp_path / "models" / "m.sql", code_root=tmp_path,
                                 source="SELECT * FROM t WHERE {{ amt() }}")
     assert r.ok, r.error
-    assert r.macro_problems == ["macros/bad.sql:Jinja 語法錯誤(第 1 行)"]
+    assert r.macro_problems == [f"macros/bad.sql:{MACRO_KIND_TEXT[MACRO_SYNTAX]}(第 1 行)"]
+
+
+@pytest.mark.parametrize("kind", [MACRO_UNSUPPORTED, MACRO_TOO_DEEP, MACRO_LOAD_FAILED])
+def test_每個分類_展開結果與_MR_上的_finding_用同一句(kind):
+    """分類的說明只有一份(MACRO_KIND_TEXT):新增分類只改一處,不會有一邊靜靜退回別的說法。"""
+    from orchestrator import pipeline
+    text = macro_problem_text({"path": "macros/x.sql", "kind": kind, "line": 0})
+    finding = pipeline._macro_problem_finding({"path": "macros/x.sql", "kind": kind, "line": 0})
+    assert MACRO_KIND_TEXT[kind] in text and MACRO_KIND_TEXT[kind] in finding["detail"]
+
+
+def test_語法錯誤也用同一句():
+    from orchestrator import pipeline
+    finding = pipeline._macro_problem_finding({"path": "macros/x.sql", "kind": MACRO_SYNTAX, "line": 0})
+    assert MACRO_KIND_TEXT[MACRO_SYNTAX] in finding["detail"]
