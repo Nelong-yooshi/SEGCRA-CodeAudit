@@ -316,6 +316,7 @@ mr = {"title": "調整報表", "files": [{"path": "sql/x.sql", "full_content": "
   - 覆蓋是「LLM 拆出的條件」的覆蓋:若角色一漏拆某條件,形狀檢查看不出「本來該有第 N 條」——上限由 spec 條列品質決定,這也是需求項目要逐條原子化的原因。
   - 沙盒需要先啟動(`scripts/sandbox.sh start`,約 2GB 記憶體);沙盒未啟動時執行驗證一律判不通過(major、needs_human)。
   - dbt 樣板展開不了(規格沒有同名的表、表名無法確定、用了不支援的寫法)時不送沙盒,記成待驗證「[執行驗證] dbt model 沒有展開」,原因另列一條 info;不會落在 `sql_error`,也不會誤判通過。上游 model 由測資代替時,上游自己的邏輯沒有執行(見 docs/09 已知限制)。
+    **評測裡的真實形狀 case(`mr_701`/`mr_702`)餵的是 compile 後的 SQL**,量的是什麼見 `eval/BASELINE.md` 第 12 節。
 
 ## 結構化生成:規格的形狀分類
 
