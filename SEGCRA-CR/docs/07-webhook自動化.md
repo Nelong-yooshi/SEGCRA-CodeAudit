@@ -214,7 +214,8 @@ python eval/stage_time_summary.py out/          # 各階段耗時,與照正式�
 審查沒跑完時,webhook 會做兩件事(`_notify_incomplete`):在 MR 上留言,**並把
 `segcra/review` 這個 commit status 設成失敗**。留言只是給人看的,擋合併的是 commit
 status(專案設定「Pipelines must succeed」);只留言不設狀態,等於審查沒跑完卻沒有
-東西擋著合併。
+東西擋著合併。CI 那條路(`/ci/review`)只留言、不設 commit status,擋合併的是 job 拿到的 5
+(見 06 篇第 4 節)。
 
 審查模型的端點連不上、逾時或回錯誤時,管線**不會**丟例外到這裡:它照常產出報告(程式確定性檢查的
 結果加上一條「審查模型沒有完成」的 major),照常回寫,決策是交人工,commit status 一樣是失敗

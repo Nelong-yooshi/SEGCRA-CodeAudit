@@ -19,7 +19,7 @@ OUTPUT_DIR = Path(os.environ.get("REVIEW_OUTPUT", PKG_ROOT / "review_output"))
 
 GITLAB_URL = os.environ.get("GITLAB_URL", "")          # e.g. http://localhost:8929
 GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "")
-GITLAB_PROJECT = os.environ.get("GITLAB_PROJECT", "")  # project id 或 URL-encoded path
+GITLAB_PROJECT = os.environ.get("GITLAB_PROJECT", "")  # 專案的數字 id(CI 那條路拿它跟 job 的專案比對)
 REAL_MODE = bool(GITLAB_URL and GITLAB_TOKEN and GITLAB_PROJECT)
 # 專案層級的唯讀 token(read_api,角色 Reporter),只給打包下載用(#15 條件 1)
 GITLAB_READ_TOKEN = os.environ.get("GITLAB_READ_TOKEN", "")
@@ -646,7 +646,7 @@ def post_summary(mr_id: str, body: str, score: int, verdict: str) -> str:
 def set_commit_status(sha: str, state: str, name: str = "segcra/review",
                       description: str = "", mr_id: str = "") -> str:
     """回寫 commit status(external pipeline)。state: success | failed | pending。
-    CE 的 merge 閘門靠它:專案設定「Pipelines must succeed」後,
+    不接 CI 時(webhook 那條路)merge 閘門靠它:專案設定「Pipelines must succeed」後,
     failed 的 commit 無法 merge。
 
     失敗時重送(同一個 sha 與 name 重送只會更新同一個 status,不會重複),最多

@@ -6,7 +6,7 @@ commit status)。
 
 啟動:
   export GITLAB_URL=http://localhost:8929 GITLAB_TOKEN=<token> GITLAB_PROJECT=<id>
-  export GITLAB_WEBHOOK_SECRET=<自訂密鑰>   # 與 GitLab webhook 的 Secret token 一致
+  export GITLAB_WEBHOOK_SECRET=<自訂密鑰>   # 只在用 webhook 時設;與 GitLab webhook 的 Secret token 一致
   export REVIEW_PROFILE=review               # 用哪個模型 profile 審
   .venv/bin/python scripts/webhook_server.py --port 8000
 
@@ -21,9 +21,9 @@ commit,每推一次就整份審一次);Draft 期間要看,留言 /review。/revi
 
 審查完成後管線會回寫 commit status(name=segcra/review):
 auto_approved → success;needs_human / blocked → failed(description 帶原因)。
-搭配專案設定「Pipelines must succeed」+ protected branch,即為 CE 的 merge 閘門。
+不接 CI 時,搭配專案設定「Pipelines must succeed」+ protected branch,就是 merge 閘門。
 
-**部署端用的是另一條:CI 的 job 呼叫 /ci/review**(見 orchestrator/ci_gate.py、docs/06)。
+**部署端用的是另一條:CI 的 job 呼叫 /ci/review**(見 docs/06 第 4 節、README §7)。
 審查做成 MR pipeline 最後一個 stage 的 job:job 帶自己的 CI_JOB_TOKEN 呼叫
 `POST /ci/review`(body:{"mr_iid": ..., "sha": ...}),服務向 GitLab 確認它是這個專案、這個 MR
 的 MR pipeline 裡正在跑的 job,開始審查並回一個查詢用的編號;job 每隔一段時間

@@ -260,7 +260,7 @@ export SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER FIXTURES_DIR=examples/dbt_wiring/fixt
 
 > **部署端不用這一節的 webhook**:審查做成 MR pipeline 最後一個 stage 的 job(§7)。
 > 這一節是測試環境或沒有 CI 的 repo 用的做法。§7 的 job 呼叫的審查服務也是同一支
-> `scripts/webhook_server.py`,啟動方式相同,只是 GitLab 那邊不用設 webhook。
+> `scripts/webhook_server.py`,啟動見 §7 第 1 步(不用設 webhook,也不用 `GITLAB_WEBHOOK_SECRET`)。
 
 webhook server 建議跑在**與 GitLab 同一台主機**(放在哪個目錄都可以):
 
@@ -314,16 +314,22 @@ MR 看的同一條 pipeline 上,job 的結束碼決定能不能合併(0 放行�
 
 **接上去的步驟:**
 
-1. **審查服務**跑在有 GitLab token 與模型端點的主機上,runner 連得到它。環境變數同 §5
-   (`GITLAB_URL`、`GITLAB_TOKEN`、`GITLAB_READ_TOKEN`、`GITLAB_PROJECT`),`GITLAB_PROJECT` 要填
-   **專案的數字 id**(跟 GitLab 回的 `project_id` 比對;填路徑會一律拒絕)。只走這條路時不用設
-   `GITLAB_WEBHOOK_SECRET`(webhook 那條路停用,啟動時會印一行說明)。啟動:
+1. **審查服務**跑在有 GitLab token 與模型端點的主機上,runner 連得到它。環境變數照
+   [docs/10「真實模式必填」](docs/10-設定參數.md)設齊(`GITLAB_URL`、`GITLAB_TOKEN`、`GITLAB_READ_TOKEN`、
+   `GITLAB_PROJECT`、`SANDBOX_MSSQL_PASSWORD`),`GITLAB_PROJECT` 要填**專案的數字 id**(跟 GitLab 回的
+   `project_id` 比對;填路徑會一律拒絕)。只走這條路時不用設 `GITLAB_WEBHOOK_SECRET`(webhook 那條路停用,
+   啟動時會印一行說明)。先起執行驗證的沙盒(同 §3),再啟動服務:
 
    ```bash
+   scripts/sandbox.sh start          # 沒起的話,每份審查的執行驗證都是「沙盒不可用」、不會自動放行
    .venv/bin/python scripts/webhook_server.py --port 8000
    ```
 
-2. **CI/CD 變數** `SEGCRA_URL`:審查服務的位址(例如 `http://<審查主機>:8000`)。不是秘密,不用遮罩。
+2. **審查服務的位址** `SEGCRA_URL`(例如 `http://<審查主機>:8000`)寫在第 5 步 job 的 `variables:` 裡,
+   **不要**設成待審專案的 CI/CD 變數:它決定每個 MR 由哪一個服務判,指到一個一律回 `done 0` 的服務,
+   所有 MR 都會綠;專案設定裡的變數改了不留版本紀錄、也不經過審查。寫在設定專案(第 4 步)的 YAML 裡,
+   只有負責 CI 的人改得到,改動有歷史、可以走 MR 審查。專案與群組的 CI/CD 變數優先順序比 YAML 高,
+   **待審專案與它的群組都不要另設同名的 `SEGCRA_URL`**。
 3. **專用的 runner**(只給審查 job 用,其他 job 碰不到它;原因見 docs/06 第 4 節):
    - 用 **project runner**,只在待審專案建立:專案 → Settings → CI/CD → Runners,Tags 填
      `segcra-review`,不勾 *Run untagged jobs*,勾 *Lock to current projects*;不在其他專案啟用,
@@ -361,6 +367,7 @@ MR 看的同一條 pipeline 上,job 的結束碼決定能不能合併(0 放行�
      after_script: []
      variables:
        GIT_STRATEGY: none          # 不用取原始碼:審查服務自己向 GitLab 讀 MR
+       SEGCRA_URL: "http://<審查主機>:8000"   # 第 2 步:寫在這裡,不設成專案或群組的 CI/CD 變數
      timeout: 1h                   # 要比整份審查的上限長(REVIEW_TIMEOUT_SECONDS,預設 2400 秒)
      allow_failure:
        exit_codes: [3]             # needs_human:passed with warnings

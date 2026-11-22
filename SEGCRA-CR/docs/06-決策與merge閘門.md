@@ -187,7 +187,7 @@ EOF
 
 - MR 改 repo 裡的 CI 設定(包括在 repo 放一份 `.gitlab-ci.yml`),審查 job 不會變綠。
 - 前面的 job 在 runner 上留下假的 `curl`,審查 job 不會變綠。
-- 用只在待審專案是 Developer 的帳號推 commit:在設定專案是 Reporter 時 pipeline 建得起來、審查 job 照常跑;不是設定專案成員時 pipeline 直接失敗、沒有任何 job。
+- 用只在待審專案是 Developer 的帳號推 commit:在設定專案是 Reporter 時 pipeline 建得起來、審查 job 照常跑;設定專案是 Private 又不是成員時 pipeline 直接失敗、沒有任何 job(Internal 的設定專案,External 以外的登入使用者都讀得到)。
 - 另一個專案的 job 帶 `tags: [segcra-review]`,專用 runner 不會接(job 一直 pending)。
 
 不接 CI 時(第 5 節)看 status `segcra/review` 出現在 pipeline 區、`needs_human`/`blocked` 時 Merge 按鈕呈鎖定。
