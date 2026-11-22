@@ -6,7 +6,7 @@ commit status)。
 
 啟動:
   export GITLAB_URL=http://localhost:8929 GITLAB_TOKEN=<token> GITLAB_PROJECT=<id>
-  export GITLAB_WEBHOOK_SECRET=<自訂密鑰>   # 與 GitLab webhook 的 Secret token 一致
+  export GITLAB_WEBHOOK_SECRET=<自訂密鑰>   # 只在用 webhook 時設;與 GitLab webhook 的 Secret token 一致
   export REVIEW_PROFILE=review               # 用哪個模型 profile 審
   .venv/bin/python scripts/webhook_server.py --port 8000
 
@@ -21,9 +21,9 @@ commit,每推一次就整份審一次);Draft 期間要看,留言 /review。/revi
 
 審查完成後管線會回寫 commit status(name=segcra/review):
 auto_approved → success;needs_human / blocked → failed(description 帶原因)。
-搭配專案設定「Pipelines must succeed」+ protected branch,即為 CE 的 merge 閘門。
+不接 CI 時,搭配專案設定「Pipelines must succeed」+ protected branch,就是 merge 閘門。
 
-**部署端用的是另一條:CI 的 job 呼叫 /ci/review**(見 orchestrator/ci_gate.py、docs/06)。
+**部署端用的是另一條:CI 的 job 呼叫 /ci/review**(見 docs/06 第 4 節、README §7)。
 審查做成 MR pipeline 最後一個 stage 的 job:job 帶自己的 CI_JOB_TOKEN 呼叫
 `POST /ci/review`(body:{"mr_iid": ..., "sha": ...}),服務向 GitLab 確認它是這個專案、這個 MR
 的 MR pipeline 裡正在跑的 job,開始審查並回一個查詢用的編號;job 每隔一段時間
@@ -278,9 +278,41 @@ MAX_CI_REVIEWS = 500
 
 
 def _ci_job(job_token):
-    """job token → GitLab 上的 job;查不到回 None。"""
+    """job token → GitLab 上的 job;GitLab 拒絕這把 token 時回 None,取不到丟 gitlab.GitLabLookupFailed。"""
     from toolbox import gitlab
     return gitlab.job_from_token(job_token)
+
+
+def _ci_unavailable() -> str | None:
+    """服務本身驗不了呼叫者的原因(mock 模式、GITLAB_PROJECT 不是數字);可以驗時回 None。"""
+    from toolbox import gitlab
+    if not gitlab.REAL_MODE:
+        return ci_gate.MOCK_MODE_TEXT
+    if not (isinstance(gitlab.GITLAB_PROJECT, str) and gitlab.GITLAB_PROJECT.isascii()
+            and gitlab.GITLAB_PROJECT.isdigit()):
+        return ci_gate.PROJECT_NOT_NUMBER_TEXT
+    return None
+
+
+def _ci_check(job_token, mr_iid: int, sha: str):
+    """確認呼叫者。回 (None, job) 表示通過;不通過回 ((HTTP 狀態碼, 原因), None)。
+
+    三步依序,前一步確定符合才查下一個(job 不屬於這個專案時,不去查這個專案的 pipeline:
+    那會變成「查不到」而不是「不符」)。查不到回 502,確定不符回 403。"""
+    from toolbox import gitlab
+    try:
+        job = _ci_job(job_token)
+        reason = ci_gate.check_job(job, project_id=gitlab.GITLAB_PROJECT)
+        if reason is None:
+            pipeline = gitlab.pipeline_info(job["pipeline"]["id"])
+            reason = ci_gate.check_pipeline(job, pipeline, mr_iid=mr_iid, sha=sha)
+        if reason is None:
+            reason = ci_gate.check_mr(gitlab.mr_head(str(mr_iid)), sha=sha)
+    except gitlab.GitLabLookupFailed as e:
+        return (ci_gate.STATUS_LOOKUP_FAILED, ci_gate.lookup_failure_text(e.what, e.__cause__ or e)), None
+    if reason:
+        return (ci_gate.STATUS_REJECTED, reason), None
+    return None, job
 
 
 def _ci_start(job_token, body) -> tuple[int, str]:
@@ -292,20 +324,19 @@ def _ci_start(job_token, body) -> tuple[int, str]:
     if not isinstance(body, dict):
         return 400, "body 要是 JSON 物件"
     mr_iid, sha = body.get("mr_iid"), body.get("sha")
-    if isinstance(mr_iid, str) and mr_iid.isdigit():
+    if isinstance(mr_iid, str) and mr_iid.isascii() and mr_iid.isdigit():     # 「²」也算 isdigit
         mr_iid = int(mr_iid)
     if not isinstance(mr_iid, int) or isinstance(mr_iid, bool) or mr_iid <= 0 \
             or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
         return 400, "mr_iid 要是正整數、sha 要是 40 碼的 commit"
-    job = _ci_job(job_token)
-    jp = job.get("pipeline") if isinstance(job, dict) else None
-    pipeline = gitlab.pipeline_info(jp.get("id")) if isinstance(jp, dict) else None
-    mr = gitlab.mr_head(str(mr_iid))
-    reason = ci_gate.check_request(job, pipeline, mr, project_id=gitlab.GITLAB_PROJECT,
-                                   mr_iid=mr_iid, sha=sha)
-    if reason:
-        print(f"[webhook] /ci/review 拒絕 MR !{mr_iid}:{reason}", flush=True)
-        return 403, reason
+    unavailable = _ci_unavailable()
+    if unavailable:
+        print(f"[webhook] /ci/review 不開始 MR !{mr_iid}:{unavailable}", flush=True)
+        return ci_gate.STATUS_UNAVAILABLE, unavailable
+    failed, job = _ci_check(job_token, mr_iid, sha)
+    if failed:
+        print(f"[webhook] /ci/review 不開始 MR !{mr_iid}(HTTP {failed[0]}):{failed[1]}", flush=True)
+        return failed
     ticket = secrets.token_urlsafe(16)
     with _lock:
         done = [t for t, e in _ci_reviews.items() if e["code"] is not None]
@@ -331,9 +362,15 @@ def _ci_status(job_token, ticket) -> tuple[int, str]:
         entry = dict(_ci_reviews.get(ticket) or {})
     if not entry:
         return 404, "查不到這份審查(編號不對,或審查服務重新啟動過)"
-    job = _ci_job(job_token)
-    if not isinstance(job, dict) or job.get("id") != entry["job"] or job.get("status") != "running":
-        return 403, "只有開始這份審查、而且還在執行中的 job 查得到"
+    from toolbox import gitlab
+    try:
+        job = _ci_job(job_token)
+    except gitlab.GitLabLookupFailed as e:
+        return ci_gate.STATUS_LOOKUP_FAILED, ci_gate.lookup_failure_text(e.what, e.__cause__ or e)
+    if not isinstance(job, dict):
+        return ci_gate.STATUS_REJECTED, ci_gate.JOB_TOKEN_REJECTED
+    if job.get("id") != entry["job"] or job.get("status") != "running":
+        return ci_gate.STATUS_REJECTED, "只有開始這份審查、而且還在執行中的 job 查得到"
     return 200, "running" if entry["code"] is None else f"done {entry['code']}"
 
 
@@ -493,12 +530,16 @@ class Handler(BaseHTTPRequestHandler):
 def _startup_lines(host, port) -> list:
     """啟動時印的說明。只走 CI 那條路(/ci/review)的部署不設 GITLAB_WEBHOOK_SECRET,
     不能叫他去設;兩個入口都列出來。"""
+    from toolbox import gitlab
     hook = "/gitlab-webhook" if SECRET else "/gitlab-webhook(停用)"
-    lines = [f"[webhook] 監聽 http://{host}:{port}  入口:/ci/review(CI 的審查 job)、{hook}  "
+    ci = "/ci/review(CI 的審查 job)" if gitlab.REAL_MODE else "/ci/review(mock 模式,停用)"
+    lines = [f"[webhook] 監聽 http://{host}:{port}  入口:{ci}、{hook}  "
              f"profile={PROFILE}  real_mode={'on' if os.environ.get('GITLAB_URL') else 'off(mock)'}"]
     if not SECRET:
         lines.append("[webhook] 沒設 GITLAB_WEBHOOK_SECRET:webhook 那條路停用,webhook 請求一律回 401;"
                      "CI 那條路(/ci/review)不受影響。要用 webhook 時才需要設")
+    if not gitlab.REAL_MODE:
+        lines.append(f"[webhook] {ci_gate.MOCK_MODE_TEXT}(請求回 {ci_gate.STATUS_UNAVAILABLE})")
     return lines
 
 

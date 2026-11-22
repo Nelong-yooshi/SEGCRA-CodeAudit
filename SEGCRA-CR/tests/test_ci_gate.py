@@ -119,10 +119,11 @@ def ws(monkeypatch):
     importlib.reload(mod)
     from toolbox import gitlab
     jobs = {"tok-900": _job(), "tok-901": _job(id=901)}
+    monkeypatch.setattr(gitlab, "REAL_MODE", True)
     monkeypatch.setattr(gitlab, "GITLAB_PROJECT", PROJECT)
     monkeypatch.setattr(gitlab, "job_from_token", lambda t: jobs.get(t))
-    monkeypatch.setattr(gitlab, "pipeline_info", lambda pid: _pipeline() if pid == 77 else None)
-    monkeypatch.setattr(gitlab, "mr_head", lambda iid: _mr() if iid == "5" else None)
+    monkeypatch.setattr(gitlab, "pipeline_info", lambda pid: _pipeline() if pid == 77 else {"id": pid})
+    monkeypatch.setattr(gitlab, "mr_head", lambda iid: _mr() if iid == "5" else {"state": "merged"})
     mod._test_jobs = jobs
     yield mod
     # 開始了的審查要等它結束:背景執行緒在替身還原之後才跑的話,會用到真的程式

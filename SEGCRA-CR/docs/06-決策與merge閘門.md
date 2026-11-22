@@ -14,7 +14,7 @@ LLM 審完、執行驗證跑完之後,管線用兩個**確定性函式**把「�
 - **MR 把審查 job 換掉**:CI 設定留在待審 repo 時,MR 改設定檔就能把審查 job 換成 `exit 0`;用 `include` 把 repo 的設定帶進來,同名 job 會被逐欄蓋掉。所以設定放在 MR 改不到的專案、不 include(第 4 節)。
 - **前面的 job 改後面 job 的執行環境**:同一台 runner、同一個帳號時,前面的 job 留一個假的 `curl`,審查 job 不連服務就回報成功;別的專案的 job 帶上同一個 tag 也能跑到那台。所以審查 job 跑在只屬於待審專案的專用 runner(第 4 節)。
 - **runner 上的秘密被前面的 job 拿走**:審查不在 runner 上跑,GitLab token 與模型通行碼只在審查服務那台(第 4 節)。
-- **別的 job 拿自己的 token 呼叫 `/ci/review`**:服務向 GitLab 確認呼叫者是這個專案、這個 MR 的 MR pipeline 正在跑的 job,不符回 403(第 4 節、07 篇)。
+- **別的 job 拿自己的 token 呼叫 `/ci/review`**:服務向 GitLab 確認呼叫者是這個專案、這個 MR 的 MR pipeline 正在跑的 job,不符回 403、查不到回 502(第 4 節、07 篇)。
 
 ## 怎麼建的
 
@@ -113,7 +113,7 @@ webhook 那條路在審查失敗或逾時時(`_notify_incomplete`)留言並把 c
 job 跟服務之間:
 
 1. job 送 `POST /ci/review`(header `JOB-TOKEN`,body `{"mr_iid": …, "sha": …}`)。body 不是這個形狀回 400。
-2. 服務拿這把 token 向 GitLab 查它是哪一個 job(`GET /api/v4/job`),再用自己的 token 查那條 pipeline 與 MR,確認(`ci_gate.check_request`):job 在執行中、屬於 `GITLAB_PROJECT` 這個專案;pipeline 是 `merge_request_event`、ref 是 `refs/merge-requests/<iid>/head`、sha 跟送來的一樣;MR 是開啟中、head 就是這個 sha。任一項不符回 403(job 印出「審查服務沒有開始審查(HTTP 403)」與原因、以 5 結束),不開始審查。
+2. 服務拿這把 token 向 GitLab 查它是哪一個 job(`GET /api/v4/job`),再用自己的 token 查那條 pipeline 與 MR,確認(`ci_gate.check_request`):job 在執行中、屬於 `GITLAB_PROJECT` 這個專案;pipeline 是 `merge_request_event`、ref 是 `refs/merge-requests/<iid>/head`、sha 跟送來的一樣;MR 是開啟中、head 就是這個 sha。任一項不符回 403;向 GitLab 查 job、pipeline、MR 取不到(連不上、逾時、非 2xx、內容不對)回 502,原因寫成「向 GitLab 查<哪一個>失敗:<原因>」,不說成不符;服務驗不了呼叫者(mock 模式、`GITLAB_PROJECT` 不是數字)回 503。三種都不開始審查,job 印出「審查服務沒有開始審查(HTTP <碼>)」與原因、以 5 結束。只有 GitLab 拒絕這把 job token(`GET /job` 回 401)時才說「job token 無效或 job 已經結束」:在測試 GitLab 上量過,亂打的 token 與 job 結束後的 token 都回 401,執行中回 200;其他狀態碼算查不到。查完 job 確定屬於這個專案才查 pipeline,pipeline 確定是這個 MR 的才查 MR:前一步不符時不會變成下一步「查不到」。
 3. 通過時開始審查(同一個 MR 還有進行中的就取消、改審這次的),回一個查詢用的編號;job 每 30 秒 `GET /ci/review/<編號>`(同一把 `JOB-TOKEN`,只有開始那份審查、還在執行中的 job 查得到),拿到 `done <結束碼>` 就照那個碼結束。
 4. 這條路不寫 commit status、不看 Draft、不等安靜期;留言、行內意見、label 照常。
 
@@ -187,7 +187,7 @@ EOF
 
 - MR 改 repo 裡的 CI 設定(包括在 repo 放一份 `.gitlab-ci.yml`),審查 job 不會變綠。
 - 前面的 job 在 runner 上留下假的 `curl`,審查 job 不會變綠。
-- 用只在待審專案是 Developer 的帳號推 commit:在設定專案是 Reporter 時 pipeline 建得起來、審查 job 照常跑;不是設定專案成員時 pipeline 直接失敗、沒有任何 job。
+- 用只在待審專案是 Developer 的帳號推 commit:在設定專案是 Reporter 時 pipeline 建得起來、審查 job 照常跑;設定專案是 Private 又不是成員時 pipeline 直接失敗、沒有任何 job(Internal 的設定專案,External 以外的登入使用者都讀得到)。
 - 另一個專案的 job 帶 `tags: [segcra-review]`,專用 runner 不會接(job 一直 pending)。
 
 不接 CI 時(第 5 節)看 status `segcra/review` 出現在 pipeline 區、`needs_human`/`blocked` 時 Merge 按鈕呈鎖定。

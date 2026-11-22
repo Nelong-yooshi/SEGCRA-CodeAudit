@@ -330,6 +330,15 @@ def test_GITLAB_URL_沒寫_http_時寫出例外型別(monkeypatch):
     assert "gitlab.internal" not in reason
 
 
+def test_SSL_CERT_FILE_不對時說是這個變數_不說連不上(monkeypatch, tmp_path):
+    monkeypatch.setattr(gitlab, "REAL_MODE", True)
+    monkeypatch.setattr(gitlab, "GITLAB_URL", "https://127.0.0.1:9")
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "沒有這個檔.pem"))
+    reason = gitlab.learn_own_user()
+    assert reason.startswith("GET /user 沒有送出:") and "SSL_CERT_FILE" in reason
+    assert "GITLAB_URL" not in reason
+
+
 def test_mock_模式不查(monkeypatch):
     monkeypatch.setattr(gitlab, "REAL_MODE", False)
     assert gitlab.learn_own_user() == "mock 模式,沒有 GitLab"

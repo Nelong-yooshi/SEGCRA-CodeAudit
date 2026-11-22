@@ -261,7 +261,7 @@ export SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER FIXTURES_DIR=examples/dbt_wiring/fixt
 
 > **部署端不用這一節的 webhook**:審查做成 MR pipeline 最後一個 stage 的 job(§7)。
 > 這一節是測試環境或沒有 CI 的 repo 用的做法。§7 的 job 呼叫的審查服務也是同一支
-> `scripts/webhook_server.py`,啟動方式相同,只是 GitLab 那邊不用設 webhook。
+> `scripts/webhook_server.py`,啟動見 §7 第 1 步(不用設 webhook,也不用 `GITLAB_WEBHOOK_SECRET`)。
 
 webhook server 建議跑在**與 GitLab 同一台主機**(放在哪個目錄都可以):
 
@@ -315,16 +315,22 @@ MR 看的同一條 pipeline 上,job 的結束碼決定能不能合併(0 放行�
 
 **接上去的步驟:**
 
-1. **審查服務**跑在有 GitLab token 與模型端點的主機上,runner 連得到它。環境變數同 §5
-   (`GITLAB_URL`、`GITLAB_TOKEN`、`GITLAB_READ_TOKEN`、`GITLAB_PROJECT`),`GITLAB_PROJECT` 要填
-   **專案的數字 id**(跟 GitLab 回的 `project_id` 比對;填路徑會一律拒絕)。只走這條路時不用設
-   `GITLAB_WEBHOOK_SECRET`(webhook 那條路停用,啟動時會印一行說明)。啟動:
+1. **審查服務**跑在有 GitLab token 與模型端點的主機上,runner 連得到它。環境變數照
+   [docs/10「真實模式必填」](docs/10-設定參數.md)設齊(`GITLAB_URL`、`GITLAB_TOKEN`、`GITLAB_READ_TOKEN`、
+   `GITLAB_PROJECT`、`SANDBOX_MSSQL_PASSWORD`),`GITLAB_PROJECT` 要填**專案的數字 id**(跟 GitLab 回的
+   `project_id` 比對;填路徑會一律拒絕)。只走這條路時不用設 `GITLAB_WEBHOOK_SECRET`(webhook 那條路停用,
+   啟動時會印一行說明)。先起執行驗證的沙盒(同 §3),再啟動服務:
 
    ```bash
+   scripts/sandbox.sh start          # 沒起的話,每份審查的執行驗證都是「沙盒不可用」、不會自動放行
    .venv/bin/python scripts/webhook_server.py --port 8000
    ```
 
-2. **CI/CD 變數** `SEGCRA_URL`:審查服務的位址(例如 `http://<審查主機>:8000`)。不是秘密,不用遮罩。
+2. **審查服務的位址** `SEGCRA_URL`(例如 `http://<審查主機>:8000`)寫在第 5 步 job 的 `variables:` 裡,
+   **不要**設成待審專案的 CI/CD 變數:它決定每個 MR 由哪一個服務判,指到一個一律回 `done 0` 的服務,
+   所有 MR 都會綠;專案設定裡的變數改了不留版本紀錄、也不經過審查。寫在設定專案(第 4 步)的 YAML 裡,
+   只有負責 CI 的人改得到,改動有歷史、可以走 MR 審查。專案與群組的 CI/CD 變數優先順序比 YAML 高,
+   **待審專案與它的群組都不要另設同名的 `SEGCRA_URL`**。
 3. **專用的 runner**(只給審查 job 用,其他 job 碰不到它;原因見 docs/06 第 4 節):
    - 用 **project runner**,只在待審專案建立:專案 → Settings → CI/CD → Runners,Tags 填
      `segcra-review`,不勾 *Run untagged jobs*,勾 *Lock to current projects*;不在其他專案啟用,
@@ -362,6 +368,7 @@ MR 看的同一條 pipeline 上,job 的結束碼決定能不能合併(0 放行�
      after_script: []
      variables:
        GIT_STRATEGY: none          # 不用取原始碼:審查服務自己向 GitLab 讀 MR
+       SEGCRA_URL: "http://<審查主機>:8000"   # 第 2 步:寫在這裡,不設成專案或群組的 CI/CD 變數
      timeout: 1h                   # 要比整份審查的上限長(REVIEW_TIMEOUT_SECONDS,預設 2400 秒)
      allow_failure:
        exit_codes: [3]             # needs_human:passed with warnings
@@ -519,11 +526,13 @@ ssh -L 8929:localhost:8929 <your-user>@<your-server>
 | 測資生成一直失敗(測資生成失敗 finding) | 小模型產不出合法 JSON;把 `config/models.yaml` 的 `roles.testgen` 指到較大的 profile(預設 review) |
 | GitLab 網頁打不開 | 先在該主機上 `docker ps -a --filter name=segcra-gitlab` 看容器起了沒;剛啟動要等 1~4 分鐘(ready 判準見 §8);GitLab 在遠端時,自己電腦要掛著 `ssh -L 8929:localhost:8929 <your-user>@<your-server>` |
 | commit status 沒鎖住 Merge 按鈕 | 專案 Settings → Merge requests 沒勾 **Pipelines must succeed**;或審的是舊 commit(push 新 commit 後要重審) |
-| CI 的審查 job 以 5 結束,印「審查服務沒有開始審查(HTTP 403)」 | 後面接著原因:`GITLAB_PROJECT` 填成路徑(要數字 id)、pipeline 不是 MR pipeline(`rules` 或 `workflow` 沒限定 `merge_request_event`)、要審的 commit 已經不是 MR 的 head(推了新 commit,看新的 pipeline) |
+| CI 的審查 job 以 5 結束,印「審查服務沒有開始審查(HTTP 403)」 | 呼叫者不符,後面接著原因:「job token 無效或 job 已經結束」(GitLab 拒絕了這把 token)、「job 所在的 pipeline 不是 MR pipeline」(`rules` 或 `workflow` 沒限定 `merge_request_event`)、「要審的 commit 不是 MR 目前的 head」(推了新 commit,看新的 pipeline)、「MR 不是開啟中」(已合併或關閉) |
+| 印「審查服務沒有開始審查(HTTP 502)」 | 審查服務向 GitLab 查不到,原因寫成「向 GitLab 查<job / job 所在的 pipeline / MR>失敗:<原因>」:連不上、逾時、憑證問題就查審查主機到 GitLab 的網路與 `GITLAB_URL`;401、403 就查 `GITLAB_TOKEN` 的權限(要讀得到這個專案的 pipeline 與 MR);5xx 看 GitLab 本身 |
+| 印「審查服務沒有開始審查(HTTP 503)」 | 審查服務驗不了呼叫者:原因寫「mock 模式」就是 `GITLAB_URL`、`GITLAB_TOKEN`、`GITLAB_PROJECT` 沒有設齊;寫「GITLAB_PROJECT 不是數字」就改成專案的數字 id(專案首頁看得到) |
 | CI 的審查 job 以 5 結束,印「審查服務沒有開始審查(HTTP 000)」 | runner 連不到審查服務:`SEGCRA_URL` 寫錯、服務沒起來、防火牆擋住 |
 | pipeline 直接失敗、沒有任何 job,訊息是 ``Project `…` not found or access denied!`` | 推 commit 的人讀不到 CI 設定專案:給他 Reporter,或把設定專案設成 Internal(External 使用者除外),見 §7 第 4 步 |
 | 審查 job 一直 pending | 沒有帶 `segcra-review` tag 的 runner 接得了:專用 runner 沒起來、沒設這個 tag,或沒在這個專案啟用(§7 第 3 步) |
-| 審查 job 印「連續查不到審查狀態」後以 5 結束 | 審查服務在審查途中重新啟動過,進行中的審查沒了。retry 這個 job |
+| 審查 job 印「連續查不到審查狀態」後以 5 結束 | 看後面最後一次的 HTTP 碼與原因:404「查不到這份審查」是審查服務在審查途中重新啟動過,進行中的審查沒了,retry 這個 job;502「向 GitLab 查job(用 job token)失敗」是審查期間審查服務連不到 GitLab(查法同上面 502 那列);000 是 runner 連不到審查服務(同 HTTP 000 那列) |
 
 ## 附錄:如何把工具層包回 MCP
 
