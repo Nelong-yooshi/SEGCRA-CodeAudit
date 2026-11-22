@@ -68,9 +68,10 @@ def test_時間夠就照送():
     assert len(sent) == 1 and 500 < sent[0] <= 600
 
 
-def test_巢狀時門檻取較大的_截止時間取較早的():
-    with agent.llm_deadline(600, min_left=10):
-        with agent.llm_deadline(900, min_left=30):
+@pytest.mark.parametrize("outer,inner", [(10, 30), (30, 10)])
+def test_巢狀時門檻取較大的_截止時間取較早的(outer, inner):
+    with agent.llm_deadline(600, min_left=outer):
+        with agent.llm_deadline(900, min_left=inner):
             left, need = agent._time_left()
     assert need == 30 and left <= 600
 
@@ -113,6 +114,20 @@ def test_主審查時間到了_記成主審查沒跑完(review, error):
     assert f["stage"] == "主審查"
     assert pipeline._FAILED_TITLE in pipeline.review_incomplete(report)
     assert report["decision"] != "auto_approved"
+
+
+def test_主審查的請求帶著每一步最少秒數的門檻(review, monkeypatch):
+    seen = []
+
+    async def record(*a, **k):
+        seen.append(agent._time_left())
+        raise openai.APIConnectionError(request=_REQ)
+    monkeypatch.setattr(pipeline, "run_agent", record)
+    review(openai.APIConnectionError(request=_REQ))      # fixture 會再換一次:這裡只借它的 MR 與路徑
+    seen.clear()
+    monkeypatch.setattr(pipeline, "run_agent", record)
+    asyncio.run(pipeline.review_mr(load_config(), "981"))
+    assert seen and seen[0] is not None and seen[0][1] == pipeline.MIN_STAGE_SECONDS
 
 
 def test_主審查連不上_不算沒跑完(review):
