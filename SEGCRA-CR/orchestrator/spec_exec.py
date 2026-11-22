@@ -34,7 +34,7 @@ from decimal import Decimal
 
 from toolbox.gitlab import UNAVAILABLE_TEXT, fetch_file
 from .agent import extract_json, output_truncated, run_agent
-from .config import Config, PKG_ROOT, check_config_file
+from .config import Config, PKG_ROOT, check_config_file, env_int, env_text
 from .error_text import error_label
 from .isolation import run_in_thread
 
@@ -1193,9 +1193,11 @@ def _sandbox_params() -> dict:
             if "=" in line and not line.lstrip().startswith("#"):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
-    return {"server": os.environ.get("SANDBOX_MSSQL_HOST", "127.0.0.1"),
-            "port": int(os.environ.get("SANDBOX_MSSQL_PORT", "1433")),
-            "user": os.environ.get("SANDBOX_MSSQL_USER", "sa"),
+    # 設了但是空的就停(_env_text):空的主機名連到哪裡看連線函式庫的預設,可能不是沙盒那台,
+    # MR 的 SQL 不能拿 sa 去那裡跑。環境變數(含空的)優先於 sandbox.env(上面用 setdefault 讀)
+    return {"server": env_text("SANDBOX_MSSQL_HOST", "127.0.0.1"),
+            "port": env_int("SANDBOX_MSSQL_PORT", 1433, hi=65535),
+            "user": env_text("SANDBOX_MSSQL_USER", "sa"),
             "password": os.environ.get("SANDBOX_MSSQL_PASSWORD", ""),
             "login_timeout": 10, "timeout": 120}
 

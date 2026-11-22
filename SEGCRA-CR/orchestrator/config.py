@@ -4,6 +4,9 @@ from pathlib import Path
 
 import yaml
 
+from .file_perms import PermissionProblem, check_file as _check_file, check_path as _check_path
+from .file_perms import permission_problem as _permission_problem  # noqa: F401  測試直接呼叫
+
 PKG_ROOT = Path(__file__).resolve().parent.parent
 
 # dbt 展開用的資料庫名稱:約定的固定假名(#14 review)。只用來把 ref()/source() 拼成
@@ -140,46 +143,69 @@ def _env_text(name: str) -> str | None:
     return value
 
 
+# ─── 讀環境變數的規則(這些 helper 都在這裡) ───
+# - 文字、整數、路徑(_env_text、env_int、env_path):**設了但是空的就停**(ConfigError,寫出變數名)。
+#   空的時退回預設值,等於用沒人指定的端點、資料庫、目錄繼續跑。
+# - 秒數、開關(env_seconds 等):讀不懂退回程式的預設值並印一行警告;等太短或沒送 timeout 時
+#   模型呼叫失敗也是交人工,不會因此放行。
+
+
+def env_text(name: str, default: str) -> str:
+    """文字型的環境變數,沒設時用 `default`;設了但是空的就停(見 _env_text)。預設值寫在呼叫端,
+    設定參數的檢查(env_registry)才對得到文件。"""
+    value = _env_text(name)
+    return default if value is None else value
+
+
+def env_int(name: str, default: int, *, lo: int = 1, hi: int | None = None) -> int:
+    """整數型的環境變數:沒設用預設;設了但是空的、不是整數、超出範圍就停,訊息寫出變數名。"""
+    raw = _env_text(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ConfigError(f"環境變數 {name} 的值不是整數({raw[:40]!r})") from None
+    if value < lo or (hi is not None and value > hi):
+        limit = f"{lo} 到 {hi}" if hi is not None else f"至少 {lo}"
+        raise ConfigError(f"環境變數 {name}={value} 超出範圍({limit})")
+    return value
+
+
+def env_path(name: str, default) -> Path:
+    """路徑型的環境變數:沒設用預設(repo 裡的目錄)。有設時先展開 `~`;設了但是空的、不是絕對路徑
+    就停(`Path("")` 是啟動目錄,相對路徑跟著啟動目錄走,讀寫到哪裡都是意外)。指到的檔案或目錄
+    與一路往上的每一層,群組或其他人可寫就停(file_perms.check_path):知識庫裡的 binding 會壓掉
+    finding,報告含 MR 的程式碼,誰改得到這些目錄不能是意外。`/` 開頭、`..` 不擋:能設環境變數的人
+    本來就能寫任何路徑。"""
+    raw = _env_text(name)
+    if raw is None:
+        return Path(default)
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ConfigError(f"環境變數 {name} 要是絕對路徑(目前是相對路徑,會跟著啟動目錄走)")
+    try:
+        _check_path(path)
+    except PermissionProblem as e:
+        raise ConfigError(f"環境變數 {name} 指到的位置:{e}") from None
+    return path
+
+
 # 模型設定檔裡 api_key 唯一接受的值(或不寫):Ollama 不驗證,這只是佔位
 _API_KEY_PLACEHOLDER = "ollama"
 
 
 def check_config_file(path: Path, *, secret: bool) -> None:
-    """讀設定檔前檢查權限,太寬就停(照 ssh 的做法)。**只看權限位元,不看擁有者**:設定檔
-    掛進容器時擁有者是主機的 uid,比對擁有者會誤判。
+    """讀設定檔前檢查權限,太寬就停(ConfigError)。規則在 file_perms.py,只有那一份:檔案本身、
+    實際的檔案所在的目錄一路往上到 `/`、路徑上的連結所在的目錄;只看權限位元,不看擁有者。
 
     - `secret=True`(gitlab.env、sandbox.env:裡面是密碼):群組或其他人**可讀或可寫**就停
-      (像 ssh 私鑰要 600)
     - `secret=False`(模型設定檔:不放金鑰,但別人改得到的話,端點換掉 → 金鑰與每個 MR 的
-      程式碼都送到他指定的地方;或把 policy 改寬):群組或其他人**可寫**就停
-    - 所在的目錄:群組或其他人可寫就停(目錄可寫就能把整個檔案換掉)
-
-    檔案不存在就不檢查(呼叫端各自處理「沒有這個檔」)。Windows 沒有 POSIX 的權限位元
-    (st_mode 只反映唯讀屬性),不檢查;部署端是 Linux。"""
-    if os.name != "posix" or not path.exists():
-        return
-    import stat
-    for target, is_dir in ((path, False), (path.parent, True)):
-        problem = _permission_problem(stat.S_IMODE(target.stat().st_mode), target,
-                                      secret=secret, is_dir=is_dir)
-        if problem:
-            raise ConfigError(problem)
-
-
-def _permission_problem(mode: int, target, *, secret: bool, is_dir: bool) -> str | None:
-    """權限位元 → 太寬時的說明(含路徑、目前的權限、要執行的 chmod);沒問題回 None。
-
-    跟讀檔分開,所以不在 POSIX 上也測得到每一種權限值。"""
-    if is_dir:
-        mask, need, what, how = 0o022, "755", "目錄", "改得到"
-    elif secret:
-        mask, need, what, how = 0o077, "600", "檔案(含密碼)", "讀得到或改得到"
-    else:
-        mask, need, what, how = 0o022, "644", "設定檔", "改得到"
-    if not mode & mask:
-        return None
-    return (f"{what} {target} 的權限太寬({mode:o}):群組或其他帳號{how},"
-            f"不往下跑。請執行:chmod {need} {target}")
+      程式碼都送到他指定的地方;或把 policy 改寬):群組或其他人**可寫**就停"""
+    try:
+        _check_file(path, secret=secret)
+    except PermissionProblem as e:
+        raise ConfigError(str(e)) from None
 
 
 @dataclass
@@ -296,6 +322,30 @@ def _yaml_api_key(raw: dict) -> str:
     return value
 
 
+_DEFAULT_ENDPOINT = "http://localhost:11434/v1"
+
+
+def _check_endpoint(value, source: str) -> str:
+    """最後要用的模型端點:字串、去掉前後空白後不是空的、http 或 https、有主機。不符就停。
+
+    設定檔的 `endpoint:` 空著時 YAML 讀到的是 None,openai 套件收到 `base_url=None` 會改用
+    `OPENAI_BASE_URL`,沒有的話送到 api.openai.com —— MR 的程式碼和 LLM_API_KEY 一起送到外部。
+    沒有 `http://` 的位址也不自動補:補錯了一樣是送到沒人指定的地方。訊息寫出來源,不寫出值
+    (網址可能帶通行碼)。"""
+    from urllib.parse import urlsplit
+    text = value.strip() if isinstance(value, str) else ""
+    try:
+        parts = urlsplit(text)
+        ok = parts.scheme in ("http", "https") and bool(parts.hostname)
+    except ValueError:
+        ok = False
+    if not ok:
+        raise ConfigError(
+            f"模型端點({source})不是有效的網址:要是 http:// 或 https:// 開頭、有主機名稱的位址"
+            "(例如 http://localhost:11434/v1)。值不寫出來(可能帶通行碼)")
+    return text
+
+
 # 其他會讀的設定檔(有的話):密碼類,群組與其他人不能讀寫。load_config 是服務啟動時就會
 # 呼叫的,在這裡一起檢查,權限不對時服務起不來,而不是等到第一份審查用到才失敗
 _SECRET_FILES = ("gitlab.env", "sandbox.env")
@@ -319,7 +369,13 @@ def load_config(path: Path | None = None) -> Config:
         check_config_file(PKG_ROOT / "config" / name, secret=True)
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     # endpoint 可用環境變數覆蓋(如 Ollama 掛在遠端或 tunnel 上;OpenAI 相容的端點都可以)
-    endpoint = _env_text("OLLAMA_URL") or raw.get("endpoint", "http://localhost:11434/v1")
+    env_endpoint = _env_text("OLLAMA_URL")
+    if env_endpoint is not None:
+        endpoint, source = env_endpoint, "環境變數 OLLAMA_URL"
+    else:
+        endpoint = raw["endpoint"] if "endpoint" in raw else _DEFAULT_ENDPOINT
+        source = f"模型設定檔 {path} 的 endpoint"
+    endpoint = _check_endpoint(endpoint, source)
     # 端點要驗證時,金鑰用環境變數給,不寫進設定檔(會進版控與離線包;見 _yaml_api_key)
     yaml_key = _yaml_api_key(raw)
     api_key = _env_text("LLM_API_KEY") or yaml_key

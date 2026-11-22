@@ -31,7 +31,8 @@ ERRORS = [
     (openai.APIConnectionError(message=SECRET, request=_REQ), "connection"),
     (_status(openai.RateLimitError, 429), "rate_limited"),
     (_status(openai.BadRequestError, 400), "rejected"),
-    (_status(openai.AuthenticationError, 401), "rejected"),
+    (_status(openai.AuthenticationError, 401), "rejected_key"),
+    (_status(openai.PermissionDeniedError, 403), "rejected_key"),
     (_status(openai.InternalServerError, 500), "server_error"),
     (_status(openai.APIStatusError, 503), "server_error"),
     (RuntimeError(SECRET), "other"),
@@ -92,6 +93,29 @@ def test_確定性結果照常報出_補major_不得放行(review, error, kind):
 def test_沒有任何確定性命中時也交人工(review):
     report, _ = review("SELECT id FROM t WHERE id = 1", openai.APIConnectionError(request=_REQ))
     assert len(_failed(report)) == 1 and report["decision"] == "needs_human"
+
+
+
+def test_金鑰被拒絕時說是金鑰_400_維持原本的說法():
+    text = pipeline._MODEL_FAILURE_TEXT
+    assert "LLM_API_KEY" in text["rejected_key"] and "金鑰" in text["rejected_key"]
+    assert "LLM_API_KEY" not in text["rejected"]
+    assert pipeline._model_failure_kind(_status(openai.BadRequestError, 400)) == "rejected"
+
+
+def test_SQL_方言不是_tsql_時_log_報告_MR_總結都寫一句(review, monkeypatch, capsys):
+    monkeypatch.setattr(pipeline, "DIALECT", "ansi")
+    report, output = review("SELECT id FROM t WHERE id = 1", openai.APIConnectionError(request=_REQ))
+    assert report["_sql_dialect"] == "ansi"
+    assert "不是正式環境的 tsql" in report["summary"]
+    assert "不是正式環境的 tsql" in capsys.readouterr().out
+    posted = "".join(p.read_text(encoding="utf-8") for p in output.rglob("*.json"))
+    assert "不是正式環境的 tsql" in posted
+
+
+def test_SQL_方言是_tsql_時不寫(review):
+    report, _ = review("SELECT id FROM t WHERE id = 1", openai.APIConnectionError(request=_REQ))
+    assert "_sql_dialect" not in report and "tsql" not in report["summary"]
 
 
 @pytest.mark.parametrize("error,kind", ERRORS)

@@ -2145,7 +2145,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             capture["raw"] = raw
         # 存模型原始輸出(未經 pipeline 後處理),供原汁原味檢視
         import os as _os
-        _raw_dir = Path(_os.environ.get("REVIEW_OUTPUT", PKG_ROOT / "review_output"))
+        from .config import env_path
+        _raw_dir = env_path("REVIEW_OUTPUT", PKG_ROOT / "review_output")
         try:
             if raw is not None:             # 模型呼叫失敗時沒有輸出,不寫
                 _raw_dir.mkdir(parents=True, exist_ok=True)
@@ -2257,6 +2258,14 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_dbt_exec_note(report, dbt_exec)  # dbt model 沒有送進沙盒的原因
         report = enforce_dbt_unexecuted(report, mr, dbt_ctx, cfg.dbt, executed_dbt)  # dbt 的變更沒被執行驗證到
         report = enforce_spec_change(report, mr)  # MR 改到規格檔:改了什麼、前後是否一致
+        # SQL_DIALECT 不是 tsql(開發測試用):規則層用別的方言解析,結果會跟正式環境不同。
+        # 每一份審查的 log、報告、MR 的總結都寫一句,不能只在啟動時說一次
+        if DIALECT != "tsql":
+            note = (f"(開發測試設定:SQL 方言是 {DIALECT},不是正式環境的 tsql,"
+                    "這份審查的結果會跟正式環境不同)")
+            print(f"[pipeline] MR !{mr_id} 警告:{note}", flush=True)
+            report["_sql_dialect"] = DIALECT
+            report["summary"] = f"{note}\n\n{report.get('summary', '')}"
 
         # 判斷校準:嚴重度交給能確定性驗證的證據決定,不是模型的語氣,也不是
         # 「有沒有找到規格」。順序上必須在執行驗證之後(要用它的條件與案例結果)、
@@ -4205,6 +4214,7 @@ _MODEL_FAILURE_TEXT = {
     "connection": "連不上審查模型的端點",
     "rate_limited": "審查模型的端點忙碌中(請求過多)",
     "rejected": "審查模型的端點拒絕了這次請求(例如輸入超過模型的上限,或權限、設定不符)",
+    "rejected_key": "審查模型的端點拒絕了金鑰(HTTP 401/403):確認環境變數 LLM_API_KEY",
     "server_error": "審查模型的端點發生錯誤",
     "other": "呼叫審查模型時發生非預期的錯誤",
     "no_time": "整份審查剩下的時間不夠(前面的檢查用掉了大部分時間),沒有呼叫審查模型",
@@ -4226,6 +4236,8 @@ def _model_failure_kind(error: BaseException) -> str:
         status = getattr(error, "status_code", None)
         if isinstance(status, int) and status >= 500:
             return "server_error"
+        if status in (401, 403):
+            return "rejected_key"
         return "rejected"
     return "other"
 

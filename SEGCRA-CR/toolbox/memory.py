@@ -17,13 +17,15 @@ import re
 import time
 from pathlib import Path
 
+from orchestrator.config import env_path
+
 from . import knowledge_store as ks
 from . import style_learn
 
 PKG_ROOT = Path(__file__).resolve().parent.parent
 
-HISTORY_FILE = Path(os.environ.get("MEMORY_HISTORY",
-                                   PKG_ROOT / "memory" / "review_history" / "history.jsonl"))
+# 有設時要絕對路徑、設了但是空的就停(見 config.env_path):判例會影響之後的審查
+HISTORY_FILE = env_path("MEMORY_HISTORY", PKG_ROOT / "memory" / "review_history" / "history.jsonl")
 
 
 def _scope_list(scope: str) -> list[str]:

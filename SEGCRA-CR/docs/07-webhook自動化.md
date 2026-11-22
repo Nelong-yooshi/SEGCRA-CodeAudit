@@ -43,12 +43,12 @@ webhook server 本身不產生 finding、不動 severity、不參與三態決策
 
 ## 怎麼驗證它在動
 
-不需要 GitLab、不需要模型就能驗證路由/token 驗證/取消重審三件事(mock 模式,`GITLAB_URL` 不設):
+不需要 GitLab、不需要模型就能驗證路由/token 驗證/取消重審三件事(mock 模式:GitLab 的三個環境變數都不設,啟動時加 `--mock`。服務沒接上 GitLab 又沒加 `--mock` 時不啟動;加了之後啟動時與每一份審查的 log 都會提醒「結果只寫進本機檔案」):
 
 ```bash
 cd SEGCRA-CR
 export GITLAB_WEBHOOK_SECRET=test123
-.venv/bin/python scripts/webhook_server.py --port 8000
+.venv/bin/python scripts/webhook_server.py --port 8000 --mock
 # 另開 shell:
 
 # 1. 健康檢查

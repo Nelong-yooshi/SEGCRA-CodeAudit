@@ -271,9 +271,10 @@ def test_模型設定檔_群組或其他人能改就停(mode, ok):
 
 
 @pytest.mark.parametrize("mode,ok", [(0o755, True), (0o700, True), (0o775, False),
-                                     (0o777, False), (0o1777, False), (0o757, False)])
+                                     (0o777, False), (0o1777, True), (0o757, False)])
 def test_所在目錄_群組或其他人能改就停(mode, ok):
-    """目錄可寫就能把整個檔案換掉。"""
+    """目錄可寫就能把整個檔案換掉。有 sticky bit(1777,像 /tmp)時其他帳號不能改名或刪掉
+    不是自己的項目,換不掉,所以不算太寬。"""
     problem = _permission_problem(mode, "/srv/segcra/config", secret=True, is_dir=True)
     assert (problem is None) is ok
     if problem:
@@ -365,3 +366,103 @@ def test_讀密碼檔的地方都先檢查權限():
     assert config._SECRET_FILES == ("gitlab.env", "sandbox.env")
     sh = (PKG_ROOT / "scripts" / "sandbox.sh").read_text(encoding="utf-8")
     assert 'check_secret_file "$ENV_FILE"' in sh
+
+
+# ─────────── 權限:連結的目標、上層目錄、sticky bit、sandbox.sh 用同一份規則 ───────────
+
+def _mkdir(path, mode):
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(mode)
+    return path
+
+
+def _write(path, mode, text="x: 1\n"):
+    path.write_text(text, encoding="utf-8")
+    path.chmod(mode)
+    return path
+
+
+@posix_only
+@pytest.mark.parametrize("name,mode,secret", [("models.yaml", 0o644, False), ("sandbox.env", 0o600, True)])
+def test_連結指到可寫的目錄就停(tmp_path, name, mode, secret):
+    shared = _mkdir(tmp_path / "shared", 0o777)
+    target = _write(shared / name, mode)
+    cfg = _mkdir(tmp_path / "app" / "config", 0o755)
+    (tmp_path / "app").chmod(0o755)
+    link = cfg / name
+    link.symlink_to(target)
+    with pytest.raises(ConfigError, match=str(shared)):
+        check_config_file(link, secret=secret)
+
+
+@posix_only
+def test_上層目錄可寫就停_訊息寫出是哪一層(tmp_path):
+    srv = _mkdir(tmp_path / "srv", 0o775)
+    app = _mkdir(srv / "SEGCRA-CR", 0o775)
+    cfg = _mkdir(app / "config", 0o755)
+    f = _write(cfg / "models.yaml", 0o644)
+    with pytest.raises(ConfigError) as e:
+        check_config_file(f, secret=False)
+    assert f"chmod 755 {app}" in str(e.value) and "上層" in str(e.value)
+    app.chmod(0o755)
+    with pytest.raises(ConfigError, match=f"chmod 755 {srv}"):
+        check_config_file(f, secret=False)
+    srv.chmod(0o755)
+    check_config_file(f, secret=False)
+
+
+@posix_only
+def test_連結所在的目錄可寫也停(tmp_path):
+    real_dir = _mkdir(tmp_path / "real", 0o755)
+    target = _write(real_dir / "models.yaml", 0o644)
+    link_dir = _mkdir(tmp_path / "linkdir", 0o777)
+    link = link_dir / "models.yaml"
+    link.symlink_to(target)
+    with pytest.raises(ConfigError, match=str(link_dir)):
+        check_config_file(link, secret=False)
+
+
+@posix_only
+def test_連結指到權限正確的位置照常通過(tmp_path):
+    real_dir = _mkdir(tmp_path / "real", 0o755)
+    target = _write(real_dir / "models.yaml", 0o644)
+    link_dir = _mkdir(tmp_path / "linkdir", 0o755)
+    link = link_dir / "models.yaml"
+    link.symlink_to(target)
+    check_config_file(link, secret=False)
+
+
+@posix_only
+def test_有_sticky_bit_的上層目錄不算太寬(tmp_path):
+    sticky = _mkdir(tmp_path / "tmpish", 0o1777)
+    cfg = _mkdir(sticky / "cfg", 0o755)
+    check_config_file(_write(cfg / "models.yaml", 0o644), secret=False)
+    loose = _mkdir(tmp_path / "loose", 0o777)
+    cfg2 = _mkdir(loose / "cfg", 0o755)
+    with pytest.raises(ConfigError, match=str(loose)):
+        check_config_file(_write(cfg2 / "models.yaml", 0o644), secret=False)
+
+
+def test_沒有_sticky_bit_才算太寬_權限值本身():
+    from orchestrator.file_perms import permission_problem
+    assert permission_problem(0o41777, "/tmp", secret=True, is_dir=True) is None
+    assert permission_problem(0o40777, "/x", secret=True, is_dir=True)
+
+
+@posix_only
+@pytest.mark.parametrize("mode,ok", [(0o644, False), (0o600, True)])
+def test_sandbox_sh_實際執行_用同一份規則(tmp_path, mode, ok):
+    import shutil
+    import subprocess
+    if shutil.which("python3") is None or shutil.which("bash") is None:
+        pytest.skip("要有 python3 與 bash")
+    d = _mkdir(tmp_path / "cfg", 0o755)
+    env_file = _write(d / "sandbox.env", mode, "SANDBOX_MSSQL_PASSWORD=x\n")
+    # 沒有的子指令:權限檢查在分派子指令之前,檢查過了才會走到「用法」那一行(不會碰 docker)
+    r = subprocess.run(["bash", str(PKG_ROOT / "scripts" / "sandbox.sh"), "沒有這個子指令"],
+                       env={**os.environ, "SANDBOX_ENV_FILE": str(env_file)},
+                       capture_output=True, text=True, timeout=60)
+    if ok:
+        assert "權限太寬" not in r.stderr
+    else:
+        assert r.returncode != 0 and "chmod 600" in r.stderr, r.stderr
