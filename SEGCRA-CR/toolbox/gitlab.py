@@ -800,48 +800,75 @@ def set_label(mr_id: str, label: str) -> str:
 # 審查做成部署端 CI 的一個 job 時(見 orchestrator/ci_gate.py),審查服務要確認呼叫它的是
 # 這個專案、這個 MR 的 pipeline 裡正在跑的 job。
 
+class GitLabLookupFailed(Exception):
+    """CI 那條路向 GitLab 查 job、pipeline、MR 取不到(連不上、逾時、非 2xx、內容不對)。
+
+    跟「查到了、但不符合」分開:查不到時不能說成 job token 無效或 MR 不是開啟中。底下的例外放在
+    `__cause__`,說法由 ci_gate.lookup_failure_text 照型別與狀態碼給(不帶例外原文)。"""
+
+    def __init__(self, what: str):
+        super().__init__(what)
+        self.what = what
+
+
+# GET /job 帶的是 job 的 token:GitLab 拒絕這把 token 時回的狀態碼。在測試 GitLab 上量過:亂打的 token
+# 與 job 已經結束後的 token 都是 401(執行中是 200)。其他狀態碼(包括 403)沒量到過,算取不到,不說成 token 無效
+JOB_TOKEN_REJECTED_STATUS = frozenset({401})
+
+
 def job_from_token(job_token: str) -> dict | None:
     """用 CI job 的 CI_JOB_TOKEN 向 GitLab 查它是哪一個 job(GET /job,帶 JOB-TOKEN)。
 
-    token 無效、job 已經結束、或 GitLab 回錯誤時回 None。只在 real 模式有意義;mock 模式回 None。
+    GitLab 拒絕這把 token(JOB_TOKEN_REJECTED_STATUS)、或 token 是空的 / 太長 / 不是 ASCII 可印字元時
+    回 None(確定不符)。
+    連不上、其他狀態碼、內容不是物件時丟 GitLabLookupFailed(取不到)。只在 real 模式呼叫。
     token 是呼叫端送來的(不可信),只放在 header,不記 log。"""
-    if not REAL_MODE or not isinstance(job_token, str) or not job_token or len(job_token) > 512:
+    # GitLab 發的 job token 是 ASCII 可印字元;其他的不用問 GitLab 就知道不是(放進 header 也會丟例外)
+    if (not isinstance(job_token, str) or not job_token or len(job_token) > 512
+            or not job_token.isascii() or not job_token.isprintable()):
         return None
     import httpx
     try:
+        check_ssl_cert_file()
         r = httpx.get(f"{GITLAB_URL}/api/v4/job", headers={"JOB-TOKEN": job_token}, timeout=30)
-        if r.status_code != 200:
+        if r.status_code in JOB_TOKEN_REJECTED_STATUS:
             return None
+        r.raise_for_status()
         job = r.json()
-    except Exception:                        # noqa: BLE001 — 查不到就是驗證失敗
-        return None
-    return job if isinstance(job, dict) else None
+        if not isinstance(job, dict):
+            raise NotAnMR("GET /job 的回應不是物件")
+    except Exception as e:                   # noqa: BLE001 — 取不到,原因由呼叫端照型別說
+        raise GitLabLookupFailed("job(用 job token)") from e
+    return job
 
 
-def pipeline_info(pipeline_id: int) -> dict | None:
-    """這個專案的某條 pipeline(GET /projects/:id/pipelines/:pipeline_id);取不到回 None。"""
-    if not REAL_MODE or not isinstance(pipeline_id, int) or isinstance(pipeline_id, bool):
-        return None
+def pipeline_info(pipeline_id: int) -> dict:
+    """這個專案的某條 pipeline(GET /projects/:id/pipelines/:pipeline_id)。取不到丟 GitLabLookupFailed。"""
     try:
+        if not isinstance(pipeline_id, int) or isinstance(pipeline_id, bool):
+            raise NotAnMR("pipeline 的 id 不是整數")
         info = _api("GET", f"/pipelines/{pipeline_id}")
-    except Exception:                        # noqa: BLE001
-        return None
-    return info if isinstance(info, dict) else None
+        if not isinstance(info, dict):
+            raise NotAnMR("pipeline 的回應不是物件")
+    except Exception as e:                   # noqa: BLE001
+        raise GitLabLookupFailed("job 所在的 pipeline") from e
+    return info
 
 
 def mr_head(mr_id: str) -> dict | None:
-    """MR 目前的 head commit 與狀態(GET /merge_requests/:iid):{sha, state, source_project_id};
-    取不到回 None。"""
+    """MR 目前的 head commit 與狀態(GET /merge_requests/:iid):{sha, state, source_project_id}。
+
+    real 模式取不到丟 GitLabLookupFailed;mock 模式沒有這個 MR 的 fixture 時回 None。"""
     mr_id = _check_mr_id(mr_id)
     if not REAL_MODE:
         try:
             mr = _mock_mr(mr_id)
-        except FileNotFoundError:            # 沒有這個 MR 的 fixture:跟 real 模式取不到一樣回 None
+        except FileNotFoundError:            # 沒有這個 MR 的 fixture
             return None
         return {"sha": mr.get("sha", f"mock-{mr_id}"), "state": "opened", "source_project_id": None}
     try:
-        mr = _api("GET", f"/merge_requests/{mr_id}")
-    except Exception:                        # noqa: BLE001
-        return None
+        mr = _as_mr(_api("GET", f"/merge_requests/{mr_id}"))
+    except Exception as e:                   # noqa: BLE001
+        raise GitLabLookupFailed("MR") from e
     return {"sha": mr.get("sha") or "", "state": mr.get("state") or "",
             "source_project_id": mr.get("source_project_id")}

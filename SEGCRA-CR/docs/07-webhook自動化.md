@@ -7,7 +7,7 @@
 ## 防的是什麼
 
 - **防「忘了審」**:審查若靠人手動觸發,漏跑一次就等於該 MR 完全沒有 AI 防線(漏報的最上游形態)。webhook 把觸發變成事件驅動,MR 一動就審。
-- **防別的 job 冒用 `/ci/review`**:這個入口只認這個專案、這個 MR 的 MR pipeline 正在跑的 job(拿 job 的 `JOB-TOKEN` 向 GitLab 查,再確認 ref、sha 與 MR 目前的 head,`ci_gate.check_request`),不符回 403;查詢編號只有開始那份審查、還在執行中的 job 查得到。
+- **防別的 job 冒用 `/ci/review`**:這個入口只認這個專案、這個 MR 的 MR pipeline 正在跑的 job(拿 job 的 `JOB-TOKEN` 向 GitLab 查,再確認 ref、sha 與 MR 目前的 head,`ci_gate.check_request`),不符回 403、向 GitLab 查不到回 502(原因寫出是哪一個查詢、為什麼)、mock 模式或 `GITLAB_PROJECT` 不是數字回 503,三種都不開始審查;查詢編號只有開始那份審查、還在執行中的 job 查得到。
 - **防外部亂打**:server 監聽 `0.0.0.0`,任何能連到這台機器的人都打得到 endpoint。沒有 token 驗證的話,攻擊者可以偽造 payload 對任意 MR 觸發審查(浪費 GPU 資源)、甚至藉由灌事件干擾正常審查節奏。這裡用密鑰比對確定性擋掉,不是靠「應該沒人知道這個 URL」。
 - **防自我觸發迴圈**:審查完成會回寫留言,留言又會發 note webhook——若 note 事件無條件重審,就是無限迴圈燒 GPU。所以 note 事件只認寫在留言開頭的 `/review` 指令(網址、內文裡的 `/review`、`/reviews` 都不算),且 bot 帳號(username 以 `ai-` 或 `root` 開頭)的留言一律忽略。這是機制擋,不是期待模型或人「小心一點」。
 - **防重複觸發**:GitLab 對同一 MR 短時間可能連發多個 update 事件。只有**真的推了新 commit**(事件帶 `oldrev`)才會重審,其餘 update(改 label、標題、描述、指派人 —— 包括審查自己最後加 label 那一下)一律忽略。推了新 commit 時取消進行中的那次、改審新的:舊的那次審的是舊程式,結論貼到新 commit 上是錯的。
@@ -107,24 +107,24 @@ curl -s -X POST http://127.0.0.1:8000/gitlab-webhook \
 
 步驟 3 的背景審查在 mock 模式會去讀 `fixtures/mr_1.json`——該檔不存在,所以 server 會印「MR !1 審查失敗:...」後把 iid 從 `_inflight` 移除,這同時驗證了 graceful 失敗與 `_inflight` 的清理(再發一次事件又能觸發)。要跑完整審查:`cp fixtures/mr_001.json fixtures/mr_1.json` 且模型 profile 可用,審完 stdout 會印「MR !1 審完:決策=... 分數=... findings=...」,結果落在 `review_output/mr_1_review.json`。接真 GitLab 則用 webhook 設定頁的 Test 按鈕。
 
-`/ci/review` 在本機驗得到的是擋人的那幾步(mock 模式沒有 GitLab,查不到任何 job;服務照上面啟動):
+`/ci/review` 在本機(mock 模式)驗得到的只有「不開始審查」:mock 模式沒有 GitLab,驗不了呼叫者,參數對的請求一律回 503(服務照上面啟動):
 
 ```bash
 # 7. body 不對 → 400
 curl -s -w ' %{http_code}\n' -X POST http://127.0.0.1:8000/ci/review -H 'JOB-TOKEN: x' -d '{"mr_iid": 1}'
 # → mr_iid 要是正整數、sha 要是 40 碼的 commit 400
 
-# 8. JOB-TOKEN 不是這個 MR 正在跑的 job → 403
+# 8. mock 模式:驗不了呼叫者,一律不開始 → 503
 curl -s -w ' %{http_code}\n' -X POST http://127.0.0.1:8000/ci/review -H 'JOB-TOKEN: x' \
   -d '{"mr_iid": 1, "sha": "0000000000000000000000000000000000000000"}'
-# → job token 無效或 job 已經結束 403
+# → 審查服務在 mock 模式(GITLAB_URL、GITLAB_TOKEN、GITLAB_PROJECT 沒有設齊),沒有 GitLab,CI 那條路驗不了呼叫者,一律不開始審查 503
 
 # 9. 查不存在的編號 → 404
 curl -s -w ' %{http_code}\n' http://127.0.0.1:8000/ci/review/nope -H 'JOB-TOKEN: x'
 # → 查不到這份審查(編號不對,或審查服務重新啟動過) 404
 ```
 
-完整的檢查(專案、MR pipeline、ref、sha、MR 的 head)由 `tests/test_ci_gate.py` 驗;實際接 GitLab 見 06 篇「怎麼驗證它在動」(c)。
+完整的檢查(專案、MR pipeline、ref、sha、MR 的 head)由 `tests/test_ci_gate.py` 驗,向 GitLab 查不到時的說法(連不上、非 2xx、內容不對)由 `tests/test_ci_lookup.py` 對假的 GitLab 驗;實際接 GitLab 見 06 篇「怎麼驗證它在動」(c)。
 
 ## 時間上限與未完成的處理(#45 / #53 review)
 

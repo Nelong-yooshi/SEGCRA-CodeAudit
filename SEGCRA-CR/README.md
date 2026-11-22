@@ -525,11 +525,13 @@ ssh -L 8929:localhost:8929 <your-user>@<your-server>
 | 測資生成一直失敗(測資生成失敗 finding) | 小模型產不出合法 JSON;把 `config/models.yaml` 的 `roles.testgen` 指到較大的 profile(預設 review) |
 | GitLab 網頁打不開 | 先在該主機上 `docker ps -a --filter name=segcra-gitlab` 看容器起了沒;剛啟動要等 1~4 分鐘(ready 判準見 §8);GitLab 在遠端時,自己電腦要掛著 `ssh -L 8929:localhost:8929 <your-user>@<your-server>` |
 | commit status 沒鎖住 Merge 按鈕 | 專案 Settings → Merge requests 沒勾 **Pipelines must succeed**;或審的是舊 commit(push 新 commit 後要重審) |
-| CI 的審查 job 以 5 結束,印「審查服務沒有開始審查(HTTP 403)」 | 後面接著原因:`GITLAB_PROJECT` 填成路徑(要數字 id)、pipeline 不是 MR pipeline(`rules` 或 `workflow` 沒限定 `merge_request_event`)、要審的 commit 已經不是 MR 的 head(推了新 commit,看新的 pipeline) |
+| CI 的審查 job 以 5 結束,印「審查服務沒有開始審查(HTTP 403)」 | 呼叫者不符,後面接著原因:「job token 無效或 job 已經結束」(GitLab 拒絕了這把 token)、「job 所在的 pipeline 不是 MR pipeline」(`rules` 或 `workflow` 沒限定 `merge_request_event`)、「要審的 commit 不是 MR 目前的 head」(推了新 commit,看新的 pipeline)、「MR 不是開啟中」(已合併或關閉) |
+| 印「審查服務沒有開始審查(HTTP 502)」 | 審查服務向 GitLab 查不到,原因寫成「向 GitLab 查<job / job 所在的 pipeline / MR>失敗:<原因>」:連不上、逾時、憑證問題就查審查主機到 GitLab 的網路與 `GITLAB_URL`;401、403 就查 `GITLAB_TOKEN` 的權限(要讀得到這個專案的 pipeline 與 MR);5xx 看 GitLab 本身 |
+| 印「審查服務沒有開始審查(HTTP 503)」 | 審查服務驗不了呼叫者:原因寫「mock 模式」就是 `GITLAB_URL`、`GITLAB_TOKEN`、`GITLAB_PROJECT` 沒有設齊;寫「GITLAB_PROJECT 不是數字」就改成專案的數字 id(專案首頁看得到) |
 | CI 的審查 job 以 5 結束,印「審查服務沒有開始審查(HTTP 000)」 | runner 連不到審查服務:`SEGCRA_URL` 寫錯、服務沒起來、防火牆擋住 |
 | pipeline 直接失敗、沒有任何 job,訊息是 ``Project `…` not found or access denied!`` | 推 commit 的人讀不到 CI 設定專案:給他 Reporter,或把設定專案設成 Internal(External 使用者除外),見 §7 第 4 步 |
 | 審查 job 一直 pending | 沒有帶 `segcra-review` tag 的 runner 接得了:專用 runner 沒起來、沒設這個 tag,或沒在這個專案啟用(§7 第 3 步) |
-| 審查 job 印「連續查不到審查狀態」後以 5 結束 | 審查服務在審查途中重新啟動過,進行中的審查沒了。retry 這個 job |
+| 審查 job 印「連續查不到審查狀態」後以 5 結束 | 看後面最後一次的 HTTP 碼與原因:404「查不到這份審查」是審查服務在審查途中重新啟動過,進行中的審查沒了,retry 這個 job;502「向 GitLab 查job(用 job token)失敗」是審查期間審查服務連不到 GitLab(查法同上面 502 那列);000 是 runner 連不到審查服務(同 HTTP 000 那列) |
 
 ## 附錄:如何把工具層包回 MCP
 
