@@ -33,7 +33,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from toolbox.gitlab import UNAVAILABLE_TEXT, fetch_file
-from .agent import extract_json, output_truncated, run_agent
+from .agent import LlmNoTimeLeft, extract_json, is_timeout, output_truncated, run_agent
 from .config import Config, PKG_ROOT
 from .isolation import run_in_thread
 
@@ -1011,6 +1011,7 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
     user = f"規則 {spec_code} 的核定規格如下,請產出測資計畫 JSON:\n\n{spec_text}"
     profile = cfg.role_profile("testgen") if profile_name is None else cfg.profile(profile_name)
     llm_error = None
+    timed_out = False       # 有一次是時間到了(請求逾時或剩的時間不夠):失敗時記成這一環節沒跑完
     truncated = 0
     malformed = 0
     filling = False          # 這一輪送出去的是「只補缺的」還是整份重來
@@ -1042,6 +1043,9 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
                                   use_tools=False, verbose=False, meta=meta)
         except Exception as e:   # LLM 傳輸層失敗(連線/逾時)→ 降級為「測資生成失敗」,不炸管線
             llm_error = f"{type(e).__name__}: {e}"
+            timed_out = timed_out or is_timeout(e)
+            if isinstance(e, LlmNoTimeLeft):
+                break        # 剩的時間不夠:不再重試(再送也一樣不送)
             continue
         # 被 max_tokens 截斷 → 這次結果一律不可信,連看都不看就重試。
         # **這一關不能靠 _shape_check 代勞**:截斷的 JSON 會被 extract_json 的
@@ -1171,7 +1175,9 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
         reason = f"測資生成失敗(LLM 呼叫失敗:{llm_error})"
     else:
         reason = f"測資生成失敗({max_attempts} 次嘗試皆無合法輸出)"
-    return {"schema_ddl": [], "conditions": [], "cases": []}, [reason], []
+    # 時間到了才失敗的:不是測資或模型的問題,是這一環節沒跑完(呼叫端記成帶 stage 的 finding)
+    return ({"schema_ddl": [], "conditions": [], "cases": [], "timed_out": timed_out},
+            [reason], [])
 
 
 # ------------------------------------------------------------------ 2. 確定性執行
@@ -1463,7 +1469,9 @@ async def arbitrate(cfg: Config, spec_text: str, sql: str, mismatch: dict,
     except Exception as e:   # LLM 傳輸層失敗 → 與「輸出無法解析」同樣保守處理,不炸管線
         return {"who_is_wrong": "sql",
                 "reason": f"(仲裁 LLM 呼叫失敗:{type(e).__name__},保守列為 SQL 側待人工確認)",
-                "arbiter_unparseable": True}
+                "arbiter_unparseable": True,
+                # 時間到了:仲裁沒有結論,呼叫端記成這一環節沒跑完,不混進「實作與規格行為不符」
+                "arbiter_timed_out": is_timeout(e)}
     d = extract_json(raw) or {}
     if d.get("who_is_wrong") not in ("testdata", "sql"):
         return {"who_is_wrong": "sql", "reason": "(仲裁輸出無法解析,保守列為 SQL 側待人工確認)",
@@ -1472,6 +1480,20 @@ async def arbitrate(cfg: Config, spec_text: str, sql: str, mismatch: dict,
 
 
 # ------------------------------------------------------------------ 主流程
+STAGE_GENERATE_NAME = "執行驗證(測資生成)"
+STAGE_ARBITRATE_NAME = "執行驗證(仲裁)"
+
+
+def _unfinished(path: str, stage: str, why: str, title: str | None = None) -> dict:
+    """這一環節沒跑完:帶 `stage`(pipeline.review_incomplete 靠它認,不比對標題),決策不放行、
+    CI 那條路是「沒有結論」。形狀與 pipeline._incomplete_finding 相同;不從 pipeline import
+    (pipeline 匯入 spec_exec,反向會變成循環匯入)。"""
+    return {**_finding(path, "major", title or f"[{stage}] 審查未完整(逾時)",
+                       f"{why}。這一環節的結果不在本報告內。",
+                       "請人工確認這一環節原本要檢查的內容;其餘環節的結果仍然有效。"),
+            "stage": stage}
+
+
 def _finding(path: str, severity: str, title: str, detail: str, suggestion: str = "") -> dict:
     # _source:這條是程式(執行驗證)自己產生的,不是模型講的。後處理的校準只對
     # 模型的指控動作,拿證據去對照證據會把唯一真的跑過的那條降級。
@@ -1956,6 +1978,12 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
         _leave(STAGE_GENERATE, _t)
     dropped_cases += [{"case_id": (d.get("case") or {}).get("case_id", "?"),
                        "by": "shape-check", "reason": d["reason"]} for d in malformed]
+    if not plan["cases"] and plan.get("timed_out"):
+        findings.append(_unfinished(path, STAGE_GENERATE_NAME, "測資生成的模型呼叫逾時,或剩的時間不夠再送一次"))
+        return {"passed": False, "spec_code": spec_code,
+                "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
+                "case_results": [], "dropped_cases": dropped_cases,
+                "stage_seconds": stage_seconds, "findings": findings}
     if not plan["cases"]:
         findings.append(_finding(path, "major", "執行驗證無法完成(測資生成失敗)",
                                  "測資生成 agent 未能產出任何合法案例:" +
@@ -2004,10 +2032,13 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
 
     # 角色三:仲裁(只對 mismatch 逐案出動)
     sql_faults = []
+    undecided = []          # 仲裁時間到了、沒有結論的案例
     _t = _enter(STAGE_ARBITRATE)
     for mm in ex["mismatches"]:
         verdict = await arbitrate(cfg, spec_text, sql, mm)
-        if verdict["who_is_wrong"] == "testdata":
+        if verdict.get("arbiter_timed_out"):
+            undecided.append(mm)
+        elif verdict["who_is_wrong"] == "testdata":
             dropped_cases.append({"case_id": mm["case_id"], "by": "arbiter",
                                   "reason": verdict["reason"]})
             # 被剔除的案例 = 該條件該向未經驗證 → 列入覆蓋缺口(不可據以自動放行)
@@ -2022,6 +2053,15 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
     _leave(STAGE_ARBITRATE, _t)
 
     coverage_gaps, passed = gaps_and_passed(plan, ex, coverage_gaps, sql_faults)
+    if undecided:
+        passed = False
+        findings.append(_unfinished(
+            path, STAGE_ARBITRATE_NAME,
+            "測資與 SQL 的結果不一致,仲裁沒有結論(模型呼叫逾時,或剩的時間不夠):"
+            + ";".join(f"案例 {m['case_id']}(條件 {m['condition_id']} {m['direction']} 向)"
+                       for m in undecided[:20])
+            + (f" 等 {len(undecided)} 個" if len(undecided) > 20 else ""),
+            title="[執行驗證] 測資與 SQL 的結果不一致,仲裁沒有結論"))
     if sql_faults:
         detail = ";".join(
             f"案例 {f['case_id']}({f.get('note','')}):預期"

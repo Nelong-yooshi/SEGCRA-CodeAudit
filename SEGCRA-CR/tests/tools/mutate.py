@@ -702,13 +702,17 @@ MUTANTS.update({
      "    return not current or current != reviewed_sha"),
  # 第 9 點:參數讀不懂要退回預設值,不可以讓 webhook 起不來
  "設定:秒數讀不懂就讓程式起不來": ("config.py",
-     "        print(f\"[config] 警告:環境變數 {name} 的值不是正整數秒數({raw!r}),\"" + NL
-     + '              f"改用預設 {default} 秒", flush=True)' + NL
+     "        print(f\"[config] 警告:環境變數 {name} 的值不是有限的正數秒數({raw!r}),\"" + NL
+     + '              f"改用預設 {default:g} 秒", flush=True)' + NL
      + "        return default",
-     "        raise"),
- "設定:0 或負數的秒數也照收": ("config.py",
-     "        if v <= 0:" + NL + "            raise ValueError",
-     "        if False:" + NL + "            raise ValueError"),
+     "        raise ValueError(name)"),
+ "設定:0、負數、inf 的秒數也照收": ("config.py",
+     "    if not (math.isfinite(value) and value > 0):", "    if False:"),
+ "設定:秒數設了但是空的不說": ("config.py",
+     "    raw = os.environ.get(name)" + NL + "    if raw is None:" + NL + "        return default" + NL
+     + "    try:" + NL + "        value = float(raw)",
+     "    raw = os.environ.get(name)" + NL + "    if raw is None or not raw.strip():" + NL
+     + "        return default" + NL + "    try:" + NL + "        value = float(raw)"),
 })
 # ---- 取回整份新檔的四道防線:唯讀 token、單檔上限、不退回舊版、取不到要交人工
 MUTANTS.update({
@@ -4186,40 +4190,70 @@ MUTANTS.update({
  "閘道上限:沒有傳進請求": ("agent.py",
      "            **seed_kwargs, **effort_kwargs, **timeout_kwargs,",
      "            **seed_kwargs, **effort_kwargs,"),
- "閘道上限:讀不懂的值也當成開啟": ("agent.py",
+ "閘道上限:讀不懂的值也當成開啟": ("config.py",
      "    if value not in _FLAG_OFF:",
      "    if value not in _FLAG_OFF:" + NL + "        return True"),
- "閘道上限:讀不懂的開關值不警告": ("agent.py",
-     '        print(f"[agent] 警告:環境變數 {name} 的值讀不懂({raw!r}),當成沒開;"',
-     '        pass' + NL + '    if False:' + NL + '        print(f"[agent] 警告:環境變數 {name} 的值讀不懂({raw!r}),當成沒開;"'),
- "閘道上限:LLM_TIMEOUT 接受 inf / nan / 0": ("agent.py",
-     "    if not (math.isfinite(value) and value > 0):",
-     "    if False:"),
+ "閘道上限:讀不懂的開關值不警告": ("config.py",
+     '        print(f"[config] 警告:環境變數 {name} 的值讀不懂({raw!r}),當成沒開;"',
+     '        pass' + NL + '    if False:' + NL + '        print(f"[config] 警告:環境變數 {name} 的值讀不懂({raw!r}),當成沒開;"'),
+ "閘道上限:LLM_TIMEOUT 不走秒數的檢查": ("agent.py",
+     'REQUEST_TIMEOUT = env_seconds("LLM_TIMEOUT", 3600)',
+     'REQUEST_TIMEOUT = float(os.environ.get("LLM_TIMEOUT") or 3600)'),
  "閘道上限:用戶端不用這一環節剩的時間": ("agent.py",
      "            timeout=wait," + NL,
      ""),
  "閘道上限:不看這一環節的截止時間": ("agent.py",
-     "    end = _DEADLINE.get()" + NL + "    if end is None:",
-     "    end = None" + NL + "    if end is None:"),
+     "    left = _time_left()" + NL + "    if left is None:" + NL + "        return REQUEST_TIMEOUT",
+     "    left = None" + NL + "    if left is None:" + NL + "        return REQUEST_TIMEOUT"),
  "閘道上限:巢狀時取較晚的(截止時間被延後)": ("agent.py",
-     "    token = _DEADLINE.set(end if current is None else min(current, end))",
-     "    token = _DEADLINE.set(end)"),
+     "        end, min_left = min(current[0], end), max(current[1], min_left)",
+     "        end, min_left = end, max(current[1], min_left)"),
+ "剩的時間:巢狀時門檻取較小的": ("agent.py",
+     "        end, min_left = min(current[0], end), max(current[1], min_left)",
+     "        end, min_left = min(current[0], end), min_left"),
+ "剩的時間:不夠也照送": ("agent.py",
+     "        if left is not None and left[0] < left[1]:", "        if False:"),
+ "剩的時間:不夠時不算時間到了": ("agent.py",
+     "    return isinstance(error, (openai.APITimeoutError, asyncio.TimeoutError, TimeoutError, LlmNoTimeLeft))",
+     "    return isinstance(error, (openai.APITimeoutError, asyncio.TimeoutError, TimeoutError))"),
  "閘道上限:時間到了送 0 或負數": ("agent.py",
-     "    return max(1.0, min(REQUEST_TIMEOUT, end - time.monotonic()))",
-     "    return min(REQUEST_TIMEOUT, end - time.monotonic())"),
+     "    return max(1.0, min(REQUEST_TIMEOUT, left[0]))",
+     "    return min(REQUEST_TIMEOUT, left[0])"),
  "閘道上限:主審查不設截止時間": ("pipeline.py",
-     "        with llm_deadline(limit):" + NL + "            return await asyncio.wait_for(" + NL
+     "        with llm_deadline(limit, MIN_STAGE_SECONDS):" + NL + "            return await asyncio.wait_for(" + NL
      + "                run_agent(",
      "        with llm_deadline(None):" + NL + "            return await asyncio.wait_for(" + NL
      + "                run_agent("),
+ "剩的時間:主審查不給門檻": ("pipeline.py",
+     "        with llm_deadline(limit, MIN_STAGE_SECONDS):" + NL + "            return await asyncio.wait_for(" + NL
+     + "                run_agent(",
+     "        with llm_deadline(limit):" + NL + "            return await asyncio.wait_for(" + NL
+     + "                run_agent("),
  "閘道上限:冷讀不設截止時間": ("pipeline.py",
-     "        with llm_deadline(limit):" + NL
+     "        with llm_deadline(limit, MIN_STAGE_SECONDS):" + NL
      + "            return await asyncio.wait_for(_cold_read_stage(",
      "        with llm_deadline(None):" + NL
      + "            return await asyncio.wait_for(_cold_read_stage("),
  "閘道上限:執行驗證不設截止時間": ("pipeline.py",
-     "            with llm_deadline(spec_limit):",
+     "            with llm_deadline(spec_limit, MIN_STAGE_SECONDS):",
      "            with llm_deadline(None):"),
+ "剩的時間:主審查時間到了不算沒跑完": ("pipeline.py",
+     '            model_failed["stage"] = "主審查"', "            pass"),
+ "剩的時間:不夠時當成其他錯誤": ("pipeline.py",
+     "    if isinstance(error, LlmNoTimeLeft):" + NL + "        return _NO_TIME_KIND",
+     "    if False:" + NL + "        return _NO_TIME_KIND"),
+ "剩的時間:測資生成時間到了不算沒跑完": ("spec_exec.py",
+     '    if not plan["cases"] and plan.get("timed_out"):', "    if False:"),
+ "剩的時間:測資生成不夠時還重試": ("spec_exec.py",
+     "            if isinstance(e, LlmNoTimeLeft):" + NL + "                break",
+     "            if isinstance(e, LlmNoTimeLeft):" + NL + "                pass"),
+ "剩的時間:仲裁時間到了混進行為不符": ("spec_exec.py",
+     '        if verdict.get("arbiter_timed_out"):' + NL + "            undecided.append(mm)" + NL
+     + '        elif verdict["who_is_wrong"] == "testdata":',
+     '        if verdict["who_is_wrong"] == "testdata":'),
+ "剩的時間:仲裁沒有結論時照樣算通過": ("spec_exec.py",
+     "    if undecided:" + NL + "        passed = False" + NL,
+     "    if undecided:" + NL),
 })
 
 

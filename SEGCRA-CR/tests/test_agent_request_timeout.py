@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import pytest
 
 import orchestrator.agent as agent
-from orchestrator.config import Config, ModelProfile
+from orchestrator.config import Config, ModelProfile, env_bool, env_seconds
 from tests.test_review_truncation import CLEAN_REPORT, STOP, review  # noqa: F401 — review 是 fixture
 
 
@@ -111,13 +111,13 @@ def test_開關讀得懂的值_不印警告(monkeypatch, capsys, raw, expected):
     """直接測解讀的函式,不 reload 模組:reload 會換掉 agent 裡的函式物件,別的測試比對
     「是不是同一個函式」時就會失敗。"""
     monkeypatch.setenv(FLAG, raw)
-    assert agent._env_flag(FLAG, "") is expected
+    assert env_bool(FLAG, "") is expected
     assert "警告" not in capsys.readouterr().out
 
 
 def test_開關沒設就是關_不印警告(monkeypatch, capsys):
     monkeypatch.delenv(FLAG, raising=False)
-    assert agent._env_flag(FLAG, "") is False
+    assert env_bool(FLAG, "") is False
     assert capsys.readouterr().out == ""
 
 
@@ -126,7 +126,7 @@ def test_開關讀不懂的值_印警告並當成沒開(monkeypatch, capsys, raw
     """review 實測:打錯一個字(ture、enable、2)就跟沒設一樣、又沒有任何輸出,而症狀(長請求
     被切斷)看起來跟這個設定無關。設了但是空的也說:多半是部署腳本沒把值帶進來。"""
     monkeypatch.setenv(FLAG, raw)
-    assert agent._env_flag(FLAG, "") is False
+    assert env_bool(FLAG, "") is False
     out = capsys.readouterr().out
     assert FLAG in out and "讀不懂" in out and repr(raw) in out
 
@@ -134,8 +134,15 @@ def test_開關讀不懂的值_印警告並當成沒開(monkeypatch, capsys, raw
 def test_模組讀的是_LLM_SEND_TIMEOUT_與_LLM_TIMEOUT():
     """讀哪個變數:看原始碼,不 reload(理由同上)。"""
     src = inspect.getsource(agent)
-    assert 'SEND_TIMEOUT = _env_flag("LLM_SEND_TIMEOUT", "")' in src
-    assert 'REQUEST_TIMEOUT = _env_timeout("LLM_TIMEOUT", 3600)' in src
+    assert 'SEND_TIMEOUT = env_bool("LLM_SEND_TIMEOUT", "")' in src
+    assert 'REQUEST_TIMEOUT = env_seconds("LLM_TIMEOUT", 3600)' in src
+
+
+def test_讀環境變數的_helper_只有_config_那一份():
+    """agent.py 不再有自己的讀法:秒數與開關的規則(空的、讀不懂時怎麼處理)只有一份。"""
+    src = inspect.getsource(agent)
+    assert "def _env_timeout" not in src and "def _env_flag" not in src
+    assert agent.env_seconds is env_seconds and agent.env_bool is env_bool
 
 
 # ---- LLM_TIMEOUT 要是有限的正數(它會放進請求內容)
@@ -143,7 +150,7 @@ def test_模組讀的是_LLM_SEND_TIMEOUT_與_LLM_TIMEOUT():
 @pytest.mark.parametrize("raw,expected", [("1800", 1800.0), ("90.5", 90.5), (" 60 ", 60.0)])
 def test_請求逾時讀得懂的值(monkeypatch, capsys, raw, expected):
     monkeypatch.setenv(FLAG, raw)
-    assert agent._env_timeout(FLAG, 3600.0) == expected
+    assert env_seconds(FLAG, 3600.0) == expected
     assert capsys.readouterr().out == ""
 
 
@@ -152,17 +159,23 @@ def test_請求逾時不是有限的正數_退回預設並警告(monkeypatch, ca
     """review 實測:LLM_TIMEOUT=inf 加 LLM_SEND_TIMEOUT=1 時,每次 run_agent 都在送出前丟
     `ValueError: Out of range float values are not JSON compliant`,所有模型呼叫都失敗。"""
     monkeypatch.setenv(FLAG, raw)
-    assert agent._env_timeout(FLAG, 3600.0) == 3600.0
+    assert env_seconds(FLAG, 3600.0) == 3600.0
     out = capsys.readouterr().out
     assert FLAG in out and "有限的正數" in out
 
 
-def test_請求逾時沒設或空的_用預設不警告(monkeypatch, capsys):
+def test_請求逾時沒設_用預設不警告(monkeypatch, capsys):
     monkeypatch.delenv(FLAG, raising=False)
-    assert agent._env_timeout(FLAG, 3600.0) == 3600.0
-    monkeypatch.setenv(FLAG, " ")
-    assert agent._env_timeout(FLAG, 3600.0) == 3600.0
+    assert env_seconds(FLAG, 3600.0) == 3600.0
     assert capsys.readouterr().out == ""
+
+
+@pytest.mark.parametrize("raw", ["", " ", "\t"])
+def test_請求逾時設了但是空的_用預設並警告(monkeypatch, capsys, raw):
+    """多半是部署腳本沒把值帶進來:跟 LLM_SEND_TIMEOUT 一樣要說出來。"""
+    monkeypatch.setenv(FLAG, raw)
+    assert env_seconds(FLAG, 3600.0) == 3600.0
+    assert FLAG in capsys.readouterr().out
 
 
 # ---- 送出去的值 = 這次請求實際會等的時間

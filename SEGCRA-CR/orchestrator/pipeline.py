@@ -15,7 +15,8 @@ from typing import NamedTuple
 from pathlib import Path
 
 
-from .agent import MAX_ITERATIONS, extract_json, llm_deadline, output_truncated, run_agent
+from .agent import (MAX_ITERATIONS, LlmNoTimeLeft, extract_json, llm_deadline, output_truncated,
+                    run_agent)
 from .config import (DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, env_seconds,
                      estimate_tokens)
 from .dbt_affected import (
@@ -1503,7 +1504,7 @@ async def _run_main_review(cfg: Config, profile, system: str, user: str, hub, tr
         return None
     try:
         # 每次請求等多久跟這個上限一致(見 agent.llm_deadline):外層取消時,閘道也不再多等
-        with llm_deadline(limit):
+        with llm_deadline(limit, MIN_STAGE_SECONDS):
             return await asyncio.wait_for(
                 run_agent(cfg, profile, system, user, hub, trace=trace, meta=meta), limit)
     except Exception as e:
@@ -1535,7 +1536,7 @@ async def _run_cold_read(cfg: Config, mr: dict, dbt_ctx: DbtContext | None, dead
     if limit is None:
         return None, _incomplete_finding("冷讀", reason=_NO_TIME_REASON)
     try:
-        with llm_deadline(limit):
+        with llm_deadline(limit, MIN_STAGE_SECONDS):
             return await asyncio.wait_for(_cold_read_stage(cfg, mr, dbt_ctx), limit)
     except asyncio.TimeoutError:
         return None, _timeout_finding("冷讀", limit, COLD_READ_TIMEOUT_SECONDS)
@@ -2226,7 +2227,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                                              dbt_ctx, cfg.dbt)
             # 執行驗證裡有好幾次模型呼叫(測資生成、重試、仲裁),越後面的剩的時間越少:
             # 每一次各自用那一刻剩下的(見 agent.llm_deadline / request_timeout)
-            with llm_deadline(spec_limit):
+            with llm_deadline(spec_limit, MIN_STAGE_SECONDS):
                 spec_result = await asyncio.wait_for(
                     run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text,
                                   progress=progress, deadline=deadline),
@@ -4222,6 +4223,8 @@ def _model_failure_kind(error: BaseException) -> str:
     """模型呼叫失敗的問題類型(_MODEL_FAILURE_TEXT 的鍵)。由細到粗判斷:逾時是連線錯誤的子類別,
     請求過多是狀態錯誤的子類別。"""
     import openai
+    if isinstance(error, LlmNoTimeLeft):
+        return _NO_TIME_KIND           # 這一環節剩的時間不夠,請求沒有送出(見 agent.llm_deadline)
     if isinstance(error, (openai.APITimeoutError, asyncio.TimeoutError, TimeoutError)):
         return "timeout"
     if isinstance(error, openai.APIConnectionError):
@@ -4341,6 +4344,10 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
             "suggestion": ("請人工審查這個 MR;MR 很大時可以拆小後重新觸發審查。" if failed == _NO_TIME_KIND
                            else "請通知維運確認審查模型的端點狀態,恢復後重新觸發審查。"),
             "citations": []}
+        if failed in ("timeout", _NO_TIME_KIND):
+            # 時間到了(請求逾時,或剩的時間不夠沒送出):這一環節沒跑完,跟外層整段逾時同一種
+            # (review_incomplete 靠 stage 認;CI 那條路是「沒有結論」,不是「審完了交給人」)
+            model_failed["stage"] = "主審查"
         _put_program_finding(report, model_failed)
         # 沒有最終輸出:meta 裡的結束原因與用量是前幾輪的,不能拿來判斷截斷或用完回合
         return report
