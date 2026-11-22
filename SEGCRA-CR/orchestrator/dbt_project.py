@@ -382,12 +382,8 @@ def clear_cache() -> None:
 
 
 def _safe_error(e: BaseException) -> str:
-    if isinstance(e, DbtProjectError):
-        text = f"DbtProjectError: {e}"
-    else:
-        # 下載失敗(ArchiveDownloadError)的訊息本來就是固定文字;其他例外只留類型
-        from toolbox.gitlab import ArchiveDownloadError
-        text = (f"ArchiveDownloadError: {e}" if isinstance(e, ArchiveDownloadError)
-                else f"{type(e).__name__}: 無法取得 dbt 專案")
-    text = "".join(ch if ch.isprintable() else " " for ch in text)
-    return text[:MAX_ERROR_CHARS]
+    # 下載失敗(ArchiveDownloadError)的訊息本來就是固定文字;其他例外只留類型
+    from toolbox.gitlab import ArchiveDownloadError
+    from .error_text import safe_error
+    return safe_error(e, own=(DbtProjectError, ArchiveDownloadError),
+                      other="無法取得 dbt 專案", max_chars=MAX_ERROR_CHARS)

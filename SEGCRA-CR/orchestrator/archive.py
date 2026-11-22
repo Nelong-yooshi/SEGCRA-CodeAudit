@@ -293,11 +293,7 @@ def _extract_and_read(tar: tarfile.TarFile, wanted) -> dict[str, str]:
 
 def _safe_error(e: BaseException) -> str:
     """只留我們自己的固定文字;第三方例外(tarfile、gzip)的訊息可能帶成員名稱,不回顯。"""
-    if isinstance(e, ArchiveError):
-        text = f"ArchiveError: {e}"
-    elif isinstance(e, MemoryError):
-        text = "MemoryError: 解壓時記憶體不足,已中止"
-    else:
-        text = f"{type(e).__name__}: 壓縮檔無法解析或無法解出"
-    text = "".join(ch if ch.isprintable() else " " for ch in text)
-    return text[:MAX_ERROR_CHARS]
+    from .error_text import safe_error
+    return safe_error(e, own=(ArchiveError,),
+                      fixed={MemoryError: "MemoryError: 解壓時記憶體不足,已中止"},
+                      other="壓縮檔無法解析或無法解出", max_chars=MAX_ERROR_CHARS)

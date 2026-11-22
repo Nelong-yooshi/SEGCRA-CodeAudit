@@ -15,22 +15,15 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${SANDBOX_ENV_FILE:-$HERE/../config/sandbox.env}"
 
-# 讀密碼檔前先檢查權限,太寬就停(跟 orchestrator/config.py:check_config_file 同一套規則):
-# 檔案群組或其他人可讀、可寫,或所在目錄群組或其他人可寫(可以把檔案整個換掉)。只看權限
-# 位元,不看擁有者(掛進容器時擁有者是主機的 uid)。
+# 讀密碼檔前先檢查權限,太寬就停。規則只有一份(orchestrator/file_perms.py,只用標準庫):
+# 檔案、實際的檔案所在的目錄一路往上、路徑上的連結所在的目錄;只看權限位元,不看擁有者。
+# 主機上沒有 python3 時停下來,不跳過檢查。
 check_secret_file() {
-  local f="$1" d mode
-  d="$(dirname "$f")"
-  mode="$(stat -c %a "$f")"
-  if [ $(( 8#$mode & 8#077 )) -ne 0 ]; then
-    echo "檔案(含密碼)$f 的權限太寬($mode):群組或其他帳號讀得到或改得到,不往下跑。請執行:chmod 600 $f" >&2
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "找不到 python3,無法檢查 $1 的權限,不往下跑(RHEL、Ubuntu 預設都有 python3)" >&2
     exit 1
   fi
-  mode="$(stat -c %a "$d")"
-  if [ $(( 8#$mode & 8#022 )) -ne 0 ]; then
-    echo "目錄 $d 的權限太寬($mode):群組或其他帳號改得到,不往下跑。請執行:chmod 755 $d" >&2
-    exit 1
-  fi
+  python3 -I "$HERE/../orchestrator/file_perms.py" --secret "$1" || exit 1
 }
 
 if [ -f "$ENV_FILE" ]; then check_secret_file "$ENV_FILE"; set -a; . "$ENV_FILE"; set +a; fi

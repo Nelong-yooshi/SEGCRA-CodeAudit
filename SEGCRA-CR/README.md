@@ -252,7 +252,7 @@ dbt 專案不在 repo 根目錄時,另外在 `models.yaml` 的 `dbt` 底下設 `
 (只在本機改,不要提交),然後:
 
 ```bash
-export SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER FIXTURES_DIR=examples/dbt_wiring/fixtures
+export SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER FIXTURES_DIR=$PWD/examples/dbt_wiring/fixtures   # 要絕對路徑
 .venv/bin/python demo.py --mr 801 --dry-run    # 只改 model:findings 是空的(展開成功、規則沒有命中)
 .venv/bin/python demo.py --mr 802 --dry-run    # 只改 macro:多一條 major「dbt 變更對其他 model 的影響」
 ```

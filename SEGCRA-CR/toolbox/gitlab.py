@@ -13,11 +13,16 @@ import re
 import time
 from pathlib import Path
 
-PKG_ROOT = Path(__file__).resolve().parent.parent
-FIXTURES_DIR = Path(os.environ.get("FIXTURES_DIR", PKG_ROOT / "fixtures"))
-OUTPUT_DIR = Path(os.environ.get("REVIEW_OUTPUT", PKG_ROOT / "review_output"))
+from orchestrator.config import ConfigError, env_int, env_path
+from orchestrator.config import _env_text as _config_env_text
 
-class GitLabConfigError(ValueError):
+PKG_ROOT = Path(__file__).resolve().parent.parent
+# 有設時要絕對路徑、設了但是空的就停(見 config.env_path):報告含 MR 的程式碼,不能寫到啟動目錄
+FIXTURES_DIR = env_path("FIXTURES_DIR", PKG_ROOT / "fixtures")
+OUTPUT_DIR = env_path("REVIEW_OUTPUT", PKG_ROOT / "review_output")
+
+
+class GitLabConfigError(ConfigError):
     """GitLab 的設定不完整:停下來,不悄悄改走 mock 模式。"""
 
 
@@ -25,15 +30,13 @@ _REAL_MODE_VARS = ("GITLAB_URL", "GITLAB_TOKEN", "GITLAB_PROJECT")
 
 
 def _env_text(name: str, unset: str) -> str:
-    """沒設回 `unset`;**設了但去掉前後空白後是空的,直接報錯並寫出變數名**(同
-    orchestrator/config.py 的 _env_text;這個模組不 import orchestrator)。"""
-    raw = os.environ.get(name)
-    if raw is None:
-        return unset
-    value = raw.strip()
-    if not value:
-        raise GitLabConfigError(f"環境變數 {name} 有設定但是空的;要用就給值,不用就把這個變數拿掉")
-    return value
+    """沒設回 `unset`;**設了但去掉前後空白後是空的,直接報錯並寫出變數名**。規則用 config.py 那一份,
+    這裡只把錯誤換成 GitLabConfigError(它是 ConfigError 的子類別)。"""
+    try:
+        value = _config_env_text(name)
+    except ConfigError as e:
+        raise GitLabConfigError(str(e)) from None
+    return unset if value is None else value
 
 
 def _real_mode_settings() -> tuple[str, str, str]:
@@ -128,7 +131,7 @@ def review_ref() -> str | None:
 
 # 取回單一檔案的大小上限。超過就當成「取不到完整內容」交人工,不要讓一個超大的
 # 檔案拖住預掃、注入掃描與沙盒(與審查流程的時間上限同一個原則)。
-MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(1024 * 1024)))
+MAX_FILE_BYTES = env_int("MAX_FILE_BYTES", 1024 * 1024)
 
 
 def _read_token() -> str | None:
