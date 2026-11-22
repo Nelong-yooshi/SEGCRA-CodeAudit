@@ -1472,22 +1472,13 @@ async def arbitrate(cfg: Config, spec_text: str, sql: str, mismatch: dict,
 
 
 # ------------------------------------------------------------------ 主流程
-# 執行驗證沒跑到、沒驗到的部分記成「待驗證」:帶這個 stage(pipeline.review_incomplete 認的是 stage 欄位),
-# 不是確定的缺陷,不說成 SQL 寫錯
-EXEC_STAGE = "執行驗證"
-
-
-def _finding(path: str, severity: str, title: str, detail: str, suggestion: str = "",
-             stage: str | None = None) -> dict:
+def _finding(path: str, severity: str, title: str, detail: str, suggestion: str = "") -> dict:
     # _source:這條是程式(執行驗證)自己產生的,不是模型講的。後處理的校準只對
     # 模型的指控動作,拿證據去對照證據會把唯一真的跑過的那條降級。
     # 字串直接寫、不從 pipeline import:pipeline 匯入 spec_exec,反向會變成循環匯入。
-    finding = {"file": path, "line": 0, "severity": severity, "title": title,
-               "detail": detail, "suggestion": suggestion, "citations": [],
-               "_source": "program"}
-    if stage:
-        finding["stage"] = stage
-    return finding
+    return {"file": path, "line": 0, "severity": severity, "title": title,
+            "detail": detail, "suggestion": suggestion, "citations": [],
+            "_source": "program"}
 
 
 def _other_branch_satisfied(conds: list[dict], actual: dict[str, bool],
@@ -1862,6 +1853,9 @@ def _execute(sql: str, plan: dict, deadline: float | None):
     return execute_cases(sql, plan, deadline) if takes else execute_cases(sql, plan)
 
 
+# 執行驗證沒跑到、沒驗到的部分記成「待驗證」:帶這個 stage(pipeline.review_incomplete 認的是 stage 欄位),
+# 不是確定的缺陷,不說成 SQL 寫錯
+EXEC_STAGE = "執行驗證"
 DBT_NOT_RENDERED_TITLE = "[執行驗證] dbt model 沒有展開"
 STAND_IN_MISMATCH_TITLE = "[執行驗證] 上游由測資代替,結果不符無法判定"
 
@@ -1944,12 +1938,12 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
         return {"passed": False, "spec_code": spec_code, "conditions": [],
                 "coverage_gaps": [], "case_results": [], "dropped_cases": [],
                 "dbt_template": True,
-                "findings": [_finding(
+                "findings": [{**_finding(
                     path, "major", DBT_NOT_RENDERED_TITLE,
                     "此檔含 dbt / Jinja 樣板標記,沒能展開成沙盒用的 SQL(原因見「dbt model 沒有送進"
                     "沙盒執行」那條),原樣送進 MS SQL 沙盒只會得到語法錯誤,不代表程式有誤。"
                     "這一部分沒有經過執行驗證,記成待驗證,本 MR 不得自動放行。",
-                    "請人工依核定規格核對實作邏輯。", stage=EXEC_STAGE)]}
+                    "請人工依核定規格核對實作邏輯。"), "stage": EXEC_STAGE}]}
 
     findings, dropped_cases = [], []
 
@@ -2048,13 +2042,13 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
             for f in sql_faults)
         if stand_ins:
             names = "、".join(str(n) for n in list(stand_ins)[:10])
-            findings.append(_finding(
+            findings.append({**_finding(
                 path, "major", STAND_IN_MISMATCH_TITLE,
                 f"上游 model 由規格的測資表代替:{names}。規格的條件可能是在上游做的(例如上游過濾、"
                 f"這個 model 只是選出欄位),測資直接放進上游的表時,結果不符不代表這個 model 寫錯;"
                 f"仲裁看不到上游的邏輯,判斷也不能採用。不符的案例:{detail}",
-                "上游 model 依它自己的規格驗證,或以 dbt compile 取得展開後的完整 SQL 人工核對。",
-                stage=EXEC_STAGE))
+                "上游 model 依它自己的規格驗證,或以 dbt compile 取得展開後的完整 SQL 人工核對。"),
+                "stage": EXEC_STAGE})
         else:
             findings.append(_finding(path, "major", "執行驗證失敗:實作與規格行為不符",
                                      f"規則 {spec_code} 在依規格生成的測資上行為不符:{detail}",
