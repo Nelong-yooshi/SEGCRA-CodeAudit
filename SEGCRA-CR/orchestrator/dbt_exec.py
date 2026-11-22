@@ -74,6 +74,9 @@ def spec_tables(spec_text) -> dict:
     return out
 
 
+RUN_STARTED_AT_UNVERIFIED = "model 用到 run_started_at,審查不知道排程時間跟資料日期的關係"
+
+
 def render_for_exec(path: str, source: str, spec_text: str, database: str,
                     project_kwargs: dict) -> tuple[str | None, str | None]:
     """展開成沙盒執行用的 SQL。回傳 (SQL, None) 或 (None, 不能展開的原因)。
@@ -93,6 +96,10 @@ def render_for_exec(path: str, source: str, spec_text: str, database: str,
         return None, f"dbt 專案裡有 {len(rendered.macro_conflicts)} 組同名的 macro,無法確定展開結果"
     if rendered.incremental_checked:
         return None, "增量 model(呼叫了 is_incremental())的執行驗證尚未支援"
+    if rendered.run_started_at_used:
+        # 展開時的值是審查開始的時間,測資固定在 WIN_START:兩個「現在」對不上,撈不到資料時
+        # 會被當成 model 寫錯。排程拿它當資料日還是資料日的隔天,各個 model 不同,審查猜不到
+        return None, RUN_STARTED_AT_UNVERIFIED
     if is_dbt_template(rendered.sql):
         return None, "展開後的 SQL 仍含樣板標記"
     if not rendered.sql.strip():
