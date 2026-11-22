@@ -88,7 +88,7 @@ def one_case(monkeypatch):
         calls.append(baseline)
         if baseline:
             return {"_mode": "baseline", "verdict": "approve", "summary": "看起來沒問題",
-                    "findings": []}
+                    "findings": [], "truncated": False}
         return {"decision": "blocked", "findings": [{"file": "a.sql", "line": 1, "severity": "blocker",
                                                      "title": "DELETE 沒有 WHERE", "detail": ""}]}
     monkeypatch.setattr(run_eval, "review_mr", fake_review)
@@ -126,3 +126,59 @@ def test_讀存檔重新評分時認得裸模型的報告(one_case, tmp_path):
     asyncio.run(run_eval.run(_args(from_reports=str(d), json=str(out))))
     data = json.loads(out.read_text(encoding="utf-8"))
     assert data["cases"][0]["decision"] == "blocked" and data["cases"][0]["checks"] == 0
+
+
+# ─────────────────── review 這一輪 ───────────────────
+
+@pytest.mark.parametrize("findings", [
+    [{"file": "a.sql", "line": "12-15", "severity": "blocker", "title": "x"}],   # line 是範圍
+    ["DELETE 沒有 WHERE"],                                                         # finding 是字串
+    None,                                                                         # findings 是 null
+])
+def test_裸模型的報告格式不對也照常算完_結果檔寫出(one_case, tmp_path, monkeypatch, findings):
+    async def fake_review(cfg, mr_id, profile=None, dry_run=False, baseline=False):
+        return {"_mode": "baseline", "verdict": "reject", "findings": findings, "truncated": False}
+    monkeypatch.setattr(run_eval, "review_mr", fake_review)
+    out = tmp_path / "r.json"
+    asyncio.run(run_eval.run(_args(baseline=True, json=str(out))))
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data["cases"][0]["decision"] == "blocked" and not data["errors"]
+
+
+def test_裸模型的層級記成不適用_不是通過(one_case, tmp_path, capsys):
+    out = tmp_path / "bare.json"
+    asyncio.run(run_eval.run(_args(baseline=True, json=str(out))))
+    layers = json.loads(out.read_text(encoding="utf-8"))["layers"]
+    assert layers["rule-base"]["pass"] == 0 and layers["rule-base"]["na"] == 1
+    printed = capsys.readouterr().out
+    assert "不適用 1" in printed and "1/1 通過" not in printed
+
+
+def test_讀裸模型的存檔重新評分_mode_是_baseline(one_case, tmp_path):
+    saved = tmp_path / "saved"
+    saved.mkdir()
+    (saved / "mr_901.json").write_text(json.dumps({"_mode": "baseline", "verdict": "approve",
+                                                  "findings": [], "truncated": False}), encoding="utf-8")
+    out = tmp_path / "r.json"
+    asyncio.run(run_eval.run(_args(from_reports=str(saved), json=str(out))))
+    assert json.loads(out.read_text(encoding="utf-8"))["mode"] == "baseline"
+
+
+@pytest.mark.parametrize("report, reason", [
+    ({"_mode": "baseline", "verdict": "LGTM", "findings": [], "truncated": False}, "verdict 對不上"),
+    ({"_mode": "baseline", "verdict": "approve", "findings": [], "truncated": True}, "輸出不完整"),
+    ({"_mode": "baseline", "verdict": "approve", "findings": []}, "輸出不完整"),       # 沒有 truncated 鍵
+    ({"decision": "needs_human", "findings": [{"file": "(MR 內容)", "line": 0, "severity": "major",
+                                               "title": "[冷讀] 審查未完整(逾時)", "stage": "冷讀"}]},
+     "有環節沒跑完"),
+])
+def test_無法判讀的不算對錯_也不算_missed_block(one_case, tmp_path, monkeypatch, report, reason):
+    async def fake_review(cfg, mr_id, profile=None, dry_run=False, baseline=False):
+        return dict(report)
+    monkeypatch.setattr(run_eval, "review_mr", fake_review)
+    out = tmp_path / "r.json"
+    asyncio.run(run_eval.run(_args(baseline="_mode" in report, json=str(out))))
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert (data["decision_right"], data["decision_wrong"], data["missed_block"]) == (0, 0, 0)
+    assert data["decision_unreadable"] == 1 and reason in data["cases"][0]["unreadable"]
+    assert data["cases"][0]["decision_ok"] is None and not data["cases"][0]["missed_block"]

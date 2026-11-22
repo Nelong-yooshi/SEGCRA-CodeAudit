@@ -354,6 +354,28 @@ def report_decision(report: dict) -> str:
     return report.get("decision", "-")
 
 
+def unreadable_reason(report: dict) -> str | None:
+    """這份報告的決策能不能拿來跟預期比;不能時回原因(固定文字),能時回 None。
+
+    - 裸模型:verdict 對不上三態;輸出不完整(`truncated` 不是 False,沒有這個鍵也算 —— 被截斷後
+      repair 補回的 verdict 不是模型的結論)
+    - 管線:有環節沒跑完(`review_incomplete` 不是空的),決策剛好對上預期也不算答對
+    這一類不算符合、不算不符,也不算 missed_block,單獨計數。"""
+    bare = report.get("_mode") == "baseline"
+    if bare:
+        if report_decision(report) == BARE_UNREADABLE:
+            return "verdict 對不上三態"
+        if report.get("truncated") is not False:
+            return "輸出不完整(truncated)"
+        return None
+    from orchestrator.pipeline import review_incomplete
+    try:
+        incomplete = review_incomplete(report)
+    except Exception:                        # noqa: BLE001 — 判讀不了也是沒有結論
+        return "有環節沒跑完"
+    return f"有環節沒跑完({'、'.join(incomplete)[:120]})" if incomplete else None
+
+
 def decision_ok(golden: dict, decision: str) -> "bool | None":
     """決策有沒有落在 expect_decision 裡(字串或清單);題目沒寫預期決策時是 None(不計)。"""
     want = golden.get("expect_decision")
@@ -370,6 +392,10 @@ def missed_block(golden: dict, decision: str) -> bool:
         return False
     want = want if isinstance(want, list) else [want]
     return "auto_approved" not in want and decision == "auto_approved"
+
+
+BASELINE_NOTE = ("⚠  裸模型對照:只給模型看 MR 的標題、描述與 diff,沒有預掃、知識庫、工具、執行驗證與"
+                 "後處理;層級斷言不適用,只比問題偵測與決策。\n")
 
 
 async def run(args) -> int:
@@ -404,10 +430,10 @@ async def run(args) -> int:
 
     tp = fp = fn = 0
     rows, layer_stat, decisions, failures, gaps, errors = [], {}, {}, [], [], []
-    decision_tally = {"right": 0, "wrong": 0, "missed_block": 0}
+    decision_tally = {"right": 0, "wrong": 0, "missed_block": 0, "unreadable": 0}
+    modes: set = set()                       # 這一輪看到的報告種類(裸模型 / 管線),--from-reports 也一樣
     if getattr(args, "baseline", False):
-        print("⚠  --baseline:裸模型對照。只給模型看 MR 的標題、描述與 diff,沒有預掃、知識庫、"
-              "工具、執行驗證與後處理;層級斷言不適用,只比問題偵測與決策。\n")
+        print(BASELINE_NOTE)
 
     for mr_id, case in cases:
         golden = case.get("_golden") or {}
@@ -436,6 +462,16 @@ async def run(args) -> int:
             (d / f"mr_{mr_id}.json").write_text(
                 json.dumps(report, ensure_ascii=False, indent=2, default=str),
                 encoding="utf-8")
+        bare = report.get("_mode") == "baseline"
+        if bare:
+            # 裸模型的報告是模型原樣輸出:先整理成管線的形狀(跟管線同一份 normalize_findings),
+            # line 寫成 "12-15"、finding 是字串、findings 是 null 都不會讓整輪停掉
+            from orchestrator.pipeline import normalize_findings
+            report = normalize_findings(report)
+            if not modes:
+                if not getattr(args, "baseline", False):
+                    print(BASELINE_NOTE)
+        modes.add("baseline" if bare else "pipeline")
         findings = report.get("findings", [])
         expected = case.get("expected", [])
 
@@ -451,7 +487,6 @@ async def run(args) -> int:
         fn += len(expected) - hits
         fp += len(noise)
 
-        bare = report.get("_mode") == "baseline"
         # 層級斷言驗的是管線的各道防線,裸模型沒有那些防線,不適用(不算通過也不算失敗)
         checks = [] if bare else check_golden(golden, report, skip_post_llm=args.dry_run)
         bad = [c for c in checks if not c[1]]
@@ -460,13 +495,18 @@ async def run(args) -> int:
         is_gap = bool(golden.get("known_gap"))
         decision = report_decision(report)
         decisions[decision] = decisions.get(decision, 0) + 1
-        ok = decision_ok(golden, decision)
-        if ok is not None:
+        unreadable = unreadable_reason(report)
+        ok = None if unreadable else decision_ok(golden, decision)
+        missed = (not unreadable) and missed_block(golden, decision)
+        if unreadable:
+            decision_tally["unreadable"] += 1
+        elif ok is not None:
             decision_tally["right" if ok else "wrong"] += 1
-        if missed_block(golden, decision):
+        if missed:
             decision_tally["missed_block"] += 1
-        st = layer_stat.setdefault(layer, {"pass": 0, "fail": 0, "gap": 0, "error": 0})
-        st["gap" if (bad and is_gap) else ("fail" if bad else "pass")] += 1
+        st = layer_stat.setdefault(layer, {"pass": 0, "fail": 0, "gap": 0, "error": 0, "na": 0})
+        st.setdefault("na", 0)
+        st["na" if bare else ("gap" if (bad and is_gap) else ("fail" if bad else "pass"))] += 1
 
         # 執行驗證的細節是分析品質最需要的數字(通過與否、驗了幾案、缺了幾角),
         # 全部收進結果檔,報告可直接由 JSON 生成,不必人工翻 review 輸出。
@@ -484,7 +524,7 @@ async def run(args) -> int:
             "case": mr_id, "layer": layer, "intent": golden.get("intent", ""),
             "known_gap": is_gap, "expected": len(expected), "hit": hits,
             "noise": len(noise), "decision": decision,
-            "decision_ok": ok, "missed_block": missed_block(golden, decision),
+            "decision_ok": ok, "missed_block": missed, "unreadable": unreadable,
             "severities": sorted({f.get("severity") for f in findings if f.get("severity")}),
             "spec_exec": se_stat,
             "policy_signals": report.get("_policy_signals") or {},
@@ -506,8 +546,10 @@ async def run(args) -> int:
                        f" passed={se_stat['passed']}"
                        f" 案例{se_stat['cases']}"
                        f" 缺口{se_stat['coverage_gaps']}")
+        asserted_text = "不適用" if bare else f"{len(checks) - len(bad)}/{len(checks)}"
         print(f"{mark} mr_{mr_id} [{layer}] recall {hits}/{len(expected)} "
-              f"誤報 {len(noise)} 決策 {decision} 斷言 {len(checks) - len(bad)}/{len(checks)}"
+              f"誤報 {len(noise)} 決策 {decision}"
+              + (f"(無法判讀:{unreadable})" if unreadable else "") + f" 斷言 {asserted_text}"
               + se_note + ("  (已知缺口)" if bad and is_gap else ""))
 
     # ── 彙總 ──
@@ -516,6 +558,8 @@ async def run(args) -> int:
     for layer, st in sorted(layer_stat.items()):
         total = st["pass"] + st["fail"] + st["gap"] + st.get("error", 0)
         notes = []
+        if st.get("na"):
+            notes.append(f"不適用 {st['na']}")
         if st["gap"]:
             notes.append(f"已知缺口 {st['gap']}")
         if st.get("error"):
@@ -540,6 +584,8 @@ async def run(args) -> int:
     judged = decision_tally["right"] + decision_tally["wrong"]
     print(f"\n決策對照(有預期決策的 {judged} 題)")
     print(f"  符合預期     {decision_tally['right']}/{judged}")
+    print(f"  無法判讀     {decision_tally['unreadable']}(verdict 對不上、輸出不完整、有環節沒跑完;"
+          "不算符合也不算不符)")
     print(f"  不該放行卻自動放行 {decision_tally['missed_block']}")
 
     if style_sev:
@@ -579,12 +625,18 @@ async def run(args) -> int:
             for name, _, why in bad:
                 print(f"    ✗ {name}: {why}")
 
+    # 結果檔的 mode 看報告本身(--from-reports 重算裸模型的存檔也是 baseline);同一輪混了兩種就標出來
+    mode = (next(iter(modes)) if len(modes) == 1
+            else "mixed" if modes else ("baseline" if getattr(args, "baseline", False) else "pipeline"))
+    if mode == "mixed":
+        print("\n⚠  這一輪同時有裸模型與管線的報告(存檔目錄混了兩種),兩種的數字不能直接比")
     if args.json:
         Path(args.json).write_text(json.dumps({
             "profile": args.profile, "dry_run": args.dry_run,
-            "mode": "baseline" if getattr(args, "baseline", False) else "pipeline",
+            "mode": mode,
             "decision_right": decision_tally["right"], "decision_wrong": decision_tally["wrong"],
             "missed_block": decision_tally["missed_block"],
+            "decision_unreadable": decision_tally["unreadable"],
             "precision": precision, "recall": recall,
             "tp": tp, "fp": fp, "fn": fn,
             "layers": layer_stat, "decisions": decisions,
