@@ -1472,13 +1472,22 @@ async def arbitrate(cfg: Config, spec_text: str, sql: str, mismatch: dict,
 
 
 # ------------------------------------------------------------------ 主流程
-def _finding(path: str, severity: str, title: str, detail: str, suggestion: str = "") -> dict:
+# 執行驗證沒跑到、沒驗到的部分記成「待驗證」:帶這個 stage(pipeline.review_incomplete 認的是 stage 欄位),
+# 不是確定的缺陷,不說成 SQL 寫錯
+EXEC_STAGE = "執行驗證"
+
+
+def _finding(path: str, severity: str, title: str, detail: str, suggestion: str = "",
+             stage: str | None = None) -> dict:
     # _source:這條是程式(執行驗證)自己產生的,不是模型講的。後處理的校準只對
     # 模型的指控動作,拿證據去對照證據會把唯一真的跑過的那條降級。
     # 字串直接寫、不從 pipeline import:pipeline 匯入 spec_exec,反向會變成循環匯入。
-    return {"file": path, "line": 0, "severity": severity, "title": title,
-            "detail": detail, "suggestion": suggestion, "citations": [],
-            "_source": "program"}
+    finding = {"file": path, "line": 0, "severity": severity, "title": title,
+               "detail": detail, "suggestion": suggestion, "citations": [],
+               "_source": "program"}
+    if stage:
+        finding["stage"] = stage
+    return finding
 
 
 def _other_branch_satisfied(conds: list[dict], actual: dict[str, bool],
@@ -1853,12 +1862,22 @@ def _execute(sql: str, plan: dict, deadline: float | None):
     return execute_cases(sql, plan, deadline) if takes else execute_cases(sql, plan)
 
 
+DBT_NOT_RENDERED_TITLE = "[執行驗證] dbt model 沒有展開"
+STAND_IN_MISMATCH_TITLE = "[執行驗證] 上游由測資代替,結果不符無法判定"
+
+
 async def run_spec_exec(cfg: Config, hub, mr: dict,
                         spec_code: str | None = None,
                         spec_text: str | None = None,
                         progress: dict | None = None,
-                        deadline: float | None = None) -> dict:
+                        deadline: float | None = None,
+                        stand_ins: tuple = ()) -> dict:
     """執行驗證主流程。spec_code/spec_text 可由 pipeline 先找好傳入(避免重找)。
+
+    `stand_ins`:執行的是展開後的 dbt model,ref() 指向的上游 model 由規格的測資表代替時,那些
+    上游的名稱。這時案例不符不算 SQL 錯:規格的條件可能是在上游做的(上游過濾、這個 model 只
+    SELECT),測資直接放進上游的表,「不應命中」的資料列會被原樣輸出;仲裁看不到上游,判 `sql`
+    也一樣。記成待驗證、寫出由測資代替的上游。通過照舊。
 
     `progress` 給定時,逐階段寫進去({"stage": 現在在哪個階段, "seconds": {階段: 秒}}),
     **外層逾時中止時才看得出是卡在哪一個階段**(逾時是外層丟的,它看不到裡面)。
@@ -1926,12 +1945,11 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                 "coverage_gaps": [], "case_results": [], "dropped_cases": [],
                 "dbt_template": True,
                 "findings": [_finding(
-                    path, "major", "執行驗證無法進行:dbt 樣板尚未支援執行驗證",
-                    "此檔含 dbt / Jinja 樣板標記,原樣送進 MS SQL 沙盒只會得到語法錯誤,"
-                    "不代表程式有誤。展開後的 SQL 要在沙盒執行,需要把 ref()/source() "
-                    "對應到沙盒的資料庫與測資表名,目前尚未支援。未經執行驗證,"
-                    "本 MR 不得自動放行。",
-                    "請人工依核定規格核對實作邏輯。")]}
+                    path, "major", DBT_NOT_RENDERED_TITLE,
+                    "此檔含 dbt / Jinja 樣板標記,沒能展開成沙盒用的 SQL(原因見「dbt model 沒有送進"
+                    "沙盒執行」那條),原樣送進 MS SQL 沙盒只會得到語法錯誤,不代表程式有誤。"
+                    "這一部分沒有經過執行驗證,記成待驗證,本 MR 不得自動放行。",
+                    "請人工依核定規格核對實作邏輯。", stage=EXEC_STAGE)]}
 
     findings, dropped_cases = [], []
 
@@ -2028,9 +2046,19 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
             f"{'命中' if f['expect_flagged'] else '不命中'}、實際"
             f"{'命中' if f['actual_flagged'] else '未命中'} — {f['arbiter_reason'][:150]}"
             for f in sql_faults)
-        findings.append(_finding(path, "major", "執行驗證失敗:實作與規格行為不符",
-                                 f"規則 {spec_code} 在依規格生成的測資上行為不符:{detail}",
-                                 "對照規格與上列案例修正邏輯(含/不含、時段、過濾、粒度)。"))
+        if stand_ins:
+            names = "、".join(str(n) for n in list(stand_ins)[:10])
+            findings.append(_finding(
+                path, "major", STAND_IN_MISMATCH_TITLE,
+                f"上游 model 由規格的測資表代替:{names}。規格的條件可能是在上游做的(例如上游過濾、"
+                f"這個 model 只是選出欄位),測資直接放進上游的表時,結果不符不代表這個 model 寫錯;"
+                f"仲裁看不到上游的邏輯,判斷也不能採用。不符的案例:{detail}",
+                "上游 model 依它自己的規格驗證,或以 dbt compile 取得展開後的完整 SQL 人工核對。",
+                stage=EXEC_STAGE))
+        else:
+            findings.append(_finding(path, "major", "執行驗證失敗:實作與規格行為不符",
+                                     f"規則 {spec_code} 在依規格生成的測資上行為不符:{detail}",
+                                     "對照規格與上列案例修正邏輯(含/不含、時段、過濾、粒度)。"))
     if coverage_gaps:
         findings.append(_finding(path, "info", "執行驗證覆蓋缺口",
                                  "以下條件未達 true/false 兩向覆蓋,該部分未經執行驗證:" +

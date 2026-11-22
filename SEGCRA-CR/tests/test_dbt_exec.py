@@ -12,7 +12,8 @@ import orchestrator.dbt_exec as dbt_exec
 import orchestrator.pipeline as pipeline
 from orchestrator.dbt_exec import AMBIGUOUS, render_for_exec, spec_tables
 from orchestrator.dbt_render import DbtProjectInfo, render_model, render_model_isolated
-from orchestrator.pipeline import (_DBT_EXEC_NOTE_TITLE, _DBT_EXEC_STAND_IN_TITLE, _DBT_UNEXECUTED_TITLE,
+from orchestrator.pipeline import (_DBT_EXEC_NOTE_TITLE, _DBT_EXEC_STAND_IN_TITLE, _DBT_OTHER_MODELS_TITLE,
+                                   _DBT_UNEXECUTED_TITLE, review_incomplete,
                                    _dbt_exec_mr,
                                    enforce_dbt_exec_note, enforce_dbt_unexecuted)
 from orchestrator.dbt_affected import SpecForModels
@@ -39,25 +40,30 @@ INFO = DbtProjectInfo(project_name="sample", ref_names=frozenset({"mrt_BIG", "st
                                ("raw", "templated"): (None, None)},
                       uncertain_sources=frozenset({("raw", "templated")}),
                       refs_complete=True, sources_complete=True)
-TABLES = {"transactions": "[transactions]"}
+TABLES = {"transactions": "[dbo].[transactions]"}
 
 
 # ─────────────────── 規格的資料表定義 ───────────────────
 
 def test_資料表定義_取出表名與寫法():
-    assert spec_tables(SPEC) == {"transactions": "[transactions]"}
+    assert spec_tables(SPEC) == {"transactions": "[dbo].[transactions]"}
 
 
 def test_資料表定義_帶_schema_照寫_同名不分大小寫當成同一張():
     text = ("## 資料表定義\n```sql\nCREATE TABLE dbo.Txn(a INT);\nCREATE TABLE rpt.TXN(a INT);\n"
-            "CREATE TABLE [ok_t] (a INT);\nCREATE TABLE stage.only_one(a INT);\n```\n")
-    assert spec_tables(text) == {"txn": AMBIGUOUS, "ok_t": "[ok_t]",
+            "CREATE TABLE [dbo].[ok_t] (a INT);\nCREATE TABLE stage.only_one(a INT);\n```\n")
+    assert spec_tables(text) == {"txn": AMBIGUOUS, "ok_t": "[dbo].[ok_t]",
                                  "only_one": "[stage].[only_one]"}
+
+
+def test_沒寫_schema_與寫了_dbo_是同一張表():
+    text = "## 資料表定義\n```sql\nCREATE TABLE t(a INT);\nCREATE TABLE dbo.t(b INT);\n```\n"
+    assert spec_tables(text) == {"t": "[dbo].[t]"}
 
 
 def test_資料表定義_同一張表寫兩次_寫法相同不算重複():
     text = "## 資料表定義\n```sql\nCREATE TABLE t(a INT);\nCREATE TABLE t(b INT);\n```\n"
-    assert spec_tables(text) == {"t": "[t]"}
+    assert spec_tables(text) == {"t": "[dbo].[t]"}
 
 
 @pytest.mark.parametrize("ddl", [
@@ -74,11 +80,11 @@ def test_資料表定義_只看那一段():
     text = ("## 說明\n```sql\nCREATE TABLE before_t(a INT);\n```\n## 資料表定義\n```sql\n"
             "CREATE TABLE mine(a INT);\n```\n### 子標題\n```sql\nCREATE TABLE sub_t(a INT);\n```\n"
             "## 需求項目\n```sql\nCREATE TABLE after_t(a INT);\n```\n")
-    assert spec_tables(text) == {"mine": "[mine]", "sub_t": "[sub_t]"}
+    assert spec_tables(text) == {"mine": "[dbo].[mine]", "sub_t": "[dbo].[sub_t]"}
 
 
 def test_資料表定義_沒有程式碼區塊時看整段():
-    assert spec_tables("## 資料表定義\nCREATE TABLE t(a INT);\n\n## 需求\nx\n") == {"t": "[t]"}
+    assert spec_tables("## 資料表定義\nCREATE TABLE t(a INT);\n\n## 需求\nx\n") == {"t": "[dbo].[t]"}
 
 
 @pytest.mark.parametrize("text", [None, 1, "", "# 規格\n沒有資料表定義\n",
@@ -92,13 +98,13 @@ def test_資料表定義_找不到或太大時是空的(text):
 
 def test_source_展開成規格的表名():
     r = _render("SELECT account_no FROM {{ source('raw', 'transactions') }}", INFO, TABLES)
-    assert r.ok and r.sql == "SELECT account_no FROM [transactions]"
+    assert r.ok and r.sql == "SELECT account_no FROM [dbo].[transactions]"
     assert r.relation_notice is None
 
 
 def test_source_用宣告的_identifier_不分大小寫_不看來源的_schema():
     r = _render("SELECT 1 FROM {{ source('raw', 'txn_alias') }}", INFO, TABLES)
-    assert r.ok and r.sql == "SELECT 1 FROM [transactions]"
+    assert r.ok and r.sql == "SELECT 1 FROM [dbo].[transactions]"
 
 
 def test_規格帶_schema_時照規格的寫法():
@@ -146,13 +152,13 @@ def test_沒有專案資訊_source_無法確定():
 def test_同一個來源用兩次沒關係():
     r = _render("{{ source('raw', 'transactions') }} {{ source('raw', 'transactions') }}",
                 INFO, TABLES)
-    assert r.ok and r.sql == "[transactions] [transactions]"
+    assert r.ok and r.sql == "[dbo].[transactions] [dbo].[transactions]"
 
 
 def test_this_有定義_沒用到就照常展開():
     r = _render("{% if this is defined %}SELECT 1 FROM {{ source('raw', 'transactions') }}{% endif %}",
                 INFO, TABLES)
-    assert r.ok and r.sql == "SELECT 1 FROM [transactions]"
+    assert r.ok and r.sql == "SELECT 1 FROM [dbo].[transactions]"
 
 
 def test_macro_檔最外層的_source_與_ref_不讓展開失敗():
@@ -160,7 +166,7 @@ def test_macro_檔最外層的_source_與_ref_不讓展開失敗():
     macros = {"macros/m.sql": "{% set a = ref('stg_a') %}{% set b = source('raw', 'x') %}"
                               "{% macro pick() %}{{ source('raw', 'transactions') }}{% endmacro %}"}
     r = _render("SELECT 1 FROM {{ pick() }}", INFO, TABLES, macro_files=macros)
-    assert r.ok and r.sql == "SELECT 1 FROM [transactions]"
+    assert r.ok and r.sql == "SELECT 1 FROM [dbo].[transactions]"
 
 
 def test_沒給_sandbox_tables_時照正式環境的表名():
@@ -172,7 +178,7 @@ def test_子行程隔離的展開也收得到():
     r = render_model_isolated("models/mrt_BIG.sql", database=DB, project=INFO,
                               source="SELECT 1 FROM {{ source('raw', 'transactions') }}",
                               sandbox_tables=TABLES)
-    assert r.ok and r.sql == "SELECT 1 FROM [transactions]"
+    assert r.ok and r.sql == "SELECT 1 FROM [dbo].[transactions]"
 
 
 # ─────────────────── render_for_exec ───────────────────
@@ -191,7 +197,7 @@ def _for_exec(source, spec=SPEC, project=INFO, **kw):
 
 def test_render_for_exec_成功(in_process):
     assert _for_exec("SELECT 1 FROM {{ source('raw', 'transactions') }}") == (
-        "SELECT 1 FROM [transactions]", None, ())
+        "SELECT 1 FROM [dbo].[transactions]", None, ())
 
 
 @pytest.mark.parametrize("source, spec, project, why", [
@@ -247,7 +253,7 @@ def test_最後一個檔案是_model_展開後換掉內容(in_process):
     mr = _exec_mr(["models/mrt_BIG.sql"])
     out, record = _dbt_exec_mr(mr, SPEC, SPEC, (), _ctx(["models/mrt_BIG.sql"]), CFG)
     assert record == {"file": "models/mrt_BIG.sql", "ok": True, "reason": None, "stand_ins": []}
-    assert out["files"][0]["full_content"] == "SELECT account_no FROM [transactions]"
+    assert out["files"][0]["full_content"] == "SELECT account_no FROM [dbo].[transactions]"
     assert mr["files"][0]["full_content"] == MODEL                  # 傳進來的 MR 不動
 
 
@@ -268,13 +274,13 @@ def test_最後一個有內容的才算_後面沒有內容的檔案不算(in_pro
     mr = _exec_mr(["models/mrt_BIG.sql"])
     mr["files"].append({"path": "sql/empty.sql", "diff": ""})
     out, record = _dbt_exec_mr(mr, SPEC, SPEC, (), _ctx(["models/mrt_BIG.sql"]), CFG)
-    assert record["ok"] and out["files"][0]["full_content"].endswith("[transactions]")
+    assert record["ok"] and out["files"][0]["full_content"].endswith("[dbo].[transactions]")
 
 
 def test_diff_裡的樣板也算(in_process):
     mr = {"files": [{"path": "models/mrt_BIG.sql", "diff": "@@ -0,0 +1 @@\n+" + MODEL}]}
     out, record = _dbt_exec_mr(mr, SPEC, SPEC, (), _ctx(["models/mrt_BIG.sql"]), CFG)
-    assert record["ok"] and out["files"][0]["full_content"] == "SELECT account_no FROM [transactions]"
+    assert record["ok"] and out["files"][0]["full_content"] == "SELECT account_no FROM [dbo].[transactions]"
 
 
 @pytest.mark.parametrize("ctx", [None, "error", "seed"])
@@ -422,7 +428,7 @@ def _titles(report):
 
 def test_只引用_source_的_model_送進沙盒執行(run):
     report, sqls = run(["models/mrt_BIG.sql"])
-    assert sqls == ["SELECT account_no FROM [transactions]"]
+    assert sqls == ["SELECT account_no FROM [dbo].[transactions]"]
     assert report["_spec_exec"]["passed"] is True
     assert report["_spec_exec"]["executed_file"] == "models/mrt_BIG.sql"
     assert report["_dbt_exec"] == {"file": "models/mrt_BIG.sql", "ok": True, "reason": None,
@@ -451,13 +457,13 @@ def test_ref_由規格裡同名的表代替_記下代替了哪些(in_process):
     mr = _exec_mr(["models/mrt_BIG.sql"], REF_FILES)
     out, record = _dbt_exec_mr(mr, SPEC_STG, SPEC_STG, (), _ctx(["models/mrt_BIG.sql"], REF_FILES), CFG)
     assert record == {"file": "models/mrt_BIG.sql", "ok": True, "reason": None, "stand_ins": ["stg_a"]}
-    assert out["files"][0]["full_content"] == "SELECT account_no FROM [stg_a]"
+    assert out["files"][0]["full_content"] == "SELECT account_no FROM [dbo].[stg_a]"
 
 
 def test_ref_由測資代替時送進沙盒_並寫出上游的邏輯沒有執行(run):
     (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC_STG, encoding="utf-8")
     report, sqls = run(["models/mrt_BIG.sql"], REF_FILES)
-    assert sqls == ["SELECT account_no FROM [stg_a]"]
+    assert sqls == ["SELECT account_no FROM [dbo].[stg_a]"]
     assert report["_dbt_exec"]["stand_ins"] == ["stg_a"]
     note = next(f for f in report["findings"] if f["title"] == _DBT_EXEC_STAND_IN_TITLE)
     assert note["severity"] == "info" and "stg_a" in note["detail"]
@@ -479,8 +485,8 @@ def test_改了由測資代替的上游_不管有沒有樣板都補未執行():
     ctx = _ctx(["models/stg_a.sql", "models/mrt_BIG.sql"], REF_FILES)
     (fd,) = enforce_dbt_unexecuted(_passed_with(["stg_a"]), REF_MR, ctx, CFG,
                                    "models/mrt_BIG.sql")["findings"]
-    assert (fd["severity"], fd["title"]) == ("major", _DBT_UNEXECUTED_TITLE)
-    assert "stg_a" in fd["detail"] and "由規格的測資代替" in fd["detail"]
+    assert (fd["title"], fd["stage"]) == (_DBT_OTHER_MODELS_TITLE, "執行驗證")      # 待驗證
+    assert "stg_a" in fd["detail"] and "由規格的測資代替的上游" in fd["detail"]
 
 
 def test_上游是樣板時也寫出是哪個上游():
@@ -550,16 +556,34 @@ def test_同時改了上游_model_時_通過也要補未執行(run):
     """上游 model 由測資代替,它自己的改動沒有被執行:MR 改到 dbt 的不只這個 model。"""
     (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC_STG, encoding="utf-8")
     report, sqls = run(["models/stg_a.sql", "models/mrt_BIG.sql"], REF_FILES)
-    assert sqls == ["SELECT account_no FROM [stg_a]"]
-    assert _DBT_UNEXECUTED_TITLE in _titles(report)
+    assert sqls == ["SELECT account_no FROM [dbo].[stg_a]"]
+    assert _DBT_OTHER_MODELS_TITLE in _titles(report)
     assert _DBT_EXEC_STAND_IN_TITLE in _titles(report)
-    assert report["decision"] == "needs_human"
+    assert report["decision"] == "needs_human" and _DBT_OTHER_MODELS_TITLE in review_incomplete(report)
+    assert report["verdict"] != "approve"
+
+
+@pytest.mark.parametrize("other", [
+    "models/stg_x.sql",          # stg_a 引用它(間接的上游)
+    "models/other_plain.sql",    # 跟這次無關
+])
+def test_改到的其他純_SQL_model_也記成待驗證_不會自動放行(run, other):
+    """執行驗證只跑一個 model:MR 改到的其他 model 都沒有被執行,不管有沒有樣板。"""
+    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC_STG, encoding="utf-8")
+    files = {**REF_FILES, other: "SELECT account_no FROM raw_table"}
+    report, sqls = run([other, "models/mrt_BIG.sql"], files)
+    assert sqls == ["SELECT account_no FROM [dbo].[stg_a]"]
+    (fd,) = [f for f in report["findings"] if f["title"] == _DBT_OTHER_MODELS_TITLE]
+    assert fd["stage"] == "執行驗證" and other.rsplit("/", 1)[-1][:-4] in fd["detail"]
+    assert "其他 model" in fd["detail"]
+    assert report["decision"] != "auto_approved" and report["verdict"] != "approve"
 
 
 def test_同時改了_macro_時_通過也要補未執行(run):
     report, sqls = run(["macros/m.sql", "models/mrt_BIG.sql"])
-    assert sqls == ["SELECT account_no FROM [transactions]"]
-    assert _DBT_UNEXECUTED_TITLE in _titles(report)
+    assert sqls == ["SELECT account_no FROM [dbo].[transactions]"]
+    (fd,) = [f for f in report["findings"] if f["title"] == _DBT_UNEXECUTED_TITLE]
+    assert fd["stage"] == "執行驗證"                    # 沒跑到:待驗證
     assert report["decision"] == "needs_human"
 
 
@@ -598,4 +622,106 @@ def test_golden_的_dbt_model_送進沙盒的是跟_mr_406_相同的_SQL(in_proc
     out, record = _dbt_exec_mr(exec_mr, spec, spec, (), ctx, cfg)
     assert record == {"file": "models/mrt_cash_inbound.sql", "ok": True, "reason": None,
                       "stand_ins": []}
-    assert out["files"][-1]["full_content"] == plain.replace("FROM txn_log t", "FROM [txn_log] t")
+    assert out["files"][-1]["full_content"] == plain.replace("FROM txn_log t", "FROM [dbo].[txn_log] t")
+
+
+# ─────────────────── 上游由測資代替時,不符不判成 SQL 錯 ───────────────────
+
+def _mismatch_run(monkeypatch, stand_ins):
+    """上游 stg_a 過濾金額、mrt_BIG 只 SELECT:測資直接放進 [stg_a] 的「不應命中」資料列被原樣輸出,
+    案例不符;仲裁看不到上游,判 sql。"""
+    import asyncio
+    from orchestrator.config import load_config
+    plan = {"schema_ddl": ["CREATE TABLE stg_a (account_no INT);"],
+            "conditions": [{"id": "C1", "desc": "金額達門檻"}],
+            "cases": [{"case_id": "C1-T", "condition_id": "C1", "direction": "true",
+                       "rows": [["stg_a", 1]], "expect_flagged": True},
+                      {"case_id": "C1-F", "condition_id": "C1", "direction": "false",
+                       "rows": [["stg_a", 2]], "expect_flagged": False}]}
+
+    async def generate(cfg, code, text, profile_name=None):
+        return plan, [], []
+
+    def execute(sql, plan_, deadline=None):
+        mm = {"case_id": "C1-F", "condition_id": "C1", "direction": "false", "note": "金額未達",
+              "expect_flagged": False, "actual_flagged": True}
+        return {"engine": "stub", "sandbox_error": None, "testdata_error": None, "sql_error": None,
+                "case_results": [{"case_id": "C1-T"}, {"case_id": "C1-F"}], "mismatches": [mm]}
+
+    async def arbitrate(cfg, spec_text, sql, mm, profile_name=None):
+        return {"who_is_wrong": "sql", "reason": "實作沒有過濾金額"}
+
+    monkeypatch.setattr(spec_exec, "generate_cases", generate)
+    monkeypatch.setattr(spec_exec, "execute_cases", execute)
+    monkeypatch.setattr(spec_exec, "arbitrate", arbitrate)
+    mr = {"files": [{"path": "models/mrt_BIG.sql", "full_content": "SELECT account_no FROM [dbo].[stg_a]"}]}
+    return asyncio.run(spec_exec.run_spec_exec(load_config(), None, mr, "BIG", SPEC_STG,
+                                               stand_ins=stand_ins))
+
+
+def test_上游由測資代替時_不符記成待驗證_不說實作與規格不符(monkeypatch):
+    result = _mismatch_run(monkeypatch, ("stg_a",))
+    titles = {f["title"] for f in result["findings"]}
+    assert "執行驗證失敗:實作與規格行為不符" not in titles
+    (fd,) = [f for f in result["findings"] if f["title"] == spec_exec.STAND_IN_MISMATCH_TITLE]
+    assert fd["stage"] == "執行驗證" and "stg_a" in fd["detail"]
+    assert result["passed"] is False
+
+
+def test_沒有代替時_不符照舊是實作與規格不符(monkeypatch):
+    result = _mismatch_run(monkeypatch, ())
+    (fd,) = [f for f in result["findings"] if f["title"] == "執行驗證失敗:實作與規格行為不符"]
+    assert "stage" not in fd
+
+
+def test_ref_指向的表規格裡沒有時_記成待驗證(run):
+    report, sqls = run(["models/mrt_BIG.sql"], REF_FILES)
+    (fd,) = [f for f in report["findings"] if f["title"] == spec_exec.DBT_NOT_RENDERED_TITLE]
+    assert fd["stage"] == "執行驗證" and fd["title"] in review_incomplete(report)
+    assert report["verdict"] != "approve" and report["decision"] != "auto_approved"
+
+
+# ─────────────────── 名叫 ref 的 source 跟 ref() 分開 ───────────────────
+
+def test_名叫_ref_的_source_跟_ref_對到同一張表時展開失敗(in_process):
+    from orchestrator.dbt_render import render_model
+    info = DbtProjectInfo(project_name="sample", ref_names=frozenset({"mrt_BIG", "stg_a"}),
+                          sources={("ref", "stg_a"): (None, None), ("raw", "stg_a"): (None, None)},
+                          naming={"stg_a": {}})
+    tables = {"stg_a": "[dbo].[stg_a]"}
+    for other in ("source('ref', 'stg_a')", "source('raw', 'stg_a')"):
+        r = render_model("models/mrt_BIG.sql", database=DB, project=info, sandbox_tables=tables,
+                         source=f"SELECT 1 FROM {{{{ {other} }}}} JOIN {{{{ ref('stg_a') }}}}")
+        assert not r.ok and "都對到規格的同一張表" in r.error, (other, r.sql)
+
+
+# ─────────────────── 同名的 CTE 不會蓋掉測資表 ───────────────────
+
+@pytest.mark.parametrize("model", [
+    "WITH stg_a AS (SELECT * FROM {{ ref('stg_a') }})\nSELECT account_no FROM stg_a",
+    "WITH stg_a AS (SELECT 0 AS x WHERE 1=0),\nb AS (SELECT * FROM {{ ref('stg_a') }}) SELECT * FROM b",
+    "WITH transactions AS (SELECT * FROM {{ source('raw', 'transactions') }})\nSELECT * FROM transactions",
+])
+def test_展開成兩段式_不會被同名的_CTE_蓋掉(in_process, model):
+    """單段的 [stg_a] 在 CTE 裡會解成 CTE 自己(遞迴 CTE 錯誤 252),或讀到前面同名的 CTE;
+    [dbo].[stg_a] 只會是表。"""
+    info = DbtProjectInfo(project_name="sample", ref_names=frozenset({"mrt_BIG", "stg_a"}),
+                          sources={("raw", "transactions"): (None, None)}, naming={"stg_a": {}},
+                          refs_complete=True, sources_complete=True)
+    sql, reason, _ = _for_exec(model, spec=SPEC_STG, project=info)
+    assert reason is None, reason
+    assert "FROM [dbo].[" in sql and "FROM [stg_a]" not in sql and "FROM [transactions]" not in sql
+
+
+def test_代替了哪些交給執行驗證(run, monkeypatch):
+    """執行驗證要知道哪些上游由測資代替,不符時才不會說成 SQL 錯。"""
+    seen = {}
+    real = pipeline.run_spec_exec
+
+    async def spy(*a, **kw):
+        seen["stand_ins"] = kw.get("stand_ins")
+        return await real(*a, **kw)
+    monkeypatch.setattr(pipeline, "run_spec_exec", spy)
+    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC_STG, encoding="utf-8")
+    run(["models/mrt_BIG.sql"], REF_FILES)
+    assert seen["stand_ins"] == ("stg_a",)

@@ -12,7 +12,7 @@ import pytest
 from orchestrator.config import DBT_DATABASE_PLACEHOLDER as DB
 from orchestrator.dbt_render import DbtProjectInfo, render_model
 
-TABLES = {"transactions": "[transactions]", "stg_a": "[stg_a]", "stg_alias": "[stage].[stg_alias]",
+TABLES = {"transactions": "[dbo].[transactions]", "stg_a": "[dbo].[stg_a]", "stg_alias": "[stage].[stg_alias]",
           "dup": None}
 
 
@@ -43,7 +43,7 @@ def _render(src, info=None, tables=TABLES):
 def test_ref_由同名的測資表代替():
     r = _render("SELECT a FROM {{ ref('stg_a') }}")
     assert r.ok, r.error
-    assert r.sql == "SELECT a FROM [stg_a]"
+    assert r.sql == "SELECT a FROM [dbo].[stg_a]"
     assert r.stand_ins == ["stg_a"]
 
 
@@ -56,7 +56,7 @@ def test_用_alias_算過之後的表名_不看自訂_schema():
 
 def test_指定本專案的_ref_也算():
     r = _render("SELECT a FROM {{ ref('sample', 'stg_a') }}")
-    assert r.ok and r.sql == "SELECT a FROM [stg_a]"
+    assert r.ok and r.sql == "SELECT a FROM [dbo].[stg_a]"
 
 
 def test_同一個_model_引用兩次只記一次():

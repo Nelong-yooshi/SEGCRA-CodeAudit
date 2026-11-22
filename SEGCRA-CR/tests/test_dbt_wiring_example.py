@@ -312,7 +312,7 @@ def test_golden_mr_862的標準答案_不會被程式補的finding命中():
     case = json.loads((PKG_ROOT / "eval" / "golden" / "mr_862.json").read_text(encoding="utf-8"))
     [expected] = case["expected"]
     program = {"file": "macros/alert_threshold.sql", "line": 0, "severity": "major",
-               "title": "執行驗證無法進行:dbt 樣板尚未支援執行驗證"}
+               "title": "[執行驗證] dbt model 沒有展開"}
     model = {"file": "macros/alert_threshold.sql", "line": 3, "severity": "major",
              "title": "門檻 60000 與規格 SHARED_A_EVAL 的 50,000 不符"}
     assert not match_expected(expected, [program])

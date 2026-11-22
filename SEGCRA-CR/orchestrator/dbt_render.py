@@ -486,21 +486,33 @@ def model_identity(project: "DbtProjectInfo | None", name: str, schema: str) -> 
         model 名稱與 target 的 schema 展開,只是記成不確定、不讓展開失敗
 
     資料庫名不在這裡:一律用呼叫端給的 database(約定的假名,見 DbtProjectInfo)。"""
-    if project is None or project.global_uncertain or name in project.uncertain_models:
+    alias = model_alias(project, name)
+    if alias is None:
         return name, schema, False
-    naming = project.naming.get(name)
-    if naming is None:
-        return name, schema, False
-    alias = naming["alias"].strip() if naming.get("alias") else name
-    custom = naming.get("schema")
+    custom = project.naming[name].get("schema")
     if custom is None:
-        return (alias, schema, True) if _IDENT.fullmatch(alias) else (name, schema, False)
+        return alias, schema, True
     if project.schema_concat is None:
         return name, schema, False
     rel_schema = f"{schema}_{custom.strip()}" if project.schema_concat else custom.strip()
-    if not (_IDENT.fullmatch(alias) and _IDENT.fullmatch(rel_schema)):
+    if not _IDENT.fullmatch(rel_schema):
         return name, schema, False
     return alias, rel_schema, True
+
+
+def model_alias(project: "DbtProjectInfo | None", name: str) -> str | None:
+    """model 在正式環境的表名(dbt 的 generate_alias_name:alias 有值就去掉頭尾空白,沒設用 model 名稱);
+    無法確定時回 None:沒有專案資訊、專案層級無法確定、這個 model 無法確定(seed、snapshot 也列在
+    uncertain_models)、不是英數與底線(會被拼進 SQL 識別字)。model_identity 與執行驗證的代替表
+    都用這一份。"""
+    if project is None or project.global_uncertain or name in project.uncertain_models:
+        return None
+    naming = project.naming.get(name)
+    if naming is None:
+        return None
+    raw = naming.get("alias")
+    alias = raw.strip() if raw else name
+    return alias if _IDENT.fullmatch(alias) else None
 
 
 def _make_relations(database: str | None, schema: str, usage: dict,
@@ -621,7 +633,7 @@ def _sandbox_relations(usage: dict, project: "DbtProjectInfo | None", sandbox_ta
     來源的 schema:沙盒只有規格建的那幾張表。兩個不同的來源對到同一張測資表時無法分辨,展開失敗。
     任何一項不成立就展開失敗(錯誤訊息是原因),不猜表名:猜錯的話執行結果會被當成程式的問題。
 
-    ref() 由測資代替上游 model:被引用的 model 表名確定(alias 算過之後,見 _stand_in_name),而且規格
+    ref() 由測資代替上游 model:被引用的 model 表名確定(alias 算過之後,見 model_alias),而且規格
     裡有同名的表,就指向那張表。上游 model 自己的邏輯不在這次執行(由規格的測資當成它的輸出);
     代替了哪些 model 記在 usage["stand_ins"],報告要寫出來。seed、snapshot、其他套件的 model、
     表名無法確定的 model,一律展開失敗。
@@ -660,11 +672,11 @@ def _sandbox_relations(usage: dict, project: "DbtProjectInfo | None", sandbox_ta
             raise DbtRenderError(f"ref() 指向其他套件的 model,不在這個專案裡:{args[0]}.{name}")
         if name not in project.ref_names:
             raise DbtRenderError(f"ref() 指向專案裡不存在的 model / seed / snapshot:{name}")
-        identifier = _stand_in_name(project, name)
+        identifier = model_alias(project, name)
         if identifier is None:
             raise DbtRenderError(
                 f"ref() 指向的表名無法確定(seed、snapshot,或 alias 等設定是樣板值):{name}")
-        relation = table(("ref", name), identifier, "ref() ")
+        relation = table(("ref", name), identifier, "ref() ")      # 鍵的第一個元素區分 ref 與 source
         if name not in stand_ins:
             stand_ins.append(name)
         return relation
@@ -683,29 +695,12 @@ def _sandbox_relations(usage: dict, project: "DbtProjectInfo | None", sandbox_ta
         elif key in project.uncertain_sources:
             raise DbtRenderError(f"source() 的表名無法確定(樣板值等):{source_name}.{table_name}")
         identifier = _check_ident("表", project.sources[key][1] or table_name)
-        return table(key, identifier, "source() ")
+        return table(("source", *key), identifier, "source() ")
 
     def this(name: str):
         return _UnavailableRelation(_EXEC_NO_THIS)
 
     return ref, source, this
-
-
-def _stand_in_name(project: "DbtProjectInfo", name: str) -> str | None:
-    """ref() 指向的 model 在正式環境的表名(alias 算過之後);無法確定時回 None。
-
-    跟 model_identity 同一套規則,但只看表名:沙盒裡只有規格建的表,綱要與資料庫用不到,
-    所以自訂 schema 要不要串接不知道也沒關係。seed、snapshot(呼叫端提供的名稱一律列在
-    uncertain_models)與專案層級無法確定時回 None。"""
-    if project.global_uncertain or name in project.uncertain_models:
-        return None
-    naming = project.naming.get(name)
-    if naming is None:
-        return None
-    # dbt 的 generate_alias_name:有設就去頭尾空白(只有空白的會變成空字串,不合法)
-    raw = naming.get("alias")
-    alias = raw.strip() if raw else name
-    return alias if _IDENT.fullmatch(alias) else None
 
 
 def _mark_this_used(usage: dict, project: "DbtProjectInfo | None", name: str) -> None:

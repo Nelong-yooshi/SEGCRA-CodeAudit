@@ -48,7 +48,9 @@ def _tables_section(spec_text: str) -> str:
 def spec_tables(spec_text) -> dict:
     """規格「資料表定義」裡 CREATE TABLE 的表:{表名(小寫): 沙盒裡的寫法}。
 
-    寫法每段加上方括號(`[dbo].[txn]`、`[txn]`),跟規格寫的一樣帶不帶 schema。
+    寫法每段加上方括號,一律兩段式:規格沒寫 schema 的表是 `[dbo].[txn]`(沙盒的資料庫由同一個登入建立,
+    它是擁有者,沒寫 schema 的表就在 dbo)。單段的 `[txn]` 會被同名的 CTE 蓋掉(`WITH txn AS (SELECT *
+    FROM [txn])` 會被 SQL Server 當成遞迴 CTE;前面另有叫 txn 的 CTE 時讀到的是那個 CTE),兩段式不會。
     名稱不是英數與底線、或帶資料庫名(三段式)的表不收;同名(不分大小寫)的表不只一張時
     值是 AMBIGUOUS。段落找不到或解析不了回空的 dict。"""
     if not isinstance(spec_text, str):
@@ -67,7 +69,7 @@ def spec_tables(spec_text) -> dict:
         table = st.this.this if isinstance(st.this, exp.Schema) else st.this
         if not isinstance(table, exp.Table) or table.catalog:
             continue
-        parts = [p for p in (table.db, table.name) if p]
+        parts = [table.db or "dbo", table.name]
         if not parts or not all(_IDENT.fullmatch(p) for p in parts):
             continue
         spelled = ".".join(f"[{p}]" for p in parts)
