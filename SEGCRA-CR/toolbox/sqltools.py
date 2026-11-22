@@ -53,37 +53,73 @@ def _skip_block_comment(sql: str, i: int, end: int) -> int:
     return i
 
 
+def _segments(sql: str):
+    """把 SQL 掃成一段一段,吐出 `(種類, 起, 迄)`。種類:
+    `code` / `string` / `ident` / `line_comment` / `block_comment`。
+
+    **字串/識別字/註解的跳過規則只留這一份**:字串 `''` 跳脫、`[...]` 裡的 `]]` 與
+    `"..."` 裡的 `""` 是跳脫(代表一個字面 `]`/`"`,不是結束)、行註解停在換行前、區塊
+    註解可巢狀、沒收尾的吃到檔尾。`_scan_code`、切句、`strip_comments`、`prepare_sql` 的
+    開頭註解、注入掃描的註解抽取都走它——跳脫規則各寫一份,就會有一邊補了另一邊沒補:
+    `find("]")` 不認 `]]`、`[a]]--b]` 的識別字被攔腰當成註解、`[a]];b]` 的分號被當成切點、
+    巢狀 `/* /* */ */` 在第一個 `*/` 就收尾而漏掉後半。
+    """
+    i, n, code = 0, len(sql), 0
+    while i < n:
+        ch = sql[i]
+        if ch == "'":                        # 字串
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":   # '' 跳脫
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            else:
+                j = n
+            kind, end = "string", j
+        elif ch in '"[':                     # 以引號或方括號包起來的識別字
+            close = '"' if ch == '"' else "]"
+            j = i + 1
+            while j < n:
+                if sql[j] == close:
+                    if j + 1 < n and sql[j + 1] == close:  # ]] 或 "" 跳脫
+                        j += 2
+                        continue
+                    j += 1
+                    break
+                j += 1
+            else:
+                j = n
+            kind, end = "ident", j
+        elif sql.startswith("--", i):        # 行註解:停在換行前(換行屬於 code)
+            j = sql.find("\n", i)
+            kind, end = "line_comment", (n if j < 0 else j)
+        elif sql.startswith("/*", i):        # 區塊註解(T-SQL 可巢狀)
+            kind, end = "block_comment", _skip_block_comment(sql, i, n)
+        else:
+            i += 1
+            continue
+        if code < i:
+            yield "code", code, i
+        yield kind, i, end
+        i = code = end
+    if code < n:
+        yield "code", code, n
+
+
 def _scan_code(sql: str):
     """逐一吐出「不在字串、識別字、註解裡」的位置與字元:`(位置, 字元)`。
 
-    切句的兩個掃描器(分號、行首關鍵字)共用這一份:字串常值、`[...]`/`"..."` 識別字、
-    行註解與可巢狀的區塊註解整段跳過,沒收尾的就吃到檔尾。各寫一份的話,補了一邊的
-    跳脫規則就會漏掉另一邊。
+    切句的兩個掃描器(分號、行首關鍵字)共用這一份(底層是 `_segments`);對外的樣子
+    不變:只吐 code 段的每個字元。
     """
-    i, n = 0, len(sql)
-    while i < n:
-        ch = sql[i]
-        if ch == "'":                        # 字串('' 是跳脫,不是結束)
-            i += 1
-            while i < n:
-                if sql[i] == "'":
-                    if i + 1 < n and sql[i + 1] == "'":
-                        i += 2
-                        continue
-                    i += 1
-                    break
-                i += 1
-        elif ch in '"[':                     # 以引號或方括號包起來的識別字
-            j = sql.find('"' if ch == '"' else "]", i + 1)
-            i = n if j < 0 else j + 1
-        elif sql.startswith("--", i):        # 行註解:停在換行上,換行本身還要看得到
-            j = sql.find("\n", i)
-            i = n if j < 0 else j
-        elif sql.startswith("/*", i):        # 區塊註解(T-SQL 可以巢狀)
-            i = _skip_block_comment(sql, i, n)
-        else:
-            yield i, ch
-            i += 1
+    for kind, a, b in _segments(sql):
+        if kind == "code":
+            for i in range(a, b):
+                yield i, sql[i]
 
 
 def _semicolon_cuts(sql: str) -> list[int]:
@@ -113,19 +149,40 @@ class Chunk(NamedTuple):
 
 
 def _first_token(sql: str, i: int, end: int) -> int:
-    """從 i 往後找第一個不是空白、也不在註解裡的位置;整段都是空白與註解時回 end。"""
-    while i < end:
-        if sql[i].isspace() or sql[i] == ";":
-            i += 1
-        elif sql.startswith("--", i):
-            j = sql.find("\n", i)
-            i = end if j < 0 else j + 1
-        elif sql.startswith("/*", i):
-            i = _skip_block_comment(sql, i, end)
-        else:
-            return i
+    """從 i 往後找第一個不是空白/分號、也不在註解裡的位置;整段都是空白與註解時回 end。
+
+    走 _segments(與切句、去註解、注入掃描共用同一份跳脫規則):字串裡的 `--`、
+    `[a]]--b]` 的 `--b]`、巢狀區塊註解都不會被誤判成註解。自己再寫一份跳過規則,就會
+    有一邊補了跳脫另一邊沒補——那正是這張要收掉的那種債。"""
+    sub = sql[i:end]
+    for kind, a, b in _segments(sub):
+        if kind in ("line_comment", "block_comment"):
+            continue
+        if kind in ("string", "ident"):
+            return i + a                 # 字串/識別字的內容就是第一個 token
+        for k in range(a, b):            # code 段:略過前導空白與分號
+            if not (sub[k].isspace() or sub[k] == ";"):
+                return i + k
     return end
 
+
+def strip_comments(sql: str) -> str:
+    """把註解換成等長的空白,**字串常值與識別字原樣保留**;換行留著,行號不變。
+
+    用途是「送出去的內容不該帶註解」(例如送仲裁:註解不影響執行結果,仲裁也用不到,
+    但 MR 作者可以在裡面寫陳述句影響判斷)。
+
+    跟切句共用同一份跳過規則(`_segments`):字串裡的 `--` 不是註解開頭、區塊註解可
+    巢狀、`[a]]--b]` 的 `--b]` 在識別字裡不是註解。各寫一份的話,一邊補了跳脫規則
+    另一邊沒補,就會有一種寫法在某一條路上被當成註解切掉。
+    """
+    out = list(sql)
+    for kind, a, b in _segments(sql):
+        if kind in ("line_comment", "block_comment"):
+            for k in range(a, b):
+                if out[k] != "\n":          # 換行留著,行號不變
+                    out[k] = " "
+    return "".join(out)
 
 def statement_chunks(sql: str) -> list[Chunk]:
     """依分號切成一句一句。
@@ -633,20 +690,16 @@ _MASKED_KEY_RE = re.compile(
 # R005:讀取執行環境(資料庫名、主機、登入身分、系統表)。規則程式不需要知道自己跑在
 # 哪裡;會讀的話,就能在沙盒裡照規格跑、到正式環境才做別的事(例如
 # `AND DB_NAME() NOT LIKE 'segcra%'`)——執行驗證反而會通過,規則層與沙盒都擋不住。
-# 刻意**不排除註解裡的寫法**:去註解的 regex 會被字串裡的 `--` 騙(`'--' AND DB_NAME()`
-# 會連真正會執行的呼叫一起被當成註解去掉);寫在註解裡的誤報只是多一次人工確認。
-# 函式名與括號之間可以夾空白**或註解**:`DB_NAME/**/()` 在 T-SQL 是合法的,
-# 只容許空白就漏掉了(#27 review)。`--` 到行尾的註解同理。
-# 長度有上限:沒有上限的話,`DB_NAME /*` 這種**不閉合**的註解開頭,每一個出現位置都會
-# 一路掃到檔尾才宣告失敗,整體是平方時間(實測 8 萬字元要 14 秒)。而這些內容由 MR
-# 決定。函式名與括號之間的空白或註解本來就很短,給得很寬也只是常數。
-# **上限只算註解的個數,不算空白**:若把每一個空白字元都算一次(`(?:\s|註解){0,30}`),
-# 函式名與括號之間放 31 個空白就比對不到了 —— 繞過只要多按幾下空白鍵。空白一段一段
-# 整段吃掉(註解之間各一段),每一段都不會跟註解搶同一個字元,所以仍然是線性時間。
-_COMMENT = r"/\*(?:[^*]|\*(?!/)){0,500}\*/|--[^\n]*\n"
-_GAP = r"\s*(?:(?:" + _COMMENT + r")\s*){0,30}"
-# 關鍵字與關鍵字之間:至少要有一個空白或註解(`CREATE/**/ENDPOINT` 是合法的 T-SQL)
-_SEP = r"(?:\s|" + _COMMENT + r")" + _GAP
+# _GAP:函式名/關鍵字與括號、點之間容許的間隔,只剩**純空白、不設次數上限**。
+# 原本在這裡自己容許註解(`DB_NAME/**/()`),但那份 regex 的註解比對是非巢狀的:
+# `EXEC /* a /* b */ c */ (` 會在第一個 */ 收尾、後半接不回括號而漏掉;而且上限 30 讓
+# 31 個空白也能繞過。改成:用到 _GAP 的那幾條規則(R005/R006–R010 與 H 類)一律先把
+# SQL 送進 strip_comments(註解變成等長空白、位置不變)再比對,間隔就只會是空白,_GAP
+# 只需 \s*,巢狀註解與空白數量都繞不過(見 _text_rules)。R004(明碼憑證)仍對原文比,
+# 寫在註解裡的密碼一樣外洩。
+_GAP = r"\s*"
+# 關鍵字與關鍵字之間(`CREATE ENDPOINT`、`BACKUP DATABASE`):去註解之後只會是空白,至少一個、不設上限
+_SEP = r"\s+"
 # 識別字的三種寫法:不加引號、方括號、雙引號(SQL Server 預設 `QUOTED_IDENTIFIER ON`,
 # `"sys"."databases"` 是可用的寫法)。**共用一份**:原本每條規則各寫各的,結果補的時候
 # 補得到一條、漏掉另一條 —— 換一種引號就繞過去的洞,要一次補完所有用到識別字的規則。
@@ -719,8 +772,8 @@ def _procs(names) -> str:
 # (前綴不限);危險原語清單裡的(`sp_addsrvrolemember` 等)由 R006–R008、R011 報。
 # 沒列到的 `sys.sp_*` 照樣由 `sys.<物件>` 那條接住。
 def _proc_name(p) -> str:
-    """清單裡一支預存程序的比對寫法(名稱開頭的那種,後面可以再接任何字)。"""
-    return p.pattern[0] + (r"\w*" if p.prefix else "")
+    """清單裡一支預存程序的比對寫法(完整名稱)。"""
+    return p.pattern[0]
 
 
 _SP_ELSEWHERE = ("sp_executesql",) + _ENV_PROCS + tuple(
@@ -772,11 +825,10 @@ _LIST_PROC_RE = re.compile(r"(?i)" + _procs(_proc_name(p) for p in _LIST_PROCS))
 
 
 def _list_proc(name: str):
-    """比對到的名稱是清單裡的哪一項(名稱開頭的那種比開頭)。"""
+    """比對到的名稱是清單裡的哪一項(不分大小寫)。"""
     low = name.lower()
     for p in _LIST_PROCS:
-        want = p.pattern[0].lower()
-        if low == want or (p.prefix and low.startswith(want)):
+        if low == p.pattern[0].lower():
             return p
     return None
 
@@ -803,6 +855,33 @@ _CONFIG_WRITE_RE = re.compile(
 # 網路路徑。**不認 `//` 開頭**:XML 查詢的 XPath(`.nodes('//row')`)是正常寫法,會誤擋;
 # 會吃路徑的程序本身(`xp_dirtree`、`BACKUP`、`OPENROWSET`…)已經各自有規則。
 _UNC_RE = re.compile(r"N?'\\\\")
+# 完整的網路路徑:`\\` 後面接著主機名稱(或 IP、`$` 結尾的管理共用)。只有 `'\\'` 的常值分不出
+# 是在拼網路路徑還是在找反斜線,記成 major 交人工
+_UNC_HOST_RE = re.compile(r"N?'\\\\[\w.$-]")
+# 在 linked server 上執行:`EXEC ('…') AT 伺服器`(execute-transact-sql)。`AT TIME ZONE` 是日期時間的
+# 寫法,不算
+_EXEC_AT_RE = re.compile(r"(?i)\)\s*AT\s+(?!TIME\s+ZONE\b)[\w\[\"]")
+# Jinja 標記:掃四段式名稱前先換掉(_mask_jinja)。`{{ … }}` 換成一個佔位的名稱(`{{ var('srv') }}.db.dbo.t`
+# 照樣是四段式),`{% … %}`、`{# … #}` 換成空白(裡面的 `modules.datetime.datetime.strptime` 是 Jinja 的
+# 屬性存取,不是 linked server)
+_JINJA_OPEN_RE = re.compile(r"\{[{%#]")
+_JINJA_CLOSE = {"{{": "}}", "{%": "%}", "{#": "#}"}
+
+
+def _mask_jinja(sql: str) -> str:
+    """把 Jinja 標記換掉。一次往前掃(線性時間):沒有閉合的標記,後面整段都當成 Jinja、不再找。"""
+    out, pos = [], 0
+    for m in _JINJA_OPEN_RE.finditer(sql):
+        if m.start() < pos:
+            continue
+        end = sql.find(_JINJA_CLOSE[m.group(0)], m.end())
+        out.append(sql[pos:m.start()])
+        if end < 0:
+            return "".join(out) + " "
+        out.append("jinja_value" if m.group(0) == "{{" else " ")
+        pos = end + 2
+    out.append(sql[pos:])
+    return "".join(out)
 # 用 EXEC 呼叫任何 `xp_` 開頭的延伸預存程序:在 SQL Server 的處理序裡執行 DLL,規則 SQL 用
 # 不到。清單裡沒列的名稱也算,所以只認呼叫的位置(`EXEC` 後面,可以有限定名稱、接回傳值),
 # 不在任意位置比對 —— `t.xp_total` 這種欄位名才不會命中。回傳執行環境的那幾支(`xp_msver`)
@@ -843,24 +922,33 @@ def _list_hits(sql: str) -> dict[str, list[str]]:
     夾註解,原文照印會把註解裡的句子貼進留言)。"""
     found: dict[str, list[str]] = {}
     for m in _LIST_PROC_RE.finditer(sql):
-        name = m.group(0).strip('[]"')
-        p = _list_proc(name)
+        p = _list_proc(m.group(0).strip('[]"'))
         if p is not None:
-            found.setdefault(p.rule, []).append(name if p.prefix else p.pattern[0])
+            found.setdefault(p.rule, []).append(p.pattern[0])
     for rule, pairs in _LIST_STATEMENTS.items():
         for p, rx in pairs:
             if rx.search(sql):
                 found.setdefault(rule, []).append(p.label)
     if _CONFIG_WRITE_RE.search(sql):
         found.setdefault(sql_primitives.SERVER_CONFIG, []).insert(0, "sp_configure(帶設定值)")
-    if _UNC_RE.search(sql):
+    if _UNC_HOST_RE.search(sql):
         found.setdefault(sql_primitives.EXTERNAL, []).append("網路路徑(\\\\主機\\…)")
-    env = {n.lower() for n in _ENV_PROCS}
-    for m in _XP_CALL_RE.finditer(sql):
-        name = m.group(1)
-        if name.lower() not in env and _list_proc(name) is None:
-            found.setdefault(sql_primitives.HOST_EXEC, []).append(name)
+    if _EXEC_AT_RE.search(sql):
+        found.setdefault(sql_primitives.EXTERNAL, []).append("EXEC (…) AT(在 linked server 上執行)")
     return {rule: list(dict.fromkeys(names)) for rule, names in found.items()}
+
+
+def _unsure_primitives(sql: str) -> list[str]:
+    """分不出是不是危險原語的寫法(固定說法,不回顯原文):清單外的 `xp_` 開頭預存程序(自己寫的 T-SQL
+    預存程序也可以叫 `xp_`)、只有 `'\\\\'` 的字串(可能在拼網路路徑,也可能只是找反斜線)。"""
+    unsure = []
+    env = {n.lower() for n in _ENV_PROCS}
+    if any(m.group(1).lower() not in env and _list_proc(m.group(1)) is None
+           for m in _XP_CALL_RE.finditer(sql)):
+        unsure.append("清單外的 xp_ 開頭預存程序(無法確認是不是延伸預存程序)")
+    if _UNC_RE.search(sql) and not _UNC_HOST_RE.search(sql):
+        unsure.append("以 \\\\ 開頭的字串(無法確認是不是網路路徑)")
+    return unsure
 
 
 def _dangerous_primitives(sql: str) -> list[tuple[str, str, str]]:
@@ -869,7 +957,8 @@ def _dangerous_primitives(sql: str) -> list[tuple[str, str, str]]:
     listed = _list_hits(sql)
     external = [" ".join(m.group(0).split()).rstrip("(").strip()
                 for m in _EXTERNAL_SRC_RE.finditer(sql)]
-    external += [m.group(0) for m in _FOUR_PART_RE.finditer(sql)]
+    if _FOUR_PART_RE.search(_mask_jinja(sql)):
+        external.append("四段式名稱(經 linked server 讀寫)")
     external += listed.get(sql_primitives.EXTERNAL, [])
     if external:
         hits.append(("R006", "blocker",
@@ -886,10 +975,15 @@ def _dangerous_primitives(sql: str) -> list[tuple[str, str, str]]:
     config = listed.get(sql_primitives.SERVER_CONFIG, [])
     if config:
         hits.append(("R011", "blocker",
-                     f"改伺服器設定或建立伺服器層級的物件:{'、'.join(config)[:200]}——規則 SQL "
-                     "不需要改伺服器設定。打開預設關閉的功能(例如 xp_cmdshell、Ole Automation)"
+                     f"改伺服器設定或伺服器層級的狀態:{'、'.join(config)[:200]}——規則 SQL "
+                     "不需要改伺服器設定或伺服器層級的狀態(終止連線、關掉稽核、追蹤旗標等)。打開預設關閉的功能(例如 xp_cmdshell、Ole Automation)"
                      "會讓後面的寫法可以執行作業系統命令或把資料送出去,而且影響同一台伺服器上"
                      "所有的資料庫。一律禁止"))
+    unsure = _unsure_primitives(sql)
+    if unsure:
+        hits.append(("R007", "major",
+                     f"可能是危險 SQL 原語:{'、'.join(unsure)}——名稱或寫法看起來像,但程式分不出來。"
+                     "請說明用途;是延伸預存程序或網路路徑的話,規則 SQL 不該用"))
     priv = [" ".join(m.group(0).split()).strip() for m in _PRIVILEGE_RE.finditer(sql)]
     priv += listed.get(sql_primitives.PRIVILEGE, [])
     if priv:
@@ -1012,8 +1106,12 @@ def _text_rules(sql: str):
     elif _CRED_COL_RE.search(sql):
         hits.append(("H004", "hint",
                      "查詢選取了憑證/密碼/卡號類敏感欄位:請確認此存取的正當性與最小必要"))
-    probes = _env_probes(sql)
-    if _CONFIG_WRITE_RE.search(sql):
+    # R005/R006–R010 與 H 類(用到 _GAP 的那幾條)一律在去註解後的文字上比對:註解變成
+    # 等長空白、位置不變,_GAP 只需 \s*,巢狀註解與超長空白都繞不過(見 _GAP)。註解本身
+    # 不會執行,所以藏在註解裡的危險原語本來就不該報;R004(明碼憑證)例外,仍對原文比。
+    no_comments = strip_comments(sql)
+    probes = _env_probes(no_comments)
+    if _CONFIG_WRITE_RE.search(no_comments):
         # 改設定由 R011 報;`sys.sp_configure` 再由系統目錄那條報一次就重複了。只讀設定
         # (只帶一個參數)仍然算讀取執行環境。
         probes = [t for t in probes if not t.strip('[]"').lower().endswith("sp_configure")]
@@ -1022,8 +1120,8 @@ def _text_rules(sql: str):
                      f"規則 SQL 讀取執行環境:{'、'.join(probes[:5])}——規則不需要知道自己跑在"
                      f"哪個資料庫/主機/身分下;讀取環境的寫法可以讓規則在執行驗證的沙盒裡照規格跑、"
                      f"到正式環境才做別的事,執行驗證會因此通過。請移除,或說明正當用途"))
-    hits += _dangerous_primitives(sql)
-    hits += _env_hints(sql)
+    hits += _dangerous_primitives(no_comments)
+    hits += _env_hints(no_comments)
     if _MASKED_KEY_RE.search(sql):
         hits.append(("H005", "hint",
                      "輸出的 account_id/主鍵疑似被遮罩:若規格要求明碼輸出(供下游部門"

@@ -166,7 +166,7 @@ def test_四類都有清單():
 def _example(p) -> str:
     """從清單的一項組出一句會用到它的 SQL(每一格取第一個字)。"""
     if p.kind == "proc":
-        return f"EXEC {p.pattern[0]}{'Create' if p.prefix else ''} 'x'"
+        return f"EXEC {p.pattern[0]} 'x'"
     return " ".join(w[0] if isinstance(w, tuple) else w for w in p.pattern) + " x"
 
 
@@ -225,13 +225,24 @@ def test_只讀的sp_configure不算改設定(sql):
 @pytest.mark.parametrize("sql", [
     r"SELECT * FROM t WHERE p = '\\host\share'",               # 不管是哪個程序用到它
     r"DECLARE @p NVARCHAR(100) = N'\\host\share'",
-    r"DECLARE @p NVARCHAR(100) = '\\' + @host + '\x'",         # 拼出來的網路路徑
     r"EXEC dbo.load_file @path = '\\192.0.2.10\in\a.csv'",
+    r"EXEC dbo.load_file @path = '\\fs01\c$\x'",
 ])
-def test_字串以兩個反斜線開頭就是網路路徑(sql):
+def test_兩個反斜線接主機名稱就是網路路徑(sql):
     hits = _hits(sql, "R006")
-    assert hits, sql
+    assert hits and hits[0]["severity"] == "blocker", sql
     assert "網路路徑" in hits[0]["message"]
+
+
+@pytest.mark.parametrize("sql", [
+    r"DECLARE @p NVARCHAR(100) = '\\' + @host + '\x'",         # 可能是拼出來的網路路徑
+    r"SELECT REPLACE(path, '\\', '/') FROM t",                 # 也可能只是找反斜線
+    r"SELECT CHARINDEX('\\', path) FROM t",
+])
+def test_只有兩個反斜線的字串分不出來_交人工不擋(sql):
+    assert not [h for h in _hits(sql, "R006") if "網路路徑" in h["message"]], sql
+    (h,) = [h for h in _hits(sql, "R007") if h["severity"] == "major"]
+    assert "無法確認是不是網路路徑" in h["message"]
 
 
 def test_網路路徑的訊息不寫出主機名稱():
@@ -255,10 +266,11 @@ def test_不是網路路徑的不算(sql):
     "EXEC @rc = master.dbo.xp_some_new_proc 'a'",
     "EXECUTE /* x */ xp_some_new_proc",
 ])
-def test_EXEC呼叫沒列到的xp程序也算(sql):
-    hits = _hits(sql, "R007")
-    assert hits, sql
-    assert "xp_some_new_proc" in hits[0]["message"]
+def test_EXEC呼叫沒列到的xp程序_交人工_不寫出名稱(sql):
+    """自己寫的 T-SQL 預存程序也可以叫 xp_:分不出來,記 major;訊息不回顯 MR 寫的名稱。"""
+    (h,) = _hits(sql, "R007")
+    assert h["severity"] == "major" and "清單外的 xp_" in h["message"], sql
+    assert "xp_some_new_proc" not in h["message"]
 
 
 @pytest.mark.parametrize("sql", [
@@ -285,7 +297,7 @@ _PREFIXES = ["", "sys.", "dbo.", "master.dbo.", "master..", "msdb.dbo.", "[maste
 @pytest.mark.parametrize("prefix", _PREFIXES)
 @pytest.mark.parametrize("p", sql_primitives.procs(), ids=lambda p: p.label)
 def test_預存程序前面接什麼都算(p, prefix):
-    for name in (p.pattern[0] + ("Create" if p.prefix else ""),):
+    for name in (p.pattern[0],):
         for quoted in (name, f"[{name}]", f'"{name}"'):
             sql = f"EXEC {prefix}{quoted} 'x'"
             assert p.rule in _rules(sql), sql

@@ -20,16 +20,19 @@
 
 比對方式(`kind`):
 
-- `proc`:系統預存程序的名稱。**前面接什麼都算**(`sys.`、`master.dbo.`、`master..`、
-  `msdb.dbo.`、方括號、雙引號),也不要求前面有 `EXEC`(批次的第一句可以不寫)。
-  `prefix=True` 時名稱是開頭(`sp_OA` 開頭的一整組)。
-- `statement`:語句的關鍵字序列。每一格可以是一個字,或幾個字裡的任一個;字與字之間
-  要有空白或註解(`CREATE/**/ENDPOINT` 是合法的 T-SQL)。
+- `proc`:系統預存程序的完整名稱。**前面接什麼都算**(`sys.`、`master.dbo.`、`master..`、
+  `msdb.dbo.`、方括號、雙引號),也不要求前面有 `EXEC`(批次的第一句可以不寫)。一律列完整
+  名稱、不比開頭:比開頭的話,`xp_region`、`sp_OAuditLog` 這種欄位名、表名、自己寫的預存程序
+  都會命中。
+- `statement`:語句的關鍵字序列。每一格可以是一個字,或幾個字裡的任一個;規則層先把註解換成
+  空白(`sqltools.strip_comments`)再比對,字與字之間就只會是空白。
+
+出處的網址後面一律接空白、分號、頓號或結尾,說明另外寫在空白之後(複製網址時不會帶到說明)。
 
 另外有兩種**不靠逐一列名稱**的比對,寫在 `sqltools.py`(它們不是一個名字,而是一種寫法):
 
 - `sp_configure` 帶第二個參數(設定值)= 改伺服器設定;只帶一個參數是讀設定,不算。
-- 字串常值以 `\\\\` 或 `//` 開頭 = 網路路徑,不管是哪個程序用到它。
+- 字串常值以 `\\\\` 開頭 = 網路路徑,不管是哪個程序用到它(`//` 不算:XML 的 XPath 會用到)。
 - `EXEC` 呼叫任何 `xp_` 開頭的延伸預存程序 = 在 SQL Server 的處理序裡執行 DLL。
 """
 from __future__ import annotations
@@ -37,7 +40,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 # 規則碼
-SERVER_CONFIG = "R011"     # 改伺服器設定、建立伺服器層級的物件
+SERVER_CONFIG = "R011"     # 改伺服器設定與伺服器層級的狀態(物件、稽核、連線、追蹤旗標)
 EXTERNAL = "R006"          # 資料外送與外部連線
 HOST_EXEC = "R007"         # 執行作業系統命令或外部程式、存取主機
 PRIVILEGE = "R008"         # 權限與帳號
@@ -58,6 +61,10 @@ def _st(page: str) -> str:
     return f"{_LEARN}{_ST}{page}-transact-sql"
 
 
+def _le(page: str) -> str:
+    return f"{_LEARN}t-sql/language-elements/{page}-transact-sql"
+
+
 def _option(name: str) -> str:
     return f"Server configuration options:{name}(預設關閉) {CONFIG_OPTIONS}"
 
@@ -68,41 +75,48 @@ class Primitive:
     kind: str                      # "proc" | "statement"
     pattern: tuple                 # proc:(名稱,);statement:每一格是字或幾個字的 tuple
     source: str
-    prefix: bool = False           # proc 才用:名稱是開頭
 
     @property
     def label(self) -> str:
-        """訊息裡顯示的寫法(比對到的原文另外印;這裡給清單與文件用)。"""
+        """訊息裡顯示的寫法:清單上的名稱(不回顯 MR 的原文)。"""
         if self.kind == "proc":
-            return self.pattern[0] + ("*" if self.prefix else "")
+            return self.pattern[0]
         return " ".join("/".join(w) if isinstance(w, tuple) else w for w in self.pattern)
 
 
-def _proc(rule, name, source, prefix=False):
-    return Primitive(rule, "proc", (name,), source, prefix)
+def _proc(rule, name, source):
+    return Primitive(rule, "proc", (name,), source)
 
 
 def _stmt(rule, words, source):
     return Primitive(rule, "statement", tuple(words), source)
 
 
-# ── 1. 改伺服器設定、建立伺服器層級的物件(R011) ──
+# ── 1. 改伺服器設定與伺服器層級的狀態(R011) ──
 # `sp_configure` 帶設定值另外比對(不列選項名稱:任何設定被改都算)。
 SERVER_CONFIG_LIST = (
     _stmt(SERVER_CONFIG, ["RECONFIGURE"], _LEARN + "t-sql/language-elements/reconfigure-transact-sql"),
     _stmt(SERVER_CONFIG, ["ALTER", "DATABASE"],
-          _LEARN + _ST + "alter-database-transact-sql-set-options(TRUSTWORTHY、DB_CHAINING 等)"),
+          _LEARN + _ST + "alter-database-transact-sql-set-options (TRUSTWORTHY、DB_CHAINING 等)"),
     _stmt(SERVER_CONFIG, ["ALTER", "SERVER", "CONFIGURATION"], _st("alter-server-configuration")),
-    _proc(SERVER_CONFIG, "sp_procoption", _sp("sp-procoption") + "(SQL Server 啟動時自動執行);"
+    _proc(SERVER_CONFIG, "sp_procoption", _sp("sp-procoption") + " (SQL Server 啟動時自動執行);"
           + _option("scan for startup procs")),
     # 伺服器層級觸發程序(例如每次登入都會跑);事件通知 `ON SERVER` 不在這裡
-    _stmt(SERVER_CONFIG, ["ON", "ALL", "SERVER"], _st("create-trigger") + "(DDL/登入觸發程序)"),
-    _stmt(SERVER_CONFIG, [("CREATE", "ALTER"), "ENDPOINT"], _st("create-endpoint") + "(開網路監聽埠)"),
+    _stmt(SERVER_CONFIG, ["ON", "ALL", "SERVER"], _st("create-trigger") + " (DDL/登入觸發程序)"),
+    _stmt(SERVER_CONFIG, [("CREATE", "ALTER"), "ENDPOINT"], _st("create-endpoint") + " (開網路監聽埠)"),
     _stmt(SERVER_CONFIG, [("CREATE", "ALTER"), "EVENT", "SESSION"], _st("create-event-session")),
+    _stmt(SERVER_CONFIG, ["KILL"], _le("kill") + " (終止別的連線)"),
+    _stmt(SERVER_CONFIG, ["SHUTDOWN"], _le("shutdown") + " (停掉整台 SQL Server)"),
+    # DBCC 整個指令都算:規則 SQL 用不到,子指令有全伺服器的追蹤旗標(TRACEON)、清快取、
+    # 直接寫資料頁這類;不排除只讀統計資訊的子指令(要排除的話在這裡列出來並寫理由)
+    _stmt(SERVER_CONFIG, ["DBCC"], _LEARN + "t-sql/database-console-commands/dbcc-transact-sql"),
+    _stmt(SERVER_CONFIG, [("CREATE", "ALTER", "DROP"), "SERVER", "AUDIT"],
+          _st("alter-server-audit") + "、" + _st("drop-server-audit") + " (關掉或刪掉稽核)"),
+    _stmt(SERVER_CONFIG, ["ALTER", "RESOURCE", "GOVERNOR"], _st("alter-resource-governor")),
 )
 
 # ── 2. 資料外送與外部連線(R006) ──
-# 網路路徑另外比對(字串常值以 \\ 或 // 開頭)。OPENROWSET 等與四段式名稱在 sqltools.py。
+# 網路路徑另外比對(字串常值以 \\ 開頭)。OPENROWSET 等、四段式名稱、EXEC (…) AT 在 sqltools.py。
 EXTERNAL_LIST = (
     _proc(EXTERNAL, "sp_send_dbmail", _sp("sp-send-dbmail") + ";" + _option("Database Mail XPs")),
     _proc(EXTERNAL, "xp_sendmail", REVIEW + "(舊版 SQL Mail)"),
@@ -127,11 +141,13 @@ EXTERNAL_LIST = (
 )
 
 # ── 3. 執行作業系統命令或外部程式、存取主機(R007) ──
-# 用 EXEC 呼叫的其他 xp_ 開頭延伸預存程序另外比對。
+# 用 EXEC 呼叫的其他 xp_ 開頭延伸預存程序另外比對(分不出是不是延伸預存程序,記 major 交人工)。
 HOST_EXEC_LIST = (
     _proc(HOST_EXEC, "xp_cmdshell", _option("xp_cmdshell") + ";" + MITRE_T1505_001),
-    _proc(HOST_EXEC, "sp_OA", _sp("sp-oacreate") + ";" + _option("Ole Automation Procedures"),
-          prefix=True),
+    # Ole Automation 的 7 支(Microsoft 文件列的完整名稱)
+    *(_proc(HOST_EXEC, name, _sp(name.lower().replace("_", "-")) + ";" + _option("Ole Automation Procedures"))
+      for name in ("sp_OACreate", "sp_OADestroy", "sp_OAGetErrorInfo", "sp_OAGetProperty", "sp_OAMethod",
+                   "sp_OASetProperty", "sp_OAStop")),
     _proc(HOST_EXEC, "sp_execute_external_script", _sp("sp-execute-external-script") + ";"
           + _option("external scripts enabled")),
     _stmt(HOST_EXEC, [("CREATE", "ALTER"), "EXTERNAL", "LIBRARY"], _st("create-external-library")),
@@ -148,8 +164,10 @@ HOST_EXEC_LIST = (
     _proc(HOST_EXEC, "sp_add_proxy", _sp("sp-add-proxy")),
     _proc(HOST_EXEC, "sp_grant_proxy_to_subsystem", _sp("sp-grant-proxy-to-subsystem")),
     # 主機的登錄檔、服務與檔案系統(沒有官方說明頁的延伸預存程序)
-    _proc(HOST_EXEC, "xp_reg", REVIEW + "(登錄檔)", prefix=True),
-    _proc(HOST_EXEC, "xp_instance_reg", REVIEW + "(登錄檔)", prefix=True),
+    *(_proc(HOST_EXEC, prefix + op, REVIEW + "(登錄檔)")
+      for prefix in ("xp_", "xp_instance_")
+      for op in ("regread", "regwrite", "regdeletekey", "regdeletevalue", "regenumkeys",
+                 "regenumvalues", "regaddmultistring", "regremovemultistring")),
     _proc(HOST_EXEC, "xp_servicecontrol", REVIEW + "(啟停主機上的服務)"),
     _proc(HOST_EXEC, "xp_dirtree", REVIEW + "(列目錄;路徑可以是網路路徑)"),
     _proc(HOST_EXEC, "xp_subdirs", REVIEW + "(列目錄)"),
@@ -191,7 +209,7 @@ PRIVILEGE_LIST = (
     _stmt(PRIVILEGE, [("CREATE", "ALTER"), "CREDENTIAL"], _st("create-credential")),
     _stmt(PRIVILEGE, [("CREATE", "ALTER"), "DATABASE", "SCOPED", "CREDENTIAL"],
           _st("create-database-scoped-credential")),
-    _stmt(PRIVILEGE, ["SETUSER"], _st("setuser") + "(舊的換身分寫法,等於 EXECUTE AS)"),
+    _stmt(PRIVILEGE, ["SETUSER"], _st("setuser") + " (舊的換身分寫法,等於 EXECUTE AS)"),
 )
 
 ALL = SERVER_CONFIG_LIST + EXTERNAL_LIST + HOST_EXEC_LIST + PRIVILEGE_LIST

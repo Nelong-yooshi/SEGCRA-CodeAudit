@@ -200,52 +200,53 @@ class _FakeCfg:
 
 _MISMATCH = {"case_id": "C1-T", "condition_id": "C1", "direction": "true",
              "note": "邊界案例", "rows": [["transactions", 1]],
-             "expect_flagged": True, "actual_flagged": False, "actual_rows": 0}
+             "expect_flagged": True, "actual_flagged": False,
+             "actual_rows": [["transactions", "1"]]}      # 實際輸出的列(不是列數)
 
 
-def test_仲裁_LLM_呼叫失敗時保守倒向_SQL_錯(monkeypatch):
-    """**方向很重要**:倒向「SQL 錯」= 開 major finding、擋下自動放行(誤報,人來看);
-    倒向「測資錯」= 剔除案例、當成沒事(可能誤放)。
-
-    策略是寧可誤差也不要錯放,所以環境掛掉時必須倒向前者。
-    """
+def test_仲裁_LLM_呼叫失敗時沒有結論(monkeypatch):
+    """呼叫失敗不能倒向任一側:倒向「SQL 錯」會憑空開 major(作者以為自己錯了),倒向
+    「測資錯」會剔除證據(可能誤放)。環境掛掉時是『沒有結論』,交人工。"""
     async def boom(*a, **kw):
         raise ConnectionError("端點連不到")
 
     monkeypatch.setattr(spec_exec, "run_agent", boom)
     verdict = asyncio.run(arbitrate(_FakeCfg(), "規格", "SELECT 1;", _MISMATCH))
-    assert verdict["who_is_wrong"] == "sql"
-    assert verdict["arbiter_unparseable"] is True
-    assert "ConnectionError" in verdict["reason"]
+    assert verdict["who_is_wrong"] is None and verdict["inconclusive"] is True
+    assert verdict["why_kind"] == "call_failed"
 
 
 @pytest.mark.parametrize("raw", [
-    "模型今天不想輸出 JSON",              # 完全解析不出來
-    '{"who_is_wrong": "maybe"}',         # 解出來了但值不合法
-    '{"who_is_wrong": "both"}',
+    "模型今天不想輸出 JSON",                      # 完全解析不出來
+    '{"who_is_wrong": "maybe", "reason": "x"}',   # 解出來了但值不合法
+    '{"who_is_wrong": "both", "reason": "x"}',
     '{"reason": "忘了寫 who_is_wrong"}',
 ])
-def test_仲裁輸出無法解析時也倒向_SQL_錯(monkeypatch, raw):
-    """只接受 testdata / sql 兩個值。任何其他東西都當成「不可信」並保守處理
-    ——不能因為模型回了個看起來像 JSON 的東西就採信。"""
-    async def fake(*a, **kw):
+def test_仲裁輸出不可信時沒有結論(monkeypatch, raw):
+    """只接受 testdata / sql 兩個值且 reason 非空。其他(解不出、值不合法、缺 who)都不採信,
+    但不是倒向某一側,而是『沒有結論』(who=None、inconclusive=True)。乾淨結束才看內容,
+    所以 fake 設 finish=stop,把不確定隔離到解析/值這一層。"""
+    async def fake(*a, meta=None, **kw):
+        if meta is not None:
+            meta["finish_reason"] = "stop"
         return raw
 
     monkeypatch.setattr(spec_exec, "run_agent", fake)
     verdict = asyncio.run(arbitrate(_FakeCfg(), "規格", "SELECT 1;", _MISMATCH))
-    assert verdict["who_is_wrong"] == "sql"
-    assert verdict["arbiter_unparseable"] is True
+    assert verdict["who_is_wrong"] is None and verdict["inconclusive"] is True
 
 
 @pytest.mark.parametrize("who", ["testdata", "sql"])
-def test_合法的仲裁判定原樣返回(monkeypatch, who):
-    async def fake(*a, **kw):
+def test_合法的仲裁判定採用(monkeypatch, who):
+    async def fake(*a, meta=None, **kw):
+        if meta is not None:           # 乾淨結束 + 嚴格解析 + 非空 reason 才採信
+            meta["finish_reason"] = "stop"
         return f'{{"who_is_wrong": "{who}", "reason": "理由"}}'
 
     monkeypatch.setattr(spec_exec, "run_agent", fake)
     verdict = asyncio.run(arbitrate(_FakeCfg(), "規格", "SELECT 1;", _MISMATCH))
     assert verdict["who_is_wrong"] == who
-    assert "arbiter_unparseable" not in verdict
+    assert not verdict.get("inconclusive")
 
 
 # ─────────────────── prompt 落檔(診斷用,預設關閉) ───────────────────
@@ -343,3 +344,11 @@ def test_落檔失敗不可以弄垮跑批(monkeypatch, tmp_path):
     monkeypatch.setattr(agent, "DUMP_PROMPTS", str(blocker / "x"))
     agent._dump("m", [{"role": "user", "content": "x"}], 0)   # 不得丟例外
     assert blocker.is_file() and not (blocker / "x").exists()
+
+
+def test_prepare_sql_巢狀開頭註解不吃掉後面的INSERT():
+    """開頭是可巢狀的區塊註解時,判斷語句類型要先跳過它。舊的 /\\*.*?\\*/ 正則會在內層
+    */ 就停、把後面的 INSERT 當成註解的一部分,整句 INSERT 原樣送進沙盒而非取出 SELECT。"""
+    from orchestrator.spec_exec import prepare_sql
+    out = prepare_sql("/* 外層 /* 內層 */ 還在註解 */\nINSERT INTO rpt SELECT a FROM t WHERE a > 1")
+    assert "INSERT INTO rpt" not in out and "SELECT a FROM t" in out, out

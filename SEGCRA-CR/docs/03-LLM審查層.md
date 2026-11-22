@@ -35,7 +35,7 @@
 
 ### 輸出收取與容錯(`orchestrator/agent.py`:`extract_json`、`decode_byte_fallback`)
 
-`extract_json` 是整個管線共用的「模型輸出 → dict」收口(review、baseline、spec_exec 的測資生成與仲裁都用它):
+`extract_json` 是整個管線共用的「模型輸出 → dict」收口(review、baseline、spec_exec 的測資生成都用它;仲裁與知識起草改用更嚴格的 `strict_json_object`——整段剛好一個 JSON 物件、無重複鍵、**不走 json-repair**,因為它們要「乾淨、唯一、完整的結論」才採信):
 
 1. **`decode_byte_fallback`**:修 sentencepiece/gemma 的 byte-fallback——gemma4 偶爾把全形空格等字元吐成**字面的** `<0xE3><0x80><0x80>` 文字而非字元本身。做法:regex 抓連續 `<0xHH>` 序列,轉 bytes 後 `decode("utf-8")`;解不開就原樣保留。
 2. 剝 ` ```json ` / ` ``` ` 圍欄(行首行尾,MULTILINE)。
@@ -170,7 +170,7 @@
 
    預期 stdout:`[agent] model=… tools=on prompt≈N tokens` 起頭,接著多行 `[agent] tool #i: memory__lookup_similar_reviews(…)`、`load_skill({'name': 'mr-comment-format'})` 等工具呼叫紀錄,最後印出報告 JSON;模型原始輸出存 `review_output/mr_001_raw.txt`。
 
-3. **對照組**:`python demo.py --mr 001 --baseline` — 無工具呼叫紀錄、無後處理,直接輸出裸模型 JSON,report 帶 `"_mode": "baseline"`。
+3. **對照組**:`python demo.py --mr 001 --baseline` — 無工具呼叫紀錄、無後處理,直接輸出裸模型 JSON,report 帶 `"_mode": "baseline"`,並帶 `completeness`(三態)與 `truncated`(非 `complete` 即 `True`):被切的輸出被 json-repair 修回來會當成完整報告、finding 變少,A/B 比較就會高估完整管線,所以對照組也查完整度、比較時不把它當成完整的一份。
 
 ## 擴充與注意
 
