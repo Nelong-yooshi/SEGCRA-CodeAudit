@@ -1197,41 +1197,18 @@ def _sandbox_params() -> dict:
             "login_timeout": 10, "timeout": 120}
 
 
-# dbt compile 的輸出一定帶三段式表名(`"<資料庫>"."<schema>"."<表>"`),而沙盒的測資建在
-# 隨機命名的 segcra_sbx_* 資料庫裡、表名就是規格 DDL 寫的那個單純名稱 —— 兩邊對不起來,
-# 查詢會以 Invalid object name 失敗。「規則 SQL 先 dbt compile 再送進管線」是正式流程,
-# 所以這是真的會遇到的情況,不是只有評測。
-#
-# 做法是把三段式名稱剝成純表名,但**只剝剝完真的對得上測資的那些**:
-#   * 剝完的名稱要是規格 DDL 真的建了的表。剝錯會指到別的表,那種錯從結果看不出來;
-#     留著不剝只是查詢失敗,看得見。
-#   * 剝完撞到 CTE 的名字時不剝 —— 那會悄悄換成另一份資料。
-#   * 兩個不同資料庫/schema 下的同名表剝完會撞在一起,而沙盒只有一份測資:整段都不剝,
-#     由呼叫端報成「表名無法對應沙盒的測資」交人工。
-# 只處理三段式:兩段式(`dbo.transactions`)在沙盒本來就解得開(測資建在 dbo),不必動。
-# 三段式的最後一段在 T-SQL 也可能是欄位(`dbo.t.col`),但那要欄位名剛好跟測資的某張表
-# 同名才會誤剝,而且誤剝的結果是查詢直接失敗、不是悄悄換一張表。
-_CREATE_TABLE_NAME = re.compile(
-    r"""^\s*CREATE\s+TABLE\s+(?:\[([^\]]+)\]|"([^"]+)"|([A-Za-z_@#][\w@#$]*))"""
-    r"""(?:\s*\.\s*(?:\[([^\]]+)\]|"([^"]+)"|([A-Za-z_@#][\w@#$]*)))*""", re.I)
-
-
+# 帶三段式表名(`"<資料庫>"."<schema>"."<表>"`)的 SQL 要把表名剝成 `dbo.<表>` 才對得上
+# 沙盒的測資(見 _strip_table_qualifiers 與 docs/05)。會帶三段式的不是 dbt 樣板——dbt 的
+# ref()/source() 由管線自己展開成 `[表]`,不會有三段式;會帶三段式的是 MR 裡本來就寫成
+# 三段式的 SQL(手寫的跨資料庫寫法,或直接提交 compile 的輸出),以及評測的 mr_701/702。
 def _ddl_tables(schema_ddl) -> set[str]:
-    """規格 DDL 建了哪些表(只取表名本身,不含 schema)。
+    """規格 DDL 建了哪些表(只取表名本身、小寫)。
 
+    直接用 `_ddl_columns`(同一份 sqlglot 解析,鍵就是小寫表名),不另寫一份 regex——
+    欄位型別檢查已經解析過一次,表名再解析一次只是同一件事做兩遍、還可能不一致。
     比對用小寫:SQL Server 預設的定序不分大小寫,而編譯輸出與規格 DDL 的大小寫常常
-    不一樣(`TXN_LOG_NET` / `txn_log_net`)。
-    """
-    names = set()
-    for ddl in schema_ddl or []:
-        if not isinstance(ddl, str):
-            continue
-        m = _CREATE_TABLE_NAME.match(ddl)
-        if m:
-            parts = [g for g in m.groups() if g]
-            if parts:
-                names.add(parts[-1].lower())
-    return names
+    不一樣(`TXN_LOG_NET` / `txn_log_net`)。"""
+    return set(_ddl_columns(schema_ddl or []))
 
 
 def _ident_spans(sql: str):
@@ -1431,6 +1408,30 @@ def _eval_conditions(cursor, conds: list[dict]) -> tuple[dict[str, bool] | None,
     return out, ""
 
 
+_EXEC_ERROR_KEYS = ("sandbox_error", "sql_error", "testdata_error", "table_error")
+
+
+def execution_error(ex: dict) -> str | None:
+    """執行結果(`execute_cases` 的回傳)裡第一個非空的錯誤,沒有就回 None。
+
+    「這次執行有沒有失敗」只留這一份判斷:散在各處各自列 `sandbox_error or sql_error or
+    testdata_error` 的話,新增一種錯誤(例如 `table_error`)就會有的地方漏接,把「沒跑成」
+    當成「驗過了」。"""
+    for k in _EXEC_ERROR_KEYS:
+        if ex.get(k):
+            return ex[k]
+    return None
+
+
+def _mssql_error_number(e: Exception) -> int | None:
+    """從 pymssql 的例外取 SQL Server 錯誤碼。`MSSQLDatabaseException` 有 `.number`;
+    `OperationalError` 之類把 (錯誤碼, 訊息) 放在 args。取不到回 None。"""
+    num = getattr(e, "number", None)
+    if num is None and getattr(e, "args", None) and isinstance(e.args[0], int):
+        num = e.args[0]
+    return num
+
+
 def execute_cases(sql: str, plan: dict, deadline: float | None = None) -> dict:
     """角色二:確定性執行(非 LLM)。
 
@@ -1499,8 +1500,17 @@ def execute_cases(sql: str, plan: dict, deadline: float | None = None) -> dict:
                 try:
                     c.execute(prepared)
                     rows = c.fetchall() if c.description else []
-                except Exception as e:   # SQL 本身跑不起來(語法/欄位/方言)→ SQL 側的錯
-                    out["sql_error"] = str(e)[:300]
+                except Exception as e:
+                    # SQL Server 回「找不到物件/資料庫/linked server」(208/911/7202):多半是
+                    # tokenizer 還認不出、沒剝掉的限定表名,或規格的資料表定義漏了那張表——
+                    # 不是這份 SQL 的邏輯錯,記待驗證(table_error),不要說成「SQL 有錯」。
+                    if _mssql_error_number(e) in (208, 911, 7202):
+                        out["table_error"] = (
+                            f"沙盒找不到物件/資料庫(SQL Server 錯誤 "
+                            f"{_mssql_error_number(e)}),可能是沒剝掉的限定表名或規格 DDL 漏了"
+                            f"那張表,無法對應沙盒的測資:需人工執行驗證。{str(e)[:160]}")
+                        return out
+                    out["sql_error"] = str(e)[:300]     # 語法/欄位/方言 → SQL 側的錯
                     return out
                 # 標籤一致性(#23 第 3 點):在**同一個交易、同一份資料**上逐條算出
                 # 每個條件的真假,確認這個案例真的在測它自己宣稱的那一條。

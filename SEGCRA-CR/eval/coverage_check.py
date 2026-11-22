@@ -229,8 +229,9 @@ def coverage(spec_code: str, plan: dict, sql: str, execute) -> dict:
           "rows": [(類別, 要素, 狀態, 抓到的案例)], "by_category": {類別: (測到, 總數)}}。
     狀態:"測到"、"沒測到"、"無法判斷"(改過的 SQL 跑不起來,不算測到)。
     """
+    from orchestrator.spec_exec import execution_error
     ok = execute(sql, plan)
-    err = ok.get("sandbox_error") or ok.get("sql_error") or ok.get("testdata_error")
+    err = execution_error(ok)      # 含 table_error:表名對不上也算正確 SQL 跑不起來
     if err:
         return {"reference_error": f"正確的 SQL 跑不起來:{err}", "rows": [], "by_category": {}}
     if ok.get("mismatches"):
@@ -241,7 +242,7 @@ def coverage(spec_code: str, plan: dict, sql: str, execute) -> dict:
     by_category: OrderedDict[str, list[int]] = OrderedDict((c, [0, 0]) for c in CATEGORIES)
     for category, name, mutated in targets_sql(spec_code, sql):
         ex = execute(mutated, plan)
-        err = ex.get("sandbox_error") or ex.get("sql_error") or ex.get("testdata_error")
+        err = execution_error(ex)
         caught = [str(m.get("case_id")) for m in ex.get("mismatches") or []]
         state = "無法判斷" if err else ("測到" if caught else "沒測到")
         rows.append((category, name, state, caught))

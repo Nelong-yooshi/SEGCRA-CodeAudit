@@ -181,10 +181,9 @@ def test_執行驗證失敗時小diff也不得自動放行(bugged):
 
 
 def test_編譯輸出的三段式表名剝得掉():
-    """`dbt compile` 的輸出一定帶三段式表名(`"<database>"."<schema>"."<表>"`),而沙盒
-    把測資建在隨機命名的 `segcra_sbx_*` 資料庫、表名是規格 DDL 的單純名稱。剝完要剛好
-    對上那些表 —— 這條路是 README 寫的正式流程(「規則 SQL 先 dbt compile 展開再送進
-    管線」),對不上的話查詢會以 Invalid object name 失敗。
+    """帶三段式表名(`"<database>"."<schema>"."<表>"`)的 SQL(評測的 mr_701/702、或 MR
+    裡本來就寫成三段式的 SQL)要剝成 `dbo.<表>` 才對得上沙盒的測資(表名是規格 DDL 的
+    單純名稱、建在 dbo),對不上的話查詢會以 Invalid object name 失敗。
 
     規格釘死的 schema 是真值:從它取出表名,拿去剝編譯輸出,不該剩下任何限定名。
     """

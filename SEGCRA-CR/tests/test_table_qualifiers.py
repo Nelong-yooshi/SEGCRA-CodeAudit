@@ -1,11 +1,12 @@
-"""三段式表名剝成純表名(#26 第 4 點)——不連資料庫。
+"""三段式表名剝成 dbo.<表>——不連資料庫。
 
-`dbt compile` 的輸出一定帶三段式表名(`"<資料庫>"."<schema>"."<表>"`),而沙盒把測資
-建在隨機命名的資料庫裡、表名是規格 DDL 的單純名稱。「規則 SQL 先 dbt compile 再送進
-管線」是正式流程,所以這是真的會遇到的情況。
+帶三段式表名(`"<資料庫>"."<schema>"."<表>"`)的 SQL 要剝成 `dbo.<表>` 才對得上沙盒的
+測資(表名是規格 DDL 的單純名稱、建在 dbo)。會帶三段式的是 MR 裡本來就寫成三段式的
+SQL(手寫的跨資料庫寫法,或直接提交 compile 的輸出),以及評測的 mr_701/702;dbt 樣板
+由管線自己展開成 `[表]`,不會有三段式。
 
-這裡釘住的是**剝的範圍**:剝完對得上測資的才剝,剝不對的留著讓它失敗(看得見),
-會換成另一份資料的不剝。
+這裡釘住的是**剝的範圍與形式**:剝成 dbo.<表>(同名 CTE 不受影響)、T-SQL tokenizer 認得
+方括號/省略 schema、對應不到一份測資的(撞名/四段式/找不到物件)記待驗證、不判 SQL 錯。
 """
 from pathlib import Path
 
@@ -230,6 +231,70 @@ def test_送進沙盒的SQL已經剝掉限定詞(monkeypatch):
     assert out["table_error"] is None and out["sql_error"] is None
     ran = [s for s in sent if "SELECT 1 FROM" in s]   # 受審 SQL 那一句
     assert ran and all('"D"' not in s for s in ran), ran
+
+
+def test_execution_error含table_error():
+    """「這次執行有沒有失敗」只留一份判斷,一定要含 table_error——不然 coverage_check /
+    freeze_testdata 等腳本會把「表名對不上沒跑成」當成「驗過了」。"""
+    from orchestrator.spec_exec import execution_error
+    base = {"sandbox_error": None, "sql_error": None, "testdata_error": None,
+            "table_error": None}
+    assert execution_error(base) is None
+    assert execution_error({**base, "table_error": "撞名"}) == "撞名"
+    assert execution_error({**base, "sandbox_error": "s", "table_error": "t"}) == "s"  # 第一個
+
+
+class _MssqlErr(Exception):
+    """模擬 pymssql 的 SQL Server 例外:(錯誤碼, 訊息),.number 帶錯誤碼。"""
+    def __init__(self, number, msg):
+        super().__init__(number, msg)
+        self.number = number
+
+
+@pytest.mark.parametrize("number", [208, 911, 7202])
+def test_沙盒找不到物件時記待驗證不是SQL有錯(monkeypatch, number):
+    """tokenizer 還認不出的限定名、或規格 DDL 漏了表 → SQL Server 回 208/911/7202。
+    那是「對應不到沙盒的測資」,記待驗證(table_error),不是說這份 SQL 有錯。"""
+    class Cursor:
+        def __init__(self):
+            self.description = None
+
+        def execute(self, sql, params=None):
+            if "GHOST" in sql.upper():            # 受審 SQL(找不到的表)
+                raise _MssqlErr(number, "Invalid object name 'ghost'.")
+            self.description = None
+
+        def fetchone(self):
+            return ("16.0", "Developer Edition")
+
+        def fetchall(self):
+            return []
+
+        def close(self):
+            pass
+
+    class Con:
+        def __init__(self, **kw):
+            pass
+
+        def cursor(self):
+            return Cursor()
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    fake = types.ModuleType("pymssql")
+    fake.connect = lambda **kw: Con(**kw)
+    monkeypatch.setitem(sys.modules, "pymssql", fake)
+    monkeypatch.setattr(spec_exec, "_sandbox_params",
+                        lambda: {"server": "x", "port": 1433, "user": "sa", "password": "pw"})
+    monkeypatch.setattr(spec_exec, "_drop_stale_sandbox_dbs", lambda admin: None)
+    out = spec_exec.execute_cases("SELECT 1 FROM ghost", _PLAN)
+    assert out["table_error"] and str(number) in out["table_error"]
+    assert out["sql_error"] is None
 
 
 def test_撞名時不連沙盒(monkeypatch):

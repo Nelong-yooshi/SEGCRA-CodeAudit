@@ -334,13 +334,12 @@ id 依層分段:`1xx` 注入、`2xx` rule-base、`3xx` binding、`4xx` spec_exec
 > 由 `run_eval.py` 的 `case_config()` 單獨換一份設定跑,**不動 `config/models.yaml`
 > 的預設值**——改預設等於把正式審查的行為一起改掉。
 >
-> **已知缺口(不是這個 case 的問題,是管線的)**:`dbt compile` 的輸出一定帶三段式
-> 表名(`"<database>"."<schema>"."<表>"`),但執行驗證的沙盒把測資建在隨機命名的
-> `segcra_sbx_*` 資料庫、表名是規格 DDL 的單純名稱,兩邊對不起來會以
-> 「Invalid object name」失敗。而「先 `dbt compile` 再送進管線」正是 README 寫的
-> **正式流程**,所以這不只是評測的問題。`mr_701` 目前是靠改寫表名繞過;真正的修法
-> (沙盒以同名資料庫承接,或在 `prepare_sql` 剝掉限定詞)要單獨設計與審。
-> 現況由 `tests/test_golden_real_shape.py` 釘住,實作了會變紅提醒回來拿掉繞道。
+> **真實形狀的三段式表名**:`mr_701` 的 case 放的是 `dbt compile` 的原樣輸出,帶三段式
+> 表名(`"<database>"."<schema>"."<表>"`),而執行驗證的沙盒把測資建在隨機命名的
+> `segcra_sbx_*` 資料庫、表名是規格 DDL 的單純名稱。執行驗證時由 `_strip_table_qualifiers`
+> 把三段式剝成 `dbo.<表>`(見 docs/05「三段式表名剝成 dbo.<表>」),所以 case 不必再改寫
+> 表名繞過。對應不到沙盒一份測資的(撞名、四段式、tokenizer 認不出的寫法)記待驗證、
+> 不是判 SQL 錯。
 
 > 標記 `known_gap` 的 case(`mr_102`、`mr_403`、`mr_408`)見下方
 > 「三個已知缺口」——斷言照跑照顯示,但不計入失敗,以免有人為了讓套件變綠而刪掉它們。
