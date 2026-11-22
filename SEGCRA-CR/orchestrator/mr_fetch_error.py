@@ -12,6 +12,18 @@
 變,而型別與代碼不會。**輸出只有固定的說明文字,不帶例外訊息**:httpx 的訊息常帶完整網址
 (GitLab 的主機名稱),會被寫進 log。跟 `gitlab._rejected_by_gitlab`、
 `pipeline._model_failure_kind` 同一種做法。
+
+`SSL_CERT_FILE` 有設時,取 MR 前先自己載入一次(`gitlab.check_ssl_cert_file`):檔案不存在、是目錄、
+不是 PEM 都直接說是這個變數,不從 httpx 丟出的例外反推(那時丟的是沒有檔名的 FileNotFoundError、
+IsADirectoryError 或 ssl.SSLError,GITLAB_URL 是 http 也一樣)。
+
+已知限制(對不上的一律說「無法分類的錯誤(<例外類別>)」,不猜原因;取 MR 照樣停住):
+- `SSL_CERT_FILE` 是 PEM、但裡面沒有簽發 GitLab 憑證的那個 CA:載入檢查過得了,連線時說「憑證不受
+  信任、要把 SSL_CERT_FILE 指到含有那個 CA 的檔」,沒有分出是「設了但少了 CA」還是「沒設」。
+- 回 200、是 MR 的資料,但個別欄位型別不對:不算取不到 MR,不經過這裡(例如 `diff_refs` 不是物件
+  時當成拿不到 commit 編號,見 `gitlab._diff_refs`)。
+- 上面沒列到的例外型別(例如 httpx 新版本加的例外、代理回的非標準內容):說「無法分類」,附上可以用
+  curl 確認的 API。
 """
 from __future__ import annotations
 
@@ -22,7 +34,7 @@ import ssl
 
 import httpx
 
-from toolbox.gitlab import NotAnMR
+from toolbox.gitlab import InvalidMrId, MockFixtureMissing, NotAnMR, SslCertFileError
 
 # OpenSSL 的憑證驗證代碼(X509_V_ERR_*)。分成三種,因為處理方式不同:
 #   不受信任 → 執行環境要信任簽發的 CA;名稱不符 → GITLAB_URL 要寫憑證上的名稱;
@@ -32,9 +44,9 @@ _NAME_MISMATCH = {62, 64}             # 主機名稱不符、IP 不符
 _EXPIRED = {9, 10}                    # 還沒生效、已過期
 
 _UNTRUSTED_TEXT = ("HTTPS 憑證不受信任(例如內部 CA 簽發的):執行環境要信任簽發的 CA。"
-                   "本程式的 HTTPS 用的是 Python 自帶的 CA 清單、不看系統的,所以在主機上"
-                   "信任了也不夠 —— 要把 CA 檔(PEM)放進執行環境,並把環境變數 SSL_CERT_FILE "
-                   "指到它(容器要掛進去)")
+                   "本程式的 HTTPS(httpx)用的是 certifi 套件的 CA 清單、不看系統的,所以在主機上"
+                   "信任了也不夠 —— 要把環境變數 SSL_CERT_FILE 指到含有簽發 GitLab 憑證那個 CA 的 "
+                   "PEM 檔(會取代整份清單;容器要把檔案掛進去)")
 _NAME_TEXT = ("HTTPS 憑證上的名稱跟 GITLAB_URL 的主機不符:GITLAB_URL 要寫憑證上的那個名稱"
               "(不能用 IP 或別名),或請 GitLab 管理者換一張包含這個名稱的憑證")
 _EXPIRED_TEXT = ("HTTPS 憑證已過期或還沒生效:請 GitLab 管理者更新憑證;"
@@ -121,7 +133,9 @@ def _dns_reason(exc: BaseException) -> str | None:
 
 def _connect_reason(exc: BaseException) -> str | None:
     if _first(exc, httpx.ConnectTimeout) is not None:
-        return "連線 GitLab 逾時(還沒連上):確認網路、防火牆與 GITLAB_URL 的主機和埠"
+        # httpx 的連線逾時包含 TLS 握手:TCP 已經連上、握手卡住也是這一種
+        return ("連線或 TLS 握手逾時(還沒拿到回應):確認網路、防火牆與 GITLAB_URL 的主機和埠;"
+                "主機連得到卻一直卡住時,看那個埠是不是 GitLab 的 HTTPS")
     if _first(exc, httpx.ReadTimeout) is not None:
         return ("已經連上 GitLab,但它一直沒有回應:GitLab 本身忙碌或卡住"
                 "(看 GitLab 的狀態),不是網路問題")
@@ -141,6 +155,10 @@ def _connect_reason(exc: BaseException) -> str | None:
 
 def mr_fetch_reason(exc: BaseException) -> str:
     """取 MR 時丟出的例外 → 看得懂、可以照著處理的原因。固定文字,不帶例外訊息。"""
+    # SSL_CERT_FILE 載入不了(取 MR 前先檢查,gitlab.check_ssl_cert_file):訊息是固定文字
+    cert_file = _first(exc, SslCertFileError)
+    if cert_file is not None:
+        return str(cert_file)
     # 2. 拿到回應但不是 2xx
     status = _first(exc, httpx.HTTPStatusError)
     if status is not None:
@@ -153,13 +171,14 @@ def mr_fetch_reason(exc: BaseException) -> str:
     # 3. 拿到 200,內容不是 MR
     if _first(exc, NotAnMR) is not None:
         return _NOT_MR_TEXT
-    if _first(exc, json.JSONDecodeError) is not None:
+    # 200 但內容解析不了,不論是哪一種編碼(不是 UTF-8 的網頁丟的是 UnicodeDecodeError)
+    if _first(exc, (json.JSONDecodeError, UnicodeDecodeError)) is not None:
         return _NOT_JSON_TEXT
-    # 我們自己的檢查(mock 模式與 MR 編號)
-    if isinstance(exc, FileNotFoundError):
+    # 我們自己的檢查(mock 模式與 MR 編號):只看型別,其他來源的 FileNotFoundError 不算
+    if _first(exc, MockFixtureMissing) is not None:
         return ("mock 模式找不到這個編號的測試資料(要連 GitLab 時,GITLAB_URL、"
                 "GITLAB_TOKEN、GITLAB_PROJECT 三個都要設)")
-    if isinstance(exc, ValueError) and str(exc) == "MR 編號必須是數字":
+    if _first(exc, InvalidMrId) is not None:
         return "MR 編號必須是數字"
     return (f"無法分類的錯誤({type(exc).__name__}):可以用 curl 對同一個 API "
             f"(GITLAB_URL/api/v4/projects/<專案>/merge_requests/<編號>)確認")

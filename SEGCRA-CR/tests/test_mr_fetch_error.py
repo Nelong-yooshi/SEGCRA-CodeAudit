@@ -228,7 +228,7 @@ def test_沒有網路路由():
 def test_連線前逾時與連上之後逾時_說法不同():
     before = mr_fetch_reason(_connect_error(TimeoutError("timed out"), httpx.ConnectTimeout))
     after = mr_fetch_reason(_connect_error(TimeoutError("timed out"), httpx.ReadTimeout))
-    assert "還沒連上" in before and "已經連上" in after
+    assert "TLS 握手" in before and "已經連上" in after       # 連線逾時包含 TLS 握手
 
 
 # ─────────────────── 2. 拿到回應但不是 2xx(真的連線)───────────────────
@@ -293,8 +293,82 @@ def test_mock模式找不到測試資料_點出三個變數(monkeypatch, tmp_pat
     assert all(name in msg for name in ("GITLAB_URL", "GITLAB_TOKEN", "GITLAB_PROJECT"))
 
 
-def test_MR編號不是數字():
-    assert mr_fetch_reason(ValueError("MR 編號必須是數字")) == "MR 編號必須是數字"
+def test_MR編號不是數字_看型別():
+    assert mr_fetch_reason(gitlab.InvalidMrId("x")) == "MR 編號必須是數字"
+    with pytest.raises(gitlab.InvalidMrId):
+        gitlab.get_mr_diff("!951")
+
+
+def test_訊息一樣的_ValueError_不算_MR_編號不對():
+    """不比對訊息字串:別處丟出同一句話的 ValueError 不能被當成 MR 編號不對。"""
+    assert mr_fetch_reason(ValueError("MR 編號必須是數字")).startswith("無法分類的錯誤")
+
+
+def test_其他來源的_FileNotFoundError_不說成_mock_模式():
+    """其他來源的 FileNotFoundError 不說成 mock 模式:SSL_CERT_FILE 指到不存在的檔時,httpx 丟的也是它。"""
+    msg = mr_fetch_reason(FileNotFoundError(2, "No such file or directory"))
+    assert "mock" not in msg and msg.startswith("無法分類的錯誤")
+    assert "mock 模式" in mr_fetch_reason(gitlab.MockFixtureMissing("x"))
+
+
+# ─────────────────── SSL_CERT_FILE 設錯 ───────────────────
+
+def _cert_file_case(tmp_path, kind):
+    if kind == "missing":
+        return str(tmp_path / "nope.pem")
+    if kind == "dir":
+        d = tmp_path / "cadir"
+        d.mkdir()
+        return str(d)
+    if kind == "not_pem":
+        f = tmp_path / "bad.pem"
+        f.write_text("this is not a certificate\n", encoding="utf-8")
+        return str(f)
+    return "   "
+
+
+@pytest.mark.parametrize("kind,words", [("missing", "不存在"), ("dir", "讀得到"),
+                                        ("not_pem", "PEM"), ("empty", "空的")])
+@pytest.mark.parametrize("scheme", ["http", "https"])
+def test_SSL_CERT_FILE_設錯時說出是這個變數(monkeypatch, tmp_path, kind, words, scheme):
+    """GITLAB_URL 是 http 也一樣:httpx 每個請求都照 SSL_CERT_FILE 建 TLS 設定。取 MR 前先自己載入一次。"""
+    monkeypatch.setattr(gitlab, "_SSL_CERT_FILE_OK", set())
+    monkeypatch.setenv("SSL_CERT_FILE", _cert_file_case(tmp_path, kind))
+    msg = _review_error(monkeypatch, tmp_path, f"{scheme}://127.0.0.1:9")
+    assert "SSL_CERT_FILE" in msg and words in msg, msg
+    assert "mock" not in msg and "無法分類" not in msg
+
+
+def test_SSL_CERT_FILE_是正常的_CA_檔時照常(monkeypatch):
+    import certifi
+    monkeypatch.setattr(gitlab, "_SSL_CERT_FILE_OK", set())
+    monkeypatch.setenv("SSL_CERT_FILE", certifi.where())
+    gitlab.check_ssl_cert_file()
+    assert certifi.where() in gitlab._SSL_CERT_FILE_OK
+
+
+# ─────────────────── 200 但內容解析不了、/diffs 不是清單 ───────────────────
+
+def test_200_但不是_UTF8_的網頁也說不是_JSON():
+    try:
+        "登入".encode("big5").decode("utf-8")
+    except UnicodeDecodeError as e:
+        err = e
+    assert "不是 JSON" in mr_fetch_reason(err)
+
+
+@pytest.mark.parametrize("payload", ["null", "5", '"text"', '{"a": 1}'])
+def test_diffs_的每一頁不是清單就是不是_MR(monkeypatch, tmp_path, payload):
+    monkeypatch.setattr(gitlab, "REAL_MODE", True)
+    monkeypatch.setattr(gitlab, "GITLAB_URL", "http://gitlab.invalid")
+    monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "3")
+
+    def get(url, *a, **k):
+        return httpx.Response(200, text=payload, request=httpx.Request("GET", url))
+    monkeypatch.setattr(httpx, "get", get)
+    with pytest.raises(gitlab.NotAnMR) as info:
+        gitlab._api_pages("/merge_requests/7/diffs")
+    assert "不是 MR" in mr_fetch_reason(info.value)
 
 
 def test_分類不到的_說無法分類並提示用curl確認():
