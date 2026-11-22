@@ -95,7 +95,7 @@
     `relation_notice`,不要讓表名看起來像是已經過完整驗證。
   * `adapter` 只提供 `dispatch`(依 `adapter` 參數先找 `<轉接器>__x`,再退回
     `default__x`);不讀 `dbt_project.yml` 的 dispatch 搜尋順序設定,也不分辨套件。
-    `{{ this }}`、`run_query`、`modules`、`fromjson` 等其餘 dbt 內建未支援,
+    `{{ this }}`、`run_query`、`fromjson`、`modules` 除了 `modules.datetime` 以外等其餘 dbt 內建未支援,
     用到即 render 失敗。
   * macro 同名時 dbt 用套件命名空間解析,這裡是單一平面命名空間。遇到同名
     只能擇一,結果**可能與 dbt 不同** → 記進 `macro_conflicts` 讓上游看得到。
@@ -180,7 +180,7 @@ DEFAULT_MACRO_DIRS = ("macros",)
 # macro 不得使用的名稱:dbt 內建(含刻意不提供的 this / env_var / builtins)與 Jinja 內建。
 RESERVED_NAMES = frozenset({
     "ref", "source", "config", "return", "var", "execute", "is_incremental",
-    "invocation_id", "run_started_at", "target", "this", "env_var", "builtins",
+    "invocation_id", "run_started_at", "target", "this", "env_var", "builtins", "modules",
 }) | frozenset(DEFAULT_NAMESPACE)
 
 # 刻意留空:不預設任何 dbt var。
@@ -242,6 +242,9 @@ class DbtProjectInfo:
                        dbt_sqlserver_use_default_schema_concat):True / False;None = 無法確定
     schema_concat_unset  專案自己沒有決定(flags 與 vars 都沒寫):由部署端設定的預設值補上
                        (設定檔 dbt.sqlserver_schema_concat,見 dbt_context)
+    project_vars       dbt_project.yml 最外層的 vars 裡值確定的那些 {名稱: 值}(var() 在呼叫端沒給值時用)
+    project_vars_unclear  dbt_project.yml 的 vars 裡值無法確定的名稱(樣板值),或 "*" 表示有子區塊
+                       (專案或套件層級的 vars:哪個 model 吃到哪個值不判斷)。var() 查到它們就展開失敗
     """
     project_name: str | None = None
     ref_names: frozenset = frozenset()
@@ -254,6 +257,8 @@ class DbtProjectInfo:
     naming: dict = field(default_factory=dict)
     schema_concat: bool | None = None
     schema_concat_unset: bool = False
+    project_vars: dict = field(default_factory=dict)
+    project_vars_unclear: frozenset = frozenset()
 
 
 class DbtRenderError(Exception):
@@ -415,8 +420,10 @@ class _DbtSandbox(SandboxedEnvironment):
         return result
 
 
-def _make_var(variables: dict):
-    """dbt 的 var()。找不到又沒給預設值時**硬失敗**,不回 None。
+def _make_var(variables: dict, project: "DbtProjectInfo | None" = None):
+    """dbt 的 var()。值的來源照 dbt 的順序:呼叫端給的(排程的 `--vars`,也就是設定檔的 dbt.vars 與
+    dbt.run_date_vars)> dbt_project.yml 最外層的 vars > `var()` 的預設值。找不到又沒給預設值時**硬失敗**,
+    不回 None。dbt_project.yml 的值無法確定(樣板值、專案或套件層級的子區塊)時也失敗,寫出原因。
 
     回 None 的話 Jinja 會把它渲染成字串 "None" 寫進 SQL(例如
     `WHERE d = None`),而且整個流程還會回報展開成功——這種錯最難抓。
@@ -425,18 +432,46 @@ def _make_var(variables: dict):
     每次回傳複本:樣板(例如 `{% do var('codes').append(...) %}`)改不到呼叫端的
     資料,也不會因為哨兵那次渲染看到被改過的值而讓行號對應失準。
     """
+    project_vars = project.project_vars if project is not None else {}
+    unclear = project.project_vars_unclear if project is not None else frozenset()
 
     def var(name, default=_MISSING):
         if name in variables:
             return copy.deepcopy(variables[name])
+        if name in unclear or "*" in unclear:
+            raise DbtRenderError(
+                f"var('{name}'):dbt_project.yml 的 vars 裡這個值無法確定(樣板值,或寫在專案、套件層級的"
+                f"子區塊裡),展開器不判斷哪個 model 吃到哪個值。")
+        if name in project_vars:
+            return copy.deepcopy(project_vars[name])
         if default is _MISSING:
             raise DbtRenderError(
-                f"var('{name}') 沒有預設值,呼叫端也沒有提供。"
+                f"var('{name}') 沒有預設值,dbt_project.yml 的 vars 與設定檔也沒有給。"
                 f"dbt 在這種情況會編譯失敗,這裡同樣不猜值。正式環境的值由排程每次執行時傳入的話,"
                 f"在設定檔的 dbt.vars(固定值)或 dbt.run_date_vars(這次執行的日期)給值。")
         return default
 
     return var
+
+
+class _UnsupportedModule(Exception):
+    pass
+
+
+class _Modules:
+    """dbt 的 `modules`:只提供 `modules.datetime`(datetime、date、timedelta 三個類別)。時間的類別與
+    值都經過 _guard_time_access(`now()`、`today()`、`utcnow()`、`fromtimestamp()` 這類看主機時間的
+    擋下)。其他模組(pytz、re、itertools…)不提供,用到就展開失敗,寫出是哪一個。"""
+
+    def __init__(self):
+        object.__setattr__(self, "datetime", types.SimpleNamespace(
+            datetime=datetime.datetime, date=datetime.date, timedelta=datetime.timedelta))
+
+    def __getattr__(self, name):
+        raise DbtRenderError(f"modules.{name} 不提供(只提供 modules.datetime 的 datetime、date、timedelta)")
+
+    def __setattr__(self, name, value):
+        raise DbtRenderError("modules 是唯讀的")
 
 
 class _Config:
@@ -1184,7 +1219,8 @@ def build_env(code_root=None, variables: dict | None = None,
         env.globals["this"] = this(model_name)
     env.globals["config"] = _Config()
     env.globals["return"] = _return
-    env.globals["var"] = _make_var(variables)
+    env.globals["var"] = _make_var(variables, project)
+    env.globals["modules"] = _Modules()
     env.globals["execute"] = True                   # compile 期為 True
     # 預設比照 compile 回 False;有沒有被呼叫記下來,呼叫端據此決定要不要以 True 再展開一次
     env.segcra_incremental = {"called": False}
