@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 from .agent import extract_json, output_truncated, run_agent
 from .config import Config, estimate_tokens_upper, token_units
+from .text_fields import as_text
 
 # 一次最多採用幾段模型挑出的片段、每段最多幾個字元(只留在內部紀錄)
 MAX_QUOTES = 3
@@ -93,14 +94,14 @@ def collect_sections(mr: dict, head_texts: dict | None = None) -> list[Section]:
         if not isinstance(f, dict) or not isinstance(f.get("path"), str):
             continue
         path = f["path"]
-        diff = f.get("diff") if isinstance(f.get("diff"), str) else ""
+        diff = as_text(f.get("diff"))
         if _is_deleted(diff):
             diffs.append(Section("檔案", path, "", PART_DIFF))
             continue
         full = f.get("full_content")
         if not (isinstance(full, str) and full):
             full = head_texts.get(path)
-        full = full if isinstance(full, str) else ""
+        full = as_text(full)
         if "\x00" in diff or "\x00" in full:
             # 二進位檔:內容不是給人讀的文字,整份送只會塞滿上限
             diffs.append(Section("檔案", path, BINARY_NOTE, PART_DIFF))
