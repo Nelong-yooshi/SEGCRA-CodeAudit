@@ -52,6 +52,7 @@ PKG_ROOT = EVAL_DIR.parent
 sys.path.insert(0, str(PKG_ROOT))
 
 from orchestrator.config import estimate_tokens, load_config  # noqa: E402
+from orchestrator.error_text import error_label  # noqa: E402  只留型別與狀態碼,不放原文
 
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -269,7 +270,7 @@ def check_endpoint(cfg) -> Check:
     except Exception as e:
         # 連不到就連不到,但訊息不要把端點位址印出來(同上:這份輸出會被貼進 PR)
         return Check("端點身分", "fail",
-                     f"連不到模型端點:{type(e).__name__}: {str(e)[:120]}", data)
+                     f"連不到模型端點:{error_label(e)}", data)
     if status == 200:
         try:
             data["api_version"] = json.loads(body).get("version")
@@ -343,7 +344,7 @@ def check_sandbox() -> Check:
     try:
         ex = execute_cases(PROBE_SQL, PROBE_PLAN)
     except Exception as e:
-        return Check("執行驗證沙盒", "fail", f"{type(e).__name__}: {str(e)[:150]}", {})
+        return Check("執行驗證沙盒", "fail", f"{error_label(e)}", {})
     took = round(time.monotonic() - t0, 2)
     data = {"engine": ex.get("engine"), "seconds": took,
             "sql_error": ex.get("sql_error"), "testdata_error": ex.get("testdata_error"),
@@ -409,7 +410,7 @@ async def check_seed(client, model: str) -> Check:
         c, tc = await _ask(client, model, prompt, seed=None, temperature=1.0, max_tokens=800)
     except Exception as e:
         return Check("seed 是否生效", "fail",
-                     f"探針呼叫失敗:{type(e).__name__}: {str(e)[:150]}", {})
+                     f"探針呼叫失敗:{error_label(e)}", {})
     data = {"same_seed_identical": a == b, "control_differs": c != a,
             "seconds": [round(x, 1) for x in (ta, tb, tc)]}
     if a != b:
@@ -464,7 +465,7 @@ async def check_num_ctx(client, model: str, budget_tokens: int) -> Check:
                                max_tokens=800)
     except Exception as e:
         return Check("context 長度", "fail",
-                     f"探針呼叫失敗:{type(e).__name__}: {str(e)[:150]}", data)
+                     f"探針呼叫失敗:{error_label(e)}", data)
     data["seconds"] = round(took, 1)
     data["recalled"] = marker in out
     if not data["recalled"]:
@@ -508,7 +509,7 @@ async def check_truncation_signal(cfg) -> Check:
                         hub=None, use_tools=False, verbose=False, meta=meta)
     except Exception as e:
         return Check("輸出截斷回報", "fail",
-                     f"探針呼叫失敗:{type(e).__name__}: {str(e)[:150]}", {})
+                     f"探針呼叫失敗:{error_label(e)}", {})
     reason, used = meta.get("finish_reason"), meta.get("completion_tokens")
     data = {"model": prof.model, "max_tokens": TRUNC_PROBE_TOKENS,
             "finish_reason": reason, "completion_tokens": used,
@@ -543,7 +544,7 @@ async def check_latency(client, model: str, n: int = 3) -> Check:
                               seed=None, temperature=0.0, max_tokens=64)
         except Exception as e:
             return Check("推論延遲", "fail",
-                         f"短呼叫失敗:{type(e).__name__}: {str(e)[:120]}",
+                         f"短呼叫失敗:{error_label(e)}",
                          {"seconds": times})
         times.append(round(t, 1))
     med = statistics.median(times)

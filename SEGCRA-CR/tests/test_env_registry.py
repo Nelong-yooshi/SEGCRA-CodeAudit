@@ -51,6 +51,8 @@ _KNOWN_DYNAMIC = {
     # helper 本體:名稱是參數,實際的名稱在呼叫端(那些是字串常值,照樣掃得到)
     ("orchestrator/config.py", "os.environ[name]"),
     ("orchestrator/config.py", "os.environ.get(name)"),
+    ("orchestrator/agent.py", "os.environ.get(name)"),       # _env_timeout、_env_flag 的本體
+    ("orchestrator/config.py", "_env_text(name)"),           # env_text、env_int、env_path 的本體
     # 把 config/sandbox.env 的內容塞進環境:鍵來自那個檔案,不是程式寫死的
     ("orchestrator/spec_exec.py", "os.environ.setdefault(k.strip(), v.strip())"),
 }
@@ -210,3 +212,31 @@ def test_setdefault_設的值不算預設值(tmp_path):
     f.write_text('import os\nos.environ.setdefault("SEEDY", "42")\n', encoding="utf-8")
     read = scan_file(f)[0]
     assert read.name == "SEEDY" and read.default_value is None
+
+
+# 直接讀、沒有值時退到別的東西的地方,每一個都要有理由。新加的環境變數用 config.py 的 helper
+# (設了但是空的:文字、整數、路徑就停;秒數、開關警告並用預設)。
+DIRECT_FALLBACK_OK = {
+    "GITLAB_WEBHOOK_SECRET": "空的或沒設時 webhook 那條路一律 401(等於停用),不會退到別的密鑰",
+    "SANDBOX_MSSQL_PASSWORD": "空的或沒設時沙盒登入失敗、執行驗證記無法完成,不會退到別的帳密",
+    "SEGCRA_DUMP_PROMPTS": "開發除錯用的開關,空的等於沒開",
+    "LLM_TIMEOUT": "讀法在 agent.py,改成 config.py 的秒數 helper 時從這裡拿掉",
+}
+
+
+def test_直接讀環境變數又退到預設值的地方_每一個都有理由():
+    from orchestrator.env_registry import scan_repo_fallbacks
+    found = scan_repo_fallbacks()
+    names = {name for name, _ in found}
+    unexplained = sorted((n, w) for n, w in found if n not in DIRECT_FALLBACK_OK)
+    assert not unexplained, f"改用 config.py 的 helper,或寫進 DIRECT_FALLBACK_OK 並寫理由:{unexplained}"
+    assert set(DIRECT_FALLBACK_OK) <= names, f"已經不直接讀了,從清單拿掉:{set(DIRECT_FALLBACK_OK) - names}"
+
+
+@pytest.mark.parametrize("src", ['os.environ.get("X", "d")', 'os.environ.get("X") or "d"',
+                                 'os.getenv("X", "d")'])
+def test_退到預設值的寫法都掃得到(tmp_path, src):
+    from orchestrator.env_registry import _fallback_reads
+    f = tmp_path / "m.py"
+    f.write_text(f"import os\nv = {src}\n", encoding="utf-8")
+    assert [n for n, _ in _fallback_reads(f, "m.py")] == ["X"]

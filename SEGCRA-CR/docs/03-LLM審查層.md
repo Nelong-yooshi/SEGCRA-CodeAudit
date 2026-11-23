@@ -26,7 +26,7 @@
 
 逐步:
 
-1. 建 `AsyncOpenAI` client:`base_url=cfg.endpoint`(`config/models.yaml` 的 `endpoint`,可用環境變數 `OLLAMA_URL` 覆蓋;見 `orchestrator/config.py`:`load_config`)、`timeout=REQUEST_TIMEOUT`、**`max_retries=0`(不自動重試)**。`REQUEST_TIMEOUT` 由環境變數 `LLM_TIMEOUT`(秒)覆蓋,預設 3600——單次請求上限 1 小時。
+1. 建 `AsyncOpenAI` client:`base_url=cfg.endpoint`(`config/models.yaml` 的 `endpoint`,可用環境變數 `OLLAMA_URL` 覆蓋;見 `orchestrator/config.py`:`load_config`)、`api_key=cfg.api_key`(`models.yaml` 的 `api_key`,可用環境變數 `LLM_API_KEY` 覆蓋;端點要驗證時用環境變數給,不寫進 yaml)、`timeout=REQUEST_TIMEOUT`、**`max_retries=0`(不自動重試)**。`REQUEST_TIMEOUT` 由環境變數 `LLM_TIMEOUT`(秒)覆蓋,預設 3600——單次請求上限 1 小時。
 2. `messages = [system, user]`;`use_tools` 且有 hub 時帶 `tools=hub.openai_tools, tool_choice="auto"`(**只含唯讀白名單**,見下方 `MODEL_TOOLS`)(baseline 模式 `use_tools=False`,純一問一答)。
 3. 迴圈至多 `MAX_ITERATIONS = 12` 輪,每輪呼叫 `chat.completions.create`(帶 profile 的 `temperature`、`max_output_tokens`),把回覆 append 進 messages。
 4. **無 tool_calls 時**:若 `content` 非空 → 直接回傳(正常結束);若為空 → append 一則 user 訊息「請直接輸出最終報告 JSON,不要其他文字。」再 continue(**空回應補推**,對付推理型模型偶發的空 content)。
@@ -57,7 +57,7 @@
   - 白名單內的工具也要擋得住模型給的參數:`get_mr_diff` / `get_file` 的 `mr_id` 會被接進 GitLab API 路徑與 fixture 檔名,只接受 1–10 位 ASCII 數字(`toolbox/gitlab.py:_check_mr_id`),`1/../../issues/5`、`x/../../config/x` 這類值直接報錯、不發請求、不讀檔
 - **schema 自動生成**(`function_schema` + `_annotation_schema`):由函式簽名 + docstring 生成——docstring 就是給 LLM 看的工具描述;參數型別註記對映 `str/int/bool/float → string/integer/boolean/number`,`list/set/tuple → array`(含 items),`dict → object`,未知型別退回 `string`;**有預設值的參數為非必填**(`required` 只收無預設值者)。所以「加工具」= 在 toolbox 寫一個帶型別註記與 docstring 的函式,掛進 `TOOL_GROUPS`,schema 自己長出來。
 - **`register_local(name, fn, description, parameters)`**:註冊 orchestrator 本地工具(目前只有 `load_skill`),schema 手寫,與 toolbox 工具同列;要交給模型的也必須列進 `MODEL_TOOLS`。
-- **`call(full_name, args, truncate=True)`** 分派順序:local_tools → toolbox 函式(例外不炸管線,回 `Error executing tool …: {e}` 字串,與舊 MCP server 端吞錯行為一致)→ 未知 group/工具回中文錯誤字串。結果 `str()` 後,**`truncate=True` 且超過 `max_chars`(`config/models.yaml` 的 `budget.tool_result_max_chars`,現值 6000)時截斷**,尾附「…(截斷,原長 N 字元)」。截斷**只用於餵給 LLM 的工具結果**。
+- **`call(full_name, args, truncate=True)`** 分派順序:local_tools → toolbox 函式(例外不炸管線,回 `Error executing tool …: <例外型別>,HTTP <狀態碼>` 字串:只留型別與狀態碼,不放例外原文——原文由對方決定,可能帶金鑰或內部主機名稱,而工具結果會交給模型、可能被照抄進 finding;見 `orchestrator/error_text.py`)→ 未知 group/工具回中文錯誤字串。結果 `str()` 後,**`truncate=True` 且超過 `max_chars`(`config/models.yaml` 的 `budget.tool_result_max_chars`,現值 6000)時截斷**,尾附「…(截斷,原長 N 字元)」。截斷**只用於餵給 LLM 的工具結果**。
 - **`call_json(full_name, args)`**:orchestrator 自用(預掃、抓 MR、檢索知識),`truncate=False` 直接解析 JSON,失敗回 `None`——不可截斷,否則大型 MR 的 JSON 會被腰斬成解析失敗。
 - `__aenter__/__aexit__` 為介面相容保留(舊版要起子行程),行程內版無事可做,但 `async with ToolHub(...)` 用法一行不改。
 

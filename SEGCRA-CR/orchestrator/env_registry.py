@@ -17,9 +17,10 @@ PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
 # 參數不會被要求寫進文件。範圍跟進入點檢查那一條測試對齊。
 SCAN_DIRS = ("orchestrator", "toolbox", "scripts", "eval", "tools")
 SCAN_FILES = ("demo.py",)
-# 讀環境變數的 helper(定義在 config.py)。名稱前面可能有底線(模組內私有的版本)。
+# 讀環境變數的 helper(定義在 config.py;agent.py 的 _env_timeout、_env_flag)。名稱前面可能
+# 有底線(模組內私有的版本)。
 ENV_HELPERS = frozenset({"env_seconds", "env_float", "env_seed", "env_effort",
-                         "env_int", "env_bool"})
+                         "env_int", "env_bool", "env_timeout", "env_flag", "env_text", "env_path"})
 
 
 def const_value(expr: str | None):
@@ -151,6 +152,39 @@ def scan_repo(root: pathlib.Path | None = None) -> dict[str, list[EnvRead]]:
         for read in scan_file(f, f.relative_to(root).as_posix()):
             found.setdefault(read.name, []).append(read)
     return dict(sorted(found.items()))
+
+
+def _fallback_reads(path: pathlib.Path, rel: str) -> list[tuple[str, str]]:
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except (SyntaxError, UnicodeDecodeError):
+        return []
+    first_of_or = {id(n.values[0]) for n in ast.walk(tree)
+                   if isinstance(n, ast.BoolOp) and isinstance(n.op, ast.Or)}
+    out = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and node.args):
+            continue
+        func = ast.unparse(node.func)
+        tail = ".".join(func.split(".")[-2:])
+        if tail != "environ.get" and func.split(".")[-1] != "getenv":
+            continue
+        if len(node.args) >= 2 or id(node) in first_of_or:
+            name = node.args[0].value if isinstance(node.args[0], ast.Constant) else ast.unparse(node.args[0])
+            out.append((str(name), f"{rel}:{node.lineno}"))
+    return out
+
+
+def scan_repo_fallbacks(root: pathlib.Path | None = None) -> list[tuple[str, str]]:
+    """直接讀環境變數、沒有值時退到別的東西的地方:`os.environ.get("X", 預設)`、
+    `os.environ.get("X") or …`。這兩種寫法在「設了但是空的」時行為不一樣(前者照用空字串,後者當成
+    沒設),跟 config.py 的 helper(空的就停或警告)也不一樣。新加的變數應該用 helper;
+    有理由直接讀的由測試逐一認帳。回傳 (名稱, 位置)。"""
+    root = root or PKG_ROOT
+    out = []
+    for f in _scan_targets(root):
+        out.extend(_fallback_reads(f, f.relative_to(root).as_posix()))
+    return sorted(out)
 
 
 def scan_repo_dynamic(root: pathlib.Path | None = None) -> list[EnvRead]:

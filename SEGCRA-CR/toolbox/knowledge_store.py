@@ -28,8 +28,11 @@ from pathlib import Path
 
 import yaml
 
+from orchestrator.config import env_path
+
 PKG_ROOT = Path(__file__).resolve().parent.parent
-KB_DIR = Path(os.environ.get("MEMORY_KB", PKG_ROOT / "memory" / "knowledge"))
+# 有設時要絕對路徑、設了但是空的就停(見 config.env_path):binding 會壓掉 finding,從哪裡讀不能是意外
+KB_DIR = env_path("MEMORY_KB", PKG_ROOT / "memory" / "knowledge")
 
 AUTHORITY = {
     "user-explicit": 40,

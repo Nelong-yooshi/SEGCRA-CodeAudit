@@ -34,7 +34,8 @@ from decimal import Decimal
 
 from toolbox.gitlab import UNAVAILABLE_TEXT, fetch_file
 from .agent import extract_json, output_truncated, run_agent
-from .config import Config, PKG_ROOT
+from .config import Config, PKG_ROOT, check_config_file, env_int, env_text
+from .error_text import error_label
 from .isolation import run_in_thread
 
 SPECS_DIR = PKG_ROOT / "specs"
@@ -1041,7 +1042,8 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
             raw = await run_agent(cfg, profile, system, user, hub=None,
                                   use_tools=False, verbose=False, meta=meta)
         except Exception as e:   # LLM 傳輸層失敗(連線/逾時)→ 降級為「測資生成失敗」,不炸管線
-            llm_error = f"{type(e).__name__}: {e}"
+            # 只放例外型別與狀態碼,不放原文(會進報告與 MR 留言;原文可能帶金鑰或主機,見 error_text)
+            llm_error = error_label(e)
             continue
         # 被 max_tokens 截斷 → 這次結果一律不可信,連看都不看就重試。
         # **這一關不能靠 _shape_check 代勞**:截斷的 JSON 會被 extract_json 的
@@ -1185,14 +1187,17 @@ _WRAPPED = re.compile(r"\s*(?:WITH\b[\s\S]*?\bINSERT\b|INSERT\b|CREATE\s+(?:OR\s
 def _sandbox_params() -> dict:
     """沙盒連線設定:環境變數優先,沒設就讀 config/sandbox.env(不進版控)。"""
     env_file = PKG_ROOT / "config" / "sandbox.env"
+    check_config_file(env_file, secret=True)   # 含沙盒密碼:群組或其他人讀得到就停
     if env_file.exists():
         for line in env_file.read_text(encoding="utf-8").splitlines():
             if "=" in line and not line.lstrip().startswith("#"):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
-    return {"server": os.environ.get("SANDBOX_MSSQL_HOST", "127.0.0.1"),
-            "port": int(os.environ.get("SANDBOX_MSSQL_PORT", "1433")),
-            "user": os.environ.get("SANDBOX_MSSQL_USER", "sa"),
+    # 設了但是空的就停(_env_text):空的主機名連到哪裡看連線函式庫的預設,可能不是沙盒那台,
+    # MR 的 SQL 不能拿 sa 去那裡跑。環境變數(含空的)優先於 sandbox.env(上面用 setdefault 讀)
+    return {"server": env_text("SANDBOX_MSSQL_HOST", "127.0.0.1"),
+            "port": env_int("SANDBOX_MSSQL_PORT", 1433, hi=65535),
+            "user": env_text("SANDBOX_MSSQL_USER", "sa"),
             "password": os.environ.get("SANDBOX_MSSQL_PASSWORD", ""),
             "login_timeout": 10, "timeout": 120}
 

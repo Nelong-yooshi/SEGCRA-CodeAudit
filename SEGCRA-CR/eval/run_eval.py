@@ -56,6 +56,7 @@ sys.path.insert(0, str(PKG_ROOT))
 
 from orchestrator.config import DBT_DATABASE_PLACEHOLDER, load_config  # noqa: E402
 from orchestrator.pipeline import review_mr  # noqa: E402
+from orchestrator.error_text import error_label  # noqa: E402  只留型別與狀態碼,不放原文
 
 # Windows 主控台預設 cp950,中文輸出會炸;能改就改成 UTF-8。
 if hasattr(sys.stdout, "reconfigure"):
@@ -381,10 +382,10 @@ async def run(args) -> int:
                 report = await review_mr(case_config(cfg, golden), mr_id, args.profile,
                                          dry_run=args.dry_run)
         except Exception as e:  # noqa: BLE001 - 蒐集所有失敗原因,不預設種類
-            errors.append((mr_id, layer, f"{type(e).__name__}: {e}"))
+            errors.append((mr_id, layer, error_label(e)))
             st = layer_stat.setdefault(layer, {"pass": 0, "fail": 0, "gap": 0, "error": 0})
             st["error"] += 1
-            rows.append({"case": mr_id, "layer": layer, "error": f"{type(e).__name__}: {e}"})
+            rows.append({"case": mr_id, "layer": layer, "error": error_label(e)})
             print(f"‼ mr_{mr_id} [{layer}] 執行失敗:{type(e).__name__}(已跳過,續跑下一個)")
             continue
         # 完整報告要在**算分之前**就落地:模型那一段是 15-20 分鐘、要 GPU、會飄;
