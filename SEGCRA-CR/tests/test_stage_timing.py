@@ -160,5 +160,6 @@ def test_量收尾的工具跑得動_回寫走真的_gitlab_模組(tmp_path, mon
     # 收尾不取檔案內容
     assert req["GET MR"] == r["findings"] + 3
     assert "GET diffs" not in req and "GET 檔案" not in req
+    assert req["GET 留言清單"] == 1, "貼總結前要先找上一則(重審時改寫它)"
     assert req.get("POST 行內討論", 0) + req.get("POST 一般留言", 0) >= r["findings"] + 1  # + 總結
     assert list(r["stage_seconds"]) == STAGES
