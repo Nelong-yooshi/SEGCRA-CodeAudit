@@ -368,7 +368,8 @@ def test_服務啟動時先查帳號再開始收_webhook_並印出帳號(ws, mon
 
     monkeypatch.setattr(ws, "_learn_own_account", lambda: order.append("learn") or "[webhook] 帳號那一行")
     monkeypatch.setattr(ws, "ThreadingHTTPServer", FakeServer)
-    monkeypatch.setattr(sys, "argv", ["webhook_server.py", "--port", "0"])
+    # 測試環境沒有 GitLab 的三個設定:服務要明確加 --mock 才啟動(_require_real_mode)
+    monkeypatch.setattr(sys, "argv", ["webhook_server.py", "--port", "0", "--mock"])
     ws.main()
     assert order == ["learn", "listen"]
     assert "[webhook] 帳號那一行" in capsys.readouterr().out
