@@ -30,7 +30,7 @@
 
 **連續觸發只審最後一次(`_trigger` / `_start`)**:`_trigger(mr_iid, head_sha)` 不立刻開始,而是排一個計時器(`_pending`,{mr_iid: 計時器}):`WEBHOOK_DEBOUNCE_SECONDS` 內同一個 MR 又有事件就取消舊的計時器、改排新的(帶最新的 head sha)。計時器到了(`_start`)先確認自己還是這個 MR 最新的那一個——取消得太晚、已經在跑的舊計時器就不開始,不會出現兩份。
 
-**取消舊審查(`_start` / `_cancel`)**:模組層一個 `_inflight: dict`({mr_iid: (event_loop, task)})配 `threading.Lock`。`_start` 先試著取消同一個 MR 進行中的那次(跨執行緒要用 `loop.call_soon_threadsafe(task.cancel)`,task 屬於那個執行緒的迴圈),再開一條新的 thread。取消只會在下一個真正的等待點生效,所以舊的那次有可能一路走到回寫 —— `review_mr` 在回寫前會比對 MR 目前的 head sha,發現已被取代就不貼(見 `orchestrator/pipeline.py:_superseded`)。
+**取消舊審查(`_start` / `_cancel`)**:模組層一個 `_inflight: dict`({mr_iid: (event_loop, task)})配 `threading.Lock`。`_start` 先試著取消同一個 MR 進行中的那次(跨執行緒要用 `loop.call_soon_threadsafe(task.cancel)`,task 屬於那個執行緒的迴圈),再開一條新的 thread。取消只會在下一個真正的等待點生效,而貼留言、加 label、設狀態都是同步的工具呼叫,所以舊的那次有可能一路走到回寫並跑完 —— 真正擋住它的是 `review_mr`:**每一步寫回 GitLab 之前**都比對一次 MR 目前的 head sha,發現已被取代就停在那裡,後面的步驟不再寫(見 `orchestrator/pipeline.py:_writeback_target`)。
 
 **背景執行(`_trigger` → `_run_review`)**:審查耗時數十秒到數分鐘,而 GitLab webhook 有逾時限制,所以 `_trigger` 排好計時器就**立刻**回 200,`_start` 再起一個 `threading.Thread(daemon=True)` 跑 `_run_review`。`_run_review` 在這條執行緒開自己的事件迴圈,用 `run_until_complete` 跑 `asyncio.wait_for(review_mr(_cfg, str(mr_iid), profile_name=PROFILE), REVIEW_TIMEOUT_SECONDS)`(profile 由 `REVIEW_PROFILE` 環境變數決定,預設 `review`);迴圈與 task 登記在 `_inflight`,新 commit 進來時才取消得到。HTTP 服務本身用 `ThreadingHTTPServer`,審查進行中仍能收後續事件。
 
@@ -232,5 +232,5 @@ status(專案設定「Pipelines must succeed」);只留言不設狀態,等於審
   決策不同時 label 又變、再觸發一次。
 - **改 bot 判斷**:在 `_from_bot`。審查自己的帳號是服務啟動時查的(查不到就背景重查),帳號 id 記在 `toolbox/gitlab.py`(`own_user_id()`,只有一份);換了 `GITLAB_TOKEN` 要重啟服務才會重查。其他機器人帳號看 `_TOKEN_BOT_NAME`(GitLab 產生的名稱格式);`ai-`、`root` 只在查不到自己的帳號時當退路。加名稱規則時別寫得太寬,會誤擋真人。
 - **改審查 profile / 密鑰**:環境變數 `REVIEW_PROFILE`、`GITLAB_WEBHOOK_SECRET`，不用改碼。
-- **已知限制(單機、無佇列)**:事件只存在 `_inflight` 記憶體集合裡，server 重啟即遺失;審查中收到同 MR 的**新 commit** 事件會取消舊的那次、改審新的(舊的那次審的是舊程式,結論貼到新 commit 上是錯的),而舊的那次若較晚走到回寫,`review_mr` 會比對 MR 目前的 head sha、發現已被取代就不回寫;多 MR 同時觸發就同時起多條管線，沒有併發上限，單機 GPU 可能被打滿;server 掛掉期間的事件不會重放(GitLab 端有重試但次數有限)。要上量得換成佇列(如一個簡單的 job queue + worker)並把 in-flight 狀態持久化。
+- **已知限制(單機、無佇列)**:事件只存在 `_inflight` 記憶體集合裡，server 重啟即遺失;審查中收到同 MR 的**新 commit** 事件會取消舊的那次、改審新的(舊的那次審的是舊程式,結論貼到新 commit 上是錯的),而舊的那次若較晚走到回寫,`review_mr` 每一步寫入前都比對 MR 目前的 head sha,被取代就停下來(已經貼出去的行內意見收不回來,但 label 與總結不會變成舊結論);多 MR 同時觸發就同時起多條管線，沒有併發上限，單機 GPU 可能被打滿;server 掛掉期間的事件不會重放(GitLab 端有重試但次數有限)。要上量得換成佇列(如一個簡單的 job queue + worker)並把 in-flight 狀態持久化。
 - **安全邊界**:token 驗證只擋「誰能觸發」，MR 內容本身的提示注入是管線內 `scan_mr` + `enforce_injection` 的事(見 `orchestrator/pipeline.py`)，兩層互不取代。
