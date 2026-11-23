@@ -165,7 +165,7 @@ python eval/stage_time_summary.py out/          # 各階段耗時,與照正式�
 都是「讀不懂就退回預設值並印一行警告」(`orchestrator/config.py:env_seconds`),
 **不是**直接丟例外:讀它們的是 webhook 伺服器在 import 的時候,填錯一個字就起不來 →
 所有 MR 都收不到審查,那比用預設值跑糟得多。0 或負數也退回預設(上限設成 0 等於每次
-都立刻逾時,不會是誰的本意)。
+都立刻逾時,不會是誰的本意);`inf`、`nan` 與設了但是空的也一樣,都會印出變數名。可以有小數。
 
 審查沒跑完時,webhook 會做兩件事(`_notify_incomplete`):在 MR 上留言,**並把
 `segcra/review` 這個 commit status 設成失敗**。留言只是給人看的,擋合併的是 commit

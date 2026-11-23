@@ -51,8 +51,8 @@ _KNOWN_DYNAMIC = {
     # helper 本體:名稱是參數,實際的名稱在呼叫端(那些是字串常值,照樣掃得到)
     ("orchestrator/config.py", "os.environ[name]"),
     ("orchestrator/config.py", "os.environ.get(name)"),
-    ("orchestrator/agent.py", "os.environ.get(name)"),       # _env_timeout、_env_flag 的本體
     ("orchestrator/config.py", "_env_text(name)"),           # env_text、env_int、env_path 的本體
+    ("toolbox/gitlab.py", "os.environ.get(name)"),           # _env_text 的本體
     # 把 config/sandbox.env 的內容塞進環境:鍵來自那個檔案,不是程式寫死的
     ("orchestrator/spec_exec.py", "os.environ.setdefault(k.strip(), v.strip())"),
 }
@@ -220,7 +220,6 @@ DIRECT_FALLBACK_OK = {
     "GITLAB_WEBHOOK_SECRET": "空的或沒設時 webhook 那條路一律 401(等於停用),不會退到別的密鑰",
     "SANDBOX_MSSQL_PASSWORD": "空的或沒設時沙盒登入失敗、執行驗證記無法完成,不會退到別的帳密",
     "SEGCRA_DUMP_PROMPTS": "開發除錯用的開關,空的等於沒開",
-    "LLM_TIMEOUT": "讀法在 agent.py,改成 config.py 的秒數 helper 時從這裡拿掉",
 }
 
 

@@ -26,9 +26,9 @@
 
 逐步:
 
-1. 建 `AsyncOpenAI` client:`base_url=cfg.endpoint`(`config/models.yaml` 的 `endpoint`,可用環境變數 `OLLAMA_URL` 覆蓋;見 `orchestrator/config.py`:`load_config`)、`api_key=cfg.api_key`(`models.yaml` 的 `api_key`,可用環境變數 `LLM_API_KEY` 覆蓋;端點要驗證時用環境變數給,不寫進 yaml)、`timeout=REQUEST_TIMEOUT`、**`max_retries=0`(不自動重試)**。`REQUEST_TIMEOUT` 由環境變數 `LLM_TIMEOUT`(秒)覆蓋,預設 3600——單次請求上限 1 小時。
+1. 建 `AsyncOpenAI` client:`base_url=cfg.endpoint`(`config/models.yaml` 的 `endpoint`,可用環境變數 `OLLAMA_URL` 覆蓋;見 `orchestrator/config.py`:`load_config`)、`api_key=cfg.api_key`(`models.yaml` 的 `api_key`,可用環境變數 `LLM_API_KEY` 覆蓋;端點要驗證時用環境變數給,不寫進 yaml)、**`max_retries=0`(不自動重試)**。每一次請求等多久在第 3 步每輪重算(`request_timeout()`):`LLM_TIMEOUT`(預設 3600 秒)與這一環節剩下的時間(`llm_deadline`,主審查、冷讀、執行驗證各自的上限)取小的,至少 1 秒。
 2. `messages = [system, user]`;`use_tools` 且有 hub 時帶 `tools=hub.openai_tools, tool_choice="auto"`(**只含唯讀白名單**,見下方 `MODEL_TOOLS`)(baseline 模式 `use_tools=False`,純一問一答)。
-3. 迴圈至多 `MAX_ITERATIONS = 12` 輪,每輪呼叫 `chat.completions.create`(帶 profile 的 `temperature`、`max_output_tokens`),把回覆 append 進 messages。
+3. 迴圈至多 `MAX_ITERATIONS = 12` 輪,每輪呼叫 `chat.completions.create`(帶 profile 的 `temperature`、`max_output_tokens`,與 `timeout=request_timeout()`;開啟 `LLM_SEND_TIMEOUT` 時同一個值另外放進 `extra_body` 的 `timeout`,送給模型閘道),把回覆 append 進 messages。**每輪送出前先比一次剩下的時間**:這一環節剩不到 `MIN_STAGE_SECONDS`(由 `llm_deadline` 帶進來)就不送,丟 `LlmNoTimeLeft`,呼叫端照「這一環節沒跑完」記(剩幾秒送出去的請求多半等不到結果,只是讓閘道多跑一次)。
 4. **無 tool_calls 時**:若 `content` 非空 → 直接回傳(正常結束);若為空 → append 一則 user 訊息「請直接輸出最終報告 JSON,不要其他文字。」再 continue(**空回應補推**,對付推理型模型偶發的空 content)。
 5. **有 tool_calls 時**:逐個解析 `tc.function.arguments`(JSON 解析失敗退回 `{}`)、呼叫 `hub.call_from_model(name, args)`(不在白名單的工具**不執行**,回固定的拒絕文字);工具丟例外時不炸迴圈,把 `(工具執行失敗:{e})` 當工具結果餵回模型。結果以 `role="tool"` append。`trace` 參數給定時逐次記錄(工具名/args/結果前 400 字),供產生逐字 transcript。
 6. 12 輪耗盡仍沒有最終文字 → 一律回傳固定字串「(達到工具呼叫上限,未產出最終結果)」,並在 `meta["exhausted"]` 標記。**不回傳最後一則工具結果**:那則內容由 MR 決定(工具看的是 MR),是 JSON 物件時 `extract_json` 會把它當成審查報告收下,而最後一次模型呼叫的 `finish_reason` 是 `"stop"` —— 呼叫端從 `meta` 看不出發生了這件事。標記讓呼叫端比照截斷處理(不解析輸出、補一條 major、不得自動放行)。
@@ -175,7 +175,7 @@
 ## 擴充與注意
 
 - **換模型/調參**:只改使用中的模型設定檔(`SEGCRA_MODELS_CONFIG` 指的那份,沒設時是 `config/models.yaml`;見 docs/10)的 `profiles`(model/num_ctx/temperature/max_output_tokens);orchestrator 不綁模型。角色化(testgen/arbiter)在 `roles` 段。
-- **調 timeout**:環境變數 `LLM_TIMEOUT`(秒);迭代上限改 `orchestrator/agent.py` 的 `MAX_ITERATIONS`。
+- **調 timeout**:環境變數 `LLM_TIMEOUT`(秒);迭代上限改 `orchestrator/agent.py` 的 `MAX_ITERATIONS`。模型前面有閘道(例如 LiteLLM)時,另設 `LLM_SEND_TIMEOUT=1` 把這次請求會等的時間放進請求內容,否則閘道會照它自己的上限切斷(見 docs/10)。每次請求等的時間是 `LLM_TIMEOUT` 與那一環節剩下的時間取小的(`agent.llm_deadline` / `request_timeout`;主審查、冷讀、執行驗證外面的 `asyncio.wait_for` 用同一個上限包著),用戶端與閘道用同一個值:時間到時用戶端斷線,閘道也不會照一個更長的值繼續等、讓模型生成沒有人要的答案。
 - **加工具**:toolbox 寫純函式(型別註記 + docstring)→ 掛 `orchestrator/tool_hub.py` 的 `TOOL_GROUPS`;orchestrator 本地工具用 `register_local`。**要讓審查模型呼叫,另外加進 `MODEL_TOOLS`,而且必須確認它不會寫入**(`tests/test_model_tool_allowlist.py` 會要求每個工具都被歸類)。
 - **加 skill**:新增 `skills/<name>/SKILL.md`(front-matter 必填 `name`;`trigger: always` 慎用——會吃每次審查的 context)。要強制注入的觸發條件,加在 `pipeline.review_mr` 的 always_block 組裝段。
 - **調 context 預算**:使用中的模型設定檔(見 docs/10)的 `budget`(diff/spec/memory/tool_result_max_chars)。

@@ -203,11 +203,13 @@ RETAIL_M1 那組快了 15 分鐘,但那是因為它提早放棄拆解,不是效�
 
 ### LLM 傳輸失敗的優雅降級(彙總)
 
-單次 LLM 請求上限 3600 秒、**不自動重試**(`orchestrator/agent.py:REQUEST_TIMEOUT`,環境變數 `LLM_TIMEOUT` 可調;openai client 預設的 600s×3 次重試對本地慢推理只是把同一個慢請求連跑三遍)。在 spec_exec 內:
+**不自動重試**(openai client 預設的 600s×3 次重試對本地慢推理只是把同一個慢請求連跑三遍)。在執行驗證裡,每次請求等的是 `LLM_TIMEOUT` 與**這一段剩下的時間**取小的(見 03 篇 Agent loop);剩不到 `MIN_STAGE_SECONDS` 就不再送。在 spec_exec 內:
 
 | 失敗點 | 行為 |
 |---|---|
 | 測資生成呼叫失敗(兩次) | major「執行驗證無法完成(測資生成失敗:LLM 呼叫失敗)」→ `passed: False` → needs_human |
+| 測資生成**時間到了**(請求逾時且重試用完,或剩的時間不夠、不再送) | 記成這一環節沒跑完:major「[執行驗證(測資生成)] 審查未完整(逾時)」,帶 `stage`(`review_incomplete` 認得到;CI 那條路是「沒有結論」)。剩的時間不夠時不再重試 |
+| 仲裁**時間到了** | 該案例「測資與 SQL 的結果不一致,仲裁沒有結論」,帶 `stage`(執行驗證(仲裁)),不混進「實作與規格行為不符」;`passed: False` |
 | 仲裁呼叫失敗 / 輸出無法解析 | 該 mismatch 保守判 SQL 側(帶 `arbiter_unparseable`)→ major → needs_human |
 
 兩者都不會中斷整條審查管線,也絕不會產生「假通過」。
