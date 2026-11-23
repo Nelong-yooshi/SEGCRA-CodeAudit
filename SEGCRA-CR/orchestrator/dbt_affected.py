@@ -36,6 +36,7 @@ from .dbt_context import DbtContext
 from .dbt_impact import ImpactReport
 from .dbt_render import DEFAULT_ISOLATED_TIMEOUT_S, render_model_isolated
 from .isolation import run_in_thread
+from .text_fields import MR_CONTENT_FILE
 from toolbox.gitlab import UNAVAILABLE_TEXT
 from toolbox.sqltools import DIALECT, parsed_chunks
 
@@ -516,7 +517,7 @@ def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None
                      f"{_listed([_code(n) for n in impact.unreferenced_macros])}。")
     if severity == "info":
         parts.append("沒有檢查出問題;清單供人工確認影響範圍。")
-    return {"file": "(MR 內容)", "line": 0, "severity": severity, "title": IMPACT_TITLE,
+    return {"file": MR_CONTENT_FILE, "line": 0, "severity": severity, "title": IMPACT_TITLE,
             "detail": "".join(parts),
             "suggestion": ("逐一確認上列 model 的展開結果符合預期;必要時以 dbt compile 比對變更前後。"
                            if severity != "info" else ""),

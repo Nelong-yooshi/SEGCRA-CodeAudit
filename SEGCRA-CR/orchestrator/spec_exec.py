@@ -37,6 +37,7 @@ from .agent import LlmNoTimeLeft, extract_json, is_timeout, output_truncated, ru
 from .config import Config, PKG_ROOT, check_config_file, env_int, env_text
 from .error_text import error_label
 from .isolation import run_in_thread
+from .text_fields import as_text
 
 SPECS_DIR = PKG_ROOT / "specs"
 
@@ -51,8 +52,9 @@ _DDL_OK = re.compile(r"^\s*CREATE\s+TABLE\s", re.I)
 # ------------------------------------------------------------------ 0. 找 spec
 def extract_rule_codes(mr: dict) -> list[str]:
     """確定性抓規則碼:SQL 內容 + 標題 + 描述 + 檔名。"""
-    text = " ".join([mr.get("title", ""), mr.get("description", "")] +
-                    [f.get("path", "") + " " + (f.get("full_content") or f.get("diff", ""))
+    # 欄位可能在、但值是 None(GitLab 對沒填說明的 MR 回 null)或不是字串:一律當成空字串
+    text = " ".join([as_text(mr.get("title")), as_text(mr.get("description"))] +
+                    [as_text(f.get("path")) + " " + (as_text(f.get("full_content")) or as_text(f.get("diff")))
                      for f in mr.get("files", [])])
     return sorted(set(_RULE_CODE.findall(text)))
 
