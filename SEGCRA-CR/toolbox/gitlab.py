@@ -78,6 +78,20 @@ def check_ssl_cert_file() -> None:
     _SSL_CERT_FILE_OK.add(raw)
 
 
+def tls_verify():
+    """httpx 的 `verify=`:SSL_CERT_FILE 有設時用它建的 TLS 設定,沒設時 True(httpx 內建的根憑證)。
+
+    給 `trust_env=False` 的請求用(_read_only_get):那種請求不讀任何環境變數,SSL_CERT_FILE
+    也不讀,GitLab 是 https、憑證的根不在映像裡時,取 MR 正常、dbt 讀檔卻會憑證驗證失敗。
+    載入不了時跟 check_ssl_cert_file 一樣丟 SslCertFileError。"""
+    check_ssl_cert_file()
+    raw = os.environ.get("SSL_CERT_FILE")
+    if raw is None:
+        return True
+    import ssl
+    return ssl.create_default_context(cafile=raw)
+
+
 def _as_mr(mr):
     """GitLab 回的 MR:不是 MR 的資料就丟 NotAnMR(原本會在後面變成看不出原因的 KeyError)。"""
     if not isinstance(mr, dict) or "title" not in mr:
@@ -333,6 +347,10 @@ def _read_only_get(endpoint: str, params: dict, max_bytes: int, what: str) -> by
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
         raise ArchiveDownloadError("必須指定正整數的下載大小上限")
     import httpx
+    try:
+        verify = tls_verify()
+    except SslCertFileError as e:            # 訊息是固定文字,說得出是哪個變數
+        raise ArchiveDownloadError(str(e)) from None
     buf = bytearray()
     deadline = time.monotonic() + ARCHIVE_DEADLINE_S
     try:
@@ -344,8 +362,9 @@ def _read_only_get(endpoint: str, params: dict, max_bytes: int, what: str) -> by
                 headers={"PRIVATE-TOKEN": GITLAB_READ_TOKEN, "Accept-Encoding": "identity"},
                 # 不跟隨轉址:自訂的 PRIVATE-TOKEN 標頭可能被帶到別的主機
                 follow_redirects=False,
-                # 不讀 HTTP_PROXY / HTTPS_PROXY / .netrc 等環境設定:token 不送往代理
-                trust_env=False, timeout=30) as r:
+                # 不讀 HTTP_PROXY / HTTPS_PROXY / .netrc 等環境設定:token 不送往代理。
+                # 不讀環境也就不讀 SSL_CERT_FILE,所以 TLS 設定由 verify 明確傳進去
+                trust_env=False, verify=verify, timeout=30) as r:
             if r.status_code == 404:
                 return None
             if r.status_code != 200:

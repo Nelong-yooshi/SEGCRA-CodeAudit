@@ -710,6 +710,19 @@ MUTANTS.update({
      "        if v <= 0:" + NL + "            raise ValueError",
      "        if False:" + NL + "            raise ValueError"),
 })
+# ---- 唯讀請求(dbt 讀單檔、打包下載)不讀環境,SSL_CERT_FILE 的 TLS 設定要明確傳進去
+MUTANTS.update({
+ "唯讀請求:不傳 SSL_CERT_FILE 的 TLS 設定": ("../toolbox/gitlab.py",
+     "                trust_env=False, verify=verify, timeout=30) as r:",
+     "                trust_env=False, timeout=30) as r:"),
+ "唯讀請求:SSL_CERT_FILE 有設也用預設驗證": ("../toolbox/gitlab.py",
+     "    if raw is None:" + NL + "        return True",
+     "    if True:" + NL + "        return True"),
+ "唯讀請求:SSL_CERT_FILE 設錯照樣送出": ("../toolbox/gitlab.py",
+     "        verify = tls_verify()" + NL + "    except SslCertFileError as e:",
+     "        verify = True" + NL + "    except SslCertFileError as e:"),
+})
+
 # ---- 取回整份新檔的四道防線:唯讀 token、單檔上限、不退回舊版、取不到要交人工
 MUTANTS.update({
  "完整檔:讀程式碼用有寫入權的 token": ("../toolbox/gitlab.py",
@@ -2253,8 +2266,8 @@ MUTANTS.update({
      "    if not host:\n        raise",
      "    if False:\n        raise"),
  "下載:讀代理等環境設定": ("../toolbox/gitlab.py",
-     "trust_env=False, timeout=30) as r:",
-     "trust_env=True, timeout=30) as r:"),
+     "trust_env=False, verify=verify, timeout=30) as r:",
+     "trust_env=True, verify=verify, timeout=30) as r:"),
  "解壓:Windows 問題名稱不擋": ("archive.py",
      '        if p.endswith((".", " ")) or p.split(".")[0].lower() in _WINDOWS_RESERVED:',
      "        if False:"),
