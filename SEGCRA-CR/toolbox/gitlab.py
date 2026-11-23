@@ -64,8 +64,87 @@ GITLAB_READ_TOKEN = _env_text("GITLAB_READ_TOKEN", "")
 
 # --- real mode helpers ---------------------------------------------------
 
+class NotAnMR(Exception):
+    """GitLab 回了 200 的 JSON,內容卻不是 MR(GITLAB_URL 指到別的服務、代理…)。
+
+    跟「回的不是 JSON」(json.JSONDecodeError)分開:兩者都是 200,但後者多半是網頁或
+    登入頁。管線據此說出原因(orchestrator/mr_fetch_error.py),不必比對錯誤訊息。"""
+
+
+class MockFixtureMissing(FileNotFoundError):
+    """mock 模式找不到這個 MR 編號的測試資料。用自己的型別:其他來源的 FileNotFoundError(例如
+    SSL_CERT_FILE 指到不存在的檔)不能被說成 mock 模式。繼承 FileNotFoundError,接 FileNotFoundError 的地方照樣接得到。"""
+
+
+class InvalidMrId(ValueError):
+    """MR 編號不是 1–10 位的 ASCII 數字。用型別分辨,不比對訊息。繼承 ValueError。"""
+
+
+class SslCertFileError(Exception):
+    """環境變數 SSL_CERT_FILE 有設,但載入不了(不存在、是目錄、不是 PEM)。訊息是固定文字。"""
+
+
+_SSL_CERT_FILE_OK: set = set()
+
+
+def check_ssl_cert_file() -> None:
+    """SSL_CERT_FILE 有設時先自己載入一次,載入不了就丟 SslCertFileError 說出是這個變數。
+
+    httpx 每個請求都照 SSL_CERT_FILE 建 TLS 設定(GITLAB_URL 是 http 也會),載入失敗時丟的是
+    沒有檔名的 FileNotFoundError、IsADirectoryError 或 ssl.SSLError,從那裡反推不出來源。
+    同一個值載入成功過就不再試。"""
+    raw = os.environ.get("SSL_CERT_FILE")
+    if raw is None or raw in _SSL_CERT_FILE_OK:
+        return
+    import ssl
+    if not raw.strip():
+        raise SslCertFileError("環境變數 SSL_CERT_FILE 有設定但是空的:要指到 CA 檔(PEM),不用就把它拿掉")
+    # 先看路徑本身:檔案不存在時各平台丟的例外不一樣(Linux 是 FileNotFoundError、Windows 是 OSError)
+    if not os.path.exists(raw):
+        raise SslCertFileError("環境變數 SSL_CERT_FILE 指到的檔案不存在(容器有沒有把 CA 檔掛進去)")
+    if os.path.isdir(raw):
+        raise SslCertFileError("環境變數 SSL_CERT_FILE 指到的是目錄,不是讀得到的檔案:要指到 CA 檔(PEM)")
+    try:
+        ssl.create_default_context(cafile=raw)
+    except ssl.SSLError:
+        raise SslCertFileError("環境變數 SSL_CERT_FILE 指到的檔案不是 PEM 格式的 CA 憑證") from None
+    except OSError as e:
+        raise SslCertFileError(f"環境變數 SSL_CERT_FILE 指到的不是讀得到的檔案({type(e).__name__},"
+                               "例如是目錄或沒有讀取權限)") from None
+    _SSL_CERT_FILE_OK.add(raw)
+
+
+def tls_verify():
+    """httpx 的 `verify=`:SSL_CERT_FILE 有設時用它建的 TLS 設定,沒設時 True(httpx 內建的根憑證)。
+
+    給 `trust_env=False` 的請求用(_read_only_get):那種請求不讀任何環境變數,SSL_CERT_FILE
+    也不讀,GitLab 是 https、憑證的根不在映像裡時,取 MR 正常、dbt 讀檔卻會憑證驗證失敗。
+    載入不了時跟 check_ssl_cert_file 一樣丟 SslCertFileError。"""
+    check_ssl_cert_file()
+    raw = os.environ.get("SSL_CERT_FILE")
+    if raw is None:
+        return True
+    import ssl
+    return ssl.create_default_context(cafile=raw)
+
+
+def _as_mr(mr):
+    """GitLab 回的 MR:不是 MR 的資料就丟 NotAnMR(原本會在後面變成看不出原因的 KeyError)。"""
+    if not isinstance(mr, dict) or "title" not in mr:
+        raise NotAnMR("MR 的回應不是 MR 的資料")
+    return mr
+
+
+def _as_changes(changes):
+    """MR 的變更清單:每一項都要有 new_path,不對就丟 NotAnMR。"""
+    if not all(isinstance(c, dict) and "new_path" in c for c in changes):
+        raise NotAnMR("MR 的變更清單不是預期的形狀")
+    return changes
+
+
 def _api(method: str, path: str, **kwargs):
     import httpx
+    check_ssl_cert_file()
     r = httpx.request(
         method, f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}{path}",
         headers={"PRIVATE-TOKEN": GITLAB_TOKEN}, timeout=30, **kwargs)
@@ -87,13 +166,18 @@ def _api_pages(path: str, params: dict | None = None) -> tuple[list, bool]:
     進去,MR 可能因此被誤判成小改而自動放行。
     """
     import httpx
+    check_ssl_cert_file()
     items, page = [], 1
     while page and page <= MAX_DIFF_PAGES:
         r = httpx.get(f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}{path}",
                       headers={"PRIVATE-TOKEN": GITLAB_TOKEN}, timeout=30,
                       params={**(params or {}), "per_page": 100, "page": page})
         r.raise_for_status()
-        items.extend(r.json())
+        data = r.json()
+        if not isinstance(data, list):
+            # 每一頁都要是清單:null、數字、dict 都不是(dict 會被 extend 成它的 key 字串)
+            raise NotAnMR("分頁的回應不是清單")
+        items.extend(data)
         nxt = r.headers.get("X-Next-Page", "").strip()
         page = int(nxt) if nxt else 0
     return items, bool(page)
@@ -299,6 +383,10 @@ def _read_only_get(endpoint: str, params: dict, max_bytes: int, what: str) -> by
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
         raise ArchiveDownloadError("必須指定正整數的下載大小上限")
     import httpx
+    try:
+        verify = tls_verify()
+    except SslCertFileError as e:            # 訊息是固定文字,說得出是哪個變數
+        raise ArchiveDownloadError(str(e)) from None
     buf = bytearray()
     deadline = time.monotonic() + ARCHIVE_DEADLINE_S
     try:
@@ -310,8 +398,9 @@ def _read_only_get(endpoint: str, params: dict, max_bytes: int, what: str) -> by
                 headers={"PRIVATE-TOKEN": GITLAB_READ_TOKEN, "Accept-Encoding": "identity"},
                 # 不跟隨轉址:自訂的 PRIVATE-TOKEN 標頭可能被帶到別的主機
                 follow_redirects=False,
-                # 不讀 HTTP_PROXY / HTTPS_PROXY / .netrc 等環境設定:token 不送往代理
-                trust_env=False, timeout=30) as r:
+                # 不讀 HTTP_PROXY / HTTPS_PROXY / .netrc 等環境設定:token 不送往代理。
+                # 不讀環境也就不讀 SSL_CERT_FILE,所以 TLS 設定由 verify 明確傳進去
+                trust_env=False, verify=verify, timeout=30) as r:
             if r.status_code == 404:
                 return None
             if r.status_code != 200:
@@ -342,7 +431,7 @@ def _read_only_get(endpoint: str, params: dict, max_bytes: int, what: str) -> by
 def _mock_mr(mr_id: str) -> dict:
     f = FIXTURES_DIR / f"mr_{_check_mr_id(mr_id)}.json"
     if not f.exists():
-        raise FileNotFoundError(f"fixture 不存在: {f.name};現有: "
+        raise MockFixtureMissing(f"fixture 不存在: {f.name};現有: "
                                 + ", ".join(p.name for p in FIXTURES_DIR.glob('mr_*.json')))
     return json.loads(f.read_text(encoding="utf-8"))
 
@@ -372,7 +461,7 @@ def _check_mr_id(mr_id) -> str:
     token 去讀別的 API 端點或別的檔案。不用 isdigit() 單獨判斷:它也接受「²」等 Unicode 數字。"""
     mr_id = str(mr_id)
     if not (mr_id.isascii() and mr_id.isdigit() and len(mr_id) <= 10):
-        raise ValueError("MR 編號必須是數字")
+        raise InvalidMrId("MR 編號必須是數字")
     return mr_id
 
 
@@ -396,13 +485,13 @@ def get_mr_diff(mr_id: str) -> str:
     """
     mr_id = _check_mr_id(mr_id)
     if REAL_MODE:
-        mr = _api("GET", f"/merge_requests/{mr_id}")
+        mr = _as_mr(_api("GET", f"/merge_requests/{mr_id}"))
         changes, truncated = _api_pages(f"/merge_requests/{mr_id}/diffs")
         files = [{"path": c["new_path"], "old_path": c.get("old_path"),
                   "diff": c.get("diff") or "",
                   "deleted": bool(c.get("deleted_file")),
                   "unreviewable": bool(c.get("too_large") or c.get("collapsed"))}
-                 for c in changes]
+                 for c in _as_changes(changes)]
         refs = _diff_refs(mr)
         # **預掃與執行驗證要的是整份新檔,不是 diff 裡那幾行**。大檔小改的 MR,
         # 從 diff 還原出來的 SQL 可能只剩一行,sqlglot 解析不了、沙盒也沒東西可跑
@@ -477,9 +566,25 @@ _PROSE = {
 }
 _ABSENT_PROSE = "(repo 內無 {path})"
 _MOCK_ABSENT_PROSE = "(mock 模式無 {path} 的完整內容,請依 diff 判斷)"
-# GitLab 的 404 分得出是哪一種:檔案不存在才是「確實沒有」,專案或 commit 找不到是
-# 環境的問題(權限不足時 GitLab 也回 404 而不是 403)。
-_FILE_NOT_FOUND = "file not found"
+# GitLab 的 404 分不出是哪一種:檔案不存在、專案或 commit 找不到、token 沒有權限(GitLab 也回 404)
+# 都是 404,代理或別的服務回的 404 頁也是。所以 404 時再確認那個 commit 取得到(回 200),
+# 才算「這個檔案確實不存在」;其他一律算取不到。不看內文:內文的寫法由對方決定。
+
+
+def _commit_exists(ref: str, token: str) -> bool:
+    """這個 commit 取得到:回 200,而且內容是 commit 的資料(有 `id`)。
+
+    只看 200 不夠:代理或登入頁也可能回 200 的網頁,那時說「檔案確實不存在」就是猜的。
+    解析不了、不是 commit 的資料一律算取不到(丟的例外由 fetch_file 收成 fetch_failed)。"""
+    import urllib.parse
+    import httpx
+    r = httpx.get(f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}/repository/commits/"
+                  f"{urllib.parse.quote(ref, safe='')}",
+                  headers={"PRIVATE-TOKEN": token}, timeout=30)
+    if r.status_code != 200:
+        return False
+    data = r.json()
+    return isinstance(data, dict) and isinstance(data.get("id"), str) and bool(data["id"])
 
 
 def fetch_file(path: str, ref: str = "", mr_id: str = "") -> tuple[str | None, str | None]:
@@ -512,9 +617,8 @@ def fetch_file(path: str, ref: str = "", mr_id: str = "") -> tuple[str | None, s
             f"{urllib.parse.quote(path, safe='')}/raw",
             headers={"PRIVATE-TOKEN": token}, params={"ref": ref}, timeout=30)
         if r.status_code == 404:
-            # 只有「檔案不存在」算確實沒有;專案/commit 找不到、權限不足都是環境問題
-            body = (r.text or "").lower()
-            return (None, None) if _FILE_NOT_FOUND in body else (None, "not_found")
+            # 只有 commit 取得到時才算檔案確實不存在;專案/commit 找不到、權限不足都是環境問題
+            return (None, None) if _commit_exists(ref, token) else (None, "not_found")
         r.raise_for_status()
         if len(r.content) > MAX_FILE_BYTES:
             return None, "too_large"
