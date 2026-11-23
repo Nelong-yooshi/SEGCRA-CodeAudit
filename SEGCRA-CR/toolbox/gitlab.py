@@ -897,6 +897,57 @@ def job_from_token(job_token: str) -> dict | None:
     return job
 
 
+# GITLAB_TOKEN 是哪一個帳號({"id": int, "username": str}),由 learn_own_user 查到後記下;還沒查到是 None。
+# 只有這一份:要認「審查自己留的言」的地方都讀 own_user_id(),不各自再查。
+_own_user: dict | None = None
+
+
+def own_user_id() -> int | None:
+    """GITLAB_TOKEN 的帳號 id;還沒查到(或查不到)是 None。不打 API。"""
+    return _own_user["id"] if _own_user else None
+
+
+def own_username() -> str:
+    return _own_user["username"] if _own_user else ""
+
+
+def learn_own_user() -> str | None:
+    """向 GitLab 查 GITLAB_TOKEN 是哪一個帳號(GET /user),查到記下來回 None;查不到回原因。
+
+    原因是固定文字加上狀態碼或例外型別,不帶例外原文(httpx 的訊息帶完整網址)。分得出
+    「token 被拒絕」(重查也不會好,要換 GITLAB_TOKEN)與「連不上」(等 GitLab 起來就好)。
+    webhook 服務用它認出審查自己留的言:project / group access token 的帳號名稱由 GitLab 產生,
+    不一定是我們取的前綴。"""
+    global _own_user
+    if not REAL_MODE:
+        return "mock 模式,沒有 GitLab"
+    import httpx
+    try:
+        check_ssl_cert_file()
+        r = httpx.get(f"{GITLAB_URL}/api/v4/user", headers={"PRIVATE-TOKEN": GITLAB_TOKEN},
+                      timeout=10)
+    except SslCertFileError as e:            # 訊息是固定文字,寫明是 SSL_CERT_FILE
+        return f"GET /user 沒有送出:{e}"
+    except Exception as e:                   # noqa: BLE001 — 只留型別,原文帶網址
+        return f"GET /user 連不上 GitLab({type(e).__name__}):確認 GITLAB_URL(要寫 http:// 或 https://)與網路"
+    if r.status_code in (401, 403):
+        return f"GET /user 回 {r.status_code}:GITLAB_TOKEN 被拒絕(token 錯、過期或被撤銷),要換 token"
+    if r.status_code != 200:
+        return f"GET /user 回 {r.status_code}"
+    try:
+        user = r.json()
+    except Exception:                        # noqa: BLE001 — 不是 JSON(不論編碼)
+        user = None
+    uid = user.get("id") if isinstance(user, dict) else None
+    if not isinstance(uid, int) or isinstance(uid, bool):
+        return ("GET /user 回 200,但不是帳號資料(不是 JSON 或沒有數字的 id):GITLAB_URL 可能指到網頁"
+                "或代理的登入頁")
+    name = user.get("username")
+    name = name if isinstance(name, str) and name.isprintable() else ""
+    _own_user = {"id": uid, "username": name[:100]}
+    return None
+
+
 def pipeline_info(pipeline_id: int) -> dict:
     """這個專案的某條 pipeline(GET /projects/:id/pipelines/:pipeline_id)。取不到丟 GitLabLookupFailed。"""
     try:
