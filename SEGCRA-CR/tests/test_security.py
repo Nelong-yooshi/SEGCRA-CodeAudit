@@ -348,7 +348,7 @@ def test_分頁邏輯會跟著_X_Next_Page_一直取到底(monkeypatch):
                                headers={"X-Next-Page": nxt} if nxt else {},
                                request=_httpx.Request("GET", url))
 
-    monkeypatch.setattr(gitlab, "GITLAB_URL", "http://fake")
+    monkeypatch.setattr(gitlab, "GITLAB_URL", "https://fake")
     monkeypatch.setattr(gitlab, "GITLAB_TOKEN", "t")
     monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "1")
     monkeypatch.setattr(_httpx, "get", fake_get)
@@ -371,7 +371,7 @@ def test_超過分頁上限時標記_truncated(monkeypatch):
         return _httpx.Response(200, json=["x"], headers={"X-Next-Page": str(params["page"] + 1)},
                                request=_httpx.Request("GET", url))
 
-    monkeypatch.setattr(gitlab, "GITLAB_URL", "http://fake")
+    monkeypatch.setattr(gitlab, "GITLAB_URL", "https://fake")
     monkeypatch.setattr(gitlab, "GITLAB_TOKEN", "t")
     monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "1")
     monkeypatch.setattr(gitlab, "MAX_DIFF_PAGES", 3)
