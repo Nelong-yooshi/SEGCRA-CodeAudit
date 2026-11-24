@@ -4343,11 +4343,11 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
                       + ("" if failed == _NO_TIME_KIND else "這是審查環境的問題,不是這個 MR 的問題。"),
             "suggestion": ("請人工審查這個 MR;MR 很大時可以拆小後重新觸發審查。" if failed == _NO_TIME_KIND
                            else "請通知維運確認審查模型的端點狀態,恢復後重新觸發審查。"),
-            "citations": []}
-        if failed in ("timeout", _NO_TIME_KIND):
-            # 時間到了(請求逾時,或剩的時間不夠沒送出):這一環節沒跑完,跟外層整段逾時同一種
-            # (review_incomplete 靠 stage 認;CI 那條路是「沒有結論」,不是「審完了交給人」)
-            model_failed["stage"] = "主審查"
+            "citations": [],
+            # 審查模型沒有產出結果(時間到了、連不上、端點錯誤、拒絕請求……):這一環節沒跑完,跟外層整段
+            # 逾時同一種。review_incomplete 靠 stage 認;CI 那條路是「沒有結論」(結束碼 5、retry 就是重審),
+            # 不是「審完了交給人」——交給人(3)可以合併,等於沒經過審查也能合
+            "stage": "主審查"}
         _put_program_finding(report, model_failed)
         # 沒有最終輸出:meta 裡的結束原因與用量是前幾輪的,不能拿來判斷截斷或用完回合
         return report

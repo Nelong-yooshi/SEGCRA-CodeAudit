@@ -1014,6 +1014,7 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
     timed_out = False       # 有一次是時間到了(請求逾時或剩的時間不夠):失敗時記成這一環節沒跑完
     truncated = 0
     malformed = 0
+    answered = 0            # 模型有回應的次數:有過回應就不是環境的問題
     filling = False          # 這一輪送出去的是「只補缺的」還是整份重來
     fill_batch = _FILL_BATCH # 補缺的批量;一旦被截斷就減半(見下方 length 分支)
     filled_total = 0         # 靠補生成多拿到幾個案例(寫進失敗原因,供判讀)
@@ -1047,6 +1048,7 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
             if isinstance(e, LlmNoTimeLeft):
                 break        # 剩的時間不夠:不再重試(再送也一樣不送)
             continue
+        answered += 1       # 模型有回應(不論內容能不能用)
         # 被 max_tokens 截斷 → 這次結果一律不可信,連看都不看就重試。
         # **這一關不能靠 _shape_check 代勞**:截斷的 JSON 會被 extract_json 的
         # json-repair 修補成合法物件,形狀檢查只會看到「案例比較少」,看不出
@@ -1176,8 +1178,11 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
     else:
         reason = f"測資生成失敗({max_attempts} 次嘗試皆無合法輸出)"
     # 時間到了才失敗的:不是測資或模型的問題,是這一環節沒跑完(呼叫端記成帶 stage 的 finding)
-    return ({"schema_ddl": [], "conditions": [], "cases": [], "timed_out": timed_out},
-            [reason], [])
+    # 每一次都是呼叫失敗(模型一次都沒有回應):環境的問題,跟時間到了一樣記成這一環節沒跑完。
+    # 有過回應(被截斷、格式錯、內容不能用)就不是:那是模型或規格的問題,重試不一定會好,照舊交人工
+    call_failed = llm_error is not None and not answered
+    return ({"schema_ddl": [], "conditions": [], "cases": [], "timed_out": timed_out,
+             "call_failed": call_failed}, [reason], [])
 
 
 # ------------------------------------------------------------------ 2. 確定性執行
@@ -1470,8 +1475,9 @@ async def arbitrate(cfg: Config, spec_text: str, sql: str, mismatch: dict,
         return {"who_is_wrong": "sql",
                 "reason": f"(仲裁 LLM 呼叫失敗:{type(e).__name__},保守列為 SQL 側待人工確認)",
                 "arbiter_unparseable": True,
-                # 時間到了:仲裁沒有結論,呼叫端記成這一環節沒跑完,不混進「實作與規格行為不符」
-                "arbiter_timed_out": is_timeout(e)}
+                # 呼叫失敗(時間到了、連不上、端點錯誤):仲裁沒有結論,呼叫端記成這一環節沒跑完,
+                # 不混進「實作與規格行為不符」。輸出解析不了(下面)才是保守列成 SQL 側
+                "arbiter_timed_out": is_timeout(e), "arbiter_call_failed": True}
     d = extract_json(raw) or {}
     if d.get("who_is_wrong") not in ("testdata", "sql"):
         return {"who_is_wrong": "sql", "reason": "(仲裁輸出無法解析,保守列為 SQL 側待人工確認)",
@@ -1482,6 +1488,7 @@ async def arbitrate(cfg: Config, spec_text: str, sql: str, mismatch: dict,
 # ------------------------------------------------------------------ 主流程
 STAGE_GENERATE_NAME = "執行驗證(測資生成)"
 STAGE_ARBITRATE_NAME = "執行驗證(仲裁)"
+STAGE_SANDBOX_NAME = "執行驗證(沙盒)"
 
 
 def _unfinished(path: str, stage: str, why: str, title: str | None = None) -> dict:
@@ -1978,8 +1985,12 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
         _leave(STAGE_GENERATE, _t)
     dropped_cases += [{"case_id": (d.get("case") or {}).get("case_id", "?"),
                        "by": "shape-check", "reason": d["reason"]} for d in malformed]
-    if not plan["cases"] and plan.get("timed_out"):
-        findings.append(_unfinished(path, STAGE_GENERATE_NAME, "測資生成的模型呼叫逾時,或剩的時間不夠再送一次"))
+    if not plan["cases"] and (plan.get("timed_out") or plan.get("call_failed")):
+        why = ("測資生成的模型呼叫逾時,或剩的時間不夠再送一次" if plan.get("timed_out")
+               else "測資生成的模型呼叫每一次都失敗(連不上、端點錯誤或拒絕請求),沒有任何輸出")
+        findings.append(_unfinished(path, STAGE_GENERATE_NAME, why,
+                                    None if plan.get("timed_out")
+                                    else f"[{STAGE_GENERATE_NAME}] 審查未完整(模型呼叫失敗)"))
         return {"passed": False, "spec_code": spec_code,
                 "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
                 "case_results": [], "dropped_cases": dropped_cases,
@@ -2003,10 +2014,12 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
         _leave(STAGE_SANDBOX, _t)
     if ex["sandbox_error"]:
         # 沙盒不可用 ≠ 驗證通過:照樣不得自動放行,並講清楚是環境問題而非程式問題
-        findings.append(_finding(path, "major", "執行驗證無法完成(沙盒不可用)",
-                                 f"{ex['sandbox_error']}。這是驗證環境的問題,不代表程式有錯;"
-                                 "但未經執行驗證,本 MR 不得自動放行。",
-                                 "啟動沙盒(scripts/sandbox.sh start)後重新觸發審查。"))
+        # 帶 stage:這一環節沒跑完(CI 結束碼 5),不是審完了交給人——交給人(3)可以合併
+        findings.append({**_finding(path, "major", "執行驗證無法完成(沙盒不可用)",
+                                    f"{ex['sandbox_error']}。這是驗證環境的問題,不代表程式有錯;"
+                                    "但未經執行驗證,本 MR 不得自動放行。",
+                                    "啟動沙盒(scripts/sandbox.sh start)後重新觸發審查。"),
+                         "stage": STAGE_SANDBOX_NAME})
         return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],
                 "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
                 "case_results": [], "dropped_cases": dropped_cases,
@@ -2036,7 +2049,7 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
     _t = _enter(STAGE_ARBITRATE)
     for mm in ex["mismatches"]:
         verdict = await arbitrate(cfg, spec_text, sql, mm)
-        if verdict.get("arbiter_timed_out"):
+        if verdict.get("arbiter_call_failed") or verdict.get("arbiter_timed_out"):
             undecided.append(mm)
         elif verdict["who_is_wrong"] == "testdata":
             dropped_cases.append({"case_id": mm["case_id"], "by": "arbiter",
@@ -2057,7 +2070,7 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
         passed = False
         findings.append(_unfinished(
             path, STAGE_ARBITRATE_NAME,
-            "測資與 SQL 的結果不一致,仲裁沒有結論(模型呼叫逾時,或剩的時間不夠):"
+            "測資與 SQL 的結果不一致,仲裁沒有結論(模型呼叫失敗:逾時、連不上、端點錯誤,或剩的時間不夠):"
             + ";".join(f"案例 {m['case_id']}(條件 {m['condition_id']} {m['direction']} 向)"
                        for m in undecided[:20])
             + (f" 等 {len(undecided)} 個" if len(undecided) > 20 else ""),

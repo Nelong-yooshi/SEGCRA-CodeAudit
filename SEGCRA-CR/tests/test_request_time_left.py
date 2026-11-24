@@ -116,6 +116,14 @@ def test_主審查時間到了_記成主審查沒跑完(review, error):
     assert report["decision"] != "auto_approved"
 
 
+def test_主審查剩的時間不夠_說是時間不夠不是端點的問題(review):
+    """時間不夠沒有送出:建議人工審查或拆小 MR,不叫維運去查端點。"""
+    report = review(agent.LlmNoTimeLeft("x"))
+    [f] = [f for f in report["findings"] if f["title"] == pipeline._FAILED_TITLE]
+    assert "剩下的時間不夠" in f["detail"] and "審查環境的問題" not in f["detail"]
+    assert "拆小" in f["suggestion"]
+
+
 def test_主審查的請求帶著每一步最少秒數的門檻(review, monkeypatch):
     seen = []
 
@@ -130,10 +138,19 @@ def test_主審查的請求帶著每一步最少秒數的門檻(review, monkeypa
     assert seen and seen[0] is not None and seen[0][1] == pipeline.MIN_STAGE_SECONDS
 
 
-def test_主審查連不上_不算沒跑完(review):
-    report = review(openai.APIConnectionError(request=_REQ))
+def _server_error():
+    import httpx
+    return openai.InternalServerError("x", response=httpx.Response(500, request=_REQ), body=None)
+
+
+@pytest.mark.parametrize("make", [lambda: openai.APIConnectionError(request=_REQ), _server_error])
+def test_主審查連不上或端點錯誤_也記成主審查沒跑完(review, make):
+    """審查模型沒有產出結果:不是「審完了交給人」(3,可以合併),是這一環節沒跑完(5)。"""
+    report = review(make())
     [f] = [f for f in report["findings"] if f["title"] == pipeline._FAILED_TITLE]
-    assert "stage" not in f
+    assert f["stage"] == "主審查"
+    assert pipeline._FAILED_TITLE in pipeline.review_incomplete(report)
+    assert report["decision"] != "auto_approved"
 
 
 # ─────────── 測資生成、仲裁 ───────────
@@ -151,6 +168,50 @@ def test_測資生成每次都逾時_記成測資生成沒跑完(monkeypatch):
     [f] = [f for f in r["findings"] if f.get("stage")]
     assert f["stage"] == spec_exec.STAGE_GENERATE_NAME and r["passed"] is False
     assert len(calls) > 1          # 時間還夠時照樣重試
+
+
+@pytest.mark.parametrize("make", [lambda: openai.APIConnectionError(request=_REQ), _server_error])
+def test_測資生成每次都呼叫失敗_記成測資生成沒跑完(monkeypatch, make):
+    async def failing(*a, **k):
+        raise make()
+    monkeypatch.setattr(spec_exec, "run_agent", failing)
+    mr = {"files": [{"path": "sql/rules/r201.sql", "full_content": "SELECT 1;"}]}
+    r = asyncio.run(spec_exec.run_spec_exec(load_config(), None, mr, "R-201", "規格內容"))
+    [f] = [f for f in r["findings"] if f.get("stage")]
+    assert f["stage"] == spec_exec.STAGE_GENERATE_NAME and "模型呼叫失敗" in f["title"]
+    assert r["passed"] is False
+
+
+def test_測資生成有過不合法的輸出_照舊交人工不算沒跑完(monkeypatch):
+    """模型有回應、內容不能用:是模型或規格的問題,重試不一定會好,照舊是「測資生成失敗」。"""
+    calls = []
+
+    async def bad_then_down(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            return "這不是 JSON"
+        raise openai.APIConnectionError(request=_REQ)
+    monkeypatch.setattr(spec_exec, "run_agent", bad_then_down)
+    mr = {"files": [{"path": "sql/rules/r201.sql", "full_content": "SELECT 1;"}]}
+    r = asyncio.run(spec_exec.run_spec_exec(load_config(), None, mr, "R-201", "規格內容"))
+    assert not [f for f in r["findings"] if f.get("stage")]
+    assert [f for f in r["findings"] if f["title"] == "執行驗證無法完成(測資生成失敗)"]
+
+
+def test_沙盒不可用_記成執行驗證沒跑完(monkeypatch):
+    async def fake_generate(cfg, code, text, profile_name=None):
+        return _plan(), [], []
+
+    def no_sandbox(sql, plan_):
+        return {"engine": None, "sandbox_error": "無法連線執行驗證沙盒", "testdata_error": None,
+                "sql_error": None, "case_results": [], "mismatches": []}
+    monkeypatch.setattr(spec_exec, "generate_cases", fake_generate)
+    monkeypatch.setattr(spec_exec, "execute_cases", no_sandbox)
+    mr = {"files": [{"path": "sql/rules/r201.sql", "full_content": "SELECT 1;"}]}
+    r = asyncio.run(spec_exec.run_spec_exec(load_config(), None, mr, "R-201", "規格內容"))
+    [f] = [f for f in r["findings"] if f.get("stage")]
+    assert f["stage"] == spec_exec.STAGE_SANDBOX_NAME and f["title"] == "執行驗證無法完成(沙盒不可用)"
+    assert r["passed"] is False
 
 
 def test_測資生成剩的時間不夠時不再重試(monkeypatch):
@@ -176,8 +237,9 @@ def _plan():
             "cases": [case("C1-T", "true", True), case("C1-F", "false", False)]}
 
 
-@pytest.mark.parametrize("error", [openai.APITimeoutError(request=_REQ), agent.LlmNoTimeLeft("x")])
-def test_仲裁時間到了_記成仲裁沒有結論_不混進行為不符(monkeypatch, error):
+@pytest.mark.parametrize("error", [openai.APITimeoutError(request=_REQ), agent.LlmNoTimeLeft("x"),
+                                   openai.APIConnectionError(request=_REQ)])
+def test_仲裁時間到了或呼叫失敗_記成仲裁沒有結論_不混進行為不符(monkeypatch, error):
     async def fake_generate(cfg, code, text, profile_name=None):
         return _plan(), [], []
 
