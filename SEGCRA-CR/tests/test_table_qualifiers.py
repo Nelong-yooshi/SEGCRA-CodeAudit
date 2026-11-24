@@ -233,6 +233,20 @@ def test_送進沙盒的SQL已經剝掉限定詞(monkeypatch):
     assert ran and all('"D"' not in s for s in ran), ran
 
 
+def test_INSERT的表名不在DDL白名單時記測資錯且不拼進SQL(monkeypatch):
+    """灌資料的 INSERT 不指名欄位,表名無法參數化、只能拼進字串——所以表名必須是規格
+    DDL 定義過的那幾張。測資給了別的字串 → 記成測資側的錯,而且那個字串不會進任何 INSERT。"""
+    sent = []
+    _fake_sandbox(monkeypatch, sent)
+    plan = {"schema_ddl": ["CREATE TABLE t(id INT);"],
+            "conditions": [],
+            "cases": [{"case_id": "C1-T", "condition_id": "C1", "direction": "true",
+                       "rows": [["t; DROP TABLE t;--", 1]], "expect_flagged": True}]}
+    out = spec_exec.execute_cases("SELECT 1 FROM t", plan)
+    assert out["testdata_error"] and "不在規格 DDL" in out["testdata_error"]
+    assert all("DROP TABLE" not in s for s in sent), sent
+
+
 def test_execution_error含table_error():
     """「這次執行有沒有失敗」只留一份判斷,一定要含 table_error——不然 coverage_check /
     freeze_testdata 等腳本會把「表名對不上沒跑成」當成「驗過了」。"""

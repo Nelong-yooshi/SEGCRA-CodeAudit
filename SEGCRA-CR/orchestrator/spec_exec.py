@@ -1448,7 +1448,8 @@ def execute_cases(sql: str, plan: dict, deadline: float | None = None) -> dict:
     params = _sandbox_params()
     prepared = prepare_sql(sql)
     # 編譯輸出的三段式表名剝成純表名(沙盒的測資就是規格 DDL 的那些名稱)
-    prepared, table_error = _strip_table_qualifiers(prepared, _ddl_tables(plan.get("schema_ddl")))
+    known_tables = _ddl_tables(plan.get("schema_ddl"))
+    prepared, table_error = _strip_table_qualifiers(prepared, known_tables)
     results, mismatches = [], []
     truth: dict[str, dict] = {}       # {case_id: 每個條件在這個案例裡的真假}
     out = {"case_results": results, "mismatches": mismatches, "sql_error": None,
@@ -1492,6 +1493,11 @@ def execute_cases(sql: str, plan: dict, deadline: float | None = None) -> dict:
                         c.execute(ddl)
                     for row in case["rows"]:
                         table, vals = row[0], row[1:]
+                        # INSERT 不指名欄位,表名無法參數化,只能拼進語句——所以先用規格
+                        # DDL 定義過的表名當白名單擋一次(小寫比對)。測資的表名理應就是
+                        # 那幾張;不在白名單內的字串一律不拼進 SQL,記成測資側的錯。
+                        if str(table).lower() not in known_tables:
+                            raise ValueError(f"測資的表名 {table} 不在規格 DDL 定義的表內")
                         ph = ",".join(["%s"] * len(vals))
                         c.execute(f"INSERT INTO {table} VALUES ({ph})", tuple(vals))
                 except Exception as e:   # DDL / 灌資料失敗 = 測資側的錯,不是 SQL 的錯
