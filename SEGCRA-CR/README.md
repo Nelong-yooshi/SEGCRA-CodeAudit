@@ -122,10 +122,15 @@ scripts/sandbox.sh start
 
 ## 4. spec 怎麼寫
 
-執行驗證以 `specs/<規則碼>.md` 為唯一真值，格式(參考 `specs/R-201.md`):
+執行驗證以 `specs/` 底下的規格為唯一真值，格式(參考 `specs/R-201.md`):
 
 ```markdown
 # R-xxx 規則名稱
+
+## 基本資料
+| 欄位 | 值 |
+|---|---|
+| 序號 / 程式名稱 | DEMO02 / RULE_X1 |
 
 ## 說明
 一段白話:這條規則偵測什麼、何時通報。
@@ -149,7 +154,8 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
 - **程式與規格裡的 SQL 一律寫 T-SQL**:布林是 `BIT`(`= 1`,不是 `= TRUE`)、取小時用 `DATEPART(HOUR, x)`(不是 `EXTRACT`)、參數是 `@start_date` / `@end_date`。
 - **用語與含等一致**:「達/以上」= 含 = `>=`;「超過」= 不含 = `>`。測資會對每個數值門檻生成邊界案例(恰好等於門檻、差最小單位)，含等寫錯一定被抓。
 - 測資生成怎麼用它:agent 把需求項目拆成**原子條件**(過濾、閾值、時段、幣別、豁免、時間窗各自成條)，每條生成 true/false 兩向案例;之後由確定性程式逐案在 MS SQL 沙盒執行比對。
-- **找不到 spec 會怎樣**:管線從 MR 的 SQL/標題/描述抓規則碼(`R-\d+`)，對應 `specs/<code>.md`(real 模式從 GitLab repo 的 `specs/` 目錄抓;mock 模式讀本地 `specs/`)。找不到 → major finding「無規格可驗，無法執行驗證」→ 決策至多 needs_human，**不會自動放行**。
+- **規格怎麼對到程式**:`dbt.enabled` 開啟時(部署端)，依 model 所在的 project 資料夾對應:`models/<project 編號>/` 底下的程式(含子資料夾)對到「基本資料」`序號 / 程式名稱` 是同一個編號的那份規格，規格檔名不限;MR 裡寫的 `R-` 編號不參與。dbt 關閉時，管線從 MR 的 SQL/標題/描述抓規則碼(`R-\d+`)，對應 `specs/<code>.md`。規格一律放在 repo 根目錄的 `specs/`(real 模式從 GitLab 讀審查中那個 commit;mock 模式讀本地 `specs/`)。細節見 docs/09「規格依 project 資料夾對應」。
+- **找不到 spec 會怎樣**:major finding「無規格可驗，無法執行驗證」(寫明原因，例如「這個檔案不屬於任何 project」)→ 決策至多 needs_human，**不會自動放行**。
 
 ### 範例:表格式規格 → md(導入時的第一件整理工作)
 
@@ -416,7 +422,7 @@ ssh -L 8929:localhost:8929 <your-user>@<your-server>
 | webhook 回 401 | webhook 的 Secret token 與 `GITLAB_WEBHOOK_SECRET` 不一致，或啟動時忘了 export |
 | webhook 完全收不到(GitLab 端顯示錯誤) | ① Admin Area → Settings → Network → Outbound requests 沒勾 **Allow requests to the local network from webhooks**;② URL 要用 `http://172.17.0.1:8000/...`(容器內打 `localhost` 是打容器自己);③ webhook server 沒起來(`curl http://127.0.0.1:8000/health`) |
 | MR 觸發了但沒審 | webhook server 的 stdout:action 不在 open/reopen/update,或是 `update` 但沒帶 `oldrev`(= 只改了 label/標題/描述,不是推新 commit) |
-| 執行驗證報「無規格可驗」 | MR 的 SQL/標題/描述抓不到 `R-xxx` 規則碼，或 `specs/<code>.md` 不存在(real 模式看 GitLab repo 的 `specs/`;mock 模式看本地 `specs/`) |
+| 執行驗證報「無規格可驗」 | dbt 開啟時看 finding 寫的原因:檔案要放在 `models/<project 編號>/` 底下，`specs/` 裡要剛好一份規格的「序號」是這個編號。dbt 關閉時:MR 的 SQL/標題/描述抓不到 `R-xxx` 規則碼，或 `specs/<code>.md` 不存在(real 模式看 GitLab repo 的 `specs/`;mock 模式看本地 `specs/`) |
 | SQL 無法在測資上執行 | 報告會帶 major「SQL 無法在測資上執行」與 SQL Server 的錯誤訊息。常見:不是 T-SQL 寫法(`= TRUE`、`EXTRACT(...)`、`:start_date` 這類其他資料庫的語法)、用了 spec 資料表定義沒有的欄位、含 dbt 樣板。時間參數用 `@start_date` / `@end_date` |
 | 執行驗證報「沙盒不可用」 | 沙盒沒啟動或連不上:`scripts/sandbox.sh status`;沒啟動就 `scripts/sandbox.sh start`。沙盒不可用時一律不自動放行 |
 | 預掃報「無法解析此檔的 SQL」 | rule-base 的語法樹規則沒有執行(文字層規則如明碼憑證仍有效)。常見:非 T-SQL 語法、dbt 樣板未展開。這條是 major,會擋下自動放行 |

@@ -44,6 +44,7 @@ from .security import scan_mr
 from toolbox.gitlab import (WRITE_FAILED, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UNCERTAIN,
                             write_failure)
 from .skills_loader import always_skills, load_skills, skills_index
+from . import spec_index
 from .dbt_context import PROJECT_FILE_REMOVED, PROJECT_YAML_INVALID, check_yaml_files_isolated
 from .dbt_project import YAML_MODELS_NOT_LIST, YAML_SYNTAX
 from .spec_exec import SpecLookup, find_spec, run_spec_exec
@@ -1628,6 +1629,19 @@ def _spec_versions_in_mr(mr: dict) -> tuple[dict, set]:
     return versions, unavailable
 
 
+def _load_spec_index(mr: dict, dbt_cfg: dict, dbt_ctx: DbtContext | None) -> "spec_index.SpecIndex":
+    """這份審查的「project 編號 → 規格」對照表。model 目錄用 dbt 專案的設定(取不回專案時用
+    預設的 models/;專案取不回來本身已經交人工)。"""
+    project = dbt_ctx.project if dbt_ctx is not None else None
+    prefix = dbt_ctx.prefix if dbt_ctx is not None else check_project_dir(
+        dbt_cfg.get("project_dir", ""))
+    versions, _ = _spec_versions_in_mr(mr)
+    return spec_index.load_index(
+        versions, prefix=prefix,
+        model_paths=project.model_paths if project is not None else spec_index.DEFAULT_MODEL_PATHS,
+        macro_paths=project.macro_paths if project is not None else spec_index.DEFAULT_MACRO_PATHS)
+
+
 def _is_deleted(diff) -> bool:
     """整個檔案被刪掉:diff 只有一段,變更後是 0 行。"""
     heads = _HUNK_HEAD.findall(diff) if isinstance(diff, str) else []
@@ -2018,9 +2032,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                             _mr_with_head_text, dict(mr), mr, dbt_ctx, rendered)
         injection_hits = _step(report_stub, "注入掃描", scan_mr, [], scan_target)
 
-        # 找 spec(確定性;執行驗證與 prompt 的規格段共用)。依檔名對應與展開器
-        # 同一個開關:關閉時行為與接線前完全相同。
+        # 找 spec(確定性;執行驗證與 prompt 的規格段共用)。dbt 開啟時依 project 資料夾對應,
+        # 跟展開器同一個開關。對照表每份審查讀一次,受影響 model 的查找與執行驗證共用。
         # MR 改到規格檔時,規格以這個 MR 的版本為準(見 _spec_versions_in_mr)
+        spec_index.use_index(
+            _step(report_stub, "規格清單讀取", _load_spec_index,
+                  spec_index.SpecIndex(error="fetch_failed"), mr, cfg.dbt, dbt_ctx)
+            if cfg.dbt.get("enabled") is True else None)
         find_spec_mr = _find_spec_in_mr(mr)
         spec_code, spec_text = await find_spec_mr(hub, mr, by_path=cfg.dbt.get("enabled") is True)
         # MR 改到 macro 等:檢查不在變更清單裡、但受影響的 model(沒有反查結果時是 None)

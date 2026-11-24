@@ -396,8 +396,11 @@ def test_沒有專案時照舊補(ctx):
 
 @pytest.fixture
 def run(review, monkeypatch):
-    """review 的替身之外:規格換成有資料表定義的,記下送進沙盒的 SQL。"""
-    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC, encoding="utf-8")
+    """review 的替身之外:規格換成有資料表定義的,記下送進沙盒的 SQL。model 放在 project
+    資料夾 models/P02/(規格的序號是 P02)。"""
+    (spec_exec.SPECS_DIR / "BIG.md").write_text(
+        SPEC + "\n## 基本資料\n\n| 欄位 | 值 |\n|---|---|\n| 序號 / 程式名稱 | P02 / BIG |\n",
+        encoding="utf-8")
     seen = {"sql": []}
     real_execute = spec_exec.execute_cases
 
@@ -407,11 +410,15 @@ def run(review, monkeypatch):
     monkeypatch.setattr(spec_exec, "execute_cases", capture)
 
     def go(paths, extra=None, contents=None):
-        files = [{"path": p, "diff": "@@ -0,0 +1 @@\n+" + (contents or {}).get(p, _files(extra).get(p, "x"))}
+        files = [{"path": _p02(p), "diff": "@@ -0,0 +1 @@\n+" + (contents or {}).get(p, _files(extra).get(p, "x"))}
                  for p in paths]
-        report, _ = review(files, _Loader(_files(extra)))
+        report, _ = review(files, _Loader({_p02(k): v for k, v in _files(extra).items()}))
         return report, seen["sql"]
     return go
+
+
+def _p02(path: str) -> str:
+    return "models/P02/" + path[len("models/"):] if path.startswith("models/") else path
 
 
 def _titles(report):
@@ -422,8 +429,8 @@ def test_只引用_source_的_model_送進沙盒執行(run):
     report, sqls = run(["models/mrt_BIG.sql"])
     assert sqls == ["SELECT account_no FROM [transactions]"]
     assert report["_spec_exec"]["passed"] is True
-    assert report["_spec_exec"]["executed_file"] == "models/mrt_BIG.sql"
-    assert report["_dbt_exec"] == {"file": "models/mrt_BIG.sql", "ok": True, "reason": None}
+    assert report["_spec_exec"]["executed_file"] == "models/P02/mrt_BIG.sql"
+    assert report["_dbt_exec"] == {"file": "models/P02/mrt_BIG.sql", "ok": True, "reason": None}
     assert _DBT_UNEXECUTED_TITLE not in _titles(report)
     assert not any("尚未支援" in t for t in _titles(report))
 
@@ -479,5 +486,5 @@ def test_golden_的_dbt_model_送進沙盒的是跟_mr_406_相同的_SQL(in_proc
     assert ctx.error is None and ctx.project is not None
     exec_mr = pipeline._mr_for_spec_exec(mr, ctx)
     out, record = _dbt_exec_mr(exec_mr, spec, spec, (), ctx, cfg)
-    assert record == {"file": "models/mrt_cash_inbound.sql", "ok": True, "reason": None}
+    assert record == {"file": "models/SAMPLE02/mrt_cash_inbound.sql", "ok": True, "reason": None}
     assert out["files"][-1]["full_content"] == plain.replace("FROM txn_log t", "FROM [txn_log] t")

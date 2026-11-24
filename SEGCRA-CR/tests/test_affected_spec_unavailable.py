@@ -118,15 +118,14 @@ def test_查規格的回傳值不是_SpecLookup_時不會靜靜當成沒有規�
     assert impact_finding(check)["severity"] == "major"
 
 
-# ─────────────────── 用真的 find_spec 與 gitlab.fetch_file,只換掉 GitLab 的回應 ───────────────────
+# ─────────────────── 用真的 find_spec 與規格清單的讀取,只換掉 GitLab 的回應 ───────────────────
 
-SPEC = "# BIG 規格\n\n## 條件\n- 金額大於 100\n"
+SPEC = "# BIG 規格\n\n## 基本資料\n\n| 欄位 | 值 |\n|---|---|\n| 序號 / 程式名稱 | P01 / BIG |\n"
 
 
 @pytest.fixture
 def real_gitlab(monkeypatch):
-    """真實 GitLab 模式的設定(假的位址與 token);HTTP 回應由各測試決定。"""
-    from orchestrator import spec_exec
+    """真實 GitLab 模式的設定(假的位址與 token);打包下載的結果由各測試決定。"""
     monkeypatch.setattr(gitlab, "REAL_MODE", True)
     monkeypatch.setattr(gitlab, "GITLAB_URL", "https://gitlab.invalid")
     monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "1")
@@ -134,17 +133,16 @@ def real_gitlab(monkeypatch):
     monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", "test-read-token")
     calls = []
 
-    def reply(status=200, text=SPEC, raises=False):
-        def get(url, headers=None, params=None, timeout=None):
-            calls.append({"url": url, "ref": (params or {}).get("ref")})
+    def serve(data=None, raises=False):
+        def download(sha, path, *, max_bytes):
+            calls.append((sha, path))
             if raises:
-                raise httpx.ConnectError("連不上")
-            return httpx.Response(status, text=text, request=httpx.Request("GET", url))
-        monkeypatch.setattr(httpx, "get", get)
+                raise gitlab.ArchiveDownloadError("下載失敗")
+            return data
+        monkeypatch.setattr(gitlab, "download_archive", download)
     gitlab.pin_review_ref("e1b2" + "0" * 36)
-    yield reply, calls
+    yield serve, calls
     gitlab.pin_review_ref(None)
-    assert spec_exec.fetch_file is gitlab.fetch_file      # 沒有被換掉:走的是真的取檔
 
 
 def _real_check():
@@ -153,16 +151,14 @@ def _real_check():
 
 
 @pytest.mark.parametrize("setup,code", [
-    (lambda reply: setattr(gitlab, "GITLAB_READ_TOKEN", ""), "no_read_token"),          # token 沒設
-    (lambda reply: gitlab.pin_review_ref(None), "no_review_ref"),                        # 沒釘住 commit
-    (lambda reply: reply(404, '{"message":"404 Project Not Found"}'), "not_found"),     # 專案或權限
-    (lambda reply: reply(200, "這不是規格,只是一段文字"), "not_a_spec"),               # 內容不是規格
-    (lambda reply: reply(raises=True), "fetch_failed"),                                 # 連不上
+    (lambda serve: (setattr(gitlab, "GITLAB_READ_TOKEN", ""), serve(raises=True)), "no_read_token"),
+    (lambda serve: (gitlab.pin_review_ref(None), serve(b"")), "no_review_ref"),
+    (lambda serve: serve(raises=True), "fetch_failed"),                     # 連不上、404…
+    (lambda serve: serve(b"not a tar.gz"), "fetch_failed"),                 # 解不開
 ])
 def test_用真的_find_spec_取不到時受影響_model_都記成取不到_說法也對(real_gitlab, setup, code):
-    reply, calls = real_gitlab
-    reply()                                       # 預設回一份正常的規格
-    setup(reply)
+    serve, calls = real_gitlab
+    setup(serve)
     m = _real_check()
     assert (m.spec, m.spec_unavailable) == (None, code)
     fd = impact_finding(AffectedCheck(impact=_macro_ctx().impact, models=(m,)))
@@ -170,20 +166,14 @@ def test_用真的_find_spec_取不到時受影響_model_都記成取不到_說�
     assert "沒有對應到規格" not in fd["detail"]
 
 
-def test_用真的_find_spec_檔案確實不存在時是沒有對應到(real_gitlab):
-    reply, calls = real_gitlab
-    reply(404, '{"message":"404 File Not Found"}')
+def test_用真的_find_spec_讀的是釘住那一版的_specs(real_gitlab):
+    from tests.test_dbt_affected import _gz
+    serve, calls = real_gitlab
+    serve(_gz({"specs/big.md": SPEC}))
     m = _real_check()
+    # models/mrt_BIG.sql 直接放在 models/ 底下,不屬於任何 project:確定沒有,不是取不到
     assert (m.spec, m.spec_unavailable, m.spec_looked_up) == (None, None, True)
-    assert calls and all(c["ref"] == "e1b2" + "0" * 36 for c in calls)   # 讀的是釘住的那一版
-
-
-def test_用真的_find_spec_拿到規格時對到(real_gitlab):
-    reply, calls = real_gitlab
-    reply()
-    m = _real_check()
-    assert m.spec_unavailable is None and m.spec
-
+    assert calls == [("e1b2" + "0" * 36, "specs")]
 
 
 # ─────────────────── 審查流程實際走的那一條:pipeline._find_spec_in_mr 包過的 find_spec ───────────────────

@@ -1,15 +1,9 @@
-"""dbt_impact — model 與規格的對應(Issue #7 第 2 點)、macro 反查(第 3 點)。
+"""dbt_impact — macro 反查:MR 改到 macro 時找出受影響的 model。
 
 **純靜態分析,從不執行樣板**:只用 Jinja 解析器讀語法樹,不渲染、不呼叫任何 macro。
 輸入(檔案路徑與內容)一律視為不可信的 MR 內容。
 
-一、規格對應 resolve_spec()
-  依 model 檔名找 `specs/<名稱>.md`(例:`mrt_RETAIL_M1.sql` → `specs/RETAIL_M1.md`),
-  找不到才用 MR 中出現的 R 編號當備援(`specs/R-xxx.md`)。只回傳「呼叫端提供的
-  既有規格清單」裡真的存在的路徑,不自行拼出任何檔案路徑去讀取。
-  多個 R 編號對到不同規格時不擇一(回傳 None),交給人工確認。
-
-二、macro 反查 analyze_macro_impact()
+macro 反查 analyze_macro_impact()
   MR 改到 macro 檔(含 config 註冊表)時,找出直接或間接呼叫到這些 macro 的 model。
   依賴判定比 dbt 本身更保守(以 dbt parse 的 manifest 為標準答案對照,見測試):
     * 名稱引用:直接呼叫、以命名空間呼叫(`pkg.macro()`)、當成值傳遞、字串中的名稱
@@ -57,7 +51,6 @@
     真正的防線是執行沙盒與資安審查
   * 不讀取 `dbt_project.yml` 的 model-paths / macro-paths 設定,目錄由呼叫端指定
   * 不分析第三方套件(packages)內的 macro
-  * 規格對應的檔名慣例(預設只去除 `mrt_` 前綴)待確認
 """
 import hashlib
 from dataclasses import dataclass, field
@@ -83,10 +76,6 @@ MAX_REASON_CHARS = 300
 
 DEFAULT_MODEL_DIRS = ("models",)
 DEFAULT_MACRO_DIRS = ("macros",)
-DEFAULT_SPECS_DIR = "specs"
-# 規格檔名慣例:Issue #7 範例 `mrt_RETAIL_M1.sql` → `specs/RETAIL_M1.md`。
-# 其他前綴 / 後綴(例如 earlyjob model 對應哪份規格)尚未確認,不自行猜測。
-DEFAULT_STRIP_PREFIXES = ("mrt_",)
 
 DEFAULT_ISOLATED_TIMEOUT_S = 60.0
 DEFAULT_ISOLATED_MEMORY_MB = 1024
@@ -114,21 +103,9 @@ _CONFIG_READ_ATTRS = frozenset({"get", "require", "meta_get", "meta_require",
 _CONFIG_SUFFIXES = (".yml", ".yaml")
 _RESOURCE_DIRS = frozenset({"seeds", "snapshots", "analyses", "tests"})
 _JINJA_EXTENSIONS = ["jinja2.ext.do", "jinja2.ext.loopcontrols"]
-_INVALID_PATH_LABEL = "(不合法的路徑)"
 
 
 # ------------------------------------------------------------------ 資料結構
-@dataclass(frozen=True)
-class SpecMatch:
-    """一個 model 對應到的規格。spec_path 為 None 時代表找不到或無法確定。"""
-
-    model_path: str
-    spec_path: str | None
-    method: str                      # path | rule_code | ambiguous | none
-    candidates: tuple[str, ...] = ()
-    notes: tuple[str, ...] = ()
-
-
 @dataclass(frozen=True)
 class AffectedModel:
     path: str
@@ -195,17 +172,6 @@ def _is_ident(text) -> bool:
             and all(ch.isalnum() or ch == "_" for ch in text))
 
 
-def _is_file_name(text: str) -> bool:
-    """可用於規格檔名的 model 名稱:ASCII 英數與底線(可數字開頭)。"""
-    return bool(text) and text.isascii() and all(ch.isalnum() or ch == "_" for ch in text)
-
-
-def _is_rule_code(code) -> bool:
-    """R-xxx 規則碼(R- 後接 2 至 4 位數字),與 spec_exec 既有格式相同。"""
-    return (isinstance(code, str) and code.startswith("R-")
-            and 2 <= len(code) - 2 <= 4 and code[2:].isascii() and code[2:].isdigit())
-
-
 def _identifier_tokens(text: str) -> set[str]:
     """線性時間切出所有識別字(用於 yml 中的 hook 名稱)。"""
     tokens, start = set(), None
@@ -227,74 +193,6 @@ def _clip(text: str) -> str:
 
 def _model_name(path: str) -> str:
     return path.rsplit("/", 1)[-1][:-len(".sql")]
-
-
-# ------------------------------------------------------------------ 一、規格對應
-def resolve_spec(model_path, available_specs, rule_codes=(), *,
-                 specs_dir: str = DEFAULT_SPECS_DIR,
-                 strip_prefixes=DEFAULT_STRIP_PREFIXES) -> SpecMatch:
-    """找 model 對應的規格。
-
-    model_path       model 檔的 repo 相對路徑
-    available_specs  repo 中實際存在的規格檔路徑(例如 GitLab 列目錄的結果)
-    rule_codes       MR 中出現的 R 編號(備援);可傳單一字串或多個
-    """
-    path = normalize_path(model_path)
-    if path is None:
-        return SpecMatch(_INVALID_PATH_LABEL, None, "none", (), ("model 路徑不合法,不做對應",))
-    safe_dir = normalize_path(specs_dir)
-    if safe_dir is None:
-        return SpecMatch(path, None, "none", (), ("規格目錄設定不合法",))
-    if isinstance(available_specs, str):
-        available_specs = (available_specs,)
-    if isinstance(rule_codes, str):
-        rule_codes = (rule_codes,)
-    if isinstance(strip_prefixes, str):
-        strip_prefixes = (strip_prefixes,)
-    available = {p for p in (normalize_path(s) for s in available_specs) if p}
-
-    notes: list[str] = []
-    candidates: list[str] = []
-    name = _model_name(path) if path.endswith(".sql") else ""
-    if _is_file_name(name):
-        names = [name] + [name[len(p):] for p in strip_prefixes
-                          if isinstance(p, str) and p and name.startswith(p) and len(name) > len(p)]
-        for n in names:
-            spec = f"{safe_dir}/{n}.md"
-            if spec not in candidates:
-                candidates.append(spec)
-    else:
-        notes.append("model 檔名不是 .sql,或含英數與底線以外的字元,無法依檔名對應規格")
-
-    by_path = next((c for c in candidates if c in available), None)
-    if by_path is None:
-        lowered: dict[str, str] = {}
-        for a in sorted(available):
-            lowered.setdefault(a.lower(), a)
-        near = [lowered[c.lower()] for c in candidates if c.lower() in lowered]
-        if near:
-            notes.append(f"只有大小寫不同的規格檔存在({near[0]}),未採用,請人工確認")
-
-    codes = sorted({c for c in rule_codes if _is_rule_code(c)})
-    by_code = sorted({f"{safe_dir}/{c}.md" for c in codes} & available)
-
-    if by_path is not None:
-        if by_code and by_code != [by_path]:
-            notes.append(f"MR 中的 R 編號對應到其他規格({', '.join(by_code)}),以檔名對應為準,請人工確認")
-        return SpecMatch(path, by_path, "path", tuple(candidates), tuple(notes))
-    if len(by_code) == 1:
-        return SpecMatch(path, by_code[0], "rule_code", tuple(candidates), tuple(notes))
-    if len(by_code) > 1:
-        notes.append(f"多個 R 編號對應到不同規格({', '.join(by_code)}),不自行擇一")
-        return SpecMatch(path, None, "ambiguous", tuple(candidates), tuple(notes))
-    notes.append("找不到對應的規格")
-    return SpecMatch(path, None, "none", tuple(candidates), tuple(notes))
-
-
-def resolve_specs(model_paths, available_specs, rule_codes=(), **kwargs) -> tuple[SpecMatch, ...]:
-    available = (available_specs,) if isinstance(available_specs, str) else tuple(available_specs)
-    codes = (rule_codes,) if isinstance(rule_codes, str) else tuple(rule_codes)
-    return tuple(resolve_spec(p, available, codes, **kwargs) for p in model_paths)
 
 
 # ------------------------------------------------------------------ Jinja 解析
