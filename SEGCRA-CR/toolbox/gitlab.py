@@ -781,13 +781,32 @@ def create_rule_mr(file_path: str, content: str, title: str, description: str) -
     return json.dumps({"mr_iid": new_id}, ensure_ascii=False)
 
 
-def set_label(mr_id: str, label: str) -> str:
-    """為 MR 加上標籤(如 ai-review::needs-changes)。
+REVIEW_LABEL_PREFIX = "ai-review::"
+REVIEW_DECISIONS = ("auto_approved", "needs_human", "blocked")
 
-    失敗時重送一次(加上已經有的標籤不會重複),最後還是失敗時回 `{"ok": false, "failure": 種類}`。"""
+
+def _stale_review_labels(label: str) -> str:
+    """加上 `ai-review::<決策>` 時要一起拿掉的其他決策標籤(逗號分隔)。不是審查標籤回空字串。
+
+    scoped label 互斥是 GitLab 付費版的功能;沒有授權時舊的會留著,MR 上同時掛著兩個結論,
+    看的人分不出哪個是現在的。只列這三種決策:不先查 MR 現有的標籤(少一次請求、少一種失敗),
+    代價是舊版程式用過的其他名稱不會被清掉。"""
+    if not (isinstance(label, str) and label.startswith(REVIEW_LABEL_PREFIX)):
+        return ""
+    return ",".join(REVIEW_LABEL_PREFIX + d for d in REVIEW_DECISIONS
+                    if REVIEW_LABEL_PREFIX + d != label)
+
+
+def set_label(mr_id: str, label: str) -> str:
+    """為 MR 加上標籤(如 ai-review::needs_human),同一個請求拿掉其他 ai-review:: 決策標籤。
+
+    失敗時重送一次(加上已經有的標籤不會重複、拿掉沒有的標籤不會出錯),最後還是失敗時回
+    `{"ok": false, "failure": 種類}`。"""
+    stale = _stale_review_labels(label)
+    payload = {"add_labels": label, **({"remove_labels": stale} if stale else {})}
     if REAL_MODE:
         failure = _send_with_retry(
-            lambda: _api("PUT", f"/merge_requests/{mr_id}", json={"add_labels": label}),
+            lambda: _api("PUT", f"/merge_requests/{mr_id}", json=payload),
             LABEL_ATTEMPTS)
         if failure is not None:
             return _write_failed(failure)

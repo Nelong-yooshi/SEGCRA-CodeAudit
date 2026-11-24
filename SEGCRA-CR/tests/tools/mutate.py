@@ -6066,6 +6066,28 @@ MUTANTS.update({
         '    current = now.get("head_sha") or now.get("sha")', '    current = now.get("head_sha")'),
 })
 
+# ---- 重審時舊的 ai-review:: 標籤要拿掉;建議欄位的排版
+MUTANTS.update({
+    "標籤:不拿掉舊的決策標籤": ("../toolbox/gitlab.py",
+        '    payload = {"add_labels": label, **({"remove_labels": stale} if stale else {})}',
+        '    payload = {"add_labels": label}'),
+    "標籤:連剛加的也拿掉": ("../toolbox/gitlab.py",
+        "                    if REVIEW_LABEL_PREFIX + d != label)",
+        "                    )"),
+    "標籤:不是審查標籤也拿掉決策標籤": ("../toolbox/gitlab.py",
+        "    if not (isinstance(label, str) and label.startswith(REVIEW_LABEL_PREFIX)):",
+        "    if not isinstance(label, str):"),
+    "建議:說明文字也包進程式碼區塊": ("pipeline.py",
+        "    if not _CODE_START.match(first):\n        return text",
+        "    if False:\n        return text"),
+    "建議:已經有程式碼區塊也再包一層": ("pipeline.py",
+        "    if _FENCE_LINE.search(text):\n        return text",
+        "    if False:\n        return text"),
+    "建議:圍欄固定三個反引號": ("pipeline.py",
+        '    fence = "`" * max(3, longest + 1)',
+        '    fence = "```"'),
+})
+
 # ---- 寫回 GitLab 的每一步都看結果:總結、標籤、commit status、webhook 的通知
 W = "../scripts/webhook_server.py"
 MUTANTS.update({

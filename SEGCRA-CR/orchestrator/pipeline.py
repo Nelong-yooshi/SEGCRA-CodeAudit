@@ -4390,10 +4390,33 @@ def apply_rubric(report: dict) -> dict:
     return report
 
 
+# 建議的第一行像程式(SQL 關鍵字、dbt 標記、註解、`欄位 運算子`)才放進程式碼區塊
+_CODE_START = re.compile(
+    r"\s*(?:(?:SELECT|WITH|INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|DECLARE|SET|EXEC|IF|BEGIN"
+    r"|AND|OR|WHERE|FROM|JOIN|LEFT|RIGHT|INNER|FULL|CROSS|ON|GROUP|ORDER|HAVING|CASE|WHEN|UNION"
+    r"|SUM|COUNT|CAST|CONVERT|COALESCE|ISNULL)\b|--|/\*|\{\{|\{%"
+    r"|(?:\[[^\]\n]+\]|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:\[[^\]\n]+\]|[A-Za-z_][A-Za-z0-9_]*))*"
+    r"\s*(?:[=<>!]|\bIN\b|\bIS\b|\bBETWEEN\b|\bLIKE\b))", re.I)
+_FENCE_LINE = re.compile(r"^[ \t]*(?:```|~~~)", re.M)
+
+
+def _suggestion_markdown(text: str) -> str:
+    """建議欄位怎麼排版:看起來是程式才放進程式碼區塊(圍欄比內容裡最長的反引號多一個),
+    說明文字照一般段落;內容自己已經帶了程式碼區塊的照原樣(不在區塊外再包一層)。"""
+    if _FENCE_LINE.search(text):
+        return text
+    first = next((line for line in text.splitlines() if line.strip()), "")
+    if not _CODE_START.match(first):
+        return text
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}sql\n{text}\n{fence}"
+
+
 def _format_comment(fd: dict) -> str:
     body = f"**{fd.get('title', '')}**\n\n{fd.get('detail', '')}"
     if fd.get("suggestion"):
-        body += f"\n\n建議修改:\n```sql\n{fd['suggestion']}\n```"
+        body += f"\n\n建議修改:\n{_suggestion_markdown(str(fd['suggestion']))}"
     for c in fd.get("citations", []):
         body += f"\n> 依據:{c.get('source', '')} {c.get('article', '')}"
     return body
