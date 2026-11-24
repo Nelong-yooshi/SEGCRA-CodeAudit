@@ -155,6 +155,7 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
 - **用語與含等一致**:「達/以上」= 含 = `>=`;「超過」= 不含 = `>`。測資會對每個數值門檻生成邊界案例(恰好等於門檻、差最小單位)，含等寫錯一定被抓。
 - 測資生成怎麼用它:agent 把需求項目拆成**原子條件**(過濾、閾值、時段、幣別、豁免、時間窗各自成條)，每條生成 true/false 兩向案例;之後由確定性程式逐案在 MS SQL 沙盒執行比對。
 - **規格怎麼對到程式**:`dbt.enabled` 開啟時(部署端)，依 model 所在的 project 資料夾對應:`models/<project 編號>/` 底下的程式(含子資料夾)對到「基本資料」`序號 / 程式名稱` 是同一個編號的那份規格，規格檔名不限;MR 裡寫的 `R-` 編號不參與。dbt 關閉時，管線從 MR 的 SQL/標題/描述抓規則碼(`R-\d+`)，對應 `specs/<code>.md`。規格一律放在 repo 根目錄的 `specs/`(real 模式從 GitLab 讀審查中那個 commit;mock 模式讀本地 `specs/`)。細節見 docs/09「規格依 project 資料夾對應」。
+- **表結構放在 `specs/tables/`**(dbt 開啟時):規格沒寫資料表定義的表，可以把 SSMS「Script Table as → CREATE To」的輸出存成 `specs/tables/<schema>.<表名>.md`(一張表一個檔)，執行驗證會補上規則用到的那幾張。新增或修改表時更新這個檔。細節見 docs/09「表定義放在 specs/tables/」。
 - **找不到 spec 會怎樣**:major finding「無規格可驗，無法執行驗證」(寫明原因，例如「這個檔案不屬於任何 project」)→ 決策至多 needs_human，**不會自動放行**。
 
 ### 範例:表格式規格 → md(導入時的第一件整理工作)

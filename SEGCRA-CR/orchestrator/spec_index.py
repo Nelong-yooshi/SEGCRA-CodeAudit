@@ -30,6 +30,7 @@ import unicodedata
 from dataclasses import dataclass, field
 
 SPECS_DIR = "specs"
+TABLES_DIR = "specs/tables"                 # 表定義檔(見 table_defs)
 DEFAULT_MODEL_PATHS = ("models",)
 DEFAULT_MACRO_PATHS = ("macros",)
 # 程式檔:model 目錄底下的 SQL 與 Python model。其他(yml、csv…)不決定 project
@@ -53,6 +54,8 @@ class SpecIndex:
     model_paths: tuple = DEFAULT_MODEL_PATHS
     macro_paths: tuple = DEFAULT_MACRO_PATHS
     error: str | None = None
+    # specs/tables/ 底下的表定義檔 {路徑: 內容}(見 table_defs),跟規格同一次讀
+    tables: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -126,9 +129,12 @@ def build_index(files: dict, *, prefix: str = "", model_paths=DEFAULT_MODEL_PATH
         project = project_code(text)
         if project is not None:
             by_project.setdefault(project, []).append(code)
+    tables = {path: text for path, text in files.items()
+              if isinstance(path, str) and isinstance(text, str) and text
+              and path.startswith(TABLES_DIR + "/") and path.endswith(".md") and path.count("/") == 2}
     return SpecIndex(specs=specs, by_project={k: tuple(sorted(v)) for k, v in by_project.items()},
                      prefix=prefix, model_paths=_dirs(model_paths) or DEFAULT_MODEL_PATHS,
-                     macro_paths=_dirs(macro_paths))
+                     macro_paths=_dirs(macro_paths), tables=tables)
 
 
 def _dirs(paths) -> tuple:
@@ -244,10 +250,11 @@ def choose(index: SpecIndex, files) -> SpecChoice:
 # ------------------------------------------------------------------ 讀規格
 def load_index(versions: dict, *, prefix: str = "", model_paths=DEFAULT_MODEL_PATHS,
                macro_paths=DEFAULT_MACRO_PATHS, real_mode: bool | None = None, download=None,
-               local_dir=None) -> SpecIndex:
+               local_dir=None, table_versions: dict | None = None) -> SpecIndex:
     """讀這次審查的規格,建對照表。任何失敗都收斂成 error 有值的 SpecIndex,不丟例外。
 
     versions     這個 MR 改到的規格 {代號: 內容};空字串 = 這個 MR 刪掉了
+    table_versions  這個 MR 改到的表定義檔 {路徑: 內容}(同上;只有 mock 模式需要,真實模式下載的就是)
     真實模式:用唯讀 token 打包下載審查釘住的那個 commit 的 `specs/`(跟 dbt 專案同一種取法,
                 一次請求),本來就是這個 MR 的版本
     mock 模式:讀工具內建的 specs/,再疊上 versions
@@ -267,6 +274,9 @@ def load_index(versions: dict, *, prefix: str = "", model_paths=DEFAULT_MODEL_PA
         for code, text in (versions or {}).items():
             if isinstance(code, str) and isinstance(text, str):
                 files[f"{SPECS_DIR}/{code}.md"] = text
+        for path, text in (table_versions or {}).items():
+            if isinstance(path, str) and isinstance(text, str):
+                files[path] = text
         return build_index(files, **kw)
     except Exception:                       # noqa: BLE001 — 讀不到就是取不到,不中斷審查
         return SpecIndex(error="fetch_failed", **kw)
@@ -297,5 +307,10 @@ def _local_specs(local_dir) -> dict:
         local_dir = spec_exec.SPECS_DIR
     if not local_dir.is_dir():
         return {}
-    return {f"{SPECS_DIR}/{p.name}": p.read_text(encoding="utf-8")
-            for p in sorted(local_dir.glob("*.md")) if p.is_file()}
+    files = {f"{SPECS_DIR}/{p.name}": p.read_text(encoding="utf-8")
+             for p in sorted(local_dir.glob("*.md")) if p.is_file()}
+    tables_dir = local_dir / "tables"
+    if tables_dir.is_dir():
+        files.update({f"{TABLES_DIR}/{p.name}": p.read_text(encoding="utf-8")
+                      for p in sorted(tables_dir.glob("*.md")) if p.is_file()})
+    return files
