@@ -222,30 +222,61 @@ class _Resp:
         if self.status_code >= 400:
             raise RuntimeError(f"HTTP {self.status_code}")
 
+    def json(self):
+        import json
+        return json.loads(self.text)
 
-def _real_gitlab(monkeypatch, resp):
-    """讓 gitlab.fetch_file 走 real 模式那條路,httpx 換成固定回應。"""
+
+COMMIT = '{"id": "abc123", "short_id": "abc123"}'
+
+
+def _real_gitlab(monkeypatch, resp, commit_status=404, commit_body=COMMIT):
+    """讓 gitlab.fetch_file 走 real 模式那條路,httpx 換成固定回應;確認 commit 的那個請求
+    (`/repository/commits/<ref>`)回 commit_status 與 commit_body。"""
     import httpx
     monkeypatch.setattr(gitlab, "REAL_MODE", True)
     monkeypatch.setattr(gitlab, "review_ref", lambda: "abc123")
     monkeypatch.setattr(gitlab, "_read_token", lambda: "t0ken")
-    monkeypatch.setattr(httpx, "get", lambda *a, **k: resp)
+
+    def get(url, *a, **k):
+        return _Resp(commit_status, commit_body) if "/repository/commits/" in url else resp
+    monkeypatch.setattr(httpx, "get", get)
 
 
-def test_404_檔案不存在才算確實沒有(monkeypatch):
-    _real_gitlab(monkeypatch, _Resp(404, '{"message":"404 File Not Found"}'))
+@pytest.mark.parametrize("body", ['{"message":"404 File Not Found"}', "", "<html>not found</html>"])
+def test_404_而且_commit_取得到才算確實沒有(monkeypatch, body):
+    """不看 404 的內文:寫法由對方決定。commit 取得到(專案與權限都對)時,404 才是檔案不存在。"""
+    _real_gitlab(monkeypatch, _Resp(404, body), commit_status=200)
     assert gitlab.fetch_file("specs/R-1.md") == (None, None)
 
 
 @pytest.mark.parametrize("body", [
     '{"message":"404 Project Not Found"}',      # 專案不存在,或 token 沒有權限
     '{"message":"404 Commit Not Found"}',       # 釘住的 commit 不存在
+    '{"message":"404 File Not Found"}',         # 內文說檔案不存在,但 commit 也取不到
+    "Message: File not found.",                 # Python http.server 預設的 404 頁
+    "<p>proxy: file not found</p>",             # 代理的 404 頁,內文提到 file not found
 ])
 def test_其他404是環境問題不是檔案不存在(body, monkeypatch):
     """權限不足時 GitLab 也回 404 而不是 403。一律當成「檔案不存在」的話,
-    token 設錯、專案編號打錯都會變成「請補規格」。"""
-    _real_gitlab(monkeypatch, _Resp(404, body))
+    token 設錯、專案編號打錯都會變成「請補規格」。不看內文:代理或其他服務的 404 頁
+    提到 file not found,也不能因此當成檔案不存在。"""
+    _real_gitlab(monkeypatch, _Resp(404, body), commit_status=404)
     assert gitlab.fetch_file("specs/R-1.md") == (None, "not_found")
+
+
+@pytest.mark.parametrize("commit_body,code", [
+    ("<html>登入</html>", "fetch_failed"),     # 代理或登入頁回 200 的網頁:解析不了
+    ("{}", "not_found"),                       # JSON,但不是 commit 的資料
+    ('{"id": ""}', "not_found"),
+    ('{"id": 1}', "not_found"),
+    ("[]", "not_found"),
+    ("null", "not_found"),
+])
+def test_確認_commit_時回_200_但不是_commit_也算取不到(monkeypatch, commit_body, code):
+    """只看 200 的話,代理回的網頁也會讓 404 變成「檔案確實不存在」。"""
+    _real_gitlab(monkeypatch, _Resp(404, ""), commit_status=200, commit_body=commit_body)
+    assert gitlab.fetch_file("specs/R-1.md") == (None, code)
 
 
 def test_拿到內容就是拿到(monkeypatch):
