@@ -586,12 +586,12 @@ MUTANTS.update({
      '        injection_hits = _step(report_stub, "注入掃描", scan_mr, [], scan_target)',
      "        injection_hits = scan_mr(scan_target)"),
  "隔離:執行驗證不設時間上限": ("pipeline.py",
-     "            spec_result = await asyncio.wait_for(" + NL
-     + "                run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text," + NL
-     + "                              progress=progress, deadline=deadline)," + NL
-     + "                timeout=spec_limit)",
-     "            spec_result = await run_spec_exec(" + NL
-     + "                cfg, hub, exec_mr, exec_code, exec_text)"),
+     "                spec_result = await asyncio.wait_for(" + NL
+     + "                    run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text," + NL
+     + "                                  progress=progress, deadline=deadline)," + NL
+     + "                    timeout=spec_limit)",
+     "                spec_result = await run_spec_exec(" + NL
+     + "                    cfg, hub, exec_mr, exec_code, exec_text)"),
 })
 
 # ---- #53 review:時間上限要擋得住同步卡住的沙盒、未完成是硬條件、階段要分得出來
@@ -699,13 +699,17 @@ MUTANTS.update({
      "    return not current or current != reviewed_sha"),
  # 第 9 點:參數讀不懂要退回預設值,不可以讓 webhook 起不來
  "設定:秒數讀不懂就讓程式起不來": ("config.py",
-     "        print(f\"[config] 警告:環境變數 {name} 的值不是正整數秒數({raw!r}),\"" + NL
-     + '              f"改用預設 {default} 秒", flush=True)' + NL
+     "        print(f\"[config] 警告:環境變數 {name} 的值不是有限的正數秒數({raw!r}),\"" + NL
+     + '              f"改用預設 {default:g} 秒", flush=True)' + NL
      + "        return default",
-     "        raise"),
- "設定:0 或負數的秒數也照收": ("config.py",
-     "        if v <= 0:" + NL + "            raise ValueError",
-     "        if False:" + NL + "            raise ValueError"),
+     "        raise ValueError(name)"),
+ "設定:0、負數、inf 的秒數也照收": ("config.py",
+     "    if not (math.isfinite(value) and value > 0):", "    if False:"),
+ "設定:秒數設了但是空的不說": ("config.py",
+     "    raw = os.environ.get(name)" + NL + "    if raw is None:" + NL + "        return default" + NL
+     + "    try:" + NL + "        value = float(raw)",
+     "    raw = os.environ.get(name)" + NL + "    if raw is None or not raw.strip():" + NL
+     + "        return default" + NL + "    try:" + NL + "        value = float(raw)"),
 })
 # ---- 唯讀請求(dbt 讀單檔、打包下載)不讀環境,SSL_CERT_FILE 的 TLS 設定要明確傳進去
 MUTANTS.update({
@@ -4355,6 +4359,86 @@ MUTANTS.update({
      + "        # (舊版程式)與「跑完沒用光輪次」要分得出來。" + NL
      + '        meta["exhausted"] = False',
      "        pass"),
+})
+
+
+# ---- 閘道的請求上限:開啟時請求內容帶 timeout,預設不送
+MUTANTS.update({
+ "閘道上限:開啟了也不送": ("agent.py",
+     '        timeout_kwargs = {"extra_body": {"timeout": wait}} if SEND_TIMEOUT else {}',
+     "        timeout_kwargs = {}"),
+ "閘道上限:沒開也送": ("agent.py",
+     '        timeout_kwargs = {"extra_body": {"timeout": wait}} if SEND_TIMEOUT else {}',
+     '        timeout_kwargs = {"extra_body": {"timeout": wait}}'),
+ "閘道上限:送給閘道的跟用戶端等的不一樣(送 LLM_TIMEOUT)": ("agent.py",
+     '        timeout_kwargs = {"extra_body": {"timeout": wait}} if SEND_TIMEOUT else {}',
+     '        timeout_kwargs = {"extra_body": {"timeout": REQUEST_TIMEOUT}} if SEND_TIMEOUT else {}'),
+ "閘道上限:沒有傳進請求": ("agent.py",
+     "            **seed_kwargs, **effort_kwargs, **timeout_kwargs,",
+     "            **seed_kwargs, **effort_kwargs,"),
+ "閘道上限:讀不懂的值也當成開啟": ("config.py",
+     "    if value not in _FLAG_OFF:",
+     "    if value not in _FLAG_OFF:" + NL + "        return True"),
+ "閘道上限:讀不懂的開關值不警告": ("config.py",
+     '        print(f"[config] 警告:環境變數 {name} 的值讀不懂({raw!r}),當成沒開;"',
+     '        pass' + NL + '    if False:' + NL + '        print(f"[config] 警告:環境變數 {name} 的值讀不懂({raw!r}),當成沒開;"'),
+ "閘道上限:LLM_TIMEOUT 不走秒數的檢查": ("agent.py",
+     'REQUEST_TIMEOUT = env_seconds("LLM_TIMEOUT", 3600)',
+     'REQUEST_TIMEOUT = float(os.environ.get("LLM_TIMEOUT") or 3600)'),
+ "閘道上限:用戶端不用這一環節剩的時間": ("agent.py",
+     "            timeout=wait," + NL,
+     ""),
+ "閘道上限:不看這一環節的截止時間": ("agent.py",
+     "    left = _time_left()" + NL + "    if left is None:" + NL + "        return REQUEST_TIMEOUT",
+     "    left = None" + NL + "    if left is None:" + NL + "        return REQUEST_TIMEOUT"),
+ "閘道上限:巢狀時取較晚的(截止時間被延後)": ("agent.py",
+     "        end, min_left = min(current[0], end), max(current[1], min_left)",
+     "        end, min_left = end, max(current[1], min_left)"),
+ "剩的時間:巢狀時門檻取較小的": ("agent.py",
+     "        end, min_left = min(current[0], end), max(current[1], min_left)",
+     "        end, min_left = min(current[0], end), min_left"),
+ "剩的時間:不夠也照送": ("agent.py",
+     "        if left is not None and left[0] < left[1]:", "        if False:"),
+ "剩的時間:不夠時不算時間到了": ("agent.py",
+     "    return isinstance(error, (openai.APITimeoutError, asyncio.TimeoutError, TimeoutError, LlmNoTimeLeft))",
+     "    return isinstance(error, (openai.APITimeoutError, asyncio.TimeoutError, TimeoutError))"),
+ "閘道上限:時間到了送 0 或負數": ("agent.py",
+     "    return max(1.0, min(REQUEST_TIMEOUT, left[0]))",
+     "    return min(REQUEST_TIMEOUT, left[0])"),
+ "閘道上限:主審查不設截止時間": ("pipeline.py",
+     "        with llm_deadline(limit, MIN_STAGE_SECONDS):" + NL + "            return await asyncio.wait_for(" + NL
+     + "                run_agent(",
+     "        with llm_deadline(None):" + NL + "            return await asyncio.wait_for(" + NL
+     + "                run_agent("),
+ "剩的時間:主審查不給門檻": ("pipeline.py",
+     "        with llm_deadline(limit, MIN_STAGE_SECONDS):" + NL + "            return await asyncio.wait_for(" + NL
+     + "                run_agent(",
+     "        with llm_deadline(limit):" + NL + "            return await asyncio.wait_for(" + NL
+     + "                run_agent("),
+ "閘道上限:冷讀不設截止時間": ("pipeline.py",
+     "        with llm_deadline(limit, MIN_STAGE_SECONDS):" + NL
+     + "            return await asyncio.wait_for(_cold_read_stage(",
+     "        with llm_deadline(None):" + NL
+     + "            return await asyncio.wait_for(_cold_read_stage("),
+ "閘道上限:執行驗證不設截止時間": ("pipeline.py",
+     "            with llm_deadline(spec_limit, MIN_STAGE_SECONDS):",
+     "            with llm_deadline(None):"),
+ "剩的時間:主審查時間到了不算沒跑完": ("pipeline.py",
+     '            "stage": "主審查"}', "            }"),
+ "剩的時間:不夠時當成其他錯誤": ("pipeline.py",
+     "    if isinstance(error, LlmNoTimeLeft):" + NL + "        return _NO_TIME_KIND",
+     "    if False:" + NL + "        return _NO_TIME_KIND"),
+ "剩的時間:測資生成時間到了不算沒跑完": ("spec_exec.py",
+     '    if not plan["cases"] and (plan.get("timed_out") or plan.get("call_failed")):', "    if False:"),
+ "沒跑完:測資生成每次都呼叫失敗不算": ("spec_exec.py",
+     "    call_failed = llm_error is not None and not answered", "    call_failed = False"),
+ "沒跑完:模型有回應過也算呼叫失敗": ("spec_exec.py",
+     "    call_failed = llm_error is not None and not answered", "    call_failed = llm_error is not None"),
+ "沒跑完:沙盒不可用不算": ("spec_exec.py",
+     '                         "stage": STAGE_SANDBOX_NAME})', "                         })"),
+ "剩的時間:測資生成不夠時還重試": ("spec_exec.py",
+     "            if isinstance(e, LlmNoTimeLeft):" + NL + "                break",
+     "            if isinstance(e, LlmNoTimeLeft):" + NL + "                pass"),
 })
 
 

@@ -33,7 +33,8 @@ from datetime import datetime
 from decimal import Decimal
 
 from toolbox.gitlab import UNAVAILABLE_TEXT, fetch_file
-from .agent import extract_json, output_completeness, run_agent, strict_json_object
+from .agent import (LlmNoTimeLeft, extract_json, is_timeout, output_completeness, run_agent,
+                    strict_json_object)
 from .config import Config, PKG_ROOT
 from .isolation import run_in_thread
 
@@ -1011,8 +1012,10 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
     user = f"規則 {spec_code} 的核定規格如下,請產出測資計畫 JSON:\n\n{spec_text}"
     profile = cfg.role_profile("testgen") if profile_name is None else cfg.profile(profile_name)
     llm_error = None
+    timed_out = False       # 有一次是時間到了(請求逾時或剩的時間不夠):失敗時記成這一環節沒跑完
     truncated = 0
     malformed = 0
+    answered = 0            # 模型有回應的次數:有過回應就不是環境的問題
     filling = False          # 這一輪送出去的是「只補缺的」還是整份重來
     fill_batch = _FILL_BATCH # 補缺的批量;一旦被截斷就減半(見下方 length 分支)
     filled_total = 0         # 靠補生成多拿到幾個案例(寫進失敗原因,供判讀)
@@ -1042,7 +1045,11 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
                                   use_tools=False, verbose=False, meta=meta)
         except Exception as e:   # LLM 傳輸層失敗(連線/逾時)→ 降級為「測資生成失敗」,不炸管線
             llm_error = f"{type(e).__name__}: {e}"
+            timed_out = timed_out or is_timeout(e)
+            if isinstance(e, LlmNoTimeLeft):
+                break        # 剩的時間不夠:不再重試(再送也一樣不送)
             continue
+        answered += 1       # 模型有回應(不論內容能不能用)
         # 被 max_tokens 截斷 → 這次結果一律不可信,連看都不看就重試。
         # **這一關不能靠 _shape_check 代勞**:截斷的 JSON 會被 extract_json 的
         # json-repair 修補成合法物件,形狀檢查只會看到「案例比較少」,看不出
@@ -1173,7 +1180,12 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
         reason = f"測資生成失敗(LLM 呼叫失敗:{llm_error})"
     else:
         reason = f"測資生成失敗({max_attempts} 次嘗試皆無合法輸出)"
-    return {"schema_ddl": [], "conditions": [], "cases": []}, [reason], []
+    # 時間到了才失敗的:不是測資或模型的問題,是這一環節沒跑完(呼叫端記成帶 stage 的 finding)
+    # 每一次都是呼叫失敗(模型一次都沒有回應):環境的問題,跟時間到了一樣記成這一環節沒跑完。
+    # 有過回應(被截斷、格式錯、內容不能用)就不是:那是模型或規格的問題,重試不一定會好,照舊交人工
+    call_failed = llm_error is not None and not answered
+    return ({"schema_ddl": [], "conditions": [], "cases": [], "timed_out": timed_out,
+             "call_failed": call_failed}, [reason], [])
 
 
 # ------------------------------------------------------------------ 2. 確定性執行
@@ -1588,6 +1600,21 @@ async def arbitrate(cfg: Config, spec_text: str, sql: str, mismatch: dict,
 
 
 # ------------------------------------------------------------------ 主流程
+STAGE_GENERATE_NAME = "執行驗證(測資生成)"
+STAGE_ARBITRATE_NAME = "執行驗證(仲裁)"
+STAGE_SANDBOX_NAME = "執行驗證(沙盒)"
+
+
+def _unfinished(path: str, stage: str, why: str, title: str | None = None) -> dict:
+    """這一環節沒跑完:帶 `stage`(pipeline.review_incomplete 靠它認,不比對標題),決策不放行、
+    CI 那條路是「沒有結論」。形狀與 pipeline._incomplete_finding 相同;不從 pipeline import
+    (pipeline 匯入 spec_exec,反向會變成循環匯入)。"""
+    return {**_finding(path, "major", title or f"[{stage}] 審查未完整(逾時)",
+                       f"{why}。這一環節的結果不在本報告內。",
+                       "請人工確認這一環節原本要檢查的內容;其餘環節的結果仍然有效。"),
+            "stage": stage}
+
+
 def _finding(path: str, severity: str, title: str, detail: str, suggestion: str = "") -> dict:
     # _source:這條是程式(執行驗證)自己產生的,不是模型講的。後處理的校準只對
     # 模型的指控動作,拿證據去對照證據會把唯一真的跑過的那條降級。
@@ -2072,6 +2099,16 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
         _leave(STAGE_GENERATE, _t)
     dropped_cases += [{"case_id": (d.get("case") or {}).get("case_id", "?"),
                        "by": "shape-check", "reason": d["reason"]} for d in malformed]
+    if not plan["cases"] and (plan.get("timed_out") or plan.get("call_failed")):
+        why = ("測資生成的模型呼叫逾時,或剩的時間不夠再送一次" if plan.get("timed_out")
+               else "測資生成的模型呼叫每一次都失敗(連不上、端點錯誤或拒絕請求),沒有任何輸出")
+        findings.append(_unfinished(path, STAGE_GENERATE_NAME, why,
+                                    None if plan.get("timed_out")
+                                    else f"[{STAGE_GENERATE_NAME}] 審查未完整(模型呼叫失敗)"))
+        return {"passed": False, "spec_code": spec_code,
+                "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
+                "case_results": [], "dropped_cases": dropped_cases,
+                "stage_seconds": stage_seconds, "findings": findings}
     if not plan["cases"]:
         findings.append(_finding(path, "major", "執行驗證無法完成(測資生成失敗)",
                                  "測資生成 agent 未能產出任何合法案例:" +
@@ -2091,10 +2128,12 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
         _leave(STAGE_SANDBOX, _t)
     if ex["sandbox_error"]:
         # 沙盒不可用 ≠ 驗證通過:照樣不得自動放行,並講清楚是環境問題而非程式問題
-        findings.append(_finding(path, "major", "執行驗證無法完成(沙盒不可用)",
-                                 f"{ex['sandbox_error']}。這是驗證環境的問題,不代表程式有錯;"
-                                 "但未經執行驗證,本 MR 不得自動放行。",
-                                 "啟動沙盒(scripts/sandbox.sh start)後重新觸發審查。"))
+        # 帶 stage:這一環節沒跑完(CI 結束碼 5),不是審完了交給人——交給人(3)可以合併
+        findings.append({**_finding(path, "major", "執行驗證無法完成(沙盒不可用)",
+                                    f"{ex['sandbox_error']}。這是驗證環境的問題,不代表程式有錯;"
+                                    "但未經執行驗證,本 MR 不得自動放行。",
+                                    "啟動沙盒(scripts/sandbox.sh start)後重新觸發審查。"),
+                         "stage": STAGE_SANDBOX_NAME})
         return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],
                 "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
                 "case_results": [], "dropped_cases": dropped_cases,
@@ -2163,7 +2202,7 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
             f"案例 {c['case_id']}(條件 {c['condition_id']} {c['direction']} 向):{c['reason']}"
             for c in inconclusive)
         findings.append({
-            "file": path, "line": 0, "severity": "major", "stage": STAGE_ARBITRATE,
+            "file": path, "line": 0, "severity": "major", "stage": STAGE_ARBITRATE_NAME,
             "title": "測資與 SQL 的結果不一致,仲裁沒有結論",
             "detail": f"規則 {spec_code}:下列案例的測資預期與 SQL 實際不符,仲裁無法確定是"
                       f"測資錯還是 SQL 錯(見理由),這一環節未得出結論,需人工確認:{detail}",

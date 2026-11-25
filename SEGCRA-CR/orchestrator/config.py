@@ -53,28 +53,53 @@ def _env_float(name: str, lo: float, hi: float) -> float:
     return v
 
 
-def env_seconds(name: str, default: int) -> int:
-    """讀「秒數」型的環境變數覆蓋;**讀不懂就退回預設值並印一行警告**。
+# ─── 讀環境變數的規則(這些 helper 都在這裡) ───
+# - 秒數、開關(env_seconds、env_bool):讀不懂、設了但是空的,**印一行警告(寫出變數名)並用程式的
+#   預設值**。讀它們的是 webhook 伺服器在 import 的時候,填錯一個字就起不來的話所有 MR 都收不到審查;
+#   退回的是程式的預設值,而等太短或沒送 timeout 時模型呼叫失敗也是交人工,不會因此放行。
+# - 數值的覆蓋(_env_float、_env_seed、_env_effort):手打在跑批指令前面的,讀不懂當場擋下。
 
-    跟 _env_float 的取捨刻意不同(那邊是直接擋下):這些是時間上限,而讀它們的是
-    **webhook 伺服器在 import 時**。填錯一個字就 int() 丟例外 → 伺服器根本起不來
-    → 所有 MR 都收不到審查。那比「用預設值跑」糟得多,而且錯誤只會出現在啟動時的
-    終端機上,沒人看。所以這裡往「活著並大聲說」倒。
 
-    0 或負數也退回預設:上限設成 0 等於每次都立刻逾時,不會是誰的本意。
-    """
+def env_seconds(name: str, default: float) -> float:
+    """讀「秒數」型的環境變數覆蓋:要是**有限的正數**(可以有小數)。讀不懂、`inf`、`nan`、0 或負數、
+    設了但是空的,都退回預設值並印一行警告(寫出變數名)。沒設才安靜用預設值。
+
+    設了但是空的也說:多半是部署腳本沒把值帶進來。`inf` 要擋:有的值會放進請求內容
+    (LLM_SEND_TIMEOUT),`inf` 連 JSON 都轉不出來。整數照原樣回整數。"""
+    import math
     raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
+    if raw is None:
         return default
     try:
-        v = int(raw)
-        if v <= 0:
-            raise ValueError
+        value = float(raw)
     except ValueError:
-        print(f"[config] 警告:環境變數 {name} 的值不是正整數秒數({raw!r}),"
-              f"改用預設 {default} 秒", flush=True)
+        value = math.nan
+    if not (math.isfinite(value) and value > 0):
+        print(f"[config] 警告:環境變數 {name} 的值不是有限的正數秒數({raw!r}),"
+              f"改用預設 {default:g} 秒", flush=True)
         return default
-    return v
+    return int(value) if value.is_integer() else value
+
+
+_FLAG_ON = ("1", "true", "yes", "on")
+_FLAG_OFF = ("0", "false", "no", "off")
+
+
+def env_bool(name: str, unset: str) -> bool:
+    """開關型的環境變數。沒設時看 `unset`(寫在呼叫端,docs/10 的預設值欄對照得到);
+    `1/true/yes/on` 開、`0/false/no/off` 關;**其他值(打錯字、設了但是空的)印一行警告並當成關**:
+    打錯一個字就跟沒設一樣、又沒有任何輸出的話,症狀看起來跟這個設定無關。當成關 = 跟沒有這個設定
+    一樣,不是改走別的路。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return unset.strip().lower() in _FLAG_ON
+    value = raw.strip().lower()
+    if value in _FLAG_ON:
+        return True
+    if value not in _FLAG_OFF:
+        print(f"[config] 警告:環境變數 {name} 的值讀不懂({raw!r}),當成沒開;"
+              f"要開請設 1、true、yes 或 on", flush=True)
+    return False
 
 
 # 端點接受的檔位。"none" 是「完全不要思考」,其餘是強度。
