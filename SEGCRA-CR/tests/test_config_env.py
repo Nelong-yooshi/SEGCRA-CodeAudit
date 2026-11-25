@@ -193,12 +193,22 @@ def test_正常值會生效(monkeypatch):
     assert env_seconds("SPEC_EXEC_TIMEOUT_SECONDS", 1200) == 600
 
 
-@pytest.mark.parametrize("bad", ["", "  ", "abc", "12O0", "20 分鐘", "1.5", "0", "-1"])
+@pytest.mark.parametrize("bad", ["", "  ", "abc", "12O0", "20 分鐘", "0", "-1",
+                                 "inf", "-inf", "nan", "1e400"])
 def test_讀不懂或不合理的值退回預設並印警告(monkeypatch, capsys, bad):
-    """包含 0 與負數:上限設成 0 等於每次都立刻逾時,不會是誰的本意。"""
+    """包含 0 與負數(上限設成 0 等於每次都立刻逾時)、非有限值(會放進請求內容,JSON 轉不出來),
+    以及設了但是空的(多半是部署腳本沒把值帶進來):都退回預設,而且說出是哪個變數。"""
     from orchestrator.config import env_seconds
     monkeypatch.setenv("REVIEW_TIMEOUT_SECONDS", bad)
     assert env_seconds("REVIEW_TIMEOUT_SECONDS", 2400) == 2400
     out = capsys.readouterr().out
-    if bad.strip():            # 空字串視同沒設定,不用吵
-        assert "REVIEW_TIMEOUT_SECONDS" in out and "預設 2400" in out, out
+    assert "REVIEW_TIMEOUT_SECONDS" in out and "預設 2400" in out, out
+
+
+@pytest.mark.parametrize("raw,expected", [("600", 600), (" 60 ", 60), ("90.5", 90.5), ("1.5", 1.5)])
+def test_秒數可以有小數_整數照原樣回整數(monkeypatch, capsys, raw, expected):
+    from orchestrator.config import env_seconds
+    monkeypatch.setenv("REVIEW_TIMEOUT_SECONDS", raw)
+    got = env_seconds("REVIEW_TIMEOUT_SECONDS", 2400)
+    assert got == expected and type(got) is type(expected)
+    assert capsys.readouterr().out == ""

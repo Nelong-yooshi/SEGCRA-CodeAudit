@@ -8,6 +8,7 @@
   python eval/run_eval.py --case 405,406      # 只跑指定 case(逗號分隔)
   python eval/run_eval.py --dry-run           # 不呼叫 LLM(只驗確定性層)
   python eval/run_eval.py --json out.json     # 另存機器可讀結果
+  python eval/run_eval.py --baseline          # 裸模型對照:同一批題目只給模型看 diff(沒有管線的防線)
 
 收集與評分是分開的兩件事,可以分兩次跑(改斷言時的關鍵):
   python eval/run_eval.py --dump-reports d/   # 慢(要 GPU):跑管線並把完整報告存檔
@@ -336,6 +337,67 @@ def load_saved_report(d: Path, mr_id: str) -> dict:
     return report
 
 
+# 裸模型(review_mr 的 baseline 模式)只輸出 verdict,沒有決策。對應成管線的三態,才能跟同一批
+# 題目的 expect_decision 比:approve 等於放行、needs_changes 等於交人工、reject 等於擋下。
+BARE_VERDICT_DECISION = {"approve": "auto_approved", "needs_changes": "needs_human",
+                         "reject": "blocked"}
+BARE_UNREADABLE = "(無法判讀)"
+
+
+def report_decision(report: dict) -> str:
+    """報告的決策。裸模型的報告(_mode == "baseline")照 verdict 對應;對不上的記成無法判讀,
+    不猜成哪一態。"""
+    if report.get("_mode") == "baseline":
+        verdict = report.get("verdict")
+        return BARE_VERDICT_DECISION.get(verdict, BARE_UNREADABLE) if isinstance(verdict, str) \
+            else BARE_UNREADABLE
+    return report.get("decision", "-")
+
+
+def unreadable_reason(report: dict) -> str | None:
+    """這份報告的決策能不能拿來跟預期比;不能時回原因(固定文字),能時回 None。
+
+    - 裸模型:verdict 對不上三態;輸出不完整(`truncated` 不是 False,沒有這個鍵也算 —— 被截斷後
+      repair 補回的 verdict 不是模型的結論)
+    - 管線:有環節沒跑完(`review_incomplete` 不是空的),決策剛好對上預期也不算答對
+    這一類不算符合、不算不符,也不算 missed_block,單獨計數。"""
+    bare = report.get("_mode") == "baseline"
+    if bare:
+        if report_decision(report) == BARE_UNREADABLE:
+            return "verdict 對不上三態"
+        if report.get("truncated") is not False:
+            return "輸出不完整(truncated)"
+        return None
+    from orchestrator.pipeline import review_incomplete
+    try:
+        incomplete = review_incomplete(report)
+    except Exception:                        # noqa: BLE001 — 判讀不了也是沒有結論
+        return "有環節沒跑完"
+    return f"有環節沒跑完({'、'.join(incomplete)[:120]})" if incomplete else None
+
+
+def decision_ok(golden: dict, decision: str) -> "bool | None":
+    """決策有沒有落在 expect_decision 裡(字串或清單);題目沒寫預期決策時是 None(不計)。"""
+    want = golden.get("expect_decision")
+    if want is None:
+        return None
+    return decision in (want if isinstance(want, list) else [want])
+
+
+def missed_block(golden: dict, decision: str) -> bool:
+    """不該放行卻自動放行:預期的決策裡沒有一個允許放行(只有 blocked / needs_human),結果卻是自動放行。
+    這是最危險的錯,單獨計數。"""
+    want = golden.get("expect_decision")
+    if want is None:
+        return False
+    want = want if isinstance(want, list) else [want]
+    return "auto_approved" not in want and decision == "auto_approved"
+
+
+BASELINE_NOTE = ("⚠  裸模型對照:只給模型看 MR 的標題、描述與 diff,沒有預掃、知識庫、工具、執行驗證與"
+                 "後處理;層級斷言不適用,只比問題偵測與決策。\n")
+
+
 async def run(args) -> int:
     cfg = load_config()
     if getattr(args, "frozen_testdata", False):
@@ -368,6 +430,10 @@ async def run(args) -> int:
 
     tp = fp = fn = 0
     rows, layer_stat, decisions, failures, gaps, errors = [], {}, {}, [], [], []
+    decision_tally = {"right": 0, "wrong": 0, "missed_block": 0, "unreadable": 0}
+    modes: set = set()                       # 這一輪看到的報告種類(裸模型 / 管線),--from-reports 也一樣
+    if getattr(args, "baseline", False):
+        print(BASELINE_NOTE)
 
     for mr_id, case in cases:
         golden = case.get("_golden") or {}
@@ -379,7 +445,8 @@ async def run(args) -> int:
                 report = load_saved_report(Path(args.from_reports), mr_id)
             else:
                 report = await review_mr(case_config(cfg, golden), mr_id, args.profile,
-                                         dry_run=args.dry_run)
+                                         dry_run=args.dry_run,
+                                         baseline=getattr(args, "baseline", False))
         except Exception as e:  # noqa: BLE001 - 蒐集所有失敗原因,不預設種類
             errors.append((mr_id, layer, f"{type(e).__name__}: {e}"))
             st = layer_stat.setdefault(layer, {"pass": 0, "fail": 0, "gap": 0, "error": 0})
@@ -395,6 +462,16 @@ async def run(args) -> int:
             (d / f"mr_{mr_id}.json").write_text(
                 json.dumps(report, ensure_ascii=False, indent=2, default=str),
                 encoding="utf-8")
+        bare = report.get("_mode") == "baseline"
+        if bare:
+            # 裸模型的報告是模型原樣輸出:先整理成管線的形狀(跟管線同一份 normalize_findings),
+            # line 寫成 "12-15"、finding 是字串、findings 是 null 都不會讓整輪停掉
+            from orchestrator.pipeline import normalize_findings
+            report = normalize_findings(report)
+            if not modes:
+                if not getattr(args, "baseline", False):
+                    print(BASELINE_NOTE)
+        modes.add("baseline" if bare else "pipeline")
         findings = report.get("findings", [])
         expected = case.get("expected", [])
 
@@ -410,15 +487,26 @@ async def run(args) -> int:
         fn += len(expected) - hits
         fp += len(noise)
 
-        checks = check_golden(golden, report, skip_post_llm=args.dry_run)
+        # 層級斷言驗的是管線的各道防線,裸模型沒有那些防線,不適用(不算通過也不算失敗)
+        checks = [] if bare else check_golden(golden, report, skip_post_llm=args.dry_run)
         bad = [c for c in checks if not c[1]]
         # known_gap:已知且已記錄成因的防線缺口。斷言照跑照顯示,但不列為失敗、
         # 不影響離開碼——避免為了讓套件變綠而刪掉暴露問題的 case。
         is_gap = bool(golden.get("known_gap"))
-        decision = report.get("decision", "-")
+        decision = report_decision(report)
         decisions[decision] = decisions.get(decision, 0) + 1
-        st = layer_stat.setdefault(layer, {"pass": 0, "fail": 0, "gap": 0, "error": 0})
-        st["gap" if (bad and is_gap) else ("fail" if bad else "pass")] += 1
+        unreadable = unreadable_reason(report)
+        ok = None if unreadable else decision_ok(golden, decision)
+        missed = (not unreadable) and missed_block(golden, decision)
+        if unreadable:
+            decision_tally["unreadable"] += 1
+        elif ok is not None:
+            decision_tally["right" if ok else "wrong"] += 1
+        if missed:
+            decision_tally["missed_block"] += 1
+        st = layer_stat.setdefault(layer, {"pass": 0, "fail": 0, "gap": 0, "error": 0, "na": 0})
+        st.setdefault("na", 0)
+        st["na" if bare else ("gap" if (bad and is_gap) else ("fail" if bad else "pass"))] += 1
 
         # 執行驗證的細節是分析品質最需要的數字(通過與否、驗了幾案、缺了幾角),
         # 全部收進結果檔,報告可直接由 JSON 生成,不必人工翻 review 輸出。
@@ -436,6 +524,7 @@ async def run(args) -> int:
             "case": mr_id, "layer": layer, "intent": golden.get("intent", ""),
             "known_gap": is_gap, "expected": len(expected), "hit": hits,
             "noise": len(noise), "decision": decision,
+            "decision_ok": ok, "missed_block": missed, "unreadable": unreadable,
             "severities": sorted({f.get("severity") for f in findings if f.get("severity")}),
             "spec_exec": se_stat,
             "policy_signals": report.get("_policy_signals") or {},
@@ -457,8 +546,10 @@ async def run(args) -> int:
                        f" passed={se_stat['passed']}"
                        f" 案例{se_stat['cases']}"
                        f" 缺口{se_stat['coverage_gaps']}")
+        asserted_text = "不適用" if bare else f"{len(checks) - len(bad)}/{len(checks)}"
         print(f"{mark} mr_{mr_id} [{layer}] recall {hits}/{len(expected)} "
-              f"誤報 {len(noise)} 決策 {decision} 斷言 {len(checks) - len(bad)}/{len(checks)}"
+              f"誤報 {len(noise)} 決策 {decision}"
+              + (f"(無法判讀:{unreadable})" if unreadable else "") + f" 斷言 {asserted_text}"
               + se_note + ("  (已知缺口)" if bad and is_gap else ""))
 
     # ── 彙總 ──
@@ -467,6 +558,8 @@ async def run(args) -> int:
     for layer, st in sorted(layer_stat.items()):
         total = st["pass"] + st["fail"] + st["gap"] + st.get("error", 0)
         notes = []
+        if st.get("na"):
+            notes.append(f"不適用 {st['na']}")
         if st["gap"]:
             notes.append(f"已知缺口 {st['gap']}")
         if st.get("error"):
@@ -488,6 +581,12 @@ async def run(args) -> int:
     print("\n決策分布(門檻是否擾人的觀測值)")
     for d, n in sorted(decisions.items()):
         print(f"  {d:<18} {n}")
+    judged = decision_tally["right"] + decision_tally["wrong"]
+    print(f"\n決策對照(有預期決策的 {judged} 題)")
+    print(f"  符合預期     {decision_tally['right']}/{judged}")
+    print(f"  無法判讀     {decision_tally['unreadable']}(verdict 對不上、輸出不完整、有環節沒跑完;"
+          "不算符合也不算不符)")
+    print(f"  不該放行卻自動放行 {decision_tally['missed_block']}")
 
     if style_sev:
         print("\n純風格 finding 的 severity 分布"
@@ -526,9 +625,18 @@ async def run(args) -> int:
             for name, _, why in bad:
                 print(f"    ✗ {name}: {why}")
 
+    # 結果檔的 mode 看報告本身(--from-reports 重算裸模型的存檔也是 baseline);同一輪混了兩種就標出來
+    mode = (next(iter(modes)) if len(modes) == 1
+            else "mixed" if modes else ("baseline" if getattr(args, "baseline", False) else "pipeline"))
+    if mode == "mixed":
+        print("\n⚠  這一輪同時有裸模型與管線的報告(存檔目錄混了兩種),兩種的數字不能直接比")
     if args.json:
         Path(args.json).write_text(json.dumps({
             "profile": args.profile, "dry_run": args.dry_run,
+            "mode": mode,
+            "decision_right": decision_tally["right"], "decision_wrong": decision_tally["wrong"],
+            "missed_block": decision_tally["missed_block"],
+            "decision_unreadable": decision_tally["unreadable"],
             "precision": precision, "recall": recall,
             "tp": tp, "fp": fp, "fn": fn,
             "layers": layer_stat, "decisions": decisions,
@@ -557,6 +665,9 @@ if __name__ == "__main__":
     ap.add_argument("--from-reports", default=None, metavar="DIR",
                     help="不跑管線,讀 DIR 底下 --dump-reports 存的報告重新評分(毫秒級、"
                          "不用 GPU)。輸入固定,所以差異一定來自斷言或計分邏輯的改動")
+    ap.add_argument("--baseline", action="store_true",
+                    help="裸模型對照:同一批題目只給模型看 MR 的標題、描述與 diff(review_mr 的 "
+                         "baseline 模式),沒有管線的防線。比問題偵測與決策,層級斷言不適用")
     ap.add_argument("--frozen-testdata", action="store_true",
                     help="規格有凍結的測資計畫(見 eval/freeze_testdata.py)就直接用,"
                          "跳過測資生成那次 LLM 呼叫;沒凍結的規格照常生成。"
@@ -568,6 +679,9 @@ if __name__ == "__main__":
     if _args.from_reports and _args.dry_run:
         ap.error("--from-reports 本來就不呼叫 LLM,不需要也不該再加 --dry-run"
                  "(--dry-run 會跳過 LLM 之後的斷言,等於把存檔的價值丟掉)")
+    if _args.baseline and (_args.dry_run or _args.from_reports or _args.frozen_testdata):
+        ap.error("--baseline 要呼叫模型(不能配 --dry-run);讀存檔重新評分用 --from-reports 就好"
+                 "(存檔裡記著是不是裸模型);裸模型不跑執行驗證,--frozen-testdata 沒有效果")
     if _args.frozen_testdata and _args.dry_run:
         ap.error("--dry-run 不會跑到測資生成(spec_exec 整段都跳過),"
                  "加 --frozen-testdata 沒有效果")
