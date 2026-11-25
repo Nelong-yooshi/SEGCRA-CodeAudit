@@ -44,6 +44,19 @@ class InvalidMrId(ValueError):
     """MR 編號不是 1–10 位的 ASCII 數字。用型別分辨,不比對訊息。繼承 ValueError。"""
 
 
+class InsecureGitlabUrl(Exception):
+    """GITLAB_URL 不是 https(本機除外),或不是合法的網址、夾帶帳密。訊息是固定文字,不回顯網址。
+    取 MR、寫回 GitLab 之前先擋:用 http 的話 token 會以明文送出,而 http 打到 https 的服務
+    通常只會等到逾時,看不出是網址寫錯。"""
+
+
+def check_gitlab_url() -> None:
+    """GitLab 的 API 請求送出前檢查 GITLAB_URL(規則同打包下載,見 _url_problem)。"""
+    problem = _url_problem(GITLAB_URL)
+    if problem:
+        raise InsecureGitlabUrl(problem)
+
+
 class SslCertFileError(Exception):
     """環境變數 SSL_CERT_FILE 有設,但載入不了(不存在、是目錄、不是 PEM)。訊息是固定文字。"""
 
@@ -78,6 +91,20 @@ def check_ssl_cert_file() -> None:
     _SSL_CERT_FILE_OK.add(raw)
 
 
+def tls_verify():
+    """httpx 的 `verify=`:SSL_CERT_FILE 有設時用它建的 TLS 設定,沒設時 True(httpx 內建的根憑證)。
+
+    給 `trust_env=False` 的請求用(_read_only_get):那種請求不讀任何環境變數,SSL_CERT_FILE
+    也不讀,GitLab 是 https、憑證的根不在映像裡時,取 MR 正常、dbt 讀檔卻會憑證驗證失敗。
+    載入不了時跟 check_ssl_cert_file 一樣丟 SslCertFileError。"""
+    check_ssl_cert_file()
+    raw = os.environ.get("SSL_CERT_FILE")
+    if raw is None:
+        return True
+    import ssl
+    return ssl.create_default_context(cafile=raw)
+
+
 def _as_mr(mr):
     """GitLab 回的 MR:不是 MR 的資料就丟 NotAnMR(原本會在後面變成看不出原因的 KeyError)。"""
     if not isinstance(mr, dict) or "title" not in mr:
@@ -94,6 +121,7 @@ def _as_changes(changes):
 
 def _api(method: str, path: str, **kwargs):
     import httpx
+    check_gitlab_url()
     check_ssl_cert_file()
     r = httpx.request(
         method, f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}{path}",
@@ -116,6 +144,7 @@ def _api_pages(path: str, params: dict | None = None) -> tuple[list, bool]:
     進去,MR 可能因此被誤判成小改而自動放行。
     """
     import httpx
+    check_gitlab_url()
     check_ssl_cert_file()
     items, page = [], 1
     while page and page <= MAX_DIFF_PAGES:
@@ -241,26 +270,33 @@ class ArchiveDownloadError(Exception):
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
-def _check_archive_url(url: str) -> None:
-    """本機以外一律要 https;網址裡不可夾帶帳密。訊息不回顯網址。
+def _url_problem(url) -> str | None:
+    """本機以外一律要 https;網址裡不可夾帶帳密。回傳問題的說法(固定文字,不回顯網址),沒問題回 None。
 
     README §8 的測試 GitLab 綁在本機 127.0.0.1(或經 SSH tunnel 的 localhost),
-    用 http 沒有經過網路;其餘位址的 http 會讓唯讀 token 以明文傳輸。"""
+    用 http 沒有經過網路;其餘位址的 http 會讓 token 以明文傳輸。"""
     import urllib.parse
     try:
-        parts = urllib.parse.urlsplit(url)
+        parts = urllib.parse.urlsplit(url if isinstance(url, str) else "")
         host = (parts.hostname or "").lower()
     except ValueError:
-        raise ArchiveDownloadError("GITLAB_URL 不是合法的網址") from None
+        return "GITLAB_URL 不是合法的網址"
     if parts.username is not None or parts.password is not None:
-        raise ArchiveDownloadError("GITLAB_URL 不可夾帶帳號密碼")
+        return "GITLAB_URL 不可夾帶帳號密碼"
     if not host:
-        raise ArchiveDownloadError("GITLAB_URL 不是合法的網址")
+        return "GITLAB_URL 不是合法的網址"
     if parts.scheme == "https":
-        return
+        return None
     if parts.scheme == "http" and host in _LOOPBACK_HOSTS:
-        return
-    raise ArchiveDownloadError("GITLAB_URL 必須是 https(本機 localhost / 127.0.0.1 除外)")
+        return None
+    return "GITLAB_URL 必須是 https(本機 localhost / 127.0.0.1 除外)"
+
+
+def _check_archive_url(url: str) -> None:
+    """打包下載與唯讀取檔前的檢查(規則見 _url_problem)。"""
+    problem = _url_problem(url)
+    if problem:
+        raise ArchiveDownloadError(problem)
 
 
 def download_archive(sha: str, path: str = "", *, max_bytes: int) -> bytes:
@@ -333,6 +369,10 @@ def _read_only_get(endpoint: str, params: dict, max_bytes: int, what: str) -> by
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
         raise ArchiveDownloadError("必須指定正整數的下載大小上限")
     import httpx
+    try:
+        verify = tls_verify()
+    except SslCertFileError as e:            # 訊息是固定文字,說得出是哪個變數
+        raise ArchiveDownloadError(str(e)) from None
     buf = bytearray()
     deadline = time.monotonic() + ARCHIVE_DEADLINE_S
     try:
@@ -344,8 +384,9 @@ def _read_only_get(endpoint: str, params: dict, max_bytes: int, what: str) -> by
                 headers={"PRIVATE-TOKEN": GITLAB_READ_TOKEN, "Accept-Encoding": "identity"},
                 # 不跟隨轉址:自訂的 PRIVATE-TOKEN 標頭可能被帶到別的主機
                 follow_redirects=False,
-                # 不讀 HTTP_PROXY / HTTPS_PROXY / .netrc 等環境設定:token 不送往代理
-                trust_env=False, timeout=30) as r:
+                # 不讀 HTTP_PROXY / HTTPS_PROXY / .netrc 等環境設定:token 不送往代理。
+                # 不讀環境也就不讀 SSL_CERT_FILE,所以 TLS 設定由 verify 明確傳進去
+                trust_env=False, verify=verify, timeout=30) as r:
             if r.status_code == 404:
                 return None
             if r.status_code != 200:

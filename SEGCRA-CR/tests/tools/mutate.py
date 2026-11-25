@@ -710,6 +710,34 @@ MUTANTS.update({
      "        if v <= 0:" + NL + "            raise ValueError",
      "        if False:" + NL + "            raise ValueError"),
 })
+# ---- 唯讀請求(dbt 讀單檔、打包下載)不讀環境,SSL_CERT_FILE 的 TLS 設定要明確傳進去
+MUTANTS.update({
+ "唯讀請求:不傳 SSL_CERT_FILE 的 TLS 設定": ("../toolbox/gitlab.py",
+     "                trust_env=False, verify=verify, timeout=30) as r:",
+     "                trust_env=False, timeout=30) as r:"),
+ "唯讀請求:SSL_CERT_FILE 有設也用預設驗證": ("../toolbox/gitlab.py",
+     "    if raw is None:" + NL + "        return True",
+     "    if True:" + NL + "        return True"),
+ "唯讀請求:SSL_CERT_FILE 設錯照樣送出": ("../toolbox/gitlab.py",
+     "        verify = tls_verify()" + NL + "    except SslCertFileError as e:",
+     "        verify = True" + NL + "    except SslCertFileError as e:"),
+})
+# ---- GITLAB_URL 不是 https 時,取 MR 與寫回之前就擋下
+MUTANTS.update({
+ "網址:取 MR 的分頁請求不檢查 https": ("../toolbox/gitlab.py",
+     "    import httpx" + NL + "    check_gitlab_url()" + NL + "    check_ssl_cert_file()" + NL + "    items, page = [], 1",
+     "    import httpx" + NL + "    check_ssl_cert_file()" + NL + "    items, page = [], 1"),
+ "網址:其他 API 請求不檢查 https": ("../toolbox/gitlab.py",
+     "def _api(method: str, path: str, **kwargs):" + NL + "    import httpx" + NL + "    check_gitlab_url()",
+     "def _api(method: str, path: str, **kwargs):" + NL + "    import httpx"),
+ "網址:本機以外的 http 也放行": ("../toolbox/gitlab.py",
+     '    if parts.scheme == "http" and host in _LOOPBACK_HOSTS:',
+     '    if parts.scheme == "http":'),
+ "網址:取不到 MR 的原因不說是網址": ("mr_fetch_error.py",
+     "    insecure = _first(exc, InsecureGitlabUrl)" + NL + "    if insecure is not None:",
+     "    insecure = None" + NL + "    if insecure is not None:"),
+})
+
 # ---- 取回整份新檔的四道防線:唯讀 token、單檔上限、不退回舊版、取不到要交人工
 MUTANTS.update({
  "完整檔:讀程式碼用有寫入權的 token": ("../toolbox/gitlab.py",
@@ -2252,11 +2280,11 @@ MUTANTS.update({
      "    if parts.username is not None or parts.password is not None:",
      "    if False:"),
  "下載:網址沒有主機也放行": ("../toolbox/gitlab.py",
-     "    if not host:\n        raise",
-     "    if False:\n        raise"),
+     "    if not host:\n        return \"GITLAB_URL 不是合法的網址\"",
+     "    if False:\n        return \"GITLAB_URL 不是合法的網址\""),
  "下載:讀代理等環境設定": ("../toolbox/gitlab.py",
-     "trust_env=False, timeout=30) as r:",
-     "trust_env=True, timeout=30) as r:"),
+     "trust_env=False, verify=verify, timeout=30) as r:",
+     "trust_env=True, verify=verify, timeout=30) as r:"),
  "解壓:Windows 問題名稱不擋": ("archive.py",
      '        if p.endswith((".", " ")) or p.split(".")[0].lower() in _WINDOWS_RESERVED:',
      "        if False:"),
@@ -6035,8 +6063,8 @@ MUTANTS.update({
  "取MR:MR 編號不對用一般的 ValueError": (G,
      '        raise InvalidMrId("MR 編號必須是數字")', '        raise ValueError("MR 編號必須是數字")'),
  "取MR:不先檢查 SSL_CERT_FILE": (G,
-     "    import httpx" + NL + "    check_ssl_cert_file()" + NL + "    r = httpx.request(",
-     "    import httpx" + NL + "    r = httpx.request("),
+     "    check_gitlab_url()" + NL + "    check_ssl_cert_file()" + NL + "    r = httpx.request(",
+     "    check_gitlab_url()" + NL + "    r = httpx.request("),
  "取MR:SSL_CERT_FILE 不存在不說": (G,
      "    if not os.path.exists(raw):" + NL + "        raise SslCertFileError(",
      "    if False:" + NL + "        raise SslCertFileError("),
