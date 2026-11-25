@@ -130,5 +130,5 @@ print(check_style('SELECT a,\n  b,\n  c\nFROM t', scope='sql-style'))"
 
 - **加一層知識**:通常不用改程式——建 `.md` 檔即可。要新的 scope 名,對應規則在 `pipeline.py:_SCOPE_MAP` 加一行(路徑 regex → scope 名)。
 - **加 S 碼**:`style_learn.py` 寫檢查函式並登記進 `_CHECKS`,再寫對應的挖掘函式(參考 `mine_leading_comma`);pipeline 端 `enforce_style` 以 `S-` 前綴通用比對,不用改。
-- **調權威**:`knowledge_store.py:AUTHORITY` 字典;調 top_k / memory 預算在 `pipeline.py` 呼叫處與 `config/models.yaml` 的 `budget.memory`。
+- **調權威**:`knowledge_store.py:AUTHORITY` 字典;調 top_k / memory 預算在 `pipeline.py` 呼叫處與使用中的模型設定檔(`SEGCRA_MODELS_CONFIG` 指的那份,沒設時是 `config/models.yaml`;見 docs/10)的 `budget.memory`。
 - 已知限制:檢索打分是字元 bigram 重疊(無 embedding),對同義改寫召回有限——binding 不受影響(不走打分),guideline 命名與 tags 要放關鍵詞;`suppress` 只在 `tier: binding` 生效;`_score` 只看 text+tags,不看 id;`conflict_key` 需人工命名一致,兩條實質同主題但 key 不同的項不會互斥。

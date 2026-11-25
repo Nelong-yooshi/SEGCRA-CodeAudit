@@ -14,10 +14,11 @@ import json
 import pytest
 
 from orchestrator import agent, pipeline, spec_exec
-from orchestrator.config import load_config
+from orchestrator.config import PKG_ROOT, load_config
 from toolbox import gitlab
 
-LIMIT = load_config().profile(None).max_output_tokens
+# 模組載入時讀(在 conftest 拿掉 SEGCRA_MODELS_CONFIG 之前):明確讀 repo 那份,不讀部署端的
+LIMIT = load_config(PKG_ROOT / "config" / "models.yaml").profile(None).max_output_tokens
 TITLE = pipeline._TRUNCATED_TITLE
 
 CLEAN_SQL = """-- R-201: 單日 ATM 現金提領累計達 100000(含)通報
