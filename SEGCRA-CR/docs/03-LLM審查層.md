@@ -35,7 +35,7 @@
 
 ### 輸出收取與容錯(`orchestrator/agent.py`:`extract_json`、`decode_byte_fallback`)
 
-`extract_json` 是整個管線共用的「模型輸出 → dict」收口(review、baseline、spec_exec 的測資生成與仲裁都用它):
+`extract_json` 是整個管線共用的「模型輸出 → dict」收口(review、baseline、spec_exec 的測資生成都用它;仲裁與知識起草改用更嚴格的 `strict_json_object`——整段剛好一個 JSON 物件、無重複鍵、**不走 json-repair**,因為它們要「乾淨、唯一、完整的結論」才採信):
 
 1. **`decode_byte_fallback`**:修 sentencepiece/gemma 的 byte-fallback——gemma4 偶爾把全形空格等字元吐成**字面的** `<0xE3><0x80><0x80>` 文字而非字元本身。做法:regex 抓連續 `<0xHH>` 序列,轉 bytes 後 `decode("utf-8")`;解不開就原樣保留。
 2. 剝 ` ```json ` / ` ``` ` 圍欄(行首行尾,MULTILINE)。
@@ -58,7 +58,7 @@
 - **schema 自動生成**(`function_schema` + `_annotation_schema`):由函式簽名 + docstring 生成——docstring 就是給 LLM 看的工具描述;參數型別註記對映 `str/int/bool/float → string/integer/boolean/number`,`list/set/tuple → array`(含 items),`dict → object`,未知型別退回 `string`;**有預設值的參數為非必填**(`required` 只收無預設值者)。所以「加工具」= 在 toolbox 寫一個帶型別註記與 docstring 的函式,掛進 `TOOL_GROUPS`,schema 自己長出來。
 - **`register_local(name, fn, description, parameters)`**:註冊 orchestrator 本地工具(目前只有 `load_skill`),schema 手寫,與 toolbox 工具同列;要交給模型的也必須列進 `MODEL_TOOLS`。
 - **`call(full_name, args, truncate=True)`** 分派順序:local_tools → toolbox 函式(例外不炸管線,回 `Error executing tool …: {e}` 字串,與舊 MCP server 端吞錯行為一致)→ 未知 group/工具回中文錯誤字串。結果 `str()` 後,**`truncate=True` 且超過 `max_chars`(`config/models.yaml` 的 `budget.tool_result_max_chars`,現值 6000)時截斷**,尾附「…(截斷,原長 N 字元)」。截斷**只用於餵給 LLM 的工具結果**。
-- **`call_json(full_name, args)`**:orchestrator 自用(預掃、抓 MR、檢索知識),`truncate=False` 直接解析 JSON,失敗回 `None`——不可截斷,否則大型 MR 的 JSON 會被腰斬成解析失敗。
+- **`call_json(full_name, args)`**:orchestrator 自用(預掃的規則與 lint、回寫前取 MR 的 head、檢索知識與判例),`truncate=False` 直接解析 JSON,失敗回 `None`——不可截斷,否則較大的結果(例如一份 SQL 的規則命中清單)會被腰斬成解析失敗。取 MR 本身不經過這裡:管線直接呼叫 `gitlab.get_mr_diff`,取不到時照例外說出原因(`orchestrator/mr_fetch_error.py`)。
 - `__aenter__/__aexit__` 為介面相容保留(舊版要起子行程),行程內版無事可做,但 `async with ToolHub(...)` 用法一行不改。
 
 ### Skill 機制(`orchestrator/skills_loader.py` + `skills/*/SKILL.md`)
@@ -170,7 +170,7 @@
 
    預期 stdout:`[agent] model=… tools=on prompt≈N tokens` 起頭,接著多行 `[agent] tool #i: memory__lookup_similar_reviews(…)`、`load_skill({'name': 'mr-comment-format'})` 等工具呼叫紀錄,最後印出報告 JSON;模型原始輸出存 `review_output/mr_001_raw.txt`。
 
-3. **對照組**:`python demo.py --mr 001 --baseline` — 無工具呼叫紀錄、無後處理,直接輸出裸模型 JSON,report 帶 `"_mode": "baseline"`。
+3. **對照組**:`python demo.py --mr 001 --baseline` — 無工具呼叫紀錄、無後處理,直接輸出裸模型 JSON,report 帶 `"_mode": "baseline"`,並帶 `completeness`(三態)與 `truncated`(非 `complete` 即 `True`):被切的輸出被 json-repair 修回來會當成完整報告、finding 變少,A/B 比較就會高估完整管線,所以對照組也查完整度、比較時不把它當成完整的一份。
 
 ## 擴充與注意
 
