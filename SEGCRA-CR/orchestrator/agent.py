@@ -1,34 +1,120 @@
 """Agent loop — 本地模型(OpenAI-compatible)+ ToolHub 工具呼叫迴圈。"""
+import contextlib
+import contextvars
 import json
 import os
 import re
+import time
 
 from openai import AsyncOpenAI
 
-from .config import Config, ModelProfile, estimate_tokens
+from .config import Config, ModelProfile, env_bool, env_seconds, estimate_tokens
 from .error_text import error_label
 from .tool_hub import ToolHub
 
 MAX_ITERATIONS = 12
 
 # 本地大模型單次生成可能超過 10 分鐘(openai client 預設 timeout 600s 且自動重試
-# 2 次——對本地推理只是把同一個慢請求連跑三遍再炸 Timeout)。改為:單次請求
-# 上限 1 小時、不自動重試;可用環境變數 LLM_TIMEOUT(秒)覆蓋。
-REQUEST_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "3600"))
+# 2 次——對本地推理只是把同一個慢請求連跑三遍再炸 Timeout)。改為不自動重試;單次請求
+# 最多等 LLM_TIMEOUT(預設 1 小時),有環節的截止時間時取兩者較小的(見 request_timeout)。
+REQUEST_TIMEOUT = env_seconds("LLM_TIMEOUT", 3600)
+
+# LLM_TIMEOUT 是用戶端願意等多久。端點前面若有模型閘道(例如 LiteLLM),閘道對每次請求另有
+# 自己的上限(可能只有幾十秒),超過就切斷,用戶端等再久也沒用。LiteLLM 會照請求
+# 內容裡的 `timeout` 改用那個上限,所以 LLM_SEND_TIMEOUT=1 時把這次請求會等的時間放進請求
+# 內容。預設不送,理由同 reasoning_effort:不認得這個欄位的端點可能整個退回請求。
+SEND_TIMEOUT = env_bool("LLM_SEND_TIMEOUT", "")
+
+
+# 這一環節的截止時間(time.monotonic())。主審查、冷讀、執行驗證外面各有自己的上限
+# (`asyncio.wait_for`,見 pipeline._stage_limit),時間到是外層先取消,run_agent 不知道。
+# 請求送出去的 timeout 若比剩下的時間長,用戶端斷線走了、閘道還照收到的值等,模型繼續生成
+# 一個沒有人要的答案;端點一次只處理一個請求時,下一份審查就排在它後面。
+_DEADLINE: contextvars.ContextVar = contextvars.ContextVar("segcra_llm_deadline", default=None)
+
+
+class LlmNoTimeLeft(Exception):
+    """這一環節剩下的時間不夠送下一次請求(見 llm_deadline 的 min_left):不送,讓呼叫端照「沒跑完」記。"""
+
+
+@contextlib.contextmanager
+def llm_deadline(seconds: float | None, min_left: float = 0.0):
+    """在這個區塊裡呼叫的模型,每次請求最多等到「現在 + seconds」。巢狀時取較早的。
+    `asyncio.wait_for` 建的 task 與 `run_in_thread` 都會帶上這個值,所以要在呼叫它們**之前**設。
+
+    `min_left`:剩不到這麼多秒就不再送請求(run_agent 每次送出前比一次,丟 LlmNoTimeLeft)。
+    越後面的請求拿到的時間越少,剩幾秒送出去的請求多半等不到結果,只是讓閘道多跑一次;
+    門檻用跟「剩不到就不開始這一步」同一個值(pipeline 傳 MIN_STAGE_SECONDS 進來)。"""
+    if seconds is None:
+        yield
+        return
+    end = time.monotonic() + seconds
+    current = _DEADLINE.get()
+    if current is not None:
+        end, min_left = min(current[0], end), max(current[1], min_left)
+    token = _DEADLINE.set((end, min_left))
+    try:
+        yield
+    finally:
+        _DEADLINE.reset(token)
+
+
+def _time_left() -> tuple[float, float] | None:
+    """(這一環節還剩幾秒, 剩不到幾秒就不送);沒有截止時間時 None。"""
+    current = _DEADLINE.get()
+    if current is None:
+        return None
+    return current[0] - time.monotonic(), current[1]
+
+
+def request_timeout() -> float:
+    """這一次請求會等多久:LLM_TIMEOUT 與這一環節剩下的時間取小的,至少 1 秒。
+    用戶端(openai 套件)與送給閘道的(LLM_SEND_TIMEOUT)用同一個值,兩邊同時到。"""
+    left = _time_left()
+    if left is None:
+        return REQUEST_TIMEOUT
+    return max(1.0, min(REQUEST_TIMEOUT, left[0]))
+
+
+def is_timeout(error: BaseException) -> bool:
+    """這個例外是不是「時間到了」:請求逾時,或剩下的時間不夠、沒有送出。"""
+    import asyncio
+
+    import openai
+    return isinstance(error, (openai.APITimeoutError, asyncio.TimeoutError, TimeoutError, LlmNoTimeLeft))
+
+
+def output_completeness(meta: dict, max_output_tokens: int) -> str:
+    """run_agent 回填的 meta(最後一次回應)輸出完整度,分三種:
+
+    - `"truncated"`:端點回 `finish_reason == "length"`,或回報的 `completion_tokens`
+      已達 `max_output_tokens`——不是每個端點碰到上限都照規格回 `length`,用量達到上限
+      本身就代表被切斷。
+    - `"complete"` :端點回 `finish_reason == "stop"` 且用量未達上限——乾淨結束。
+    - `"unknown"`  :其餘。端點**沒有回報**結束原因(None),或回了 `stop`/`length` 以外
+      的值(`eos`、`content_filter`、`tool_calls`…)這類不算乾淨結束的狀態。
+
+    **「無法確認(unknown)」要比照「被截斷」處理**:沒有依據說它完整,就不能當它完整——
+    不然沒回報結束原因的端點會讓被切斷的輸出安靜地走完、甚至自動放行。採信的一方(可以
+    據以自動放行、據以剔除案例)只給 `"complete"`。
+
+    主審查、測資生成、仲裁、知識起草、裸模型對照組都用這一個判斷。"""
+    finish = meta.get("finish_reason")
+    used = meta.get("completion_tokens")
+    if finish == "length" or (used is not None and used >= max_output_tokens):
+        return "truncated"
+    if finish == "stop":
+        return "complete"
+    return "unknown"
 
 
 def output_truncated(meta: dict, max_output_tokens: int) -> bool:
-    """run_agent 回填的 meta(最後一次回應)是不是被輸出長度上限切斷。
+    """輸出是不是**確定**被長度上限切斷(`output_completeness` 的 `"truncated"`)。
 
-    端點回 `finish_reason == "length"`,或回報的 `completion_tokens` 已達 `max_output_tokens`,
-    任一成立就算:不是每個端點碰到上限都照規格回 `length`,而用量達到上限本身就代表輸出被
-    切斷。兩者都沒回報時判成沒有截斷——沒有依據就報,每一次呼叫都會被當成截斷。
-
-    主審查與測資生成都用這一個判斷。"""
-    if meta.get("finish_reason") == "length":
-        return True
-    used = meta.get("completion_tokens")
-    return used is not None and used >= max_output_tokens
+    只認確定截斷:沒回報結束原因(`"unknown"`)不算這一個。呼叫端若要把「無法確認」
+    也比照截斷處理(主審查、測資生成、知識起草、裸模型對照組都要),改用
+    `output_completeness`,才分得出「被截斷」與「沒回報」兩種訊息。"""
+    return output_completeness(meta, max_output_tokens) == "truncated"
 
 
 # 診斷用:設成一個目錄路徑,就把每一次**實際送出的** messages 原文落檔。
@@ -165,11 +251,19 @@ async def _run_agent(client, cfg: Config, profile: ModelProfile, system: str, us
         meta["exhausted"] = False
     for i in range(MAX_ITERATIONS):
         dump_path = _dump(profile.model, messages, i)
+        # 每一輪都重算:這一環節剩下的時間越來越少(見 request_timeout)。用戶端的 timeout
+        # 與送給閘道的(放在 extra_body,openai 套件會原樣併進請求內容)是同一個值
+        left = _time_left()
+        if left is not None and left[0] < left[1]:
+            raise LlmNoTimeLeft(f"這一環節只剩 {max(left[0], 0):.0f} 秒,不到 {left[1]:g} 秒,不再送出請求")
+        wait = request_timeout()
+        timeout_kwargs = {"extra_body": {"timeout": wait}} if SEND_TIMEOUT else {}
         resp = await client.chat.completions.create(
             model=profile.model, messages=messages, **tool_kwargs,
             temperature=profile.temperature,
             max_tokens=profile.max_output_tokens,
-            **seed_kwargs, **effort_kwargs,
+            timeout=wait,
+            **seed_kwargs, **effort_kwargs, **timeout_kwargs,
         )
         msg = resp.choices[0].message
         usage = getattr(resp, "usage", None)
@@ -317,3 +411,37 @@ def extract_json(text: str, meta: dict | None = None) -> dict | None:
     except Exception:
         pass
     return None
+
+
+def _reject_duplicate_keys(pairs: list) -> dict:
+    """json.loads 的 object_pairs_hook:同一層出現重複鍵就拋錯。
+
+    預設的 json.loads 遇到重複鍵默默取最後一個,於是 `{"who_is_wrong": "sql",
+    "who_is_wrong": "testdata"}` 會被讀成 testdata——一份「寫了兩個結論」的輸出看起來
+    像有單一結論。重複鍵是不確定,要擋下來。"""
+    seen: dict = {}
+    for k, v in pairs:
+        if k in seen:
+            raise ValueError(f"duplicate key: {k!r}")
+        seen[k] = v
+    return seen
+
+
+def strict_json_object(text: str | None) -> dict | None:
+    """整段輸出(去掉 ```json 圍欄與前後空白後)**剛好是一個 JSON 物件、而且沒有重複鍵**
+    才回那個 dict;其餘(前後還有文字、兩個物件、重複鍵、根本不是物件、解析失敗)一律回
+    None。**不走 json-repair**。
+
+    跟 `extract_json` 的差別:extract_json 從雜訊裡抽第一個 `{…}`、解析不出還會 repair,
+    對「盡量讀出點東西」的場合(主審查)是對的;但仲裁與知識起草要的是「模型給了乾淨、
+    唯一、完整的結論」才採信,前後有字、寫了兩個結論、同一個鍵寫兩次、靠 repair 補回來,
+    都是不確定,全部不採信。"""
+    if text is None:
+        return None
+    s = decode_byte_fallback(text)
+    s = re.sub(r"^```(?:json)?|```$", "", s.strip(), flags=re.M).strip()
+    try:
+        obj = json.loads(s, object_pairs_hook=_reject_duplicate_keys)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return obj if isinstance(obj, dict) else None

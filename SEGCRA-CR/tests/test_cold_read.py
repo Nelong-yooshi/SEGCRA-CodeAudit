@@ -335,7 +335,7 @@ def test_命中時記下位置與片段_片段去掉不可列印字元並截長�
 def test_輸出被截斷時算失敗_即使解析得過(monkeypatch, reply):
     """被截斷的輸出經 json-repair 修補後可能是一份看起來正常的「沒命中」:不能採用。"""
     _fake_model(monkeypatch, reply, finish_reason="length")
-    with pytest.raises(ColdReadError):
+    with pytest.raises(cr.ColdReadTruncated):          # 是 ColdReadError 的子類別,評測靠型別分開算
         asyncio.run(cr.cold_read(load_config(), _mr()))
 
 
@@ -860,6 +860,12 @@ def test_評測腳本_輸出被截斷與其他失敗分開算(monkeypatch, capsy
     out = capsys.readouterr().out
     assert "失敗(ColdReadError)" in out and "輸出被截斷:0 題;其他失敗:1 題" in out
     assert "沒看完:0 題" in out
+
+    async def same_words(*a, **k):
+        raise ColdReadError(cr.OUTPUT_TRUNCATED)       # 訊息一樣、型別不是截斷:不算截斷
+    monkeypatch.setattr(cr, "run_agent", same_words)
+    assert cli.main(["--normal", _public_case(tmp_path)]) == 1
+    assert "輸出被截斷:0 題;其他失敗:1 題" in capsys.readouterr().out
 
 
 def test_冷讀環節交出去的內容不限副檔名(monkeypatch, real_cold_read):

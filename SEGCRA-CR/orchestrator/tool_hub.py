@@ -164,8 +164,8 @@ class ToolHub:
         else:
             return f"(錯誤:未知的工具 {full_name})"
         result = str(result)
-        # 截斷只用於「餵給 LLM 的工具結果」;orchestrator 自用的結構化抓取(call_json)
-        # 不可截斷,否則大型 MR 的 JSON 會被腰斬成解析失敗
+        # 截斷只用於「餵給 LLM 的工具結果」;orchestrator 自用的結構化抓取(call_json:規則命中、
+        # 知識檢索等)不可截斷,否則較大的 JSON 會被腰斬成解析失敗
         if truncate and len(result) > self.max_chars:
             result = result[: self.max_chars] + f"\n…(截斷,原長 {len(result)} 字元)"
         return result
