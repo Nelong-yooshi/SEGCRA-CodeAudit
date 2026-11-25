@@ -1044,6 +1044,8 @@ def review(monkeypatch, tmp_path):
 
     async def fake_run_agent(cfg, profile, system, user, hub, verbose=True, use_tools=True, trace=None, **kw):
         state["prompt"] = user
+        if kw.get("meta") is not None:      # 模擬正常端點:乾淨結束
+            kw["meta"]["finish_reason"] = "stop"
         return json.dumps({"summary": "沒有問題", "findings": []}, ensure_ascii=False)
 
     monkeypatch.setattr(spec_exec, "generate_cases", fake_generate)
