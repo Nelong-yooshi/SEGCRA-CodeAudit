@@ -12,7 +12,8 @@ import httpx
 import pytest
 
 from orchestrator import pipeline
-from orchestrator.dbt_affected import AffectedCheck, impact_finding
+from orchestrator.dbt_affected import AffectedCheck
+from tests.test_dbt_affected import impact_finding   # 兩條合起來看(見那個檔)
 from orchestrator.spec_exec import SpecLookup as _Lookup
 from tests.test_dbt_affected import _check, _cm, _macro_ctx, _only
 from toolbox import gitlab
@@ -134,8 +135,12 @@ def real_gitlab(monkeypatch):
     monkeypatch.setattr(gitlab, "GITLAB_READ_TOKEN", "test-read-token")
     calls = []
 
-    def reply(status=200, text=SPEC, raises=False):
+    def reply(status=200, text=SPEC, raises=False, commit_status=None):
+        """commit_status:確認 commit 的請求回什麼;None 表示跟檔案同一個狀態(專案或權限錯時兩個都 404)。"""
         def get(url, headers=None, params=None, timeout=None):
+            if "/repository/commits/" in url:
+                code = status if commit_status is None else commit_status
+                return httpx.Response(code, text='{"id": "e1b2"}', request=httpx.Request("GET", url))
             calls.append({"url": url, "ref": (params or {}).get("ref")})
             if raises:
                 raise httpx.ConnectError("連不上")
@@ -172,7 +177,7 @@ def test_用真的_find_spec_取不到時受影響_model_都記成取不到_說�
 
 def test_用真的_find_spec_檔案確實不存在時是沒有對應到(real_gitlab):
     reply, calls = real_gitlab
-    reply(404, '{"message":"404 File Not Found"}')
+    reply(404, '{"message":"404 File Not Found"}', commit_status=200)
     m = _real_check()
     assert (m.spec, m.spec_unavailable, m.spec_looked_up) == (None, None, True)
     assert calls and all(c["ref"] == "e1b2" + "0" * 36 for c in calls)   # 讀的是釘住的那一版
