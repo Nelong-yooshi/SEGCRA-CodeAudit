@@ -3,13 +3,17 @@
 規則層在去註解後的文字上比對(strip_comments):巢狀註解、長註解、很多段註解都繞不過;註解裡提到
 這些字也不擋。清單列完整名稱:欄位名、表名、CTE、自己寫的預存程序不會因為開頭相同而命中。
 """
+import asyncio
 import json
+import pathlib
 import re
+import sys
 
 import pytest
 
+from orchestrator.pipeline import prescan
 from toolbox import sql_primitives
-from toolbox.sqltools import run_rules
+from toolbox.sqltools import run_rules, run_rules_on_template
 
 
 def _hits(sql):
@@ -142,14 +146,112 @@ DATE_MODEL = ("{% set d = modules.datetime.datetime.strptime(var(\"target_date\"
               "SELECT acct_id FROM {{ source('core', 'txn') }} WHERE txn_date = '{{ prev }}'")
 
 
+def _template_hits(sql):
+    out = json.loads(run_rules_on_template(sql))
+    return out["hits"] if isinstance(out, dict) else out
+
+
 def test_Jinja_裡的屬性存取不是四段式名稱():
-    assert "R006" not in _rules(DATE_MODEL)
+    assert "R006" not in {h["rule"] for h in _template_hits(DATE_MODEL)}
 
 
-@pytest.mark.parametrize("sql", ["SELECT a FROM {{ var('srv') }}.db.dbo.t", "SELECT a FROM srv.db.dbo.t"])
-def test_四段式名稱照報_訊息不帶名稱(sql):
-    (h,) = [h for h in _hits(sql) if h["rule"] == "R006"]
-    assert "四段式名稱" in h["message"] and "srv" not in h["message"] and "dbo.t" not in h["message"]
+@pytest.mark.parametrize("sql, both", [("SELECT a FROM {{ var('srv') }}.db.dbo.t", False),
+                                       ("SELECT a FROM srv.db.dbo.t", True)])
+def test_四段式名稱照報_訊息不帶名稱(sql, both):
+    """`{{ var('srv') }}.db.dbo.t` 在樣板原文裡才是四段式(換成佔位名稱之後);一般的 T-SQL 兩邊都報。"""
+    for hits in ((_hits(sql), _template_hits(sql)) if both else (_template_hits(sql),)):
+        (h,) = [h for h in hits if h["rule"] == "R006"]
+        assert "四段式名稱" in h["message"] and "srv" not in h["message"] and "dbo.t" not in h["message"]
+
+
+# 一般的 T-SQL 裡沒有 Jinja:字串裡的 `{{`、`{%` 只是字。放一個在前面,後面讀寫 linked server 的
+# 語句照樣要擋
+TSQL_WITH_BRACES = [
+    "SELECT '{{' AS x;\nSELECT acct_id, bal INTO #t FROM evil_srv.core.dbo.acct;",
+    "SELECT id FROM dbo.msg WHERE payload LIKE '{%';\nINSERT INTO evil_srv.db.dbo.dump SELECT * FROM dbo.acct;",
+    "SELECT '{{' AS a, s.c FROM evil_srv.db.dbo.t AS s WHERE s.b <> '}}'",
+]
+
+
+@pytest.mark.parametrize("sql", TSQL_WITH_BRACES)
+def test_TSQL_字串裡的大括號不會藏住後面的四段式名稱(sql):
+    assert ("R006", "blocker") in {(h["rule"], h["severity"]) for h in _hits(sql)}, sql
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT a FROM t WHERE x = '{{';\nINSERT INTO evil_srv.db.dbo.dump SELECT * FROM dbo.acct;",
+    "SELECT a FROM {{ ref('t') }} WHERE x LIKE '{%'\nUNION ALL SELECT a FROM evil_srv.db.dbo.t",
+])
+def test_樣板裡沒閉合的標記_後面照樣比對四段式名稱(sql):
+    assert ("R006", "blocker") in {(h["rule"], h["severity"]) for h in _template_hits(sql)}, sql
+
+
+# 只有「dbt 開啟、樣板展開失敗、改掃原文」這條路換掉 Jinja 標記。要走完整的 prescan 才釘得住:
+# 只測 run_rules_on_template 的話,預掃改成每條路都換、或都不換,這裡照樣是綠的
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import test_dbt_context as DBT  # noqa: E402
+
+
+class _RealRulesHub:
+    """跟預掃一樣的介面,但 run_rules 跑真的規則層。"""
+
+    async def call_json(self, name, args):
+        if name == "sqltools__run_rules":
+            return json.loads(run_rules(args["sql"]))
+        return []
+
+
+@pytest.fixture
+def _fresh_dbt_cache():
+    from orchestrator import dbt_project
+    dbt_project.clear_cache()
+    yield
+    dbt_project.clear_cache()
+
+
+def _prescan_entry(path, text, dbt_on):
+    project = dict(DBT.PROJECT)
+    project[path] = text
+    mr = DBT._mr([DBT._f(path, full_content=text)])
+    ctx = DBT._ctx(files=project, mr=mr) if dbt_on else None
+    (entry,) = [e for e in asyncio.run(prescan(_RealRulesHub(), mr["files"],
+                                               DBT.CFG if dbt_on else None, ctx))
+                if e["path"] == path]
+    return entry
+
+
+def test_預掃_樣板展開失敗改掃原文時_Jinja_的屬性存取不報(_fresh_dbt_cache):
+    entry = _prescan_entry("models/mrt_date.sql", DATE_MODEL, dbt_on=True)
+    assert "dbt_render_error" in entry, "這個樣板要展開失敗,情境才成立"
+    assert "R006" not in {h["rule"] for h in entry["rules"]}
+
+
+def test_預掃_樣板展開失敗時_Jinja_之外的四段式名稱照報(_fresh_dbt_cache):
+    entry = _prescan_entry("models/mrt_date.sql", DATE_MODEL + "\nUNION ALL SELECT a FROM evil_srv.db.dbo.t",
+                           dbt_on=True)
+    assert "dbt_render_error" in entry
+    assert ("R006", "blocker") in {(h["rule"], h["severity"]) for h in entry["rules"]}
+
+
+@pytest.mark.parametrize("sql", TSQL_WITH_BRACES)
+def test_預掃_沒開dbt時不換掉大括號(sql, _fresh_dbt_cache):
+    entry = _prescan_entry("sql/rules/r_x.sql", sql, dbt_on=False)
+    assert ("R006", "blocker") in {(h["rule"], h["severity"]) for h in entry["rules"]}, sql
+
+
+@pytest.mark.parametrize("sql", TSQL_WITH_BRACES)
+def test_預掃_開了dbt_同樣的檔放在model裡也照報(sql, _fresh_dbt_cache):
+    """展開失敗(落單的 `{{`)時後面照樣比對;成對的 `'{{'`、`'}}'` 展開得出來,展開後的 SQL 照報。"""
+    entry = _prescan_entry("models/mrt_braces.sql", sql, dbt_on=True)
+    assert ("R006", "blocker") in {(h["rule"], h["severity"]) for h in entry["rules"]}, sql
+
+
+def test_預掃_已知限制_成對標記之間解析不了時不報四段式_但展開失敗交人工(_fresh_dbt_cache):
+    """docs/01 寫的已知限制:這種 model 由「dbt 樣板展開失敗」交人工,dbt 本身也編譯不了它。"""
+    sql = "SELECT '{{' AS a, s.c FROM evil_srv.db.dbo.t AS s WHERE s.b = 'x' AND s.d <> '}}'"
+    entry = _prescan_entry("models/mrt_braces.sql", sql, dbt_on=True)
+    assert "dbt_render_error" in entry
+    assert "R006" not in {h["rule"] for h in entry["rules"]}
 
 
 def test_語句命中時訊息用清單上的寫法_不照印原文():

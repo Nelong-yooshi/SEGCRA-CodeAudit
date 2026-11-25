@@ -861,23 +861,26 @@ _UNC_HOST_RE = re.compile(r"N?'\\\\[\w.$-]")
 # 在 linked server 上執行:`EXEC ('…') AT 伺服器`(execute-transact-sql)。`AT TIME ZONE` 是日期時間的
 # 寫法,不算
 _EXEC_AT_RE = re.compile(r"(?i)\)\s*AT\s+(?!TIME\s+ZONE\b)[\w\[\"]")
-# Jinja 標記:掃四段式名稱前先換掉(_mask_jinja)。`{{ … }}` 換成一個佔位的名稱(`{{ var('srv') }}.db.dbo.t`
-# 照樣是四段式),`{% … %}`、`{# … #}` 換成空白(裡面的 `modules.datetime.datetime.strptime` 是 Jinja 的
-# 屬性存取,不是 linked server)
+# Jinja 標記:**只在 dbt 樣板沒展開、改掃原文時**(run_rules_on_template),掃四段式名稱前先換掉
+# (_mask_jinja)。`{{ … }}` 換成一個佔位的名稱(`{{ var('srv') }}.db.dbo.t` 照樣是四段式),`{% … %}`、
+# `{# … #}` 換成空白(裡面的 `modules.datetime.datetime.strptime` 是 Jinja 的屬性存取,不是 linked server)。
+# 一般的 T-SQL 與展開後的 SQL 不換:T-SQL 裡沒有 Jinja,`'{{'`、`LIKE '{%'` 只是字串,換掉的話放一個在
+# 前面,後面讀寫 linked server 的語句就看不到了
 _JINJA_OPEN_RE = re.compile(r"\{[{%#]")
 _JINJA_CLOSE = {"{{": "}}", "{%": "%}", "{#": "#}"}
 
 
 def _mask_jinja(sql: str) -> str:
-    """把 Jinja 標記換掉。一次往前掃(線性時間):沒有閉合的標記,後面整段都當成 Jinja、不再找。"""
+    """把 Jinja 標記換掉。一次往前掃(線性時間)。沒有閉合的標記不是完整的 Jinja,後面的文字
+    照原樣留著、照樣比對:整段當成 Jinja 換掉的話,一個落單的 `{{` 就能把後面的語句藏起來。"""
     out, pos = [], 0
     for m in _JINJA_OPEN_RE.finditer(sql):
         if m.start() < pos:
             continue
         end = sql.find(_JINJA_CLOSE[m.group(0)], m.end())
-        out.append(sql[pos:m.start()])
         if end < 0:
-            return "".join(out) + " "
+            break
+        out.append(sql[pos:m.start()])
         out.append("jinja_value" if m.group(0) == "{{" else " ")
         pos = end + 2
     out.append(sql[pos:])
@@ -951,13 +954,13 @@ def _unsure_primitives(sql: str) -> list[str]:
     return unsure
 
 
-def _dangerous_primitives(sql: str) -> list[tuple[str, str, str]]:
-    """危險 SQL 原語。回傳 [(規則碼, severity, 訊息)]。"""
+def _dangerous_primitives(sql: str, template: bool = False) -> list[tuple[str, str, str]]:
+    """危險 SQL 原語。回傳 [(規則碼, severity, 訊息)]。template:sql 是沒展開的 dbt 樣板原文。"""
     hits = []
     listed = _list_hits(sql)
     external = [" ".join(m.group(0).split()).rstrip("(").strip()
                 for m in _EXTERNAL_SRC_RE.finditer(sql)]
-    if _FOUR_PART_RE.search(_mask_jinja(sql)):
+    if _FOUR_PART_RE.search(_mask_jinja(sql) if template else sql):
         external.append("四段式名稱(經 linked server 讀寫)")
     external += listed.get(sql_primitives.EXTERNAL, [])
     if external:
@@ -1090,7 +1093,7 @@ def _secret_matches(sql: str):
     return sorted(found, key=lambda m: m.start())
 
 
-def _text_rules(sql: str):
+def _text_rules(sql: str, template: bool = False):
     hits = []
     # **每一處各自判斷**:只看第一個比對到的話,第一處剛好是「欄位 = 狀態碼」的比較
     # 而被降級時,整份就不報了 —— 後面真的寫死的密碼跟著消失,比不改還鬆。
@@ -1120,7 +1123,7 @@ def _text_rules(sql: str):
                      f"規則 SQL 讀取執行環境:{'、'.join(probes[:5])}——規則不需要知道自己跑在"
                      f"哪個資料庫/主機/身分下;讀取環境的寫法可以讓規則在執行驗證的沙盒裡照規格跑、"
                      f"到正式環境才做別的事,執行驗證會因此通過。請移除,或說明正當用途"))
-    hits += _dangerous_primitives(no_comments)
+    hits += _dangerous_primitives(no_comments, template)
     hits += _env_hints(no_comments)
     if _MASKED_KEY_RE.search(sql):
         hits.append(("H005", "hint",
@@ -1161,6 +1164,17 @@ def _parse_each_statement(sql: str):
 
 def run_rules(sql: str) -> str:
     """執行 rule-base 檢查(組織既有規則的掛載點),回傳命中清單。"""
+    return _run_rules(sql, template=False)
+
+
+def run_rules_on_template(sql: str) -> str:
+    """dbt 樣板沒展開、改掃原文時的 run_rules:掃四段式名稱前先換掉 Jinja 標記(見 _mask_jinja)。
+
+    只給預掃自己用,不放進模型的工具(tool_hub 只列 run_rules):這一條路看的文字比 run_rules 少。"""
+    return _run_rules(sql, template=True)
+
+
+def _run_rules(sql: str, template: bool) -> str:
     hits = []
     statements, parse_error = _parse_each_statement(sql)
     for st in statements:
@@ -1175,7 +1189,7 @@ def run_rules(sql: str) -> str:
                 hits.append({"rule": code, "severity": severity, "message": msg,
                              "statement": st.sql(dialect=DIALECT)[:200]})
     # 文字層資安規則(R004 hardcode 憑證、R005 讀取執行環境、H004 異常查詢)
-    for code, severity, msg in _text_rules(sql):
+    for code, severity, msg in _text_rules(sql, template):
         hits.append({"rule": code, "severity": severity, "message": msg,
                      "statement": ""})
     # H003(檔案層):涉及規則編號 → 必須與核定規格逐項核對
