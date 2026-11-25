@@ -20,7 +20,8 @@ from .agent import (MAX_ITERATIONS, extract_json, output_completeness,
 from .config import (DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, env_seconds,
                      estimate_tokens)
 from .dbt_affected import (
-    AffectedCheck, SpecForModels, check_affected_models, impact_finding, specs_by_priority,
+    AffectedCheck, SpecForModels, check_affected_models, impact_finding, impact_unverified_finding,
+    specs_by_priority,
 )
 from .change_view import build_full_text_section
 from .cold_read import (UNREAD_NEAR_LIMIT, UNREAD_NO_USAGE, UNREAD_TOO_FEW, ColdRead,
@@ -40,7 +41,7 @@ from .dbt_asset_names import (ASSET as _ASSET_RULE, CHECK as _CHECK_RULE, GROUP 
 from .dbt_config_change import HIGH_RISK_NEW, config_changes, default_relative, is_dbt_yaml
 from .dbt_project import DbtProjectError, check_project_dir
 from .dbt_hidden_writes import MODELS_CHECKED, UNREACHED_OUTPUT, find_hidden_writes_in_macro
-from .dbt_render import (MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, MACRO_SYNTAX,
+from .dbt_render import (MACRO_KIND_TEXT, MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, MACRO_SYNTAX,
                          check_macro_files_isolated)
 from .security import scan_mr
 from toolbox.gitlab import (WRITE_FAILED, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UNCERTAIN,
@@ -2683,7 +2684,8 @@ def enforce_dbt_config_change(report: dict, mr: dict, dbt_ctx: DbtContext | None
 
 
 _DBT_ASSET_NAME_TITLE = "dbt 名稱不符合 Dagster 的命名規則,部署時會載入失敗"
-_DBT_ASSET_NAME_UNKNOWN_TITLE = "無法確認 dbt 名稱是否符合 Dagster 的命名規則"
+_DBT_ASSET_NAME_UNKNOWN_TITLE = "[dbt 名稱檢查] 無法驗證:無法確認 dbt 名稱是否符合 Dagster 的命名規則"
+_DBT_ASSET_NAME_UNKNOWN_STAGE = "dbt 名稱檢查"
 # 一個檔案最多列幾個不符合的名稱(屬性檔可以有很多 source)
 MAX_LISTED_ASSET_NAMES = 20
 _ASSET_RULE_ORDER = (_ASSET_RULE, _GROUP_RULE, _CHECK_RULE)
@@ -2746,6 +2748,7 @@ def enforce_dbt_asset_names(report: dict, mr: dict, dbt_ctx: DbtContext | None =
             unknown = {
                 "file": f["path"], "line": 0, "severity": "major", "citations": [],
                 "title": _DBT_ASSET_NAME_UNKNOWN_TITLE,
+                "stage": _DBT_ASSET_NAME_UNKNOWN_STAGE,
                 "detail": (f"{result.unknown},看不出這個檔案定義的名稱或設定是否符合 Dagster 的命名規則。"
                            "不符合時部署端整個載入失敗,需人工確認。"),
                 "suggestion": "確認名稱與 schema、group、meta.dagster、測試名稱的實際值:"
@@ -2754,7 +2757,8 @@ def enforce_dbt_asset_names(report: dict, mr: dict, dbt_ctx: DbtContext | None =
     return report
 
 
-_RENDER_FAIL_TITLE = "dbt 樣板展開失敗,rule-base 規則掃的是未展開的原文"
+_RENDER_FAIL_TITLE = "[dbt 展開] 無法驗證:dbt 樣板展開失敗,rule-base 規則掃的是未展開的原文"
+_RENDER_FAIL_STAGE = "dbt 展開"
 
 
 def _in_dirs(rel: str, dirs) -> bool:
@@ -2792,6 +2796,7 @@ def _render_fail_finding(entry: dict) -> dict:
                        "規則沒有命中不代表展開後沒有問題。")
     return {"file": entry["path"], "line": 0, "severity": "major",
             "title": _RENDER_FAIL_TITLE,
+            "stage": _RENDER_FAIL_STAGE,
             "detail": (f"展開失敗原因:{entry['dbt_render_error']}。{parse_note}"
                        "樣板標記即使寫在 SQL 註解、字串或引號識別字裡,dbt 執行時一樣會展開,"
                        "輸出可以跳出註解或字串、變成任何 SQL,所以這個檔案的確定性檢查不完整,"
@@ -2822,7 +2827,8 @@ def enforce_dbt_render_failure(report: dict, pre: list[dict]) -> dict:
     return report
 
 
-_HIDDEN_WRITE_TITLE = "dbt 樣板有寫入語句沒有經過規則檢查"
+_HIDDEN_WRITE_TITLE = "[dbt 展開] 無法驗證:dbt 樣板有寫入語句沒有經過規則檢查"
+_HIDDEN_WRITE_STAGE = "dbt 展開"
 _HIDDEN_WRITE_LIST_MAX = 10
 
 
@@ -2869,6 +2875,7 @@ def _hidden_write_finding(entry: dict) -> dict | None:
         return None
     return {"file": entry["path"], "line": min(lines) if lines else 0, "severity": "major",
             "title": _HIDDEN_WRITE_TITLE,
+            "stage": _HIDDEN_WRITE_STAGE,
             "detail": "".join(parts) + "規則層只檢查展開後的 SQL,這些寫入語句沒有經過規則檢查,"
                       "不得自動放行。",
             "suggestion": "人工確認這些寫入語句在什麼情況下會執行;以 dbt compile 取得實際會執行的 SQL"
@@ -2876,7 +2883,8 @@ def _hidden_write_finding(entry: dict) -> dict | None:
             "citations": []}
 
 
-_UNREACHED_BRANCH_TITLE = "dbt 樣板有沒有展開到的分支,裡面的輸出沒有經過規則檢查"
+_UNREACHED_BRANCH_TITLE = "[dbt 展開] 無法驗證:dbt 樣板有沒有展開到的分支,裡面的輸出沒有經過規則檢查"
+_UNREACHED_BRANCH_STAGE = "dbt 展開"
 
 
 def _unreached_branch_finding(entry: dict) -> dict | None:
@@ -2904,6 +2912,7 @@ def _unreached_branch_finding(entry: dict) -> dict | None:
         when = "在這次審查的展開結果裡沒有產生過(一般模式、增量模式都沒有)"
     return {"file": entry["path"], "line": min(lines), "severity": "major",
             "title": _UNREACHED_BRANCH_TITLE,
+            "stage": _UNREACHED_BRANCH_STAGE,
             "detail": f"這些分支裡的輸出{when},可能只有真正執行時才會進:{where}。"
                       "分支裡的內容可以用樣板組出寫入語句(例如把關鍵字拆成兩個字串接起來),"
                       "規則層只檢查展開後的 SQL,這些內容沒有經過規則檢查,無法確認,不得自動放行。",
@@ -2933,19 +2942,25 @@ def enforce_dbt_impact(report: dict, affected: AffectedCheck | None,
     確定性補報,不看模型有沒有自己提到:只改 macro 的 MR,diff 裡看不到任何一個受影響的
     model。標題只能由程式產生(_put_program_finding)。排在 enforce_hints / enforce_style
     之後,理由同 enforce_dbt_notice。"""
-    impact = impact_finding(affected, dbt_ctx.prefix if dbt_ctx is not None else "")
+    prefix = dbt_ctx.prefix if dbt_ctx is not None else ""
+    impact = impact_finding(affected, prefix)
     if impact is not None:
         _put_program_finding(report, impact)
+    unverified = impact_unverified_finding(affected, prefix)
+    if unverified is not None:
+        _put_program_finding(report, unverified)
     return report
 
 
 _MACRO_SYNTAX_TITLE = "macro 檔有 Jinja 語法錯誤,dbt 整個專案會編譯失敗"
-_MACRO_UNCERTAIN_TITLE = "展開器載入不了這個 macro 檔,無法確認 dbt 能不能編譯"
+_MACRO_UNCERTAIN_TITLE = "[dbt macro 檢查] 無法驗證:展開器載入不了這個 macro 檔,無法確認 dbt 能不能編譯"
+_MACRO_UNCERTAIN_STAGE = "dbt macro 檢查"
 _MACRO_CHECK_FAILED = "check_failed"      # 檢查本身沒做完(逾時、資源上限、設定不符)
+# 分類的說明引用 dbt_render.MACRO_KIND_TEXT(只有一份);檢查本身沒做完是這裡才有的情況
 _MACRO_UNCERTAIN_REASONS = {
-    MACRO_UNSUPPORTED: "用到不認得的濾器,或重複定義了同名的 block(dbt 解析得過,呼叫到這個 macro 時才會失敗)",
-    MACRO_TOO_DEEP: "巢狀太深,展開器解析不完",
-    MACRO_LOAD_FAILED: "解析得過,但載入時失敗(檔案開頭用到展開器沒有提供的東西,或讀不到內容)",
+    MACRO_UNSUPPORTED: MACRO_KIND_TEXT[MACRO_UNSUPPORTED],
+    MACRO_TOO_DEEP: MACRO_KIND_TEXT[MACRO_TOO_DEEP],
+    MACRO_LOAD_FAILED: MACRO_KIND_TEXT[MACRO_LOAD_FAILED],
     _MACRO_CHECK_FAILED: "檢查沒有做完(逾時、超過資源上限,或 dbt 的設定與預期不符)",
 }
 
@@ -2997,13 +3012,14 @@ def _macro_problem_finding(issue) -> dict | None:
     if kind == MACRO_SYNTAX:
         return {"file": issue["path"], "line": line, "severity": "blocker",
                 "title": _MACRO_SYNTAX_TITLE,
-                "detail": (f"{where}有 Jinja 語法錯誤(區塊沒有閉合、運算式寫錯等)。dbt 解析專案時"
+                "detail": (f"{where}{MACRO_KIND_TEXT[MACRO_SYNTAX]}。dbt 解析專案時"
                            "會失敗,部署端也會整個載入失敗,影響的不只用到這個 macro 的 model。"),
                 "suggestion": "修正語法後,用 dbt parse 確認整個專案解析得過。",
                 "citations": []}
     if kind in _MACRO_UNCERTAIN_REASONS:
         return {"file": issue["path"], "line": line, "severity": "major",
                 "title": _MACRO_UNCERTAIN_TITLE,
+                "stage": _MACRO_UNCERTAIN_STAGE,
                 "detail": (f"{where}:{_MACRO_UNCERTAIN_REASONS[kind]}。用到這個檔裡 macro 的 model "
                            "都檢查不到,也無法確認 dbt 能不能編譯,不得自動放行。"),
                 "suggestion": "用 dbt parse 確認整個專案解析得過,再人工確認用到這些 macro 的 model。",
@@ -3024,7 +3040,8 @@ def enforce_dbt_macro_problems(report: dict, issues) -> dict:
 
 
 _PROJECT_BROKEN_TITLE = "dbt 設定檔有 dbt 解析不了的寫法,dbt 整個專案會解析失敗"
-_YAML_UNCHECKED_TITLE = "無法確認 dbt 屬性檔 dbt 解析得過"
+_YAML_UNCHECKED_TITLE = "[dbt 屬性檔檢查] 無法驗證:無法確認 dbt 屬性檔 dbt 解析得過"
+_YAML_UNCHECKED_STAGE = "dbt 屬性檔檢查"
 _YAML_CHECK_FAILED = "check_failed"       # 檢查本身沒做完(逾時、資源上限)
 _YAML_PROBLEM_TEXT = {
     PROJECT_YAML_INVALID: "dbt_project.yml 不是合法的 YAML",
@@ -3089,6 +3106,7 @@ def _dbt_yaml_finding(issue) -> dict | None:
     if kind == _YAML_CHECK_FAILED:
         return {"file": issue["path"], "line": 0, "severity": "major",
                 "title": _YAML_UNCHECKED_TITLE,
+                "stage": _YAML_UNCHECKED_STAGE,
                 "detail": (f"{where}:檢查沒有做完(逾時或超過資源上限)。屬性檔有 YAML 語法錯誤時,"
                            "dbt 整個專案解析失敗,不得自動放行。"),
                 "suggestion": "用 dbt parse 確認整個專案解析得過。",
