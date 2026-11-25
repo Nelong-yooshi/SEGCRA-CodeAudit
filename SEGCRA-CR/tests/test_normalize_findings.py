@@ -365,6 +365,8 @@ def review(monkeypatch, tmp_path):
     def _review(model_output: dict):
         async def fake_run_agent(cfg, profile, system, user, hub,
                                  verbose=True, use_tools=True, trace=None, **kw):
+            if kw.get("meta") is not None:      # 模擬正常端點:乾淨結束
+                kw["meta"]["finish_reason"] = "stop"
             return json.dumps(model_output, ensure_ascii=False)
 
         monkeypatch.setattr(pipeline, "run_agent", fake_run_agent)
