@@ -364,13 +364,13 @@ def test_審查結果有寫回去(run):
     assert review["inline_comments"], "findings 沒有變成 inline 留言"
     assert review["summary"]["score"] == report["score"]
     assert f"ai-review::{report['decision']}" in review["labels"]
-    # commit status 是 CE 版 merge 閘門的依據:非 auto_approved 一律 failed
+    # 不接 CI 時 merge 閘門靠 commit status:非 auto_approved 一律 failed
     assert review["commit_status"]["state"] == "failed"
     assert review["commit_status"]["name"] == "segcra/review"
 
 
 def test_自動放行時_commit_status_要是_success(run):
-    """CE 的 merge 閘門靠 commit status,這個值錯了就等於閘門失效。"""
+    """不接 CI 時 merge 閘門靠 commit status,這個值錯了就等於閘門失效。"""
     report, output, mr_id = run(_mr(CLEAN_SQL), RESPONDED_REPORT, spec_exec_kind="pass")
     assert report["decision"] == "auto_approved"
     review = json.loads((output / f"mr_{mr_id}_review.json").read_text(encoding="utf-8"))
