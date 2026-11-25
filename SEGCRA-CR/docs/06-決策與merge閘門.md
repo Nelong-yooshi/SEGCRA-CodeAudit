@@ -22,10 +22,10 @@ LLM 審完、執行驗證跑完之後,管線用兩個**確定性函式**把「�
 
 輸入:後處理完(sanitize、enforce 鏈、spec_exec findings 已併入)的 report。步驟:
 
-1. 統計 findings 的 severity:`counts = {blocker, major, minor, info}`。
-2. 公式:`score = max(0, 100 − 40×blocker − 15×major − 5×minor)`;info 不扣分。
+1. 統計 findings 的 severity:`counts = {blocker, major, minor, info}`。**待驗證的 finding(帶 `stage`:仲裁沒有結論、環節未完成)不計入**——它不是確定的缺陷,只是某一步沒得出結論(`_is_pending`);另計 `pending` 數,記進 `report["_pending"]`。
+2. 公式:`score = max(0, 100 − 40×blocker − 15×major − 5×minor)`;info 不扣分。**待驗證不加也不扣**:否則一份 SQL 其實沒問題、只是某一步沒跑完的 MR 會被打成低分、作者以為自己錯了。
 3. **blocker 封頂**:只要有任何 blocker,`score = min(score, 59)`——不管其他組成多乾淨,有 blocker 就不可能及格到看起來能過。
-4. verdict 確定性判:`score ≥ 80 且無 blocker 且無 major → approve`;`score < 20 → reject`;其餘 `needs_changes`。
+4. verdict 確定性判:`score ≥ 80 且無 blocker 且無 major → approve`;`score < 20 → reject`;其餘 `needs_changes`。**有待驗證(`pending > 0`)時 verdict 不給 approve**,改記 `incomplete`(未完成)——不是成功,也不是確定缺陷;決策另由 `review_incomplete` 的硬條件(見 §2)擋住自動放行,不靠分數。待驗證在總評裡**單獨列一段**(`_pending_section`),不混在缺陷裡。
 5. 模型自己填的分數搬到 `report["_model_score"]` 留檔稽核,`report["score"]` / `report["verdict"]` 一律覆寫為 rubric 計算值。
 
 為什麼不信模型自評:同一輸入自評會漂(見上),而 severity 是逐條 finding 的離散標記,錯了可以逐條追溯、逐條吵,分數則是黑箱。rubric 讓「分數 = severity 組成的函數」,可重現、可解釋。
@@ -74,9 +74,9 @@ LLM 審完、執行驗證跑完之後,管線用兩個**確定性函式**把「�
 
 `review_mr` 在決策後先取一次 MR(`gitlab__get_mr_refs`,只取 head 與 `diff_refs`、不取檔案內容):head 已經換了就不回寫(`_superseded`,見 07 篇),同一份 `diff_refs` 拿來開行內討論。接著依序回寫四樣東西:
 
-1. 逐 finding `gitlab__post_inline_comment`(行內留言,`_format_comment` 排版:標題/說明/建議/引用;位置用剛取回的 `diff_refs`,不再每條重取)。行內討論**被 GitLab 拒絕(4xx,例如行號對不上 diff)**時退成一般留言;**連線中斷、逾時、5xx 時不退**:GitLab 可能已經建立了討論、只是回應沒送到,改貼的話同一條會出現兩次。這種記成「沒有確定貼上」(`report["_writeback"]["unposted"]`),在總結**每一條都列出**(前 20 條連標題,其餘只列檔名與行號:看 MR 的人拿不到伺服器上的報告檔)。
+1. 逐 finding `gitlab__post_inline_comment`(行內留言,`_format_comment` 排版:標題/說明/建議/引用。建議的第一行像程式(SQL 關鍵字、dbt 標記、註解、`欄位 運算子`)才放進 sql 程式碼區塊,圍欄比內容裡最長的反引號多一個;說明文字照一般段落;內容自己已經有程式碼區塊的照原樣。位置用剛取回的 `diff_refs`,不再每條重取)。行內討論**被 GitLab 拒絕(4xx,例如行號對不上 diff)**時退成一般留言;**連線中斷、逾時、5xx 時不退**:GitLab 可能已經建立了討論、只是回應沒送到,改貼的話同一條會出現兩次。這種記成「沒有確定貼上」(`report["_writeback"]["unposted"]`),在總結**每一條都列出**(前 20 條連標題,其餘只列檔名與行號:看 MR 的人拿不到伺服器上的報告檔)。
 2. `gitlab__set_commit_status`:**只在不接 CI 時**(`review_mr(commit_status=True)`,webhook 那條路;部署端的 CI 那條路不寫,job 的結果就是閘門,見第 4 節)。對 `mr["sha"]`(MR head commit)回寫 status,`name="segcra/review"`,**state 的映射:`auto_approved → success`,其餘(`needs_human`、`blocked`)→ `failed`**,description 帶 `decision:summary 前 180 字`。
-3. `gitlab__set_label`:`ai-review::<decision>`。
+3. `gitlab__set_label`:`ai-review::<decision>`,同一個請求用 `remove_labels` 拿掉另外兩種決策標籤(scoped label 互斥是 GitLab 付費版功能,沒有授權時重審後舊結論會留著)。只拿掉 `auto_approved`、`needs_human`、`blocked` 三種,不先查 MR 現有的標籤;舊版程式用過的其他名稱不會被清掉。
 4. `gitlab__post_summary`:總評 + 三態決策文案(✅ 自動放行 / 👤 請人工確認 / ⛔ 修正前不得合入)+ rubric 分數 + verdict;有沒有確定貼上的 finding、或 commit status / 標籤沒寫上時附在最後。**總結排在最後**,前兩步沒寫上時才寫得進總結。
 
 **每一步都看結果**(`gitlab.write_failure`):寫回的函式不丟例外,失敗時回 `{"ok": false, "failure": 種類}`——`rejected`(GitLab 拒絕,4xx)、`uncertain`(連線中斷、逾時、5xx,不確定有沒有寫上)、`no_sha`、`failed`(寫入工具本身出錯)。沒寫上的步驟記進 `report["_writeback"]`(`commit_status`、`label`、`summary`),印一行 log(只寫步驟與種類,不寫例外訊息)。

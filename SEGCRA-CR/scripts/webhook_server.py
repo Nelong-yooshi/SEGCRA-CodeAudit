@@ -64,6 +64,17 @@ DEBOUNCE_SECONDS = env_seconds("WEBHOOK_DEBOUNCE_SECONDS", 10)
 # 留言開頭的 /review 指令(後面是空白或結尾)。寫在內文、網址裡、或 /reviews 都不算
 _REVIEW_COMMAND = re.compile(r"\A\s*/review(?:\s|\Z)")
 
+# GitLab 替 project / group access token 產生的帳號名稱:project_<id>_bot_<亂數>、group_<id>_bot_<亂數>。
+# 用 match 從名稱開頭比。這種名稱一律當成機器人(不一定是審查自己,但不會是真人)
+_TOKEN_BOT_NAME = re.compile(r"(?:project|group)_\d+_bot")
+# 查不到自己的帳號時才用的退路:我們自己取的 ai- 開頭,以及整個名稱是 root。
+# 認得自己的帳號時不用它們:ai-ling、rootlee 這種真人的 /review 會被靜靜忽略
+_FALLBACK_BOT_PREFIX = "ai-"
+_FALLBACK_BOT_NAMES = frozenset({"root"})
+# GITLAB_TOKEN 的帳號查不到時,背景隔多久重查一次(秒)。帳號 id 記在 toolbox/gitlab.py(只有一份)。
+# webhook 請求裡不查:GitLab 等 webhook 回應只等幾秒,不能為了這個多打一次 API
+OWN_ACCOUNT_RETRY_SECONDS = 30
+
 # 每個 MR 一份進行中的紀錄:{mr_iid: (event_loop, task)}。
 # 用它做兩件事:同一 MR 推新 commit 時取消舊的那次、以及知道誰還在跑。
 _inflight: dict = {}
@@ -442,6 +453,61 @@ def _review_command(note) -> bool:
     return isinstance(note, str) and _REVIEW_COMMAND.match(note) is not None
 
 
+def _from_bot(user) -> bool:
+    """留言的人是不是機器人:GitLab 產生的 access token 帳號名稱,或審查自己(GITLAB_TOKEN 的帳號)。
+
+    認得自己的帳號時只看這兩樣;查不到時退回名稱(ai- 開頭、名稱就是 root)。"""
+    if not isinstance(user, dict):
+        return False
+    name = user.get("username")
+    name = name if isinstance(name, str) else ""
+    if _TOKEN_BOT_NAME.match(name):
+        return True
+    from toolbox import gitlab
+    own = gitlab.own_user_id()
+    if own is None:
+        return name.startswith(_FALLBACK_BOT_PREFIX) or name in _FALLBACK_BOT_NAMES
+    uid = user.get("id")
+    return isinstance(uid, int) and not isinstance(uid, bool) and uid == own   # True == 1,布林不算
+
+
+def _own_account_line() -> str:
+    from toolbox import gitlab
+    return (f"[webhook] GITLAB_TOKEN 的帳號:{gitlab.own_username() or '(沒有名稱)'}(id {gitlab.own_user_id()})。"
+            "這個帳號留的 /review 不觸發審查;用的是某個人的 token 時,那個人的 /review 也會被忽略")
+
+
+def _learn_own_account() -> str | None:
+    """服務啟動時查 GITLAB_TOKEN 是哪一個帳號,之後它留的言都不觸發審查。回要印的那一行(mock 模式 None)。
+
+    查不到時開一條背景執行緒每 OWN_ACCOUNT_RETRY_SECONDS 秒重查,查到為止:啟動時 GitLab 剛好連不上
+    (主機重開時審查服務先起來),不能就一直認不得自己到下次重啟。"""
+    from toolbox import gitlab
+    if not gitlab.REAL_MODE:
+        return None
+    reason = gitlab.learn_own_user()
+    if reason is None:
+        return _own_account_line()
+    threading.Thread(target=_retry_own_account, args=(reason,), daemon=True).start()
+    return (f"[webhook] 查不到 GITLAB_TOKEN 的帳號:{reason}。先只用名稱判斷機器人留言,"
+            f"每 {OWN_ACCOUNT_RETRY_SECONDS} 秒重查")
+
+
+def _retry_own_account(reason: str, stop: threading.Event | None = None) -> None:
+    """背景重查,查到就印一行並結束。同一個原因不重複印,原因變了才印。"""
+    from toolbox import gitlab
+    stop = stop or threading.Event()
+    last = reason
+    while not stop.wait(OWN_ACCOUNT_RETRY_SECONDS):
+        reason = gitlab.learn_own_user()
+        if reason is None:
+            print(_own_account_line(), flush=True)
+            return
+        if reason != last:
+            print(f"[webhook] 還是查不到 GITLAB_TOKEN 的帳號:{reason}", flush=True)
+            last = reason
+
+
 def _handle(payload: dict) -> str:
     """一個 webhook 事件要不要觸發審查;回傳回給 GitLab 的文字。觸發時排一份審查(_trigger)。"""
     kind = payload.get("object_kind")
@@ -466,7 +532,7 @@ def _handle(payload: dict) -> str:
     if kind == "note":                      # 討論串留言:只有開頭的 /review 才重審(Draft 也審)
         attrs = payload.get("object_attributes", {})
         mr = payload.get("merge_request", {})
-        author_bot = payload.get("user", {}).get("username", "").startswith(("ai-", "root"))
+        author_bot = _from_bot(payload.get("user"))
         if (attrs.get("noteable_type") == "MergeRequest" and mr.get("iid")
                 and _review_command(attrs.get("note")) and not author_bot):
             return _trigger(int(mr["iid"]), head_sha=mr.get("last_commit", {}).get("id"))
@@ -549,8 +615,9 @@ def main():
         REVIEW_REPEAT = ci_gate.review_repeat()
     except ci_gate.ReviewRepeatError as e:
         sys.exit(f"[webhook] {e}")
+    account = _learn_own_account()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    for line in _startup_lines(args.host, args.port):
+    for line in _startup_lines(args.host, args.port) + ([account] if account else []):
         print(line, flush=True)
     try:
         srv.serve_forever()

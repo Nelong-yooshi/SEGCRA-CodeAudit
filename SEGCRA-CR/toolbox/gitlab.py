@@ -44,6 +44,19 @@ class InvalidMrId(ValueError):
     """MR 編號不是 1–10 位的 ASCII 數字。用型別分辨,不比對訊息。繼承 ValueError。"""
 
 
+class InsecureGitlabUrl(Exception):
+    """GITLAB_URL 不是 https(本機除外),或不是合法的網址、夾帶帳密。訊息是固定文字,不回顯網址。
+    取 MR、寫回 GitLab 之前先擋:用 http 的話 token 會以明文送出,而 http 打到 https 的服務
+    通常只會等到逾時,看不出是網址寫錯。"""
+
+
+def check_gitlab_url() -> None:
+    """GitLab 的 API 請求送出前檢查 GITLAB_URL(規則同打包下載,見 _url_problem)。"""
+    problem = _url_problem(GITLAB_URL)
+    if problem:
+        raise InsecureGitlabUrl(problem)
+
+
 class SslCertFileError(Exception):
     """環境變數 SSL_CERT_FILE 有設,但載入不了(不存在、是目錄、不是 PEM)。訊息是固定文字。"""
 
@@ -78,6 +91,20 @@ def check_ssl_cert_file() -> None:
     _SSL_CERT_FILE_OK.add(raw)
 
 
+def tls_verify():
+    """httpx 的 `verify=`:SSL_CERT_FILE 有設時用它建的 TLS 設定,沒設時 True(httpx 內建的根憑證)。
+
+    給 `trust_env=False` 的請求用(_read_only_get):那種請求不讀任何環境變數,SSL_CERT_FILE
+    也不讀,GitLab 是 https、憑證的根不在映像裡時,取 MR 正常、dbt 讀檔卻會憑證驗證失敗。
+    載入不了時跟 check_ssl_cert_file 一樣丟 SslCertFileError。"""
+    check_ssl_cert_file()
+    raw = os.environ.get("SSL_CERT_FILE")
+    if raw is None:
+        return True
+    import ssl
+    return ssl.create_default_context(cafile=raw)
+
+
 def _as_mr(mr):
     """GitLab 回的 MR:不是 MR 的資料就丟 NotAnMR(原本會在後面變成看不出原因的 KeyError)。"""
     if not isinstance(mr, dict) or "title" not in mr:
@@ -94,6 +121,7 @@ def _as_changes(changes):
 
 def _api(method: str, path: str, **kwargs):
     import httpx
+    check_gitlab_url()
     check_ssl_cert_file()
     r = httpx.request(
         method, f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}{path}",
@@ -116,6 +144,7 @@ def _api_pages(path: str, params: dict | None = None) -> tuple[list, bool]:
     進去,MR 可能因此被誤判成小改而自動放行。
     """
     import httpx
+    check_gitlab_url()
     check_ssl_cert_file()
     items, page = [], 1
     while page and page <= MAX_DIFF_PAGES:
@@ -241,26 +270,33 @@ class ArchiveDownloadError(Exception):
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
-def _check_archive_url(url: str) -> None:
-    """本機以外一律要 https;網址裡不可夾帶帳密。訊息不回顯網址。
+def _url_problem(url) -> str | None:
+    """本機以外一律要 https;網址裡不可夾帶帳密。回傳問題的說法(固定文字,不回顯網址),沒問題回 None。
 
     README §8 的測試 GitLab 綁在本機 127.0.0.1(或經 SSH tunnel 的 localhost),
-    用 http 沒有經過網路;其餘位址的 http 會讓唯讀 token 以明文傳輸。"""
+    用 http 沒有經過網路;其餘位址的 http 會讓 token 以明文傳輸。"""
     import urllib.parse
     try:
-        parts = urllib.parse.urlsplit(url)
+        parts = urllib.parse.urlsplit(url if isinstance(url, str) else "")
         host = (parts.hostname or "").lower()
     except ValueError:
-        raise ArchiveDownloadError("GITLAB_URL 不是合法的網址") from None
+        return "GITLAB_URL 不是合法的網址"
     if parts.username is not None or parts.password is not None:
-        raise ArchiveDownloadError("GITLAB_URL 不可夾帶帳號密碼")
+        return "GITLAB_URL 不可夾帶帳號密碼"
     if not host:
-        raise ArchiveDownloadError("GITLAB_URL 不是合法的網址")
+        return "GITLAB_URL 不是合法的網址"
     if parts.scheme == "https":
-        return
+        return None
     if parts.scheme == "http" and host in _LOOPBACK_HOSTS:
-        return
-    raise ArchiveDownloadError("GITLAB_URL 必須是 https(本機 localhost / 127.0.0.1 除外)")
+        return None
+    return "GITLAB_URL 必須是 https(本機 localhost / 127.0.0.1 除外)"
+
+
+def _check_archive_url(url: str) -> None:
+    """打包下載與唯讀取檔前的檢查(規則見 _url_problem)。"""
+    problem = _url_problem(url)
+    if problem:
+        raise ArchiveDownloadError(problem)
 
 
 def download_archive(sha: str, path: str = "", *, max_bytes: int) -> bytes:
@@ -333,6 +369,10 @@ def _read_only_get(endpoint: str, params: dict, max_bytes: int, what: str) -> by
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
         raise ArchiveDownloadError("必須指定正整數的下載大小上限")
     import httpx
+    try:
+        verify = tls_verify()
+    except SslCertFileError as e:            # 訊息是固定文字,說得出是哪個變數
+        raise ArchiveDownloadError(str(e)) from None
     buf = bytearray()
     deadline = time.monotonic() + ARCHIVE_DEADLINE_S
     try:
@@ -344,8 +384,9 @@ def _read_only_get(endpoint: str, params: dict, max_bytes: int, what: str) -> by
                 headers={"PRIVATE-TOKEN": GITLAB_READ_TOKEN, "Accept-Encoding": "identity"},
                 # 不跟隨轉址:自訂的 PRIVATE-TOKEN 標頭可能被帶到別的主機
                 follow_redirects=False,
-                # 不讀 HTTP_PROXY / HTTPS_PROXY / .netrc 等環境設定:token 不送往代理
-                trust_env=False, timeout=30) as r:
+                # 不讀 HTTP_PROXY / HTTPS_PROXY / .netrc 等環境設定:token 不送往代理。
+                # 不讀環境也就不讀 SSL_CERT_FILE,所以 TLS 設定由 verify 明確傳進去
+                trust_env=False, verify=verify, timeout=30) as r:
             if r.status_code == 404:
                 return None
             if r.status_code != 200:
@@ -781,13 +822,32 @@ def create_rule_mr(file_path: str, content: str, title: str, description: str) -
     return json.dumps({"mr_iid": new_id}, ensure_ascii=False)
 
 
-def set_label(mr_id: str, label: str) -> str:
-    """為 MR 加上標籤(如 ai-review::needs-changes)。
+REVIEW_LABEL_PREFIX = "ai-review::"
+REVIEW_DECISIONS = ("auto_approved", "needs_human", "blocked")
 
-    失敗時重送一次(加上已經有的標籤不會重複),最後還是失敗時回 `{"ok": false, "failure": 種類}`。"""
+
+def _stale_review_labels(label: str) -> str:
+    """加上 `ai-review::<決策>` 時要一起拿掉的其他決策標籤(逗號分隔)。不是審查標籤回空字串。
+
+    scoped label 互斥是 GitLab 付費版的功能;沒有授權時舊的會留著,MR 上同時掛著兩個結論,
+    看的人分不出哪個是現在的。只列這三種決策:不先查 MR 現有的標籤(少一次請求、少一種失敗),
+    代價是舊版程式用過的其他名稱不會被清掉。"""
+    if not (isinstance(label, str) and label.startswith(REVIEW_LABEL_PREFIX)):
+        return ""
+    return ",".join(REVIEW_LABEL_PREFIX + d for d in REVIEW_DECISIONS
+                    if REVIEW_LABEL_PREFIX + d != label)
+
+
+def set_label(mr_id: str, label: str) -> str:
+    """為 MR 加上標籤(如 ai-review::needs_human),同一個請求拿掉其他 ai-review:: 決策標籤。
+
+    失敗時重送一次(加上已經有的標籤不會重複、拿掉沒有的標籤不會出錯),最後還是失敗時回
+    `{"ok": false, "failure": 種類}`。"""
+    stale = _stale_review_labels(label)
+    payload = {"add_labels": label, **({"remove_labels": stale} if stale else {})}
     if REAL_MODE:
         failure = _send_with_retry(
-            lambda: _api("PUT", f"/merge_requests/{mr_id}", json={"add_labels": label}),
+            lambda: _api("PUT", f"/merge_requests/{mr_id}", json=payload),
             LABEL_ATTEMPTS)
         if failure is not None:
             return _write_failed(failure)
@@ -840,6 +900,57 @@ def job_from_token(job_token: str) -> dict | None:
     except Exception as e:                   # noqa: BLE001 — 取不到,原因由呼叫端照型別說
         raise GitLabLookupFailed("job(用 job token)") from e
     return job
+
+
+# GITLAB_TOKEN 是哪一個帳號({"id": int, "username": str}),由 learn_own_user 查到後記下;還沒查到是 None。
+# 只有這一份:要認「審查自己留的言」的地方都讀 own_user_id(),不各自再查。
+_own_user: dict | None = None
+
+
+def own_user_id() -> int | None:
+    """GITLAB_TOKEN 的帳號 id;還沒查到(或查不到)是 None。不打 API。"""
+    return _own_user["id"] if _own_user else None
+
+
+def own_username() -> str:
+    return _own_user["username"] if _own_user else ""
+
+
+def learn_own_user() -> str | None:
+    """向 GitLab 查 GITLAB_TOKEN 是哪一個帳號(GET /user),查到記下來回 None;查不到回原因。
+
+    原因是固定文字加上狀態碼或例外型別,不帶例外原文(httpx 的訊息帶完整網址)。分得出
+    「token 被拒絕」(重查也不會好,要換 GITLAB_TOKEN)與「連不上」(等 GitLab 起來就好)。
+    webhook 服務用它認出審查自己留的言:project / group access token 的帳號名稱由 GitLab 產生,
+    不一定是我們取的前綴。"""
+    global _own_user
+    if not REAL_MODE:
+        return "mock 模式,沒有 GitLab"
+    import httpx
+    try:
+        check_ssl_cert_file()
+        r = httpx.get(f"{GITLAB_URL}/api/v4/user", headers={"PRIVATE-TOKEN": GITLAB_TOKEN},
+                      timeout=10)
+    except SslCertFileError as e:            # 訊息是固定文字,寫明是 SSL_CERT_FILE
+        return f"GET /user 沒有送出:{e}"
+    except Exception as e:                   # noqa: BLE001 — 只留型別,原文帶網址
+        return f"GET /user 連不上 GitLab({type(e).__name__}):確認 GITLAB_URL(要寫 http:// 或 https://)與網路"
+    if r.status_code in (401, 403):
+        return f"GET /user 回 {r.status_code}:GITLAB_TOKEN 被拒絕(token 錯、過期或被撤銷),要換 token"
+    if r.status_code != 200:
+        return f"GET /user 回 {r.status_code}"
+    try:
+        user = r.json()
+    except Exception:                        # noqa: BLE001 — 不是 JSON(不論編碼)
+        user = None
+    uid = user.get("id") if isinstance(user, dict) else None
+    if not isinstance(uid, int) or isinstance(uid, bool):
+        return ("GET /user 回 200,但不是帳號資料(不是 JSON 或沒有數字的 id):GITLAB_URL 可能指到網頁"
+                "或代理的登入頁")
+    name = user.get("username")
+    name = name if isinstance(name, str) and name.isprintable() else ""
+    _own_user = {"id": uid, "username": name[:100]}
+    return None
 
 
 def pipeline_info(pipeline_id: int) -> dict:

@@ -168,7 +168,8 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
 
 > 需要一個自己的 GitLab CE 實例;沒有現成環境的話,§8 有用 docker 起一個測試用 GitLab CE 的作法。以下的 URL、專案 id 請換成自己的。
 
-1. **建 Personal Access Token**:登入 GitLab → 右上頭像 → *Edit profile* → *Access tokens* → *Add new token*，Scopes 勾 `api`，建立後複製 token(只顯示一次)。
+1. **建 token**:用**審查專用的帳號**(或專案的 project access token:專案 → Settings → Access tokens)建,不要用某個人自己的帳號。專用帳號:登入 GitLab → 右上頭像 → *Edit profile* → *Access tokens* → *Add new token*，Scopes 勾 `api`，建立後複製 token(只顯示一次)。
+   > 這個帳號就是「審查自己」:它留的 `/review` 一律不觸發審查(防迴圈)。用某個人的 token 時,那個人留的 `/review` 也會被靜靜忽略。webhook 服務啟動時會印一行「GITLAB_TOKEN 的帳號:<名稱>(id <數字>)」,看得出用的是哪個帳號。
 2. **設環境變數**(或複製 `config/gitlab.env.example` 為 `config/gitlab.env` 填入，autopin 會讀;管線本身讀環境變數):
 
    ```bash
@@ -281,7 +282,7 @@ GitLab 設定(逐步):
    - Secret token:填與 `GITLAB_WEBHOOK_SECRET` 相同的值
    - Trigger:勾 **Merge request events** 與 **Comments**
    - Add webhook 後按該 webhook 的 **Test → Merge request events** 驗證，webhook server 端應印出觸發紀錄(HTTP 200)。
-3. 之後 MR 開啟/更新即自動觸發審查;在 MR 討論串留言 **`/review`** 可隨時重審(bot 帳號與 root 的留言不觸發，避免迴圈)。
+3. 之後 MR 開啟/更新即自動觸發審查;在 MR 討論串留言 **`/review`** 可隨時重審(`GITLAB_TOKEN` 的帳號與 project / group access token 的帳號留的不觸發，避免迴圈;所以 `GITLAB_TOKEN` 要用專用帳號,見 §5 第 1 點)。
 4. **同一 MR 推了新 commit**:取消進行中的那次、改審新的(舊的那次審的是舊程式,
    結論貼到新 commit 上是錯的)。**只有真的推了新 commit 才會重審** —— GitLab 改
    label、標題、描述、指派人都送 `action=update`(包括審查自己最後加 label 那一下),
@@ -292,7 +293,7 @@ GitLab 設定(逐步):
 
 審查有四層時間上限(整份審查、執行驗證整段、單一份內容的 lint、冷讀),都是**讀不懂就退回
 預設值並印一行警告**,不會讓伺服器起不來(填錯一個字就起不來的話,所有 MR 都收不到
-審查,那比用預設值跑糟得多);0 或負數也退回預設。
+審查,那比用預設值跑糟得多);0 或負數、`inf`、設了但是空的也退回預設並印警告(寫出變數名)。可以有小數。
 
 名稱、預設值與什麼時候該調,見 **[設定參數一覽](docs/10-設定參數.md)**。
 
@@ -522,6 +523,7 @@ ssh -L 8929:localhost:8929 <your-user>@<your-server>
 | 模型連不上(connection refused / timeout) | `curl $OLLAMA_URL` 的主機端(如 `curl http://127.0.0.1:11434/api/tags`)。經反向 tunnel 掛進來的 endpoint，確認 tunnel 活著;模型名不存在時先 `ollama pull` |
 | 審查極慢或 OOM | 換小模型:`--profile fast`，或把 `config/models.yaml` 的 fast 換成更小的模型 |
 | LLM 請求逾時(`APITimeoutError`) | 單次 LLM 請求上限預設 3600 秒、不自動重試;硬體更慢時以環境變數 `LLM_TIMEOUT`(秒)調高。測資生成/仲裁的 LLM 失敗不會中斷管線——降級為 major「執行驗證無法完成」轉 needs_human |
+| 較長的生成固定在約 30 秒失敗,端點回 400 且訊息含 `Timeout passed=30.0` | 模型前面的閘道(例如 LiteLLM)有自己的請求上限,跟 `LLM_TIMEOUT` 無關。設環境變數 `LLM_SEND_TIMEOUT=1`,把上限放進請求內容(見 docs/10) |
 | webhook 回 401 | webhook 的 Secret token 與 `GITLAB_WEBHOOK_SECRET` 不一致，或啟動時忘了 export |
 | webhook 完全收不到(GitLab 端顯示錯誤) | ① Admin Area → Settings → Network → Outbound requests 沒勾 **Allow requests to the local network from webhooks**;② URL 要用 `http://172.17.0.1:8000/...`(容器內打 `localhost` 是打容器自己);③ webhook server 沒起來(`curl http://127.0.0.1:8000/health`) |
 | MR 觸發了但沒審(webhook) | webhook server 的 stdout:action 不在 open/reopen/update,或是 `update` 但沒帶 `oldrev`(= 只改了 label/標題/描述,不是推新 commit);MR 是 Draft(webhook 那條路不審 Draft,要審就留言 `/review`);同一個 MR 短時間內連續觸發,還在等 `WEBHOOK_DEBOUNCE_SECONDS` 的安靜期 |

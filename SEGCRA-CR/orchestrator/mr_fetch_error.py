@@ -34,7 +34,7 @@ import ssl
 
 import httpx
 
-from toolbox.gitlab import InvalidMrId, MockFixtureMissing, NotAnMR, SslCertFileError
+from toolbox.gitlab import InsecureGitlabUrl, InvalidMrId, MockFixtureMissing, NotAnMR, SslCertFileError
 
 # OpenSSL 的憑證驗證代碼(X509_V_ERR_*)。分成三種,因為處理方式不同:
 #   不受信任 → 執行環境要信任簽發的 CA;名稱不符 → GITLAB_URL 要寫憑證上的名稱;
@@ -159,6 +159,10 @@ def mr_fetch_reason(exc: BaseException) -> str:
     cert_file = _first(exc, SslCertFileError)
     if cert_file is not None:
         return str(cert_file)
+    # GITLAB_URL 不是 https(本機除外)等:送出前就擋下,訊息是固定文字
+    insecure = _first(exc, InsecureGitlabUrl)
+    if insecure is not None:
+        return str(insecure)
     # 2. 拿到回應但不是 2xx
     status = _first(exc, httpx.HTTPStatusError)
     if status is not None:

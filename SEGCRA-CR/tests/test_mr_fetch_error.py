@@ -360,7 +360,7 @@ def test_200_但不是_UTF8_的網頁也說不是_JSON():
 @pytest.mark.parametrize("payload", ["null", "5", '"text"', '{"a": 1}'])
 def test_diffs_的每一頁不是清單就是不是_MR(monkeypatch, tmp_path, payload):
     monkeypatch.setattr(gitlab, "REAL_MODE", True)
-    monkeypatch.setattr(gitlab, "GITLAB_URL", "http://gitlab.invalid")
+    monkeypatch.setattr(gitlab, "GITLAB_URL", "https://gitlab.invalid")
     monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "3")
 
     def get(url, *a, **k):
@@ -369,6 +369,52 @@ def test_diffs_的每一頁不是清單就是不是_MR(monkeypatch, tmp_path, pa
     with pytest.raises(gitlab.NotAnMR) as info:
         gitlab._api_pages("/merge_requests/7/diffs")
     assert "不是 MR" in mr_fetch_reason(info.value)
+
+
+# ─────────────────── GITLAB_URL 不是 https:送出前就擋下 ───────────────────
+
+@pytest.mark.parametrize("url, words", [
+    ("http://gitlab.invalid", "必須是 https"),
+    ("http://192.0.2.9:8929", "必須是 https"),
+    ("ftp://gitlab.invalid", "必須是 https"),
+    ("https://user:pw@gitlab.invalid", "帳號密碼"),
+    ("gitlab.invalid", "不是合法的網址"),
+    ("", "不是合法的網址"),
+])
+def test_GITLAB_URL不是https時_不送出請求並說出原因(monkeypatch, url, words):
+    """http 打到 https 的服務多半只會等到逾時,看不出是網址寫錯;而且 token 會以明文送出。"""
+    monkeypatch.setattr(gitlab, "REAL_MODE", True)
+    monkeypatch.setattr(gitlab, "GITLAB_URL", url)
+    monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "3")
+
+    def never(*a, **k):
+        raise AssertionError("不應該送出請求")
+    monkeypatch.setattr(httpx, "get", never)
+    monkeypatch.setattr(httpx, "request", never)
+    for call in (lambda: gitlab._api_pages("/merge_requests/7/diffs"),
+                 lambda: gitlab._api("GET", "/merge_requests/7")):
+        with pytest.raises(gitlab.InsecureGitlabUrl) as info:
+            call()
+        msg = mr_fetch_reason(info.value)
+        assert words in msg
+        for host in ("gitlab.invalid", "192.0.2.9", "pw"):
+            _no_leak(msg, host)
+
+
+@pytest.mark.parametrize("url", ["http://localhost:8929", "http://127.0.0.1", "http://[::1]:80",
+                                 "https://gitlab.invalid"])
+def test_本機的http與https照常送出(monkeypatch, url):
+    monkeypatch.setattr(gitlab, "REAL_MODE", True)
+    monkeypatch.setattr(gitlab, "GITLAB_URL", url)
+    monkeypatch.setattr(gitlab, "GITLAB_PROJECT", "3")
+    sent = []
+
+    def request(method, u, **k):
+        sent.append(u)
+        return httpx.Response(200, json={"title": "t"}, request=httpx.Request(method, u))
+    monkeypatch.setattr(httpx, "request", request)
+    assert gitlab._api("GET", "/merge_requests/7") == {"title": "t"}
+    assert sent and sent[0].startswith(url)
 
 
 def test_分類不到的_說無法分類並提示用curl確認():
