@@ -36,6 +36,7 @@ from .dbt_context import DbtContext
 from .dbt_impact import ImpactReport
 from .dbt_render import DEFAULT_ISOLATED_TIMEOUT_S, render_model_isolated
 from .isolation import run_in_thread
+from .text_fields import MR_CONTENT_FILE
 from toolbox.gitlab import UNAVAILABLE_TEXT
 from toolbox.sqltools import DIALECT, parsed_chunks
 
@@ -440,7 +441,7 @@ def impact_unverified_finding(check: AffectedCheck | None, prefix: str = "") -> 
     _, unsure = _impact(check, prefix)
     if not unsure:
         return None
-    return {"file": "(MR 內容)", "line": 0, "severity": "major", "title": IMPACT_UNVERIFIED_TITLE,
+    return {"file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": IMPACT_UNVERIFIED_TITLE,
             "stage": IMPACT_STAGE,
             "detail": "下列項目反查或檢查沒有做完,無法確認有沒有問題:" + "".join(unsure),
             "suggestion": "逐一確認上列 model 的展開結果符合預期;必要時以 dbt compile 比對變更前後。",
@@ -548,7 +549,7 @@ def _impact(check: AffectedCheck | None, prefix: str) -> tuple[dict | None, list
         parts.append("沒有檢查出問題;清單供人工確認影響範圍。")
     elif severity == "info":
         parts.append("沒有檢查出確定的問題;做不到的部分另列在「無法驗證」那條。")
-    return ({"file": "(MR 內容)", "line": 0, "severity": severity, "title": IMPACT_TITLE,
+    return ({"file": MR_CONTENT_FILE, "line": 0, "severity": severity, "title": IMPACT_TITLE,
              "detail": "".join(parts),
              "suggestion": ("逐一確認上列 model 的展開結果符合預期;必要時以 dbt compile 比對變更前後。"
                             if severity != "info" else ""),

@@ -423,6 +423,13 @@ MR 看的同一條 pipeline 上,job 的結束碼決定能不能合併(0 放行�
   前面的 stage 要先跑完)舊的到了哪裡:還在審就被取消,舊的 job 拿到 5;已經審完的,寫回前比對 head
   發現換了、不回寫,拿到 5;舊的審查 job 還沒送出請求的,送出時 commit 已經不是 MR 的 head,服務拒絕,
   拿到 5。舊的已經開始寫回之後才推的,舊的留言與 label 會照樣貼上,舊的 job 照它的結果結束。
+- **同一個 MR 要不要每次都審**:審查服務的環境變數 `CI_REVIEW_REPEAT`,服務啟動時讀一次、啟動訊息會印出
+  用的是哪一種。`every`(預設,不設就是它)每個 pipeline 都審;`first` 審過一次之後,之後的 pipeline
+  整份審查都不跑(規則檢查與 AI 都沒有),job 以 3 結束,MR 上留言寫明「`<上一次真的審的 commit>` 之後的
+  改動都沒有經過審查」並把標籤改成 `ai-review::needs_human`。要重審:對這個 MR 最新的 pipeline 的審查 job
+  按 retry(或對同一個 commit 再跑一次 pipeline)。設了但是空的、或不是 `every` / `first`,服務不啟動。
+  **這個值改變閘門**:放在部署端版控裡的服務設定(例如 docker compose 檔的 `environment:`),改動走 MR,
+  不跟密碼放在同一個檔。跳過的條件與選 `first` 的代價見 docs/06 第 4 節與「擴充與注意」。
 - **逾時**:審查服務那邊整份審查超過 `REVIEW_TIMEOUT_SECONDS` 會中止(留言,結束碼 5);job 的
   `timeout` 要更長,job 自己逾時也是失敗、鎖住。
 - 這條路的限制(Draft 也審、服務重新啟動、job 取消時服務不停、同時審查的上限)見 docs/06「擴充與注意」。

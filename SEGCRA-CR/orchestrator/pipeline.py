@@ -55,6 +55,7 @@ from .tool_hub import ToolHub
 from toolbox.sqltools import LINT_INCOMPLETE_CODE, LINT_MAX_CHARS, LINT_TIMEOUT_SECONDS
 from toolbox.sqltools import run_rules
 from toolbox.sqltools import DIALECT, parse_statements, parsed_chunks
+from .text_fields import MR_CONTENT_FILE, as_text
 
 SYSTEM_TEMPLATE = """你是資深資料庫工程主管,負責審查 SQL merge request。\
 你的審查將直接決定 MR 能否合入,必須精準、可回溯、給得出修改建議。
@@ -328,8 +329,8 @@ def _incomplete_finding(stage: str, exc: BaseException | None = None,
         detail = (f"{stage} 執行時發生 {type(exc).__name__},已跳過。"
                   f"這一環節的結果不在本報告內。")
         title = f"[{stage}] {INCOMPLETE_TITLE_PREFIX}"
-    return {"file": "", "line": 0, "severity": "major", "title": title,
-            "detail": detail, "stage": stage,
+    return {"file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": title,
+            "detail": detail, "stage": stage, "_source": PROGRAM_SOURCE,
             "suggestion": "請人工確認這一環節原本要檢查的內容;其餘環節的結果仍然有效。",
             "citations": []}
 
@@ -367,6 +368,16 @@ def _superseded(now: dict, reviewed_sha: str | None) -> bool:
         return False
     current = now.get("head_sha") or now.get("sha")
     return bool(current) and current != reviewed_sha
+
+
+async def _writeback_target(hub, mr_id: str, reviewed_sha: str | None) -> dict | None:
+    """這一刻還能不能把這次審查的結論寫回去?可以就回開行內討論要用的 `diff_refs`,
+    已經被新的 commit 取代就回 None。
+    """
+    now = await _current_mr(hub, mr_id)
+    if _superseded(now, reviewed_sha):
+        return None
+    return {k: str(now.get(k) or "") for k in ("base_sha", "head_sha", "start_sha")}
 
 
 # 總結裡沒有確定貼上的 finding:前幾條連標題一起列,其餘只列檔名與行號(一行一條)
@@ -416,8 +427,8 @@ def _pending_section(report: dict) -> str:
 
 
 # 回寫的步驟(寫進 report["_writeback"] 的鍵 → 報告與 log 上的名稱)與失敗的種類
-_WRITEBACK_STEPS = {"commit_status": "merge 閘門(commit status)", "label": "標籤",
-                    "summary": "總結留言"}
+_WRITEBACK_STEPS = {"inline": "行內意見", "commit_status": "merge 閘門(commit status)",
+                    "label": "標籤", "summary": "總結留言"}
 _WRITE_FAILURE_TEXT = {
     WRITE_REJECTED: "GitLab 拒絕了這個請求",
     WRITE_UNCERTAIN: "連線中斷、逾時或 GitLab 回應錯誤,不確定有沒有寫上",
@@ -538,6 +549,7 @@ def normalize_findings(report: dict) -> dict:
 
     修正與丟掉的數量記在 `_format_issues`,由 enforce_format 補一條 major(要排在
     sanitize_findings 之後,見該函式)。這個欄位只由這裡寫:模型自己輸出的同名欄位會被移除。
+    每條 finding 的 `_source`、`stage` 也只由程式寫,模型自己帶的一樣拿掉(見 sanitize_findings)。
     """
     report.pop("_format_issues", None)
     summary, _ = _as_text(report.get("summary"))
@@ -554,6 +566,10 @@ def normalize_findings(report: dict) -> dict:
         if severity is not None and not isinstance(severity, str):
             dropped += 1
             continue
+        # 「這條是程式補的」(`_source`)與「這一環節沒跑完」(`stage`)只由程式寫:模型自己帶的拿掉。
+        # 不拿掉的話,模型標成程式的 finding 去重時不會被換掉、校準也不碰它
+        fd.pop("_source", None)
+        fd.pop("stage", None)
         wrong = False
         null_title = "title" in fd and fd["title"] is None
         for key in ("title", "detail", "suggestion"):
@@ -607,7 +623,7 @@ def enforce_format(report: dict) -> dict:
         parts.append(f"有 {issues['fixed'] + issues['dropped']} 條 finding 的格式不正確"
                      f"(修正後保留 {issues['fixed']} 條、無法判讀而略過 {issues['dropped']} 條)。")
     major = {
-        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _FORMAT_TITLE,
+        "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _FORMAT_TITLE,
         "detail": "".join(parts) + "被略過或修正的內容可能不完整,這次的審查結果需人工確認。",
         "suggestion": "重新觸發審查;若持續發生,請檢查審查模型的輸出。",
         "citations": [], "_source": PROGRAM_SOURCE}
@@ -723,6 +739,20 @@ class _Expanded(NamedTuple):
     incremental_line_map: dict | None = None
     # 展開失敗的原因是樣板自己的 Jinja 語法錯誤時,錯誤所在的行;其他失敗是 None
     syntax_line: int | None = None
+
+
+def _review_variables(dbt_cfg: dict | None) -> dict:
+    """這份審查展開時給 dbt 的變數:設定檔的 dbt.vars,加上 dbt.run_date_vars 列的變數一律設成
+    執行驗證測資的日期(spec_exec.WIN_START)。日期變數在正式環境由排程每次傳入「這次執行的日期」;
+    審查時給測資的日期,展開出來的 SQL(例如 `TABLE_DATE = '{{ target_date }}'`)才撈得到沙盒裡
+    的測資。規則層看的也是同一份,不另外給一個日期。"""
+    if not isinstance(dbt_cfg, dict):
+        return {}
+    from .spec_exec import WIN_START
+    out = dict(dbt_cfg.get("vars") or {})
+    for name in dbt_cfg.get("run_date_vars") or ():
+        out[name] = WIN_START
+    return out
 
 
 def _render_project(dbt_ctx: DbtContext | None) -> dict:
@@ -1951,7 +1981,7 @@ def enforce_spec_change(report: dict, mr: dict) -> dict:
                    "審查沒有用到它們;")
     detail += "規格的改動需要有人確認,這個 MR 不會自動放行。"
     _put_program_finding(report, {
-        "file": "(MR 內容)", "line": 0, "severity": "info", "title": _SPEC_CHANGE_TITLE,
+        "file": MR_CONTENT_FILE, "line": 0, "severity": "info", "title": _SPEC_CHANGE_TITLE,
         "detail": detail,
         "suggestion": "請確認規格的改動有業務依據,且規格裡相關的條文都一起改到了。",
         "citations": []})
@@ -1976,8 +2006,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
     clock = _StageClock()
     review_deadline = clock.start + REVIEW_BUDGET_SECONDS
     skills = load_skills()
-    # 這份審查的 dbt 展開(預掃的一般與增量、受影響 model 的前後)共用一個 invocation_id
-    start_review_invocation()
+    # 這份審查的 dbt 展開(預掃的一般與增量、受影響 model 的前後、執行驗證)共用一個 invocation_id,
+    # 與同一組 dbt 變數
+    start_review_invocation(_review_variables(cfg.dbt))
 
     async with ToolHub(tool_result_max_chars=cfg.budget["tool_result_max_chars"]) as hub:
         hub.register_local(
@@ -2001,6 +2032,11 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             raise RuntimeError(f"無法取得 MR {mr_id}:{mr_fetch_reason(e)}") from None
         if not isinstance(mr, dict) or not mr:
             raise RuntimeError(f"無法取得 MR {mr_id}:回應不是預期的 MR 資料")
+
+        # 標題與說明後面一律當字串用(組 prompt、抽規則碼、注入掃描)。GitLab 對沒填說明的 MR
+        # 回 null;不論 MR 從哪裡來(mock、評測),不是字串的都換成空字串
+        for key in ("title", "description"):
+            mr[key] = as_text(mr.get(key))
 
         # 把這次審查釘在 MR 的 head commit 上:之後 get_file 不指定 ref 時讀的就是
         # 「正在審的那一版」,而不是目標分支的現況(目標分支讀到的是**改之前**的
@@ -2326,27 +2362,43 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             report["decision"] = "needs_human"
             report.setdefault("decision_reason", "決策閘門未完成,一律交人工")
 
-        # 回寫之前先確認這次審查還是最新的那次。
+        # 每一步寫回 GitLab 之前,都重新確認這次審查還是最新的那次。
         #
         # 取消只會在下一個真正的等待點生效,而貼留言、加 label、設狀態都是同步的工具
         # 呼叫——所以舊的那次有機會一路走到這裡。它較晚結束時,MR 上的 label 與總結
         # 會變成**舊 commit 的結論**(commit status 是跟 sha 走的,那個本來就沒問題)。
-        # 比對 MR 目前的 head sha:不一樣就不貼,報告照樣回傳給呼叫端(給 eval 與
-        # 測試用),只是不寫回 GitLab。
+        #
+        # 回寫前只查一次不夠:回寫本身要花上幾十秒(一條 finding 一個請求),新的
+        # commit 常常就是在這段時間裡推上來的——結果前面的行內意見貼得還算合理,最後
+        # 那句總結與 label 卻是舊結論。所以改成每一步都查:發現被取代就停在那裡,
+        # 已經貼出去的收不回來,但後面的不會再寫。多出來的成本是每次寫入前一個唯讀
+        # 請求(`get_mr_refs`)。
         # head_sha 是 real 模式帶的;mock 模式(eval / 測試)只有 sha,一樣拿來比
-        now = await _current_mr(hub, mr_id)
-        if _superseded(now, mr.get("head_sha") or mr.get("sha")):
-            report["writeback_skipped"] = "已有更新的 commit,這次審查的結論不再回寫"
-            print(f"[pipeline] MR !{mr_id} 已有更新的 commit,略過回寫", flush=True)
-            clock.finish()
-            if capture is not None:
-                capture["report"] = report
-            return report
+        reviewed_sha = mr.get("head_sha") or mr.get("sha")
+        wrote: list[str] = []            # 已經送出去的步驟(用來分「整次沒回寫」與「停在中途」)
+        stopped: list[str] = []
 
-        # 開行內討論的位置用剛取回的 diff_refs,不再每條重取
-        refs = {k: str(now.get(k) or "") for k in ("base_sha", "head_sha", "start_sha")}
+        async def writable(step: str) -> dict | None:
+            """這一步還能不能寫?可以就回開行內討論要用的 diff_refs。"""
+            if stopped:
+                return None
+            refs = await _writeback_target(hub, mr_id, reviewed_sha)
+            if refs is None:
+                stopped.append(step)
+                report["writeback_skipped"] = (
+                    f"回寫到「{step}」時 MR 已有更新的 commit,之後的步驟不再回寫"
+                    if wrote else "已有更新的 commit,這次審查的結論不再回寫")
+                print(f"[pipeline] MR !{mr_id} 已有更新的 commit,略過回寫"
+                      + (f"(停在:{step})" if wrote else ""), flush=True)
+            else:
+                wrote.append(step)
+            return refs
+
         unposted = []
         for fd in report.get("findings", []):
+            refs = await writable(_WRITEBACK_STEPS["inline"])
+            if refs is None:
+                break
             result = await hub.call("gitlab__post_inline_comment", {
                 "mr_id": mr_id, "file": fd.get("file", ""), "line": int(fd.get("line") or 0),
                 "severity": fd.get("severity", "info"),
@@ -2364,7 +2416,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # commit status 回寫:不接 CI 時 CE 的 merge 閘門靠它(Pipelines must succeed)。
         # commit_status=False 是審查做成 CI 的一個 job 時(見 orchestrator/ci_gate.py):job 的結果
         # 就是閘門,不寫;留言、行內意見、label 照常
-        if commit_status:
+        if commit_status and await writable(_WRITEBACK_STEPS["commit_status"]) is not None:
             _record_writeback(writeback, mr_id, "commit_status", await hub.call(
                 "gitlab__set_commit_status", {
                     "mr_id": mr_id, "sha": mr.get("sha", ""),
@@ -2372,18 +2424,21 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                     "name": "segcra/review",
                     "description": f"{decision}:{report.get('summary', '')[:180]}",
                 }))
-        _record_writeback(writeback, mr_id, "label", await hub.call(
-            "gitlab__set_label", {"mr_id": mr_id, "label": label}))
+        if await writable(_WRITEBACK_STEPS["label"]) is not None:
+            _record_writeback(writeback, mr_id, "label", await hub.call(
+                "gitlab__set_label", {"mr_id": mr_id, "label": label}))
         decision_text = {"auto_approved": "✅ 小幅變更且無實質問題,自動放行",
                          "needs_human": "👤 請人工確認後裁決",
                          "blocked": "⛔ 有 blocker 級問題,修正前不得合入"}[decision]
-        _record_writeback(writeback, mr_id, "summary", await hub.call("gitlab__post_summary", {
-            "mr_id": mr_id,
-            "body": f"**決策:{decision_text}**\n\n{report.get('summary', '')}"
-                    + _pending_section(report)
-                    + _unposted_section(unposted) + _writeback_section(writeback, label),
-            "score": int(report.get("score", 0)), "verdict": report.get("verdict", "needs_changes"),
-        }))
+        if await writable(_WRITEBACK_STEPS["summary"]) is not None:
+            _record_writeback(writeback, mr_id, "summary", await hub.call("gitlab__post_summary", {
+                "mr_id": mr_id,
+                "body": f"**決策:{decision_text}**\n\n{report.get('summary', '')}"
+                        + _pending_section(report)
+                        + _unposted_section(unposted) + _writeback_section(writeback, label),
+                "score": int(report.get("score", 0)),
+                "verdict": report.get("verdict", "needs_changes"),
+            }))
         clock.finish()
         if capture is not None:
             capture["report"] = report
@@ -2440,17 +2495,34 @@ def _title_grams(s: str):
 @_isolated_stage("輸出清理")
 def sanitize_findings(report: dict) -> dict:
     """清理模型輸出:(1) 丟棄非法 severity(hint 是預掃內部代碼,模型有時原樣 echo);
-    (2) 同檔內近重複標題去重,保留資訊較完整者(有 citation/suggestion)。
+    (2) 同檔內近重複標題去重,保留資訊較完整者(有 citation/suggestion)。程式補的
+    finding(`_source`)不參與比長短,一律留下。
     起因:gemma4 傾向把預掃 JSON 整包複製進 findings,造成雙份報告。"""
     findings = [f for f in report.get("findings", [])
                 if f.get("severity") in _VALID_SEV]
+
+    def similar(a: dict, b: dict) -> bool:
+        grams = _title_grams(a.get("title", ""))
+        return (a.get("file") == b.get("file") and bool(grams)
+                and len(grams & _title_grams(b.get("title", "")))
+                / max(len(grams | _title_grams(b.get("title", ""))), 1) > 0.6)
+
+    # 程式補的 finding(未完整的環節、規則命中、注入掃描…)一律留下,也不會被模型寫的換掉:
+    # 去重只看標題與建議的長短,模型照抄程式的標題、建議寫長一點,就能把「這一環節沒跑完」
+    # 換成一條沒有 stage 的 finding,決策便看不到沒跑完(標題字串在 repo 裡查得到)。
+    # 跟某條程式 finding 相近、又沒有比它嚴重的模型 finding 丟掉:程式那條已經說了同一件事。
+    # 比它嚴重的留著(兩條都在):丟掉會讓嚴重度變低,後處理只能讓決策更保守。
+    program = [f for f in findings if _is_program_finding(f)]
+    rank = lambda x: _SEVERITY_RANK.get(x.get("severity"), -1)
     kept: list[dict] = []
     for f in findings:
-        grams = _title_grams(f.get("title", ""))
+        if _is_program_finding(f):
+            kept.append(f)
+            continue
+        if any(similar(f, p) and rank(f) <= rank(p) for p in program):
+            continue
         dup_idx = next((i for i, k in enumerate(kept)
-                        if k.get("file") == f.get("file") and grams
-                        and len(grams & _title_grams(k.get("title", "")))
-                        / max(len(grams | _title_grams(k.get("title", ""))), 1) > 0.6), None)
+                        if not _is_program_finding(k) and similar(f, k)), None)
         if dup_idx is None:
             kept.append(f)
         else:  # 保留較完整者
@@ -3149,7 +3221,7 @@ def enforce_dbt_unexecuted(report: dict, mr: dict, dbt_ctx: DbtContext | None,
     if (report.get("_spec_exec") or {}).get("passed") is not True:
         return report            # 執行驗證自己已經說了沒通過 / 沒執行,不重複
     _put_program_finding(report, {
-        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _DBT_UNEXECUTED_TITLE,
+        "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _DBT_UNEXECUTED_TITLE,
         "detail": "這個 MR 改到 dbt 的樣板、macro 或設定,但執行驗證通過的是 MR 裡的其他內容;"
                   "dbt 樣板目前不會送進沙盒執行,這些變更沒有經過執行驗證,不得自動放行。",
         "suggestion": "以 dbt compile 取得展開後的 SQL,人工依核定規格核對。",
@@ -3183,7 +3255,7 @@ def enforce_dbt_exec_note(report: dict, dbt_exec: dict | None) -> dict:
     if not dbt_exec or dbt_exec.get("ok") or not dbt_exec.get("reason"):
         return report
     _put_program_finding(report, {
-        "file": dbt_exec["file"] or "(MR 內容)", "line": 0, "severity": "info",
+        "file": dbt_exec["file"] or MR_CONTENT_FILE, "line": 0, "severity": "info",
         "title": _DBT_EXEC_NOTE_TITLE,
         "detail": f"執行驗證只支援只引用 source() 的 model;這個 model 沒有展開:{dbt_exec['reason']}。",
         "suggestion": "以 dbt compile 取得展開後的 SQL,人工依核定規格核對。",
@@ -4088,7 +4160,7 @@ def enforce_scan_skipped(report: dict, skipped: int) -> dict:
     if not skipped:
         return report
     _put_program_finding(report, {
-        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _SCAN_SKIPPED_TITLE,
+        "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _SCAN_SKIPPED_TITLE,
         "detail": (f"取回的完整內容與展開後的 SQL 合計超過 {MAX_EXTRA_SCAN_CHARS} 字元,其中 {skipped} 份"
                    "沒有做注入掃描(避免掃描被特製的大量內容拖住)。這些內容可能進到審查模型,"
                    "不得自動放行。"),
@@ -4119,7 +4191,7 @@ def enforce_injection(report: dict, hits: list[dict]) -> dict:
         return report
     cats = ", ".join(h["category"] for h in hits)
     report.setdefault("findings", []).insert(0, {
-        "file": "(MR 內容)", "line": 0, "severity": "blocker",
+        "file": MR_CONTENT_FILE, "line": 0, "severity": "blocker",
         "title": "疑似提示注入攻擊(確定性掃描命中)",
         "detail": f"MR 文字含疑似操縱審查器的指令,類別:{cats}。"
                   f"此類內容一律不得自動放行,已強制標記待人工資安確認。",
@@ -4159,7 +4231,7 @@ def enforce_cold_read(report: dict, cold: ColdRead | None) -> dict:
     if cold.flagged:
         places = [_cold_read_place(k, p) for k, p in cold.locations[:MAX_COLD_READ_LISTED]]
         flagged = {
-            "file": "(MR 內容)", "line": 0, "severity": "major", "citations": [],
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "citations": [],
             "title": _COLD_READ_TITLE,
             "detail": ("另一支只看 MR 文字的模型判定,有文字在對審查者或審查工具說話(要求放行、改嚴重度、"
                        "略過檢查、宣稱已核准或已測過等)。位置:" + ("、".join(places) or "位置無法確定")
@@ -4176,7 +4248,7 @@ def enforce_cold_read(report: dict, cold: ColdRead | None) -> dict:
         if cold.unread in _COLD_READ_UNREAD:        # 固定文字;不認得的不寫
             reasons.append(f"{cold.unread}。")
         truncated = {
-            "file": "(MR 內容)", "line": 0, "severity": "major", "citations": [],
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "citations": [],
             "title": _COLD_READ_TRUNCATED_TITLE,
             "detail": ("".join(reasons) or "冷讀沒有看完全部的輸入。")
                       + "沒看到的部分不知道有沒有對審查者說話的文字,需人工確認。",
@@ -4201,7 +4273,7 @@ def enforce_tool_refusals(report: dict, refused: list[str]) -> dict:
     寫的文字,寫進 finding 會被回貼到 MR 留言。標題只能由程式產生(_put_program_finding)。"""
     if not refused:
         return report
-    finding = {"file": "(MR 內容)", "line": 0, "severity": "major",
+    finding = {"file": MR_CONTENT_FILE, "line": 0, "severity": "major",
                "title": _TOOL_REFUSAL_TITLE,
                "detail": (f"審查模型要求呼叫:{', '.join(sorted(set(refused)))}。這些工具只由管線"
                           "自己執行,呼叫已被拒絕、沒有執行。模型很可能受到 MR 內容的指示,"
@@ -4252,7 +4324,7 @@ def enforce_unreviewable(report: dict, mr: dict) -> dict:
     if truncated:
         parts.append("MR 變更的檔案數超過可取得的分頁上限,部分檔案未能取得。")
     report.setdefault("findings", []).insert(0, {
-        "file": "(MR 內容)", "line": 0, "severity": "major",
+        "file": MR_CONTENT_FILE, "line": 0, "severity": "major",
         "title": _UNREVIEWABLE_TITLE,
         # 結尾那句只對「完全拿不到內容」的情況成立。取不到**完整新檔**的檔案
         # 其實有被審(diff 那幾行進了預掃與模型),只是看不到全貌——說成
@@ -4272,6 +4344,8 @@ _EXHAUSTED_TITLE = "審查模型用完工具呼叫回合,沒有產出審查結�
 _EXHAUSTED_SUMMARY = "審查模型用完工具呼叫回合、沒有產出審查結果;以下只有程式確定性檢查的結果。"
 _FAILED_TITLE = "審查模型沒有完成,這次只有程式確定性檢查的結果"
 _FAILED_SUMMARY = "呼叫審查模型失敗、沒有產出審查結果;以下只有程式確定性檢查的結果。"
+# 沒有呼叫模型(剩的時間不夠)不是「呼叫失敗」:寫成失敗,看的人會以為模型那邊出錯
+_NO_TIME_SUMMARY = "整份審查剩下的時間不夠,沒有呼叫審查模型;以下只有程式確定性檢查的結果。"
 # 模型呼叫失敗的問題類型 → 給人看的說明。只有這幾種固定文字,不放例外訊息(含主機位址、端點回應)
 _MODEL_FAILURE_TEXT = {
     "timeout": "等待審查模型的回應逾時",
@@ -4379,6 +4453,8 @@ def _parse_model_output(raw: str | None, meta: dict, max_output_tokens: int) -> 
 
     沒有截斷卻解析不出來時回 None,由呼叫端丟例外。
     """
+    if _failure_kind(meta) == _NO_TIME_KIND:
+        return {"summary": _NO_TIME_SUMMARY, "findings": []}
     if _failure_kind(meta) is not None:
         return {"summary": _FAILED_SUMMARY, "findings": []}
     if meta.get("exhausted"):
@@ -4411,7 +4487,7 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
     failed = _failure_kind(meta)
     if failed is not None:
         model_failed = {
-            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _FAILED_TITLE,
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _FAILED_TITLE,
             "detail": f"{_MODEL_FAILURE_TEXT[failed]},審查模型沒有產出結果。程式的確定性檢查照常報出;"
                       "審查模型負責的部分沒有結果,需人工確認。"
                       + ("" if failed == _NO_TIME_KIND else "這是審查環境的問題,不是這個 MR 的問題。"),
@@ -4427,7 +4503,7 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
         return report
     if meta.get("exhausted"):
         exhausted = {
-            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _EXHAUSTED_TITLE,
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _EXHAUSTED_TITLE,
             "detail": f"審查模型連續 {MAX_ITERATIONS} 輪都沒有產出審查結果(一直呼叫工具,或回應是空的),"
                       "用完回合上限;最後拿到的不是審查報告,不採用。這次只有程式確定性檢查的結果,需人工確認。",
             "suggestion": "重新觸發審查;若持續發生,確認 MR 的描述或內容是否引導模型一直讀檔,"
@@ -4439,7 +4515,7 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
         return report
     if completeness == "truncated":
         _put_program_finding(report, {
-            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _TRUNCATED_TITLE,
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _TRUNCATED_TITLE,
             "detail": f"審查模型的輸出達到長度上限({max_output_tokens} tokens)而被切斷,"
                       "切斷之後的內容沒有產出。已解析出來的 finding 予以保留,但可能有缺漏,"
                       "這次的審查結果需人工確認。",
@@ -4447,7 +4523,7 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
             "citations": []})
     else:   # unknown:端點沒回報結束原因 → 無法確認完整,比照截斷不採信(不安靜放行)
         _put_program_finding(report, {
-            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _UNKNOWN_FINISH_TITLE,
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _UNKNOWN_FINISH_TITLE,
             "detail": "審查模型的端點沒有回報結束原因(finish_reason),也沒有回報用量,"
                       "無法確認這次輸出是否完整。沒有依據說它完整,就不當它完整——已解析出來的"
                       "finding 予以保留,但可能有缺漏,這次的審查結果需人工確認。",
