@@ -510,6 +510,11 @@ def get_mr_diff(mr_id: str) -> str:
     if REAL_MODE:
         mr = _as_mr(_api("GET", f"/merge_requests/{mr_id}"))
         changes, truncated = _api_pages(f"/merge_requests/{mr_id}/diffs")
+        # GitLab 對沒填說明的 MR 回 `"description": null`(鍵在、值是 null):`.get(鍵, 預設)`
+        # 拿到的是 None,後面當字串用就會出錯。標題與 sha 一樣處理
+        from orchestrator.text_fields import as_text
+        for key in ("title", "description", "sha"):
+            mr[key] = as_text(mr.get(key))
         files = [{"path": c["new_path"], "old_path": c.get("old_path"),
                   "diff": c.get("diff") or "",
                   "deleted": bool(c.get("deleted_file")),
@@ -1004,7 +1009,8 @@ def pipeline_info(pipeline_id: int) -> dict:
 
 
 def mr_head(mr_id: str) -> dict | None:
-    """MR 目前的 head commit 與狀態(GET /merge_requests/:iid):{sha, state, source_project_id}。
+    """MR 目前的 head commit 與狀態(GET /merge_requests/:iid):{sha, state, source_project_id,
+    target_branch}。
 
     real 模式取不到丟 GitLabLookupFailed;mock 模式沒有這個 MR 的 fixture 時回 None。"""
     mr_id = _check_mr_id(mr_id)
@@ -1019,4 +1025,21 @@ def mr_head(mr_id: str) -> dict | None:
     except Exception as e:                   # noqa: BLE001
         raise GitLabLookupFailed("MR") from e
     return {"sha": mr.get("sha") or "", "state": mr.get("state") or "",
-            "source_project_id": mr.get("source_project_id")}
+            "source_project_id": mr.get("source_project_id"),
+            "target_branch": mr.get("target_branch") or ""}
+
+
+def post_note(mr_id: str, body: str) -> str:
+    """在 MR 上留一則一般留言(不是審查總結:總結另有 post_summary,不能被這則蓋掉)。
+
+    失敗時回 `{"ok": false, "failure": 種類}`,**不重送**(理由同 post_summary)。"""
+    mr_id = _check_mr_id(mr_id)
+    if REAL_MODE:
+        try:
+            _api("POST", f"/merge_requests/{mr_id}/notes", json={"body": body})
+        except Exception as e:               # noqa: BLE001 — 種類記下來,例外訊息不往外帶
+            failure = _failure_kind(e)
+            return _write_failed(failure)
+    else:
+        _mock_output(mr_id, "note", {"body": body})
+    return json.dumps({"ok": True}, ensure_ascii=False)

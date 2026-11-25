@@ -898,26 +898,51 @@ _LOCALE_RE = re.compile(r"(?i)@@(LANGUAGE|DATEFIRST|LANGID|DATEFORMAT)\b")
 # `target.` 與 `var(` **只在 Jinja 區段裡**才算,否則會誤報兩種很常見的 T-SQL:
 # `MERGE` 的慣用別名就叫 target(`target.id`),而 `VAR()` 是變異數聚合函式。
 # `env_var(` 是 dbt 專有的名字,不受這個限制。
-_JINJA = r"\{\{|\{%"
-# 從 `{{`/`{%` 往後找關鍵字的範圍也要有上限:`{{` 開頭而**沒有閉合**的內容,每一個
-# `{{` 都會掃到檔尾,整體是平方時間(實測 4 萬字元要 35 秒)。Jinja 的表達式很短。
-_IN_JINJA = r"[^}]{0,200}?"
-# 命中的「寫法」只取關鍵字本身(具名群組 tok):比對需要前面那段 Jinja 當界線,
-# 但把 `{% set target_date = var` 整段印進訊息只會讓人看不懂命中的是什麼。
+# `target.*` 與 `run_started_at` **只在 Jinja 標記裡**才算:用 Jinja 自己的 lexer 逐個標記取名稱
+# (線性時間,不受條件的長度與中間的 `}` 影響;字串常值裡的同名文字是 string,不是 name)。
+# 樣板本身 lex 不過時,關鍵字出現在第一個 `{{` / `{%` 後面就照樣給(寧可多報)。
 # **不含 `var()`**:它是帶參數的一般寫法,實際專案幾乎每個 model 都用;拿它當條件
 # 來分環境很少見,真的那樣寫也會被「原文有寫入語句、展開結果沒有」那道擋到。
+_TARGET_ATTRS = ("name", "database", "schema", "type", "user")
+_JINJA_START_RE = re.compile(r"\{\{|\{%")
+_DBT_ENV_FALLBACK_RE = re.compile(
+    r"(?<![\w.])(?:target" + _GAP + r"\." + _GAP + r"(?:" + "|".join(_TARGET_ATTRS) + r")"
+    + r"|run_started_at)(?!\w)")
+# `env_var(` 是 dbt 專有的名字,在哪裡都算;`{% if execute` 是 dbt 的執行期分支
 _DBT_ENV_RE = re.compile(
-    r"(?i)(?:" + _JINJA + r")" + _IN_JINJA + r"(?<![\w.])(?P<tok>target" + _GAP + r"\." + _GAP
-    + r"(?:name|database|schema|type|user))(?!\w)"
-    r"|(?<![\w.])(?P<tok3>env_var)" + _GAP + r"\("
+    r"(?<![\w.])(?P<tok3>env_var)" + _GAP + r"\("
     r"|(?P<tok4>\{%" + _GAP + r"if" + _GAP + r"execute)(?!\w)")
 
 
 def _dbt_env_token(m) -> str:
-    for name in ("tok", "tok3", "tok4"):
+    for name in ("tok3", "tok4"):
         if m.group(name):
             return " ".join(m.group(name).split())
     return m.group(0)
+
+
+def _jinja_env_tokens(sql: str) -> list[str]:
+    """Jinja 標記裡的 `target.<屬性>` 與 `run_started_at`(依出現順序)。"""
+    start = _JINJA_START_RE.search(sql)
+    if start is None:
+        return []
+    import jinja2
+    found = []
+    p3 = p2 = p1 = ""                    # 前三個標記(名稱與運算子記值,其他記型別)
+    try:
+        for _, kind, value in jinja2.Environment().lex(sql):
+            if kind == "whitespace":
+                continue
+            if kind == "name":
+                if value == "run_started_at" and p1 != ".":
+                    found.append("run_started_at")
+                elif value in _TARGET_ATTRS and p1 == "." and p2 == "target" and p3 != ".":
+                    found.append(f"target.{value}")
+            p3, p2, p1 = p2, p1, (value if kind in ("name", "operator") else kind)
+    except jinja2.TemplateSyntaxError:
+        return [" ".join(m.group(0).split()).replace(" ", "")
+                for m in _DBT_ENV_FALLBACK_RE.finditer(sql, start.start())]
+    return found
 # 現在時間跟寫死的日期比較:上線之後才會改變行為的寫法(定時炸彈)。
 _NOW_FUNC = r"(?:GETDATE|GETUTCDATE|SYSDATETIME|SYSUTCDATETIME|CURRENT_TIMESTAMP)"
 _DATE_LITERAL = r"'\d{4}[-/]?\d{2}[-/]?\d{2}[^']*'"
@@ -929,6 +954,20 @@ _TIME_BOMB_RE = re.compile(
 # 只認 schema 限定的呼叫(dbo.fn_x(...)),不然每個內建函式都會命中。
 _USER_FUNC_RE = re.compile(r'(?i)(?<![\w.@\["])' + _named("dbo") + r"\s*\.\s*"
                            + r'[\["]?(\w+)[\]"]?' + _GAP + r"\(")
+
+
+def _h008_message(tokens: list[str]) -> str:
+    """H008 的訊息:分流用的寫法請確認分流的內容;run_started_at 請確認跟日期有關的行為。"""
+    parts = []
+    env = [t for t in tokens if t != "run_started_at"]
+    if env:
+        parts.append(f"dbt 編譯期的環境資訊:{'、'.join(env)[:120]}——開發與正式分流本來就會用到,"
+                     f"但它決定了編譯出來的 SQL,而執行驗證驗的是編譯後的結果。請確認分流的內容")
+    if "run_started_at" in tokens:
+        parts.append("用到 run_started_at(dbt 執行當下的時間):跟日期比較或算日期時,編譯出來的 SQL 會"
+                     "隨執行的日期改變,某天之後行為就不同;審查與執行驗證是在今天跑的,驗不到那之後的"
+                     "行為。請確認跟日期有關的部分(比較的日期、算出來的資料日)是刻意的")
+    return ";".join(parts)
 
 
 def _env_hints(sql: str) -> list[tuple[str, str, str]]:
@@ -946,12 +985,10 @@ def _env_hints(sql: str) -> list[tuple[str, str, str]]:
         hits.append(("H007", "hint",
                      f"讀取連線的語系/日期設定:{'、'.join(locale)}——沙盒與正式環境的設定"
                      f"可能不同,同一段 SQL 的結果會跟著不同。請確認用途"))
-    dbt_env = dict.fromkeys(_dbt_env_token(m) for m in _DBT_ENV_RE.finditer(sql))
+    dbt_env = dict.fromkeys(_jinja_env_tokens(sql)
+                            + [_dbt_env_token(m) for m in _DBT_ENV_RE.finditer(sql)])
     if dbt_env:
-        hits.append(("H008", "hint",
-                     f"dbt 編譯期的環境資訊:{'、'.join(dbt_env)[:120]}——開發與正式分流"
-                     f"本來就會用到,但它決定了編譯出來的 SQL,而執行驗證驗的是編譯後的"
-                     f"結果。請確認分流的內容"))
+        hits.append(("H008", "hint", _h008_message(list(dbt_env))))
     if _TIME_BOMB_RE.search(sql):
         hits.append(("H009", "hint",
                      "現在時間與寫死的日期比較:行為會在某個日期之後改變,審查與執行驗證"

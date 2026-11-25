@@ -274,7 +274,7 @@ class Config:
         return self.profile(self.roles.get(role) or self.default_profile)
 
 
-def _load_dbt_section(raw: dict) -> dict:
+def _load_dbt_section(raw: dict, where: str = "設定檔") -> dict:
     """dbt 展開接線的設定。**預設關閉**——合併後現有審查流程與評測結果不受影響,
     確認後才開(見 docs/09-dbt展開與反查.md)。
 
@@ -330,10 +330,85 @@ def _load_dbt_section(raw: dict) -> dict:
         raise ValueError(
             f"設定檔 dbt.sqlserver_schema_concat 必須是布林值 true/false 或不設,目前是 {concat!r}"
             f"({type(concat).__name__})")
+    variables, run_date_vars = _dbt_variables(section, where)
     # 只有設了才帶這些鍵(讀的一方用 .get):沒設時回傳的內容與接線前相同
     return {"enabled": enabled, "database": database,
             **({"project_dir": project_dir} if project_dir else {}),
-            **({"sqlserver_schema_concat": concat} if concat is not None else {})}
+            **({"sqlserver_schema_concat": concat} if concat is not None else {}),
+            **({"vars": variables} if variables else {}),
+            **({"run_date_vars": run_date_vars} if run_date_vars else {})}
+
+
+def _dbt_variables(section: dict, where: str = "設定檔") -> tuple[dict, list]:
+    """排程(例如 Dagster)每次執行時傳進 dbt 的變數(等於 dbt 的 `--vars`)。審查時沒有人傳,沒有預設值的
+    `var()` 會展開失敗(dbt 沒傳值時也是編譯失敗),報告多一條正式環境不會發生的問題。
+
+      vars           {變數名稱: 值}。值收字串、數字、布林,以及由它們組成的清單與物件(`--vars` 也收);
+                     YAML 沒加引號的日期(`2026-01-01`)換成 `YYYY-MM-DD` 字串,跟 dbt 展開的結果相同
+      run_date_vars  代表「這次執行的日期」的變數名稱(例如 target_date)。審查時一律給執行驗證測資的
+                     日期(`YYYY-MM-DD`,等於 @start_date),展開出來的 SQL 跟沙盒的測資才對得上
+                     (見 pipeline._review_variables)
+
+    名稱只拿來查表、不會拼進 SQL,所以收任何非空字串。**寫了鍵卻沒給值就停**(多半是忘了填,或部署
+    時替換值的步驟沒跑):`vars:` / `run_date_vars:` 是空的、`vars` 裡某個值是空字串、只有空白或
+    null、同一個變數兩邊都給了。訊息寫出是哪個設定檔、哪個變數、哪裡不對。不寫這個鍵就是沒設。"""
+    variables = {}
+    if "vars" in section:
+        raw = section["vars"]
+        if raw is None or raw == {} or raw == []:
+            raise ValueError(f"{where} 的 dbt.vars 有寫但是空的;不用就把這個鍵拿掉")
+        if not isinstance(raw, dict):
+            raise ValueError(f"{where} 的 dbt.vars 要是 {{變數名稱: 值}},目前是 {type(raw).__name__}")
+        for name, value in raw.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"{where} 的 dbt.vars 有變數名稱不合法({name!r}):要是非空字串")
+            variables[name] = _var_value(value, f"{where} 的 dbt.vars.{name}")
+    run_date_vars = []
+    if "run_date_vars" in section:
+        raw = section["run_date_vars"]
+        if raw is None or raw == [] or raw == {}:
+            raise ValueError(f"{where} 的 dbt.run_date_vars 有寫但是空的;不用就把這個鍵拿掉")
+        if not isinstance(raw, list):
+            raise ValueError(f"{where} 的 dbt.run_date_vars 要是變數名稱的清單(例如 [target_date]),"
+                             f"目前是 {type(raw).__name__}")
+        for name in raw:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"{where} 的 dbt.run_date_vars 有變數名稱不合法({name!r}):要是非空字串")
+        run_date_vars = list(dict.fromkeys(raw))
+    both = [n for n in run_date_vars if n in variables]
+    if both:
+        raise ValueError(f"{where} 的變數 {'、'.join(both)} 同時寫在 dbt.vars 與 dbt.run_date_vars;"
+                         f"只能擇一(日期變數放 run_date_vars)")
+    return variables, run_date_vars
+
+
+def _var_value(value, where: str, depth: int = 0):
+    """dbt 變數的值:字串、數字、布林,與由它們組成的清單、物件;YAML 的日期換成 YYYY-MM-DD 字串。"""
+    import datetime
+    if depth > 20:
+        raise ValueError(f"{where} 巢狀太深")
+    if value is None:
+        raise ValueError(f"{where} 是 null(沒有值)")
+    if isinstance(value, str):
+        if depth == 0 and not value.strip():
+            raise ValueError(f"{where} 是空的;不用就把這個變數拿掉")
+        return value
+    if isinstance(value, datetime.datetime):
+        raise ValueError(f"{where} 是沒加引號的日期時間;請加引號寫成字串")
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, list):
+        return [_var_value(v, f"{where}[{i}]", depth + 1) for i, v in enumerate(value)]
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if not isinstance(k, (str, int, float, bool)):
+                raise ValueError(f"{where} 的鍵 {k!r} 型別不對")
+            out[k] = _var_value(v, f"{where}.{k}", depth + 1)
+        return out
+    raise ValueError(f"{where} 的型別是 {type(value).__name__},只收字串、數字、布林,以及它們組成的清單與物件")
 
 
 def _yaml_api_key(raw: dict) -> str:
@@ -460,7 +535,7 @@ def load_config(path: Path | None = None) -> Config:
         endpoint=endpoint, api_key=api_key,
         default_profile=raw["default_profile"], profiles=raw["profiles"],
         roles=raw.get("roles", {}), budget=raw["budget"],
-        policy=raw.get("policy", {}), dbt=in_file(lambda: _load_dbt_section(raw)),
+        policy=raw.get("policy", {}), dbt=in_file(lambda: _load_dbt_section(raw, where)),
         source={"path": str(path), "sha256": digest},
     )
 

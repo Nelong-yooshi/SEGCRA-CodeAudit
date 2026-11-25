@@ -126,6 +126,20 @@ job 跟服務之間:
 
 **專用 runner 為什麼要鎖在待審專案:** runner 只看 job 有沒有帶它的 tag,而 tag 是 job 自己寫的。這台 runner 若是 instance runner、group runner,或在其他專案也啟用,別的專案的 CI 設定還在它自己的 repo 裡、開發者改得到,加一行 `tags: [segcra-review]` 就跑在這台、用同一個帳號,一樣能留下假的 `curl`。docker executor 開了 `privileged` 時,容器碰得到主機,效果跟掛 `docker.sock` 相同。
 
+**同一個 MR 只審第一次(`CI_REVIEW_REPEAT=first`)時,什麼時候跳過**(`ci_gate.should_skip`,設法見
+README §7「使用時」):以下都成立才跳過,否則照樣審。
+
+- 同一個 MR 沒有還在跑的 CI 審查:有的話照樣審這次、取消舊的(「還在審就被取消」照樣成立)。
+- 審查服務自己記得這個 MR 上一次**真的審完**的結果,而且是放行或交人工。上一次擋下或沒跑完整時照樣審,
+  不然被擋的 MR 推一個新 commit 就變成可以合併。
+- 這次不是有人要求重審:上一次處理的(審過或跳過的)同一個 commit 又送來,就是有人按了 retry 或重跑
+  pipeline。MR 的 pipeline 帶不了手動變數,「重審」只能用這個方式表達;請求裡沒有「強制重審」的欄位。
+- 目標分支跟上一次真的審時相同,而且兩邊都取得到:換過目標分支(包括換回原本的)、或取不到,都照樣審。
+
+只看服務自己的紀錄,不看 GitLab 的 label 或留言:那些開發者改得到。紀錄只有這個 MR 最後一份 CI 審查的
+結果才記,比較晚結束的舊審查不會把紀錄蓋回舊的 commit。跳過時的留言寫出上一次真的審的 commit,連續
+跳過好幾次也是同一個,合併的人知道要從哪個版本開始看。
+
 ### 5. 不接 CI 時:webhook + commit status(README §6、§7)
 
 測試環境或沒有 CI 的 repo 用這一條,部署端不用。MR 事件觸發審查(webhook),審完對 head commit 回寫 `segcra/review` 的 success/failed(第 3 節第 4 點),再配上 **Pipelines must succeed** 與 **protected branch**(設定見 README §7 第 6 步):
@@ -197,6 +211,11 @@ EOF
 - **調閾值**:使用中的模型設定檔(`SEGCRA_MODELS_CONFIG` 指的那份,沒設時是 `config/models.yaml`;見 docs/10)的 `policy:` 段——`max_diff_lines`、`min_score`、`allowed_severities`、`forbid_pending_hints`、`min_blockers`。改完即生效,不用動程式。
 - **改評分權重**:`orchestrator/pipeline.py:apply_rubric` 的公式(40/15/5 與 59 封頂)。動之前想清楚連動:`min_score: 95` 的意思是「至多一個 minor(100−5)」,權重一改,yaml 的 min_score 語意跟著變。
 - **加新的放行條件**:加在 `apply_policy` 的 `ok = (...)` 鏈上,並把新訊號寫進 `_policy_signals`,決策才可稽核。與 `spec_exec_ok` 同級的「不變量」請寫死在程式,不要進 yaml。
+- **選 `CI_REVIEW_REPEAT=first` 的代價**:第一次之後的改動整份不經過審查(規則檢查、注入掃描、執行驗證、
+  AI 都沒跑),只靠有合併權限的人把關。「先送一個無害的版本取得放行、再改成惡意的改動」這種情況不會被看到。
+  預設的 `every` 沒有這個問題。
+- **`first` 的紀錄只在記憶體**:審查服務重新啟動後忘記,下一次就照樣審(往多審的方向走);紀錄有上限,
+  超過時丟掉最舊的,一樣是多審。
 - **已知限制**:
   - 不接 CI 時(第 5 節)三態映射到 commit status 只有兩值(success/failed),GitLab 上看不出 `needs_human` 與 `blocked` 的差別——差別要看 label(`ai-review::<decision>`)與總評留言。CI 那條路(第 4 節)分得出來:`needs_human` 是 passed with warnings。
   - `new_rule` 的判定靠路徑(`rules/`)與 diff 形態(`@@ -0,0` / `generated`),repo 目錄慣例改了要同步改 `apply_policy`。
