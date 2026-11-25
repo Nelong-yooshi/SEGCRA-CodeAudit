@@ -21,6 +21,8 @@ def ws(monkeypatch):
     monkeypatch.setenv("GITLAB_WEBHOOK_SECRET", "x")
     import webhook_server as mod
     importlib.reload(mod)
+    # 這裡驗的是開始之後的行為:不等(連續觸發時等多久見 test_webhook_trigger.py)
+    monkeypatch.setattr(mod, "DEBOUNCE_SECONDS", 0)
     return mod
 
 
@@ -105,8 +107,8 @@ def test_留言內容要說明這不是沒問題(ws, monkeypatch):
 
 
 def test_新的commit會取消舊的審查(ws, monkeypatch):
-    """原本是 debounce(略過新的那次),但那會讓新的 commit 不被審查 ——
-    舊的那次審的是舊程式,結論貼到新 commit 上是錯的。"""
+    """新的那次開始時取消舊的那次:舊的審的是舊程式,結論貼到新 commit 上是錯的。
+    略過新的那次也不行,那樣新的 commit 不會被審查。"""
     cancelled = threading.Event()
     second_done = []
     calls = []

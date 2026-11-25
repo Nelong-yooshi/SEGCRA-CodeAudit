@@ -212,3 +212,11 @@ def test_只切出一段不算切過():
 
     assert _split_by_keyword("\nSELECT 1 AS x", 0) is None
     assert _split_by_keyword("DELETE FROM t\nSELECT 1 AS x", 0) is not None
+
+
+def test_方括號識別字裡的分號不是切點():
+    """`[a]];b]` 是一個識別字(]] 跳脫),裡面的 ; 不能被當成句尾切點切成兩段 ——
+    find("]") 在第一個 ] 收尾就會把它錯切開。"""
+    from toolbox.sqltools import parsed_chunks
+    chunks = parsed_chunks("SELECT [a]];b] AS x FROM t", catch=Exception)
+    assert len(chunks) == 1, [c.text for c, _, _ in chunks]
