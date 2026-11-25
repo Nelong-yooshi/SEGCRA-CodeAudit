@@ -168,7 +168,8 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
 
 > 需要一個自己的 GitLab CE 實例;沒有現成環境的話,§8 有用 docker 起一個測試用 GitLab CE 的作法。以下的 URL、專案 id 請換成自己的。
 
-1. **建 Personal Access Token**:登入 GitLab → 右上頭像 → *Edit profile* → *Access tokens* → *Add new token*，Scopes 勾 `api`，建立後複製 token(只顯示一次)。
+1. **建 token**:用**審查專用的帳號**(或專案的 project access token:專案 → Settings → Access tokens)建,不要用某個人自己的帳號。專用帳號:登入 GitLab → 右上頭像 → *Edit profile* → *Access tokens* → *Add new token*，Scopes 勾 `api`，建立後複製 token(只顯示一次)。
+   > 這個帳號就是「審查自己」:它留的 `/review` 一律不觸發審查(防迴圈)。用某個人的 token 時,那個人留的 `/review` 也會被靜靜忽略。webhook 服務啟動時會印一行「GITLAB_TOKEN 的帳號:<名稱>(id <數字>)」,看得出用的是哪個帳號。
 2. **設環境變數**(或複製 `config/gitlab.env.example` 為 `config/gitlab.env` 填入，autopin 會讀;管線本身讀環境變數):
 
    ```bash
@@ -281,7 +282,7 @@ GitLab 設定(逐步):
    - Secret token:填與 `GITLAB_WEBHOOK_SECRET` 相同的值
    - Trigger:勾 **Merge request events** 與 **Comments**
    - Add webhook 後按該 webhook 的 **Test → Merge request events** 驗證，webhook server 端應印出觸發紀錄(HTTP 200)。
-3. 之後 MR 開啟/更新即自動觸發審查;在 MR 討論串留言 **`/review`** 可隨時重審(bot 帳號與 root 的留言不觸發，避免迴圈)。
+3. 之後 MR 開啟/更新即自動觸發審查;在 MR 討論串留言 **`/review`** 可隨時重審(`GITLAB_TOKEN` 的帳號與 project / group access token 的帳號留的不觸發，避免迴圈;所以 `GITLAB_TOKEN` 要用專用帳號,見 §5 第 1 點)。
 4. **同一 MR 推了新 commit**:取消進行中的那次、改審新的(舊的那次審的是舊程式,
    結論貼到新 commit 上是錯的)。**只有真的推了新 commit 才會重審** —— GitLab 改
    label、標題、描述、指派人都送 `action=update`(包括審查自己最後加 label 那一下),
