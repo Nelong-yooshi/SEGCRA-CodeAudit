@@ -45,7 +45,15 @@
    - `ref()` / `source()` 展開成 `"<資料庫>"."<綱要>"."<表>"`(資料庫名由呼叫端傳入,不猜);
      沒有專案資訊時綱要固定為 `dbo`,有專案資訊時見下方「`ref()` / `source()` 的精確度」
    - `config()` 回傳空字串、`var()` 取呼叫端給的值、`execute` 為 True、
-     `is_incremental()` 預設為 False(比照 compile 期)。以 `incremental=True` 展開時回 True;
+     `is_incremental()` 預設為 False(比照 compile 期)。`var()` 的值照 dbt 的順序:設定檔的 `dbt.vars`
+     與 `dbt.run_date_vars`(見 10 篇;等於排程的 `--vars`)> `dbt_project.yml` 最外層的 `vars` > `var()`
+     的預設值;都沒有就展開失敗(dbt 也是)。`dbt_project.yml` 的值是樣板、或 `vars` 裡有子區塊(專案或
+     套件層級,哪個 model 吃到哪個值不判斷)時無法確定,用到就展開失敗並寫原因。正式環境由排程每次
+     傳入的變數(例如 `target_date`)審查時沒有人傳;日期變數一律給執行驗證測資的日期,展開出來的 SQL
+     才撈得到沙盒裡的測資。一份審查開始時記下這組值(`start_review_invocation`),之後的展開都帶同一組。
+     `modules` 只提供 `modules.datetime`(`datetime`、`date`、`timedelta`):用日期變數算前一天、上個月的
+     寫法展得開;`now()`、`today()`、`utcnow()`、`fromtimestamp()` 這類看主機時間的擋下(跟 `run_started_at`
+     同一道防線)。其他模組(`pytz`、`re`、`itertools`)不提供,用到就展開失敗並寫出是哪一個以 `incremental=True` 展開時回 True;
      `RenderResult.incremental_checked` 說明樣板(含它呼叫的 macro)有沒有呼叫 `is_incremental()`
    - `this`:跟 dbt 一樣兩種模式都提供(這個 model 自己的表,規則與 `ref()` 相同),所以
      `{% if this is defined %}` 裡的 SQL 一般模式就展開得出來,非增量的 model 直接寫 `{{ this }}`
@@ -287,6 +295,14 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
   排程拿 `run_started_at` 當資料日還是資料日的隔天,各個 model 不同,審查猜不到;換成固定值也一樣猜。
   所以記成無法驗證(「model 用到 run_started_at,審查不知道排程時間跟資料日期的關係」)。要補的方向:
   部署端在設定寫出排程時間跟資料日期的關係(像 `run_date_vars`),有設就照它換算,沒設才記無法驗證。
+- **日期變數跟 `run_started_at` 比較的寫法一定交人工**:`{% if var('target_date') == run_started_at.strftime('%Y-%m-%d') %}`
+  這種分「當天執行 / 補跑」的寫法,審查時日期變數是測資的日期、`run_started_at` 是真實時間,永遠不相等,
+  規則層走「不是當天」那一邊,另一邊是沒展開到的分支;執行驗證這邊,用到 `run_started_at` 的 model 不送沙盒
+  (見上一點)。
+- **前一天的資料要寫進規格**:測資預設都在 `WIN_START` 當天(測資生成的第 6 點);model 讀前一天(例如
+  `DATEADD(DAY, -1, '{{ var("target_date") }}')`)時,那一天的資料要由規格的資料表定義與案例寫出來,
+  `spec_exec` 不自動產生。
+- **`modules` 只提供 `datetime`**:`pytz`、`re`、`itertools` 等用到就展開失敗。
 
 **本模組是審查輔助,不是資安邊界。** dbt 執行樣板時不在沙箱內,刻意以 Python 物件內省
 在多層資料流中隱藏呼叫(例如把 macro 當參數傳給另一個 macro,再以執行期組出的名稱取
