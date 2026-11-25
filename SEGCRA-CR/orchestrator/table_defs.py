@@ -284,9 +284,13 @@ def _ddl(table: TableDef, columns) -> str:
     return f"CREATE TABLE [{table.name}] ({cols});"
 
 
-def _insert(spec_text: str, ddl: list[str]) -> str:
-    """把 DDL 放進規格的「資料表定義」段:段落用圍欄就加一個圍欄,沒用就直接接在段尾;
-    沒有這一段就在最後加一段。"""
+def _insert(spec_text: str, ddl: list[str], raw_ok: bool) -> str:
+    """把 DDL 放進規格的「資料表定義」段:段落用圍欄就加一個圍欄;沒用圍欄、而且段落本身
+    解析得出表(raw_ok)就直接接在段尾;沒有這一段就在最後加一段。
+
+    沒用圍欄、段落又解析不出表時(例如只寫了「待補」這類說明文字)也加圍欄:沒有圍欄的
+    段落整段會被當成 SQL 解析,說明文字接上 DDL 一起解析會失敗,補上的表就全部讀不到。
+    加了圍欄只讀圍欄裡的內容,原本那段本來就讀不出表,不會少掉什麼。"""
     m = _TABLES_HEADING.search(spec_text)
     if m is None:
         return (spec_text.rstrip("\n") + "\n\n## 資料表定義(由 specs/tables/ 補上)\n\n```sql\n"
@@ -295,7 +299,7 @@ def _insert(spec_text: str, ddl: list[str]) -> str:
     nxt = _NEXT_HEADING.search(rest)
     end = m.end() + (nxt.start() if nxt else len(rest))
     section = spec_text[m.end():end]
-    if _SPEC_FENCE.search(section):
+    if _SPEC_FENCE.search(section) or not raw_ok:
         added = "\n```sql\n" + "\n".join(ddl) + "\n```\n"
     else:
         added = "\n" + "\n".join(ddl) + "\n"
@@ -347,4 +351,4 @@ def augment(spec_text, sql_texts, defs: dict, spec_tables: dict) -> tuple:
     if not ddl and not notes:
         return spec_text, None
     record = {"tables": tables, "notes": notes[:MAX_NOTES]}
-    return (_insert(spec_text, ddl) if ddl else spec_text), record
+    return (_insert(spec_text, ddl, bool(spec_tables)) if ddl else spec_text), record

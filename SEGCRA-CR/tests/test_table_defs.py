@@ -153,6 +153,9 @@ SPEC_FENCED = ("# R\n\n## 資料表定義\n```sql\nCREATE TABLE acct(acct_no VAR
                "## 需求\n- x\n")
 SPEC_RAW = "# R\n\n## 資料表定義\nCREATE TABLE acct(acct_no VARCHAR(20));\n\n## 需求\n- x\n"
 SPEC_NONE = "# R\n\n## 需求\n- x\n"
+# 段落只寫了說明文字(部署端整理規格時常留「待補」):補上的表要讀得到,說明文字不刪
+SPEC_PENDING = "# R\n\n## 資料表定義()\n\n待補(欄位與型別向部署端確認)\n\n## 需求\n- x\n"
+SPEC_EMPTY = "# R\n\n## 資料表定義\n\n## 需求\n- x\n"
 SQL = "SELECT t.acct_no, t.amt FROM dbo.txn_log t JOIN acct a ON a.acct_no = t.acct_no"
 
 
@@ -160,13 +163,14 @@ def _defs():
     return load({PATH: SSMS})[0]
 
 
-@pytest.mark.parametrize("spec", [SPEC_FENCED, SPEC_RAW, SPEC_NONE])
+@pytest.mark.parametrize("spec", [SPEC_FENCED, SPEC_RAW, SPEC_NONE, SPEC_PENDING, SPEC_EMPTY])
 def test_augment_adds_table_where_spec_tables_reads_it(spec):
     text, record = augment(spec, [SQL], _defs(), spec_tables(spec))
     tables = spec_tables(text)
     assert tables["txn_log"] == "[txn_log]"
-    assert ("acct" in tables) == (spec != SPEC_NONE), "規格原本的表不能不見"
+    assert ("acct" in tables) == (spec in (SPEC_FENCED, SPEC_RAW)), "規格原本的表不能不見"
     assert "## 需求\n- x" in text
+    assert spec != SPEC_PENDING or "待補(欄位與型別向部署端確認)" in text
     assert record["tables"][0]["table"] == "txn_log" and record["tables"][0]["kept"] == 9
     assert "IDENTITY" not in text and "NOT NULL" not in text and "DEFAULT" not in text
     assert "PRIMARY" not in text and "SAMPLE_DW" not in text and "Script Date" not in text
