@@ -2,10 +2,10 @@
 
 ## 1. 這是什麼
 
-對 GitLab CE 上的 SQL merge request(異常交易規則等)做自動 code review 的地端系統:模型跑在本地 Ollama(OpenAI-compatible endpoint),審查結果以行內留言、總評、label 與 commit status 回寫 GitLab,並依確定性政策給出三態決策(自動放行 / 需人工 / 擋下)。
+對 GitLab CE 上的 SQL merge request(異常交易規則等)做自動 code review 的地端系統:模型跑在本地 Ollama(OpenAI-compatible endpoint),審查結果以行內留言、總評、label 回寫 GitLab,以 MR pipeline 裡審查 job 的結束碼當 merge 閘門(不接 CI 時改寫 commit status),並依確定性政策給出三態決策(自動放行 / 需人工 / 擋下)。
 
 ```
-MR(webhook 或手動觸發)
+MR(CI 的審查 job、webhook 或手動觸發)
  │
  ├─ 前處理(確定性,不經 LLM)
  │    ├ 注入掃描(MR 標題/描述/diff/註解中的提示注入 → 命中即 blocker)
@@ -27,7 +27,7 @@ MR(webhook 或手動觸發)
  │    ├ rubric 評分(分數由 severity 確定性計算,不信模型自評)
  │    └ 決策三態:auto_approved / needs_human / blocked
  │
- └─ 回寫 GitLab:行內留言、總評、label、commit status(merge 閘門)
+ └─ 回寫 GitLab:行內留言、總評、label;閘門是 CI 審查 job 的結束碼(不接 CI 時寫 commit status)
 ```
 
 > **三明治理念**:中間的 LLM 不可信——它會漏報、會被提示注入壓制、自評分數會漂移。所以前後都是確定性程式:前處理把該查的資料備妥、把已講定的規範濾掉;後處理保證規則命中不消失、注入必擋、分數可重現、決策有據。個別防線可依環境增減,但「確定性前處理 → LLM → 確定性後處理」這個三明治骨架是底線。
@@ -62,8 +62,8 @@ SEGCRA-CR/
 | `docs/03-LLM審查層.md` | agent loop、JSON 容錯、工具註冊表、skill、prompt 組裝 |
 | `docs/04-後處理防線.md` | enforce 鏈逐道:防什麼、演算法、對 findings 的動作 |
 | `docs/05-執行驗證spec_exec.md` | 三角色最細一篇:測資契約、覆蓋檢查、MS SQL 沙盒執行、仲裁 |
-| `docs/06-決策與merge閘門.md` | 評分公式、三態全部條件、CE 閘門三件套 |
-| `docs/07-webhook自動化.md` | token 驗證、事件路由、取消舊審查、時間上限、已知限制 |
+| `docs/06-決策與merge閘門.md` | 評分公式、三態全部條件、CI 閘門的機制(結束碼、呼叫者確認、設定與 runner 為什麼要分開)、不接 CI 時的 commit status |
+| `docs/07-webhook自動化.md` | 審查服務的兩個入口(CI job 呼叫的 `/ci/review`、webhook)、token 驗證、事件路由、取消舊審查、時間上限、已知限制 |
 | `docs/08-學習迴路autopin.md` | 判例入庫 → 分群起草 → binding MR 人閘全鏈 |
 | `docs/09-dbt展開與反查.md` | dbt 樣板展開成純 SQL、行號對回原始檔、macro 變更反查 model 與規格(尚未接進管線) |
 | `docs/10-設定參數.md` | 程式讀的環境變數一覽:預設值、單位、用途、在哪裡設、真實模式是否必填 |
@@ -175,7 +175,8 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
 
 > 需要一個自己的 GitLab CE 實例;沒有現成環境的話,§8 有用 docker 起一個測試用 GitLab CE 的作法。以下的 URL、專案 id 請換成自己的。
 
-1. **建 Personal Access Token**:登入 GitLab → 右上頭像 → *Edit profile* → *Access tokens* → *Add new token*，Scopes 勾 `api`，建立後複製 token(只顯示一次)。
+1. **建 token**:用**審查專用的帳號**(或專案的 project access token:專案 → Settings → Access tokens)建,不要用某個人自己的帳號。專用帳號:登入 GitLab → 右上頭像 → *Edit profile* → *Access tokens* → *Add new token*，Scopes 勾 `api`，建立後複製 token(只顯示一次)。
+   > 這個帳號就是「審查自己」:它留的 `/review` 一律不觸發審查(防迴圈)。用某個人的 token 時,那個人留的 `/review` 也會被靜靜忽略。webhook 服務啟動時會印一行「GITLAB_TOKEN 的帳號:<名稱>(id <數字>)」,看得出用的是哪個帳號。
 2. **設環境變數**(或複製 `config/gitlab.env.example` 為 `config/gitlab.env` 填入，autopin 會讀;管線本身讀環境變數):
 
    ```bash
@@ -211,7 +212,7 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
    .venv/bin/python demo.py --mr <MR 的 iid>
    ```
 
-   審完到 GitLab 該 MR 頁面看:行內留言、總評(分數/verdict/決策)、`ai-review::<決策>` label，以及 commit status `segcra/review`。
+   審完到 GitLab 該 MR 頁面看:行內留言、總評(分數/verdict/決策)、`ai-review::<決策>` label，以及 commit status `segcra/review`(手動或 webhook 審查才寫;部署端的 CI 那條路不寫,見 §7)。
 4. **模型端點哪來**:管線讀 `OLLAMA_URL`(預設 `http://localhost:11434/v1`)。Ollama 跑在別台機器時,常見作法是以 SSH(或 autossh)反向 tunnel 把 11434 掛到執行管線那台機器的 loopback;掛好後驗證:
 
    ```bash
@@ -265,6 +266,10 @@ export SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER FIXTURES_DIR=examples/dbt_wiring/fixt
 
 ## 6. Webhook 自動觸發
 
+> **部署端不用這一節的 webhook**:審查做成 MR pipeline 最後一個 stage 的 job(§7)。
+> 這一節是測試環境或沒有 CI 的 repo 用的做法。§7 的 job 呼叫的審查服務也是同一支
+> `scripts/webhook_server.py`,啟動見 §7 第 1 步(不用設 webhook,也不用 `GITLAB_WEBHOOK_SECRET`)。
+
 webhook server 建議跑在**與 GitLab 同一台主機**(放在哪個目錄都可以):
 
 ```bash
@@ -284,7 +289,7 @@ GitLab 設定(逐步):
    - Secret token:填與 `GITLAB_WEBHOOK_SECRET` 相同的值
    - Trigger:勾 **Merge request events** 與 **Comments**
    - Add webhook 後按該 webhook 的 **Test → Merge request events** 驗證，webhook server 端應印出觸發紀錄(HTTP 200)。
-3. 之後 MR 開啟/更新即自動觸發審查;在 MR 討論串留言 **`/review`** 可隨時重審(bot 帳號與 root 的留言不觸發，避免迴圈)。
+3. 之後 MR 開啟/更新即自動觸發審查;在 MR 討論串留言 **`/review`** 可隨時重審(`GITLAB_TOKEN` 的帳號與 project / group access token 的帳號留的不觸發，避免迴圈;所以 `GITLAB_TOKEN` 要用專用帳號,見 §5 第 1 點)。
 4. **同一 MR 推了新 commit**:取消進行中的那次、改審新的(舊的那次審的是舊程式,
    結論貼到新 commit 上是錯的)。**只有真的推了新 commit 才會重審** —— GitLab 改
    label、標題、描述、指派人都送 `action=update`(包括審查自己最後加 label 那一下),
@@ -295,7 +300,7 @@ GitLab 設定(逐步):
 
 審查有四層時間上限(整份審查、執行驗證整段、單一份內容的 lint、冷讀),都是**讀不懂就退回
 預設值並印一行警告**,不會讓伺服器起不來(填錯一個字就起不來的話,所有 MR 都收不到
-審查,那比用預設值跑糟得多);0 或負數也退回預設。
+審查,那比用預設值跑糟得多);0 或負數、`inf`、設了但是空的也退回預設並印警告(寫出變數名)。可以有小數。
 
 名稱、預設值與什麼時候該調,見 **[設定參數一覽](docs/10-設定參數.md)**。
 
@@ -306,26 +311,131 @@ GitLab 設定(逐步):
 審查沒跑完時,webhook 會留言**並把 `segcra/review` 的 commit status 設成失敗** ——
 擋合併的是 commit status,只留言擋不住。
 
-## 7. Merge 閘門(CE 的作法)
+## 7. Merge 閘門(CI 的作法)
 
-GitLab CE 沒有 approval rules，可行的擋法是:**commit status(external pipeline)+ 專案設定「Pipelines must succeed」+ protected branch**。
+審查做成要掛審查的 repo 的 **MR pipeline 最後一個 stage 的 job**:pipeline 會等它跑完,結果就在
+MR 看的同一條 pipeline 上,job 的結束碼決定能不能合併(0 放行、3 交人工但可合併、4 擋下、5 沒跑完整;
+對照表見 [docs/06 第 4 節](docs/06-決策與merge閘門.md))。這條路不寫 commit status。job 只帶
+`CI_JOB_TOKEN` 呼叫審查服務,秘密不放在 runner(原因同一節)。
 
-1. 審查管線每次審完會對 MR 的 head commit 回寫 commit status(name=`segcra/review`):
-   - `auto_approved` → **success**
-   - `needs_human` / `blocked` → **failed**(description 帶原因)
-2. 專案 → Settings → Merge requests → Merge checks → 勾 **Pipelines must succeed** → Save。
-   從此 status 為 failed 的 MR，Merge 按鈕會被鎖住。
-3. 專案 → Settings → Repository → Protected branches:把 `main` 設為 protected，*Allowed to push* 設 No one、*Allowed to merge* 設 Maintainers——確保所有變更都走 MR、都經過審查。
+**前提**:要掛審查的 repo 要有只在 `merge_request_event` 跑的 MR pipeline。
 
-三態決策的實際效果:
+**接上去的步驟:**
 
-| 決策 | commit status | 效果 |
-|---|---|---|
-| `auto_approved` | success | 小幅變更且無實質問題;Merge 按鈕可按(仍可要求人再看) |
-| `needs_human` | failed | Merge 被鎖;人工確認後，人可留言 `/review` 重審，或由有權限者依 GitLab 流程處置 |
-| `blocked` | failed | 有 blocker(注入攻擊、hardcode 憑證、DELETE 無 WHERE 等);修正前不得合入 |
+1. **審查服務**跑在有 GitLab token 與模型端點的主機上,runner 連得到它。環境變數照
+   [docs/10「真實模式必填」](docs/10-設定參數.md)設齊(`GITLAB_URL`、`GITLAB_TOKEN`、`GITLAB_READ_TOKEN`、
+   `GITLAB_PROJECT`、`SANDBOX_MSSQL_PASSWORD`),`GITLAB_PROJECT` 要填**專案的數字 id**(跟 GitLab 回的
+   `project_id` 比對;填路徑會一律拒絕)。只走這條路時不用設 `GITLAB_WEBHOOK_SECRET`(webhook 那條路停用,
+   啟動時會印一行說明)。先起執行驗證的沙盒(同 §3),再啟動服務:
 
-補充:`needs_human` 走 failed 是刻意保守——CE 的 merge check 只認 success/failed 兩種結果，凡是需要人看過的都先鎖住，由人做最後放行。
+   ```bash
+   scripts/sandbox.sh start          # 沒起的話,每份審查的執行驗證都是「沙盒不可用」、不會自動放行
+   .venv/bin/python scripts/webhook_server.py --port 8000
+   ```
+
+2. **審查服務的位址** `SEGCRA_URL`(例如 `http://<審查主機>:8000`)寫在第 5 步 job 的 `variables:` 裡,
+   **不要**設成待審專案的 CI/CD 變數:它決定每個 MR 由哪一個服務判,指到一個一律回 `done 0` 的服務,
+   所有 MR 都會綠;專案設定裡的變數改了不留版本紀錄、也不經過審查。寫在設定專案(第 4 步)的 YAML 裡,
+   只有負責 CI 的人改得到,改動有歷史、可以走 MR 審查。專案與群組的 CI/CD 變數優先順序比 YAML 高,
+   **待審專案與它的群組都不要另設同名的 `SEGCRA_URL`**。
+3. **專用的 runner**(只給審查 job 用,其他 job 碰不到它;原因見 docs/06 第 4 節):
+   - 用 **project runner**,只在待審專案建立:專案 → Settings → CI/CD → Runners,Tags 填
+     `segcra-review`,不勾 *Run untagged jobs*,勾 *Lock to current projects*;不在其他專案啟用,
+     不用 instance runner 或 group runner。
+   - 執行帳號跟其他 job 不同,其他 job 改不到它的家目錄與 runner 的設定檔(其他 job 的帳號有 sudo 或
+     docker 權限,就等於改得到)。或用 docker executor:每個 job 一個新的容器,不掛 `docker.sock`、
+     不開 `privileged`。
+   - runner 要有 `sh` 與 `curl`。這台的 `limit`(同時跑幾個 job)就是同時審查的上限(例外見 docs/06
+     「擴充與注意」)。
+4. **CI 設定檔放在 MR 改不到的專案**:另建一個專案放 `.gitlab-ci.yml`,待審專案 → Settings → CI/CD →
+   General pipelines → *CI/CD configuration file* 填 `.gitlab-ci.yml@<群組>/<放 CI 設定的專案>`
+   (GitLab CE 可用)。
+   - 設定專案的寫入權只給負責 CI 的人。**待審 repo 既有的 job 整份搬到那份設定檔**(`stages` 與
+     `workflow` 一樣),**不要 include 待審 repo 裡的任何設定**(原因見 docs/06 第 4 節)。
+   - **會推 commit、開 MR 的開發者在設定專案至少要 Reporter**(只能讀、不能改),或把設定專案設成
+     Internal(External 使用者讀不到 Internal 專案,要另外給 Reporter)。讀不到的人推的 commit,開出的
+     pipeline 直接失敗、沒有任何 job,訊息是 ``Project `<群組>/<設定專案>` not found or access denied!``。
+     用 root 或設定專案的成員推,測不出這件事。
+5. **job**:接在最後一個 stage。
+
+   ```yaml
+   stages:
+     # ……待審 repo 既有的 stage
+     - segcra-review
+
+   segcra-review:
+     stage: segcra-review
+     tags: [segcra-review]         # 只跑在第 3 步的專用 runner
+     rules:
+       - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+     inherit:
+       default: false              # 不吃這份設定檔的 default(before_script 等,給既有 job 用的)
+       variables: false
+     before_script: []
+     after_script: []
+     variables:
+       GIT_STRATEGY: none          # 不用取原始碼:審查服務自己向 GitLab 讀 MR
+       SEGCRA_URL: "http://<審查主機>:8000"   # 第 2 步:寫在這裡,不設成專案或群組的 CI/CD 變數
+     timeout: 1h                   # 要比整份審查的上限長(REVIEW_TIMEOUT_SECONDS,預設 2400 秒)
+     allow_failure:
+       exit_codes: [3]             # needs_human:passed with warnings
+     script:
+       - |
+         set -u
+         out=$(mktemp)
+         code=$(curl -sS -o "$out" -w '%{http_code}' -X POST "$SEGCRA_URL/ci/review" \
+           -H "JOB-TOKEN: $CI_JOB_TOKEN" -H "Content-Type: application/json" \
+           -d "{\"mr_iid\": $CI_MERGE_REQUEST_IID, \"sha\": \"$CI_COMMIT_SHA\"}") || code=000
+         if [ "$code" != 202 ]; then echo "審查服務沒有開始審查(HTTP $code):$(cat "$out")"; exit 5; fi
+         ticket=$(cat "$out")
+         echo "審查已開始,MR 上會出現留言;這個 job 等審查結束"
+         misses=0
+         while true; do
+           sleep 30
+           code=$(curl -sS -o "$out" -w '%{http_code}' "$SEGCRA_URL/ci/review/$ticket" \
+             -H "JOB-TOKEN: $CI_JOB_TOKEN") || code=000
+           if [ "$code" != 200 ]; then
+             misses=$((misses + 1))
+             if [ "$misses" -ge 10 ]; then echo "連續查不到審查狀態(HTTP $code):$(cat "$out")"; exit 5; fi
+             continue
+           fi
+           misses=0
+           r=$(cat "$out")
+           case "$r" in
+             running) ;;
+             "done 0"|"done 3"|"done 4"|"done 5") echo "審查結束:$r"; exit "${r#done }" ;;
+             *) echo "審查服務回了看不懂的內容"; exit 5 ;;
+           esac
+         done
+   ```
+
+6. **待審專案的兩件設定**,確保所有變更都走 MR、都經過這條 pipeline:
+   1. 專案 → Settings → Merge requests → Merge checks → 勾 **Pipelines must succeed** → Save;
+      **不要**勾「Skipped pipelines are considered successful」。
+   2. 專案 → Settings → Repository → Protected branches:把 `main` 設為 protected,*Allowed to push* 設
+      No one、*Allowed to merge* 設 Maintainers。
+7. **接上之後在 GitLab 上試一次**:項目見 docs/06「怎麼驗證它在動」(c)。
+
+**使用時:**
+
+- **重審**:在 GitLab 上 retry 這個 job(同一個 commit 再審一次)。推了新的 commit 會開新的 pipeline,MR
+  看的是新的那條,閘門照新的那份審查。舊的那份怎麼結束,看新的審查 job 送出請求時(它在最後一個 stage,
+  前面的 stage 要先跑完)舊的到了哪裡:還在審就被取消,舊的 job 拿到 5;已經審完的,寫回前比對 head
+  發現換了、不回寫,拿到 5;舊的審查 job 還沒送出請求的,送出時 commit 已經不是 MR 的 head,服務拒絕,
+  拿到 5。舊的已經開始寫回之後才推的,舊的留言與 label 會照樣貼上,舊的 job 照它的結果結束。
+- **同一個 MR 要不要每次都審**:審查服務的環境變數 `CI_REVIEW_REPEAT`,服務啟動時讀一次、啟動訊息會印出
+  用的是哪一種。`every`(預設,不設就是它)每個 pipeline 都審;`first` 審過一次之後,之後的 pipeline
+  整份審查都不跑(規則檢查與 AI 都沒有),job 以 3 結束,MR 上留言寫明「`<上一次真的審的 commit>` 之後的
+  改動都沒有經過審查」並把標籤改成 `ai-review::needs_human`。要重審:對這個 MR 最新的 pipeline 的審查 job
+  按 retry(或對同一個 commit 再跑一次 pipeline)。設了但是空的、或不是 `every` / `first`,服務不啟動。
+  **這個值改變閘門**:放在部署端版控裡的服務設定(例如 docker compose 檔的 `environment:`),改動走 MR,
+  不跟密碼放在同一個檔。跳過的條件與選 `first` 的代價見 docs/06 第 4 節與「擴充與注意」。
+- **逾時**:審查服務那邊整份審查超過 `REVIEW_TIMEOUT_SECONDS` 會中止(留言,結束碼 5);job 的
+  `timeout` 要更長,job 自己逾時也是失敗、鎖住。
+- 這條路的限制(Draft 也審、服務重新啟動、job 取消時服務不停、同時審查的上限)見 docs/06「擴充與注意」。
+
+不接 CI 時(§6 的 webhook),審完改用 commit status(name=`segcra/review`,`auto_approved` →
+success、其餘 → failed)當閘門,搭配第 6 步同樣的兩件設定;做法與限制見 docs/06 第 5 節。
 
 ## 8. 自架一個測試用 GitLab CE(docker)
 
@@ -420,9 +530,10 @@ ssh -L 8929:localhost:8929 <your-user>@<your-server>
 | 模型連不上(connection refused / timeout) | `curl $OLLAMA_URL` 的主機端(如 `curl http://127.0.0.1:11434/api/tags`)。經反向 tunnel 掛進來的 endpoint，確認 tunnel 活著;模型名不存在時先 `ollama pull` |
 | 審查極慢或 OOM | 換小模型:`--profile fast`，或把 `config/models.yaml` 的 fast 換成更小的模型 |
 | LLM 請求逾時(`APITimeoutError`) | 單次 LLM 請求上限預設 3600 秒、不自動重試;硬體更慢時以環境變數 `LLM_TIMEOUT`(秒)調高。測資生成/仲裁的 LLM 失敗不會中斷管線——降級為 major「執行驗證無法完成」轉 needs_human |
+| 較長的生成固定在約 30 秒失敗,端點回 400 且訊息含 `Timeout passed=30.0` | 模型前面的閘道(例如 LiteLLM)有自己的請求上限,跟 `LLM_TIMEOUT` 無關。設環境變數 `LLM_SEND_TIMEOUT=1`,把上限放進請求內容(見 docs/10) |
 | webhook 回 401 | webhook 的 Secret token 與 `GITLAB_WEBHOOK_SECRET` 不一致，或啟動時忘了 export |
 | webhook 完全收不到(GitLab 端顯示錯誤) | ① Admin Area → Settings → Network → Outbound requests 沒勾 **Allow requests to the local network from webhooks**;② URL 要用 `http://172.17.0.1:8000/...`(容器內打 `localhost` 是打容器自己);③ webhook server 沒起來(`curl http://127.0.0.1:8000/health`) |
-| MR 觸發了但沒審 | webhook server 的 stdout:action 不在 open/reopen/update,或是 `update` 但沒帶 `oldrev`(= 只改了 label/標題/描述,不是推新 commit) |
+| MR 觸發了但沒審(webhook) | webhook server 的 stdout:action 不在 open/reopen/update,或是 `update` 但沒帶 `oldrev`(= 只改了 label/標題/描述,不是推新 commit);MR 是 Draft(webhook 那條路不審 Draft,要審就留言 `/review`);同一個 MR 短時間內連續觸發,還在等 `WEBHOOK_DEBOUNCE_SECONDS` 的安靜期 |
 | 執行驗證報「無規格可驗」 | dbt 開啟時看 finding 寫的原因:檔案要放在 `models/<project 編號>/` 底下，`specs/` 裡要剛好一份規格的「序號」是這個編號。dbt 關閉時:MR 的 SQL/標題/描述抓不到 `R-xxx` 規則碼，或 `specs/<code>.md` 不存在(real 模式看 GitLab repo 的 `specs/`;mock 模式看本地 `specs/`) |
 | SQL 無法在測資上執行 | 報告會帶 major「SQL 無法在測資上執行」與 SQL Server 的錯誤訊息。常見:不是 T-SQL 寫法(`= TRUE`、`EXTRACT(...)`、`:start_date` 這類其他資料庫的語法)、用了 spec 資料表定義沒有的欄位、含 dbt 樣板。時間參數用 `@start_date` / `@end_date` |
 | 執行驗證報「沙盒不可用」 | 沙盒沒啟動或連不上:`scripts/sandbox.sh status`;沒啟動就 `scripts/sandbox.sh start`。沙盒不可用時一律不自動放行 |
@@ -430,6 +541,13 @@ ssh -L 8929:localhost:8929 <your-user>@<your-server>
 | 測資生成一直失敗(測資生成失敗 finding) | 小模型產不出合法 JSON;把 `config/models.yaml` 的 `roles.testgen` 指到較大的 profile(預設 review) |
 | GitLab 網頁打不開 | 先在該主機上 `docker ps -a --filter name=segcra-gitlab` 看容器起了沒;剛啟動要等 1~4 分鐘(ready 判準見 §8);GitLab 在遠端時,自己電腦要掛著 `ssh -L 8929:localhost:8929 <your-user>@<your-server>` |
 | commit status 沒鎖住 Merge 按鈕 | 專案 Settings → Merge requests 沒勾 **Pipelines must succeed**;或審的是舊 commit(push 新 commit 後要重審) |
+| CI 的審查 job 以 5 結束,印「審查服務沒有開始審查(HTTP 403)」 | 呼叫者不符,後面接著原因:「job token 無效或 job 已經結束」(GitLab 拒絕了這把 token)、「job 所在的 pipeline 不是 MR pipeline」(`rules` 或 `workflow` 沒限定 `merge_request_event`)、「要審的 commit 不是 MR 目前的 head」(推了新 commit,看新的 pipeline)、「MR 不是開啟中」(已合併或關閉) |
+| 印「審查服務沒有開始審查(HTTP 502)」 | 審查服務向 GitLab 查不到,原因寫成「向 GitLab 查<job / job 所在的 pipeline / MR>失敗:<原因>」:連不上、逾時、憑證問題就查審查主機到 GitLab 的網路與 `GITLAB_URL`;401、403 就查 `GITLAB_TOKEN` 的權限(要讀得到這個專案的 pipeline 與 MR);5xx 看 GitLab 本身 |
+| 印「審查服務沒有開始審查(HTTP 503)」 | 審查服務驗不了呼叫者:原因寫「mock 模式」就是 `GITLAB_URL`、`GITLAB_TOKEN`、`GITLAB_PROJECT` 沒有設齊;寫「GITLAB_PROJECT 不是數字」就改成專案的數字 id(專案首頁看得到) |
+| CI 的審查 job 以 5 結束,印「審查服務沒有開始審查(HTTP 000)」 | runner 連不到審查服務:`SEGCRA_URL` 寫錯、服務沒起來、防火牆擋住 |
+| pipeline 直接失敗、沒有任何 job,訊息是 ``Project `…` not found or access denied!`` | 推 commit 的人讀不到 CI 設定專案:給他 Reporter,或把設定專案設成 Internal(External 使用者除外),見 §7 第 4 步 |
+| 審查 job 一直 pending | 沒有帶 `segcra-review` tag 的 runner 接得了:專用 runner 沒起來、沒設這個 tag,或沒在這個專案啟用(§7 第 3 步) |
+| 審查 job 印「連續查不到審查狀態」後以 5 結束 | 看後面最後一次的 HTTP 碼與原因:404「查不到這份審查」是審查服務在審查途中重新啟動過,進行中的審查沒了,retry 這個 job;502「向 GitLab 查job(用 job token)失敗」是審查期間審查服務連不到 GitLab(查法同上面 502 那列);000 是 runner 連不到審查服務(同 HTTP 000 那列) |
 
 ## 附錄:如何把工具層包回 MCP
 

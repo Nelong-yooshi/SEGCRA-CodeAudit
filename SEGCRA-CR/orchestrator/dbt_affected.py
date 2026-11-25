@@ -36,6 +36,7 @@ from .dbt_context import DbtContext
 from .dbt_impact import ImpactReport
 from .dbt_render import DEFAULT_ISOLATED_TIMEOUT_S, render_model_isolated
 from .isolation import run_in_thread
+from .text_fields import MR_CONTENT_FILE
 from toolbox.gitlab import UNAVAILABLE_TEXT
 from toolbox.sqltools import DIALECT, parsed_chunks
 
@@ -414,24 +415,49 @@ def _listed(items: list[str]) -> str:
     return "、".join(items[:_MAX_LISTED]) + more
 
 
+IMPACT_STAGE = "macro 反查"
+IMPACT_UNVERIFIED_TITLE = "[macro 反查] 無法驗證:影響範圍或受影響 model 的檢查沒有做完"
+
+
 def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None:
     """把反查與檢查的結果整理成**一條** finding(逐個 model 各報一條會洗版)。沒有東西要說回 None。
 
-    嚴重度(由前後比較推論出來的結果最多 major,不給 blocker):
-      major    範圍不確定(反查標為不確定、全部 model 可能受影響)、有 model 沒檢查到或沒查規格、
-               變更後展開失敗或無法解析、多出 blocker 或 major 級的命中、或無法與變更前比較而有命中
+    嚴重度只看**確定的**結果(由前後比較推論出來的最多 major,不給 blocker):
+      major    多出 blocker 或 major 級的命中
       minor    只多出 minor 級的命中
       info     有受影響的 model 或沒人呼叫的 macro,但檢查不出問題(清單給人看)
+    「做不到、無法確認」的(範圍不確定、有 model 沒檢查到或沒查規格、取不到規格、變更後展開失敗或
+    無法解析、無法與變更前比較)不在這裡提高嚴重度,另外記成待驗證(impact_unverified_finding)。
     內容只有路徑、名稱、規則代號、語句的序號與本模組 / 反查模組的固定文字;路徑與名稱都已由
     反查過白名單。要人逐一處理的清單(多出的命中、展開失敗、沒有檢查、沒查規格)不截斷。
     """
-    if check is None:
+    finding, _ = _impact(check, prefix)
+    return finding
+
+
+def impact_unverified_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None:
+    """impact_finding 的另一半:做不到、無法確認的部分,記成待驗證(帶 stage,review_incomplete 認得到)。
+    沒有這種情況回 None。"""
+    _, unsure = _impact(check, prefix)
+    if not unsure:
         return None
+    return {"file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": IMPACT_UNVERIFIED_TITLE,
+            "stage": IMPACT_STAGE,
+            "detail": "下列項目反查或檢查沒有做完,無法確認有沒有問題:" + "".join(unsure),
+            "suggestion": "逐一確認上列 model 的展開結果符合預期;必要時以 dbt compile 比對變更前後。",
+            "citations": []}
+
+
+def _impact(check: AffectedCheck | None, prefix: str) -> tuple[dict | None, list[str]]:
+    """(主要的那條 finding 或 None, 做不到、無法確認的說明)。"""
+    if check is None:
+        return None, []
     impact = check.impact
     if not (impact.needs_human or impact.affected_models or impact.changed_macro_files
             or check.models or check.unchecked):
-        return None
+        return None, []
     severity = "info"
+    unsure: list[str] = []
 
     def full(rel: str) -> str:
         return f"{prefix}/{rel}" if prefix else rel
@@ -449,16 +475,16 @@ def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None
         elif not impact.all_models_possibly_affected:
             parts.append("這些檔案裡沒有任何 macro 被新增、刪除或改變內容(例如只改了註解或空行)。")
     if impact.all_models_possibly_affected:
-        raise_to("major")
+        unsure.append("影響範圍無法確定,**全部 model 都可能受影響**,沒有逐一檢查。")
         parts.append("影響範圍無法確定,**全部 model 都可能受影響**,沒有逐一檢查。")
     elif impact.affected_models:
         sure = sum(m.certain for m in impact.affected_models)
         parts.append(f"受影響的 model 共 {len(impact.affected_models)} 個"
                      f"(確定 {sure} 個、保守推定 {len(impact.affected_models) - sure} 個)。")
     if impact.uncertain:
-        raise_to("major")
         reasons = [_clip(r) for r in impact.uncertain[:5]]
         more = f"(另有 {len(impact.uncertain) - 5} 項)" if len(impact.uncertain) > 5 else ""
+        unsure.append("無法確定的因素:" + ";".join(reasons) + more + "。")
         parts.append("無法確定的因素:" + ";".join(reasons) + more + "。")
 
     new, compared_blind, broken, hints = [], [], [], []
@@ -466,15 +492,15 @@ def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None
         if m.new_hints:
             hints.append(f"{full(m.path)}[{'、'.join(sorted(set(m.new_hints)))}]")
         if not m.certain:
-            raise_to("major")
+            unsure.append(f"{full(m.path)} 是保守推定受影響的,不確定它呼叫了變更的 macro。")
         if m.error is not None:
-            raise_to("major")
             broken.append(f"{full(m.path)}({_clip(m.error)})")
         elif m.new_hits:
             text = _hits_text(m)
             worst = max((sev for _, sev in m.new_hits), key=_SEVERITY_RANK.get)
-            # 前後比較推論出來的:最多 major,不以 blocker 擋下(沒有變更前的結果可以比時一律 major)
-            raise_to("major" if m.no_baseline or worst == "blocker" else worst)
+            # 前後比較推論出來的:最多 major,不以 blocker 擋下;沒有變更前的結果可以比時無法確認
+            if not m.no_baseline:
+                raise_to("major" if worst == "blocker" else worst)
             (compared_blind if m.no_baseline else new).append(f"{full(m.path)}[{text}]")
     if check.models:
         parts.append(f"已檢查 {len(check.models)} 個不在本次變更清單裡的受影響 model"
@@ -484,27 +510,32 @@ def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None
     if compared_blind:
         parts.append("變更前的版本無法展開、無法比較,以下是變更後的全部命中:"
                      + "、".join(compared_blind) + "。")
+        unsure.append("變更前的版本無法展開、無法比較:" + "、".join(compared_blind) + "。")
+    if broken:
+        unsure.append("**變更後展開失敗或無法解析**:" + "、".join(broken) + "。")
     if broken:
         parts.append("**變更後展開失敗或無法解析**:" + "、".join(broken) + "。")
     if hints:
         parts.append("變更後多出的檢核點(這些 model 不在 diff 裡,模型沒有回應過):"
                      + _listed(hints) + "。")
     if check.unchecked:
-        raise_to("major")
-        parts.append("超過數量或時間上限,**沒有檢查**的受影響 model:"
-                     + "、".join(full(p) for p in check.unchecked) + "。")
+        text = ("超過數量或時間上限,**沒有檢查**的受影響 model:"
+                + "、".join(full(p) for p in check.unchecked) + "。")
+        unsure.append(text)
+        parts.append(text)
     not_looked = [full(m.path) for m in check.models if not m.spec_looked_up]
     if not_looked:
-        raise_to("major")
-        parts.append("超過查詢數量或時間上限,**沒有查規格**的受影響 model:"
-                     + "、".join(not_looked) + "。")
+        text = "超過查詢數量或時間上限,**沒有查規格**的受影響 model:" + "、".join(not_looked) + "。"
+        unsure.append(text)
+        parts.append(text)
     mapped = [f"{full(m.path)} → {m.spec}" for m in check.models if m.spec]
     unavailable = [f"{full(m.path)}({_unavailable_text(m.spec_unavailable)})"
                    for m in check.models if m.spec_unavailable]
     if unavailable:
-        raise_to("major")
-        parts.append("**取不到規格**(驗證環境的問題,不是這個 MR 的問題,不需要補規格;處理後重新觸發審查):"
-                     + "、".join(unavailable) + "。")
+        text = ("**取不到規格**(驗證環境的問題,不是這個 MR 的問題,不需要補規格;處理後重新觸發審查):"
+                + "、".join(unavailable) + "。")
+        unsure.append(text)
+        parts.append(text)
     unmapped = [full(m.path) for m in check.models
                 if m.spec_looked_up and not m.spec and not m.spec_unavailable]
     if mapped:
@@ -514,10 +545,12 @@ def impact_finding(check: AffectedCheck | None, prefix: str = "") -> dict | None
     if impact.unreferenced_macros:
         parts.append("沒有任何 model 呼叫的 macro:"
                      f"{_listed([_code(n) for n in impact.unreferenced_macros])}。")
-    if severity == "info":
+    if severity == "info" and not unsure:
         parts.append("沒有檢查出問題;清單供人工確認影響範圍。")
-    return {"file": "(MR 內容)", "line": 0, "severity": severity, "title": IMPACT_TITLE,
-            "detail": "".join(parts),
-            "suggestion": ("逐一確認上列 model 的展開結果符合預期;必要時以 dbt compile 比對變更前後。"
-                           if severity != "info" else ""),
-            "citations": []}
+    elif severity == "info":
+        parts.append("沒有檢查出確定的問題;做不到的部分另列在「無法驗證」那條。")
+    return ({"file": MR_CONTENT_FILE, "line": 0, "severity": severity, "title": IMPACT_TITLE,
+             "detail": "".join(parts),
+             "suggestion": ("逐一確認上列 model 的展開結果符合預期;必要時以 dbt compile 比對變更前後。"
+                            if severity != "info" else ""),
+             "citations": []}, unsure)

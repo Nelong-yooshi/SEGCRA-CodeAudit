@@ -249,7 +249,8 @@ class _LimitExceeded(Exception):
 @dataclass
 class _Refs:
     names: set = field(default_factory=set)
-    dynamic: bool = False              # 動態呼叫,或字串中疑似樣板卻無法解析
+    dynamic: bool = False              # 動態呼叫(名稱在執行期才決定)
+    failures: set = field(default_factory=set)     # 掃不出來的原因:SCAN_SYNTAX、SCAN_TOO_DEEP、SCAN_ESCAPE
     root_names: set = field(default_factory=set)   # 經 context / builtins 取用的名稱
     probed: set = field(default_factory=set)       # 以執行期名稱取項目或屬性的變數名稱
     aliases: set = field(default_factory=set)      # (別名, 原名稱):{% set a = b %}
@@ -257,6 +258,7 @@ class _Refs:
     def merge(self, other: "_Refs") -> None:
         self.names |= other.names
         self.dynamic |= other.dynamic
+        self.failures |= other.failures
         self.root_names |= other.root_names
         self.probed |= other.probed
         self.aliases |= other.aliases
@@ -415,6 +417,30 @@ def _local_config_line(body, params, macro_line: int = 0):
     return min(lines) if lines else None
 
 
+# 掃描失敗的原因。分開寫:語法錯誤 dbt 一樣解析不了(整個專案失敗,另有 blocker 說明);
+# 巢狀太深是這裡的遞迴上限,dbt 不一定會失敗。寫成同一句「無法解析」,看的人分不出是
+# 該修樣板,還是分析做不到。超過資源上限(節點數、檔案數…)不在這裡:整個反查直接
+# 保守判定,另有說明。
+SCAN_SYNTAX = "有 Jinja 語法錯誤"
+SCAN_TOO_DEEP = "的巢狀太深(超過分析用的遞迴上限,dbt 不一定會失敗)"
+SCAN_ESCAPE = "有可能藏住名稱的 YAML 跳脫字元"
+SCAN_DYNAMIC = "有動態呼叫 macro 的寫法(名稱在執行期才決定)"
+
+
+def scope_reason(refs: "_Refs") -> str:
+    """這個檔案(或字串)為什麼確定不了呼叫了哪些 macro:語法錯誤、巢狀太深、跳脫字元、真的動態,分開寫。"""
+    why = []
+    if SCAN_SYNTAX in refs.failures:
+        why.append("樣板字串" + SCAN_SYNTAX)
+    if SCAN_TOO_DEEP in refs.failures:
+        why.append("樣板字串" + SCAN_TOO_DEEP)
+    if SCAN_ESCAPE in refs.failures:
+        why.append(SCAN_ESCAPE)
+    if refs.dynamic or not why:
+        why.append(SCAN_DYNAMIC)
+    return "、".join(why)
+
+
 class _Scanner:
     def __init__(self):
         # 只用來解析(parse),從不 render;仍用沙箱、不掛 loader
@@ -517,12 +543,15 @@ class _Scanner:
         還原,可能藏住樣板或 macro 名稱,出現時也視為動態。
         """
         refs = _Refs(names=_identifier_tokens(text))
-        refs.dynamic = _has_yaml_hiding_escape(text)
+        if _has_yaml_hiding_escape(text):
+            refs.failures.add(SCAN_ESCAPE)
         if "{{" in text or "{%" in text:
             try:
                 inner = self.scan(text, 1)
-            except (TemplateSyntaxError, RecursionError):
-                refs.dynamic = True
+            except TemplateSyntaxError:
+                refs.failures.add(SCAN_SYNTAX)
+            except RecursionError:
+                refs.failures.add(SCAN_TOO_DEEP)
             else:
                 for part in (inner.top, *inner.macros.values()):
                     refs.merge(part)
@@ -534,21 +563,27 @@ class _Scanner:
         if "{{" not in value and "{%" not in value:
             return
         if depth >= MAX_NESTED_TEMPLATE_DEPTH:
-            refs.dynamic = True
+            refs.failures.add(SCAN_TOO_DEEP)
             return
         try:
             inner = self.scan(value, depth + 1)
-        except (TemplateSyntaxError, RecursionError):
-            refs.dynamic = True
+        except TemplateSyntaxError:
+            refs.failures.add(SCAN_SYNTAX)
+            return
+        except RecursionError:
+            refs.failures.add(SCAN_TOO_DEEP)
             return
         for part in (inner.top, *inner.macros.values()):
             refs.merge(part)
 
-    def try_scan(self, text: str) -> _FileScan | None:
+    def try_scan(self, text: str) -> tuple[_FileScan | None, str | None]:
+        """掃描一份檔案。回傳 (結果, None),失敗時 (None, 原因)。"""
         try:
-            return self.scan(text)
-        except (TemplateSyntaxError, RecursionError):
-            return None
+            return self.scan(text), None
+        except TemplateSyntaxError:
+            return None, SCAN_SYNTAX
+        except RecursionError:
+            return None, SCAN_TOO_DEEP
 
 
 # ------------------------------------------------------------------ macro 的內容指紋
@@ -804,13 +839,18 @@ def analyze_macro_impact(files, changed_paths, *, base_files=None, added_paths=(
 
     任何無法確定的情況都收斂成 needs_human,不丟例外。
     """
+    analysis = None
     try:
-        return _Analysis(files, changed_paths, base_files, added_paths,
-                         model_dirs, macro_dirs, snapshot_dirs, resource_dirs).run()
+        analysis = _Analysis(files, changed_paths, base_files, added_paths,
+                             model_dirs, macro_dirs, snapshot_dirs, resource_dirs)
+        return analysis.run()
     except _LimitExceeded as e:
         return _fail_closed(f"超過資源上限({e}),無法完成分析,保守視為全部 model 可能受影響")
     except RecursionError:
-        return _fail_closed("語法結構過深,無法完成分析,保守視為全部 model 可能受影響")
+        current = getattr(analysis, "current_file", None)
+        where = current if current else "不確定是哪個檔"
+        return _fail_closed(f"macro 反查這一步:{where} {SCAN_TOO_DEEP.lstrip('的')},"
+                            "無法完成分析,保守視為全部 model 可能受影響")
 
 
 class _Analysis:
@@ -835,6 +875,7 @@ class _Analysis:
         self.rejected = 0
         self.affected: dict[str, AffectedModel] = {}
         self.scanner = _Scanner()
+        self.current_file: str | None = None   # 正在掃的檔(外層接到 RecursionError 時寫出來)
 
     # ---------------------------------------------------------------- 主流程
     def run(self) -> ImpactReport:
@@ -879,8 +920,8 @@ class _Analysis:
             if rejected_project_files:
                 self.all_reasons.append(
                     f"有 {rejected_project_files} 個專案檔案路徑或內容不合法而被略過,無法確認其中的呼叫關係")
-            for path in self.unparsable_macro_files:
-                self.all_reasons.append(f"macro 檔 {path} 無法解析,無法確認其中的呼叫關係")
+            for path, why in self.unparsable_macro_files:
+                self.all_reasons.append(f"macro 檔 {path} {why},無法確認其中的呼叫關係")
             for name, paths in sorted(self.macro_files.items()):
                 if len(paths) > 1:
                     self.uncertain.append(f"macro {name} 在多個檔案中重複定義({', '.join(sorted(paths))})")
@@ -989,18 +1030,20 @@ class _Analysis:
         self.macro_refs: dict[str, _Refs] = {}
         self.macro_files: dict[str, set] = {}
         self.model_refs: dict[str, _Refs] = {}
-        self.unparsable_macro_files: list[str] = []
-        self.unparsable_models: list[str] = []
+        # 解析不了的檔:[(路徑, 原因)]
+        self.unparsable_macro_files: list[tuple[str, str]] = []
+        self.unparsable_models: list[tuple[str, str]] = []
         self.snapshot_refs: dict[str, _Refs] = {}
-        self.unparsable_snapshots: list[str] = []
+        self.unparsable_snapshots: list[tuple[str, str]] = []
         for path in sorted(self.project):
             kind = self._kind(path)
             if kind not in ("macro", "model", "snapshot"):
                 continue
-            result = self.scanner.try_scan(self.project[path])
+            self.current_file = path
+            result, why = self.scanner.try_scan(self.project[path])
             if result is None:
                 {"macro": self.unparsable_macro_files, "model": self.unparsable_models,
-                 "snapshot": self.unparsable_snapshots}[kind].append(path)
+                 "snapshot": self.unparsable_snapshots}[kind].append((path, why))
                 continue
             if kind == "snapshot":
                 refs = _Refs()
@@ -1035,9 +1078,10 @@ class _Analysis:
             for label, text in (("變更後", new_text), ("變更前", old_text)):
                 if text is None:
                     continue
-                result = self.scanner.try_scan(text)
+                self.current_file = path
+                result, why = self.scanner.try_scan(text)
                 if result is None:
-                    problems.append(f"macro 檔 {path}({label})無法解析,無法得知變更了哪些 macro")
+                    problems.append(f"macro 檔 {path}({label}){why},無法得知變更了哪些 macro")
                     continue
                 names[label] = set(result.macros)
             if len(names) == 2:
@@ -1099,7 +1143,7 @@ class _Analysis:
 
         def is_dynamic(refs: _Refs) -> bool:
             # context.get(...)、context.items() 等:取用的不是 macro,可能藉此取到任意 macro
-            if refs.dynamic or refs.root_names - callables:
+            if refs.dynamic or refs.failures or refs.root_names - callables:
                 return True
             # 以執行期名稱對 macro(或其別名)取項目 / 屬性:flag[k]、{% set m = flag %}{{ m[k] }}
             probed, grew = set(refs.probed), True
@@ -1117,17 +1161,17 @@ class _Analysis:
             for target in resolve(refs.names) - {name}:
                 callers_of.setdefault(target, set()).add(("macro", name))
             if is_dynamic(refs):
-                dynamic_scopes.append(("macro", name))
+                dynamic_scopes.append(("macro", name, scope_reason(refs)))
         for path, refs in self.model_refs.items():
             for target in resolve(refs.names):
                 callers_of.setdefault(target, set()).add(("model", path))
             if is_dynamic(refs):
-                dynamic_scopes.append(("model", path))
+                dynamic_scopes.append(("model", path, scope_reason(refs)))
         for path, refs in self.snapshot_refs.items():
             for target in resolve(refs.names):
                 callers_of.setdefault(target, set()).add(("snapshot", path))
             if is_dynamic(refs):
-                dynamic_scopes.append(("snapshot", path))
+                dynamic_scopes.append(("snapshot", path, scope_reason(refs)))
         for path in sorted(self.project):
             if not path.endswith(_CONFIG_SUFFIXES):
                 continue
@@ -1137,11 +1181,12 @@ class _Analysis:
                 kind = "yml"
             else:
                 continue
+            self.current_file = path
             refs = self.scanner.scan_yml(self.project[path])
             for target in resolve(refs.names):
                 callers_of.setdefault(target, set()).add((kind, path))
             if is_dynamic(refs):
-                dynamic_scopes.append((kind, path))
+                dynamic_scopes.append((kind, path, scope_reason(refs)))
         return callers_of, dynamic_scopes
 
     def _apply_hits(self, model_hits, yml_hits, certain: bool) -> None:
@@ -1172,8 +1217,8 @@ class _Analysis:
         for path, chain in snapshot_hits:
             self.uncertain.append(
                 f"snapshot {path} 呼叫了變更的 macro({' → '.join(chain)}),反查不檢查 snapshot 的展開結果")
-        for path in self.unparsable_snapshots:
-            self.uncertain.append(f"snapshot {path} 無法解析,無法確認它呼叫了哪些 macro")
+        for path, why in self.unparsable_snapshots:
+            self.uncertain.append(f"snapshot {path} {why},無法確認它呼叫了哪些 macro")
 
         unreferenced = []
         for name in sorted(changed_macros):
@@ -1184,31 +1229,33 @@ class _Analysis:
                 unreferenced.append(name)
 
         # 動態呼叫:這些位置可能呼叫任何 macro,連同呼叫它們的 model 都保守列入
-        for path in self.unparsable_models:
-            self._add_model(path, ("model 無法解析,無法確認它呼叫了哪些 macro",), False)
-            self.uncertain.append(f"model {path} 無法解析,無法確認它呼叫了哪些 macro")
-        dynamic_macros = {who for kind, who in dynamic_scopes if kind == "macro"}
+        for path, why in self.unparsable_models:
+            self._add_model(path, (f"model {why},無法確認它呼叫了哪些 macro",), False)
+            self.uncertain.append(f"model {path} {why},無法確認它呼叫了哪些 macro")
+        dynamic_macros = {who for kind, who, _ in dynamic_scopes if kind == "macro"}
+        macro_why = {who: why for kind, who, why in dynamic_scopes if kind == "macro"}
         dynamic_ymls = []
-        for kind, who in dynamic_scopes:
+        for kind, who, why in dynamic_scopes:
             if kind == "model":
-                self._add_model(who, ("model 內有動態呼叫或無法解析的樣板字串",), False)
+                self._add_model(who, (f"model {who} {why}",), False)
             elif kind == "yml":
-                dynamic_ymls.append((who, ("yml 內有動態呼叫、無法解析的樣板或跳脫字元",)))
+                dynamic_ymls.append((who, (f"{who} {why}",)))
             elif kind == "snapshot":
-                self.uncertain.append(f"snapshot {who} 內有動態呼叫或無法解析的樣板字串,"
-                                      "可能呼叫到變更的 macro")
+                self.uncertain.append(f"snapshot {who} {why},可能呼叫到變更的 macro")
         self._apply_hits((), dynamic_ymls, certain=False)
         if dynamic_macros:
             dynamic_snapshot_hits: list = []
             model_hits, yml_hits, _ = _walk(
                 callers_of, dynamic_macros,
-                lambda n: f"{n} 內有動態呼叫或無法解析的樣板字串,可能呼叫到變更的 macro",
+                lambda n: f"macro {n} {macro_why.get(n, SCAN_DYNAMIC)},可能呼叫到變更的 macro",
                 dynamic_snapshot_hits)
             self._apply_hits(model_hits, yml_hits, certain=False)
             for path, chain in dynamic_snapshot_hits:
-                self.uncertain.append(f"snapshot {path} 呼叫的 macro 有動態呼叫,可能呼叫到變更的 macro")
+                self.uncertain.append(f"snapshot {path} 呼叫的 macro 確定不了呼叫對象,可能呼叫到變更的 macro")
         if dynamic_scopes:
-            self.uncertain.append("專案中有動態呼叫 macro 的寫法,靜態分析無法確定實際呼叫對象")
+            where = "、".join(f"{who}({why})" for _, who, why in dynamic_scopes[:5])
+            more = f" 等 {len(dynamic_scopes)} 處" if len(dynamic_scopes) > 5 else ""
+            self.uncertain.append(f"靜態分析無法確定實際呼叫的 macro:{where}{more}")
         return unreferenced
 
 
