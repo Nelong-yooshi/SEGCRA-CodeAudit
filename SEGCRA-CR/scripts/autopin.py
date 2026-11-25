@@ -23,7 +23,7 @@ PKG_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PKG_ROOT))
 from orchestrator.config import load_config                           # noqa: E402
 from orchestrator.knowledge_governance import (                       # noqa: E402
-    KnowledgeRepo, draft_binding, propose_binding)
+    DraftIncomplete, KnowledgeRepo, draft_binding, propose_binding)
 from toolbox.knowledge_store import Item                              # noqa: E402
 
 KB_LOCAL = PKG_ROOT / "memory" / "knowledge"
@@ -31,7 +31,12 @@ HISTORY = PKG_ROOT / "memory" / "review_history" / "history.jsonl"
 
 
 async def _propose_from_text(cfg, repo, text, author, scope, profile):
-    item = await draft_binding(cfg, text, profile, default_scope=scope)
+    try:
+        item = await draft_binding(cfg, text, profile, default_scope=scope)
+    except DraftIncomplete as e:
+        # 起草失敗(截斷/解析不出),不是「模型判定不是規定」—— 請人重試,別當結論
+        print(f"  ⚠ 「{text[:30]}…」起草未完成({e}),請重試")
+        return None
     if not item:
         print(f"  ✗ 「{text[:30]}…」判定為非常設規範,不起草(避免亂 pin)")
         return None

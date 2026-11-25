@@ -15,16 +15,19 @@ from typing import NamedTuple
 from pathlib import Path
 
 
-from .agent import MAX_ITERATIONS, extract_json, output_truncated, run_agent
+from .agent import (MAX_ITERATIONS, LlmNoTimeLeft, extract_json, llm_deadline, output_completeness,
+                    output_truncated, run_agent)
 from .config import (DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, env_seconds,
                      estimate_tokens)
 from .dbt_affected import (
-    AffectedCheck, SpecForModels, check_affected_models, impact_finding, specs_by_priority,
+    AffectedCheck, SpecForModels, check_affected_models, impact_finding, impact_unverified_finding,
+    specs_by_priority,
 )
 from .change_view import build_full_text_section
 from .cold_read import (UNREAD_NEAR_LIMIT, UNREAD_NO_USAGE, UNREAD_TOO_FEW, ColdRead,
                         cold_read as _cold_read, record as _cold_read_record)
-from .isolation import run_isolated
+from .isolation import run_in_thread, run_isolated
+from .mr_fetch_error import mr_fetch_reason
 from .dbt_impact import DEFAULT_ISOLATED_MEMORY_MB, DEFAULT_ISOLATED_TIMEOUT_S, macros_referenced
 from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_exec import render_for_exec
@@ -38,11 +41,12 @@ from .dbt_asset_names import (ASSET as _ASSET_RULE, CHECK as _CHECK_RULE, GROUP 
 from .dbt_config_change import HIGH_RISK_NEW, config_changes, default_relative, is_dbt_yaml
 from .dbt_project import DbtProjectError, check_project_dir
 from .dbt_hidden_writes import MODELS_CHECKED, UNREACHED_OUTPUT, find_hidden_writes_in_macro
-from .dbt_render import (MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, MACRO_SYNTAX,
+from .dbt_render import (MACRO_KIND_TEXT, MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, MACRO_SYNTAX,
                          check_macro_files_isolated)
 from .security import scan_mr
 from toolbox.gitlab import (WRITE_FAILED, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UNCERTAIN,
                             write_failure)
+from toolbox import gitlab as _gitlab
 from .skills_loader import always_skills, load_skills, skills_index
 from .dbt_context import PROJECT_FILE_REMOVED, PROJECT_YAML_INVALID, check_yaml_files_isolated
 from .dbt_project import YAML_MODELS_NOT_LIST, YAML_SYNTAX
@@ -392,6 +396,23 @@ def _unposted_section(unposted: list[dict]) -> str:
     lines += [f"- {_place(fd)}" for fd in unposted[_UNPOSTED_LISTED:]]
     return (f"\n\n**有 {len(unposted)} 條意見沒有確定貼上**(送出後連線中斷、逾時或 GitLab "
             f"回應錯誤;為了不重複貼,沒有改貼成一般留言):\n" + "\n".join(lines))
+
+
+_PENDING_LISTED = 10
+
+
+def _pending_section(report: dict) -> str:
+    """總結裡把『待驗證』單獨列一段:仲裁沒有結論、某一環節未完成這類帶 stage 的 finding。
+
+    它們不是確定的缺陷、也沒有計入分數(見 apply_rubric),所以不混在缺陷裡列——看的人才
+    不會把一份其實沒問題、只是某一步沒得出結論的 MR 當成有錯。"""
+    pending = [fd for fd in report.get("findings", []) if _is_pending(fd)]
+    if not pending:
+        return ""
+    lines = [f"- {_place(fd)} {fd.get('title', '')}" for fd in pending[:_PENDING_LISTED]]
+    lines += [f"- {_place(fd)}" for fd in pending[_PENDING_LISTED:]]
+    return (f"\n\n**另有 {len(pending)} 項待驗證**(仲裁沒有結論,或某一環節未完成;"
+            f"不是確定的缺陷、未計入分數,需人工確認):\n" + "\n".join(lines))
 
 
 # 回寫的步驟(寫進 report["_writeback"] 的鍵 → 報告與 log 上的名稱)與失敗的種類
@@ -1502,8 +1523,10 @@ async def _run_main_review(cfg: Config, profile, system: str, user: str, hub, tr
         print(f"[pipeline] MR !{mr_id} 整份審查剩下的時間不夠,沒有呼叫主審查模型", flush=True)
         return None
     try:
-        return await asyncio.wait_for(
-            run_agent(cfg, profile, system, user, hub, trace=trace, meta=meta), limit)
+        # 每次請求等多久跟這個上限一致(見 agent.llm_deadline):外層取消時,閘道也不再多等
+        with llm_deadline(limit, MIN_STAGE_SECONDS):
+            return await asyncio.wait_for(
+                run_agent(cfg, profile, system, user, hub, trace=trace, meta=meta), limit)
     except Exception as e:
         meta["failed"] = _model_failure_kind(e)
         print(f"[pipeline] MR !{mr_id} 主審查模型呼叫失敗({meta['failed']})", flush=True)
@@ -1533,7 +1556,8 @@ async def _run_cold_read(cfg: Config, mr: dict, dbt_ctx: DbtContext | None, dead
     if limit is None:
         return None, _incomplete_finding("冷讀", reason=_NO_TIME_REASON)
     try:
-        return await asyncio.wait_for(_cold_read_stage(cfg, mr, dbt_ctx), limit)
+        with llm_deadline(limit, MIN_STAGE_SECONDS):
+            return await asyncio.wait_for(_cold_read_stage(cfg, mr, dbt_ctx), limit)
     except asyncio.TimeoutError:
         return None, _timeout_finding("冷讀", limit, COLD_READ_TIMEOUT_SECONDS)
 
@@ -1938,7 +1962,7 @@ def enforce_spec_change(report: dict, mr: dict) -> dict:
 
 async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                     dry_run: bool = False, baseline: bool = False,
-                    capture: dict | None = None) -> dict:
+                    capture: dict | None = None, commit_status: bool = True) -> dict:
     """capture 給定時,記錄各階段中間產物(預掃前後、檢索到的知識、模型原始輸出、
     agent 工具對話、最終報告),供產生逐字 transcript。
 
@@ -1966,9 +1990,17 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
              "required": ["name"]},
         )
 
-        mr = await hub.call_json("gitlab__get_mr_diff", {"mr_id": mr_id})
-        if not mr:
-            raise RuntimeError(f"無法取得 MR {mr_id}")
+        # 取 MR **不經過 ToolHub**:ToolHub 是給模型用的,工具丟的例外在那裡被轉成一行字串,
+        # 型別、TLS 的驗證代碼、errno、HTTP 狀態碼都沒了,取不到時只能比對字串猜原因。直接
+        # 呼叫拿得到原本的例外,照失敗的階段分類(orchestrator/mr_fetch_error.py)。跟 ToolHub
+        # 一樣丟到背景執行緒跑,外層的時間上限插得進來。
+        # `from None`:例外鏈裡 httpx 的訊息帶完整網址,不跟著進 log;原因已經分類寫在訊息裡。
+        try:
+            mr = json.loads(await run_in_thread(_gitlab.get_mr_diff, mr_id, name="segcra-tool"))
+        except Exception as e:                   # noqa: BLE001 — 每一種都要說出原因
+            raise RuntimeError(f"無法取得 MR {mr_id}:{mr_fetch_reason(e)}") from None
+        if not isinstance(mr, dict) or not mr:
+            raise RuntimeError(f"無法取得 MR {mr_id}:回應不是預期的 MR 資料")
 
         # 把這次審查釘在 MR 的 head commit 上:之後 get_file 不指定 ref 時讀的就是
         # 「正在審的那一版」,而不是目標分支的現況(目標分支讀到的是**改之前**的
@@ -1977,7 +2009,6 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # **釘在這裡而不是 get_mr_diff 裡**:那個函式在模型的工具清單上,模型若被
         # MR 描述引導去呼叫別的 MR,釘住的版本就會被換掉,之後讀到的是別人的檔案。
         # 拿不到 head sha 時釘 None——get_file 會明講取不到,不會退回舊版。
-        from toolbox import gitlab as _gitlab
         _gitlab.pin_review_ref(mr.get("head_sha"))
 
         if baseline:
@@ -1985,12 +2016,20 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             user = BASELINE_USER.format(
                 title=mr["title"], description=mr.get("description", ""),
                 diff_section=build_diff_section(mr["files"], cfg.budget["diff"]))
+            meta: dict = {}
             raw = await run_agent(cfg, profile, BASELINE_SYSTEM, user, hub,
-                                  use_tools=False)
+                                  use_tools=False, meta=meta)
             report = extract_json(raw)
             if not report:
                 raise RuntimeError(f"baseline 輸出無法解析為 JSON:\n{raw[:2000]}")
             report["_mode"] = "baseline"
+            # 對照組也要查完整度:被切的輸出被 json-repair 修回來就當成完整報告,finding 會
+            # 變少,A/B 比較就會高估完整管線。用三態判斷,「被截斷」與「端點沒回報結束原因
+            # (無法確認)」都標成不完整(truncated=True),比較時不把它當成完整的一份;
+            # completeness 另外記是哪一種。
+            completeness = output_completeness(meta, profile.max_output_tokens)
+            report["completeness"] = completeness
+            report["truncated"] = completeness != "complete"
             return report
 
         # dbt 專案的取回也要隔離:它自己有 catch-all,但讀 dbt_project.yml 判斷專案
@@ -2222,10 +2261,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             exec_code, exec_text = _spec_for_exec(spec_code, spec_text, affected_specs, exec_mr)
             exec_mr, dbt_exec = _dbt_exec_mr(exec_mr, exec_text, spec_text, affected_specs,
                                              dbt_ctx, cfg.dbt)
-            spec_result = await asyncio.wait_for(
-                run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text,
-                              progress=progress, deadline=deadline),
-                timeout=spec_limit)
+            # 執行驗證裡有好幾次模型呼叫(測資生成、重試、仲裁),越後面的剩的時間越少:
+            # 每一次各自用那一刻剩下的(見 agent.llm_deadline / request_timeout)
+            with llm_deadline(spec_limit, MIN_STAGE_SECONDS):
+                spec_result = await asyncio.wait_for(
+                    run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text,
+                                  progress=progress, deadline=deadline),
+                    timeout=spec_limit)
         except _SpecExecSkipped as skipped:
             report.setdefault("findings", []).append(
                 _incomplete_finding("執行驗證", reason=str(skipped)))
@@ -2319,14 +2361,17 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         decision = report.get("decision", "needs_human")
         label = f"ai-review::{decision}"
         # commit status 與標籤先設、總結最後貼:這兩步沒寫上時要在總結寫明(看 MR 的人看得到)。
-        # commit status 回寫:CE 的 merge 閘門靠它(Pipelines must succeed)
-        _record_writeback(writeback, mr_id, "commit_status", await hub.call(
-            "gitlab__set_commit_status", {
-                "mr_id": mr_id, "sha": mr.get("sha", ""),
-                "state": "success" if decision == "auto_approved" else "failed",
-                "name": "segcra/review",
-                "description": f"{decision}:{report.get('summary', '')[:180]}",
-            }))
+        # commit status 回寫:不接 CI 時 CE 的 merge 閘門靠它(Pipelines must succeed)。
+        # commit_status=False 是審查做成 CI 的一個 job 時(見 orchestrator/ci_gate.py):job 的結果
+        # 就是閘門,不寫;留言、行內意見、label 照常
+        if commit_status:
+            _record_writeback(writeback, mr_id, "commit_status", await hub.call(
+                "gitlab__set_commit_status", {
+                    "mr_id": mr_id, "sha": mr.get("sha", ""),
+                    "state": "success" if decision == "auto_approved" else "failed",
+                    "name": "segcra/review",
+                    "description": f"{decision}:{report.get('summary', '')[:180]}",
+                }))
         _record_writeback(writeback, mr_id, "label", await hub.call(
             "gitlab__set_label", {"mr_id": mr_id, "label": label}))
         decision_text = {"auto_approved": "✅ 小幅變更且無實質問題,自動放行",
@@ -2335,6 +2380,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         _record_writeback(writeback, mr_id, "summary", await hub.call("gitlab__post_summary", {
             "mr_id": mr_id,
             "body": f"**決策:{decision_text}**\n\n{report.get('summary', '')}"
+                    + _pending_section(report)
                     + _unposted_section(unposted) + _writeback_section(writeback, label),
             "score": int(report.get("score", 0)), "verdict": report.get("verdict", "needs_changes"),
         }))
@@ -2624,7 +2670,8 @@ def enforce_dbt_config_change(report: dict, mr: dict, dbt_ctx: DbtContext | None
 
 
 _DBT_ASSET_NAME_TITLE = "dbt 名稱不符合 Dagster 的命名規則,部署時會載入失敗"
-_DBT_ASSET_NAME_UNKNOWN_TITLE = "無法確認 dbt 名稱是否符合 Dagster 的命名規則"
+_DBT_ASSET_NAME_UNKNOWN_TITLE = "[dbt 名稱檢查] 無法驗證:無法確認 dbt 名稱是否符合 Dagster 的命名規則"
+_DBT_ASSET_NAME_UNKNOWN_STAGE = "dbt 名稱檢查"
 # 一個檔案最多列幾個不符合的名稱(屬性檔可以有很多 source)
 MAX_LISTED_ASSET_NAMES = 20
 _ASSET_RULE_ORDER = (_ASSET_RULE, _GROUP_RULE, _CHECK_RULE)
@@ -2687,6 +2734,7 @@ def enforce_dbt_asset_names(report: dict, mr: dict, dbt_ctx: DbtContext | None =
             unknown = {
                 "file": f["path"], "line": 0, "severity": "major", "citations": [],
                 "title": _DBT_ASSET_NAME_UNKNOWN_TITLE,
+                "stage": _DBT_ASSET_NAME_UNKNOWN_STAGE,
                 "detail": (f"{result.unknown},看不出這個檔案定義的名稱或設定是否符合 Dagster 的命名規則。"
                            "不符合時部署端整個載入失敗,需人工確認。"),
                 "suggestion": "確認名稱與 schema、group、meta.dagster、測試名稱的實際值:"
@@ -2695,7 +2743,8 @@ def enforce_dbt_asset_names(report: dict, mr: dict, dbt_ctx: DbtContext | None =
     return report
 
 
-_RENDER_FAIL_TITLE = "dbt 樣板展開失敗,rule-base 規則掃的是未展開的原文"
+_RENDER_FAIL_TITLE = "[dbt 展開] 無法驗證:dbt 樣板展開失敗,rule-base 規則掃的是未展開的原文"
+_RENDER_FAIL_STAGE = "dbt 展開"
 
 
 def _in_dirs(rel: str, dirs) -> bool:
@@ -2733,6 +2782,7 @@ def _render_fail_finding(entry: dict) -> dict:
                        "規則沒有命中不代表展開後沒有問題。")
     return {"file": entry["path"], "line": 0, "severity": "major",
             "title": _RENDER_FAIL_TITLE,
+            "stage": _RENDER_FAIL_STAGE,
             "detail": (f"展開失敗原因:{entry['dbt_render_error']}。{parse_note}"
                        "樣板標記即使寫在 SQL 註解、字串或引號識別字裡,dbt 執行時一樣會展開,"
                        "輸出可以跳出註解或字串、變成任何 SQL,所以這個檔案的確定性檢查不完整,"
@@ -2763,7 +2813,8 @@ def enforce_dbt_render_failure(report: dict, pre: list[dict]) -> dict:
     return report
 
 
-_HIDDEN_WRITE_TITLE = "dbt 樣板有寫入語句沒有經過規則檢查"
+_HIDDEN_WRITE_TITLE = "[dbt 展開] 無法驗證:dbt 樣板有寫入語句沒有經過規則檢查"
+_HIDDEN_WRITE_STAGE = "dbt 展開"
 _HIDDEN_WRITE_LIST_MAX = 10
 
 
@@ -2810,6 +2861,7 @@ def _hidden_write_finding(entry: dict) -> dict | None:
         return None
     return {"file": entry["path"], "line": min(lines) if lines else 0, "severity": "major",
             "title": _HIDDEN_WRITE_TITLE,
+            "stage": _HIDDEN_WRITE_STAGE,
             "detail": "".join(parts) + "規則層只檢查展開後的 SQL,這些寫入語句沒有經過規則檢查,"
                       "不得自動放行。",
             "suggestion": "人工確認這些寫入語句在什麼情況下會執行;以 dbt compile 取得實際會執行的 SQL"
@@ -2817,7 +2869,8 @@ def _hidden_write_finding(entry: dict) -> dict | None:
             "citations": []}
 
 
-_UNREACHED_BRANCH_TITLE = "dbt 樣板有沒有展開到的分支,裡面的輸出沒有經過規則檢查"
+_UNREACHED_BRANCH_TITLE = "[dbt 展開] 無法驗證:dbt 樣板有沒有展開到的分支,裡面的輸出沒有經過規則檢查"
+_UNREACHED_BRANCH_STAGE = "dbt 展開"
 
 
 def _unreached_branch_finding(entry: dict) -> dict | None:
@@ -2845,6 +2898,7 @@ def _unreached_branch_finding(entry: dict) -> dict | None:
         when = "在這次審查的展開結果裡沒有產生過(一般模式、增量模式都沒有)"
     return {"file": entry["path"], "line": min(lines), "severity": "major",
             "title": _UNREACHED_BRANCH_TITLE,
+            "stage": _UNREACHED_BRANCH_STAGE,
             "detail": f"這些分支裡的輸出{when},可能只有真正執行時才會進:{where}。"
                       "分支裡的內容可以用樣板組出寫入語句(例如把關鍵字拆成兩個字串接起來),"
                       "規則層只檢查展開後的 SQL,這些內容沒有經過規則檢查,無法確認,不得自動放行。",
@@ -2874,19 +2928,25 @@ def enforce_dbt_impact(report: dict, affected: AffectedCheck | None,
     確定性補報,不看模型有沒有自己提到:只改 macro 的 MR,diff 裡看不到任何一個受影響的
     model。標題只能由程式產生(_put_program_finding)。排在 enforce_hints / enforce_style
     之後,理由同 enforce_dbt_notice。"""
-    impact = impact_finding(affected, dbt_ctx.prefix if dbt_ctx is not None else "")
+    prefix = dbt_ctx.prefix if dbt_ctx is not None else ""
+    impact = impact_finding(affected, prefix)
     if impact is not None:
         _put_program_finding(report, impact)
+    unverified = impact_unverified_finding(affected, prefix)
+    if unverified is not None:
+        _put_program_finding(report, unverified)
     return report
 
 
 _MACRO_SYNTAX_TITLE = "macro 檔有 Jinja 語法錯誤,dbt 整個專案會編譯失敗"
-_MACRO_UNCERTAIN_TITLE = "展開器載入不了這個 macro 檔,無法確認 dbt 能不能編譯"
+_MACRO_UNCERTAIN_TITLE = "[dbt macro 檢查] 無法驗證:展開器載入不了這個 macro 檔,無法確認 dbt 能不能編譯"
+_MACRO_UNCERTAIN_STAGE = "dbt macro 檢查"
 _MACRO_CHECK_FAILED = "check_failed"      # 檢查本身沒做完(逾時、資源上限、設定不符)
+# 分類的說明引用 dbt_render.MACRO_KIND_TEXT(只有一份);檢查本身沒做完是這裡才有的情況
 _MACRO_UNCERTAIN_REASONS = {
-    MACRO_UNSUPPORTED: "用到不認得的濾器,或重複定義了同名的 block(dbt 解析得過,呼叫到這個 macro 時才會失敗)",
-    MACRO_TOO_DEEP: "巢狀太深,展開器解析不完",
-    MACRO_LOAD_FAILED: "解析得過,但載入時失敗(檔案開頭用到展開器沒有提供的東西,或讀不到內容)",
+    MACRO_UNSUPPORTED: MACRO_KIND_TEXT[MACRO_UNSUPPORTED],
+    MACRO_TOO_DEEP: MACRO_KIND_TEXT[MACRO_TOO_DEEP],
+    MACRO_LOAD_FAILED: MACRO_KIND_TEXT[MACRO_LOAD_FAILED],
     _MACRO_CHECK_FAILED: "檢查沒有做完(逾時、超過資源上限,或 dbt 的設定與預期不符)",
 }
 
@@ -2938,13 +2998,14 @@ def _macro_problem_finding(issue) -> dict | None:
     if kind == MACRO_SYNTAX:
         return {"file": issue["path"], "line": line, "severity": "blocker",
                 "title": _MACRO_SYNTAX_TITLE,
-                "detail": (f"{where}有 Jinja 語法錯誤(區塊沒有閉合、運算式寫錯等)。dbt 解析專案時"
+                "detail": (f"{where}{MACRO_KIND_TEXT[MACRO_SYNTAX]}。dbt 解析專案時"
                            "會失敗,部署端也會整個載入失敗,影響的不只用到這個 macro 的 model。"),
                 "suggestion": "修正語法後,用 dbt parse 確認整個專案解析得過。",
                 "citations": []}
     if kind in _MACRO_UNCERTAIN_REASONS:
         return {"file": issue["path"], "line": line, "severity": "major",
                 "title": _MACRO_UNCERTAIN_TITLE,
+                "stage": _MACRO_UNCERTAIN_STAGE,
                 "detail": (f"{where}:{_MACRO_UNCERTAIN_REASONS[kind]}。用到這個檔裡 macro 的 model "
                            "都檢查不到,也無法確認 dbt 能不能編譯,不得自動放行。"),
                 "suggestion": "用 dbt parse 確認整個專案解析得過,再人工確認用到這些 macro 的 model。",
@@ -2965,7 +3026,8 @@ def enforce_dbt_macro_problems(report: dict, issues) -> dict:
 
 
 _PROJECT_BROKEN_TITLE = "dbt 設定檔有 dbt 解析不了的寫法,dbt 整個專案會解析失敗"
-_YAML_UNCHECKED_TITLE = "無法確認 dbt 屬性檔 dbt 解析得過"
+_YAML_UNCHECKED_TITLE = "[dbt 屬性檔檢查] 無法驗證:無法確認 dbt 屬性檔 dbt 解析得過"
+_YAML_UNCHECKED_STAGE = "dbt 屬性檔檢查"
 _YAML_CHECK_FAILED = "check_failed"       # 檢查本身沒做完(逾時、資源上限)
 _YAML_PROBLEM_TEXT = {
     PROJECT_YAML_INVALID: "dbt_project.yml 不是合法的 YAML",
@@ -3030,6 +3092,7 @@ def _dbt_yaml_finding(issue) -> dict | None:
     if kind == _YAML_CHECK_FAILED:
         return {"file": issue["path"], "line": 0, "severity": "major",
                 "title": _YAML_UNCHECKED_TITLE,
+                "stage": _YAML_UNCHECKED_STAGE,
                 "detail": (f"{where}:檢查沒有做完(逾時或超過資源上限)。屬性檔有 YAML 語法錯誤時,"
                            "dbt 整個專案解析失敗,不得自動放行。"),
                 "suggestion": "用 dbt parse 確認整個專案解析得過。",
@@ -4204,6 +4267,7 @@ def enforce_unreviewable(report: dict, mr: dict) -> dict:
 
 _TRUNCATED_TITLE = "審查模型的輸出被截斷,審查結果可能不完整"
 _TRUNCATED_SUMMARY = "審查模型的輸出被截斷、無法解析;以下只有程式確定性檢查的結果。"
+_UNKNOWN_FINISH_TITLE = "審查模型沒有回報結束原因,無法確認輸出完整"
 _EXHAUSTED_TITLE = "審查模型用完工具呼叫回合,沒有產出審查結果"
 _EXHAUSTED_SUMMARY = "審查模型用完工具呼叫回合、沒有產出審查結果;以下只有程式確定性檢查的結果。"
 _FAILED_TITLE = "審查模型沒有完成,這次只有程式確定性檢查的結果"
@@ -4226,6 +4290,8 @@ def _model_failure_kind(error: BaseException) -> str:
     """模型呼叫失敗的問題類型(_MODEL_FAILURE_TEXT 的鍵)。由細到粗判斷:逾時是連線錯誤的子類別,
     請求過多是狀態錯誤的子類別。"""
     import openai
+    if isinstance(error, LlmNoTimeLeft):
+        return _NO_TIME_KIND           # 這一環節剩的時間不夠,請求沒有送出(見 agent.llm_deadline)
     if isinstance(error, (openai.APITimeoutError, asyncio.TimeoutError, TimeoutError)):
         return "timeout"
     if isinstance(error, openai.APIConnectionError):
@@ -4284,6 +4350,9 @@ def _output_meta_record(meta: dict, max_output_tokens: int) -> dict:
         "max_output_tokens": max_output_tokens,
         # 模型呼叫失敗時沒有最終輸出:meta 裡的用量是前幾輪的,不算截斷
         "truncated": _failure_kind(meta) is None and output_truncated(meta, max_output_tokens),
+        # 完整度三態(complete / truncated / unknown);呼叫失敗時沒有最終輸出,記 None
+        "completeness": (None if _failure_kind(meta) is not None
+                         else output_completeness(meta, max_output_tokens)),
         "exhausted": bool(meta.get("exhausted")),
         # 模型呼叫失敗時的問題類型(見 _MODEL_FAILURE_TEXT);沒有失敗是 None
         "failed": _failure_kind(meta),
@@ -4315,7 +4384,9 @@ def _parse_model_output(raw: str | None, meta: dict, max_output_tokens: int) -> 
     if meta.get("exhausted"):
         return {"summary": _EXHAUSTED_SUMMARY, "findings": []}
     report = extract_json(raw)
-    if not report and output_truncated(meta, max_output_tokens):
+    # 沒解析出報告,而且輸出不是「完整」(被截斷,或端點沒回報結束原因無法確認)→
+    # 用空報告走完後處理,原因由 enforce_truncation 補一條 major。
+    if not report and output_completeness(meta, max_output_tokens) != "complete":
         return {"summary": _TRUNCATED_SUMMARY, "findings": []}
     return report
 
@@ -4346,7 +4417,11 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
                       + ("" if failed == _NO_TIME_KIND else "這是審查環境的問題,不是這個 MR 的問題。"),
             "suggestion": ("請人工審查這個 MR;MR 很大時可以拆小後重新觸發審查。" if failed == _NO_TIME_KIND
                            else "請通知維運確認審查模型的端點狀態,恢復後重新觸發審查。"),
-            "citations": []}
+            "citations": [],
+            # 審查模型沒有產出結果(時間到了、連不上、端點錯誤、拒絕請求……):這一環節沒跑完,跟外層整段
+            # 逾時同一種。review_incomplete 靠 stage 認;CI 那條路是「沒有結論」(結束碼 5、retry 就是重審),
+            # 不是「審完了交給人」——交給人(3)可以合併,等於沒經過審查也能合
+            "stage": "主審查"}
         _put_program_finding(report, model_failed)
         # 沒有最終輸出:meta 裡的結束原因與用量是前幾輪的,不能拿來判斷截斷或用完回合
         return report
@@ -4359,24 +4434,52 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
                           "或模型的輸出上限是否被思考用完。",
             "citations": []}
         _put_program_finding(report, exhausted)
-    if not output_truncated(meta, max_output_tokens):
+    completeness = output_completeness(meta, max_output_tokens)
+    if completeness == "complete":
         return report
-    _put_program_finding(report, {
-        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _TRUNCATED_TITLE,
-        "detail": f"審查模型的輸出達到長度上限({max_output_tokens} tokens)而被切斷,"
-                  "切斷之後的內容沒有產出。已解析出來的 finding 予以保留,但可能有缺漏,"
-                  "這次的審查結果需人工確認。",
-        "suggestion": "重新觸發審查;若持續發生,請拆分 MR,或調高審查模型的輸出上限。",
-        "citations": []})
+    if completeness == "truncated":
+        _put_program_finding(report, {
+            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _TRUNCATED_TITLE,
+            "detail": f"審查模型的輸出達到長度上限({max_output_tokens} tokens)而被切斷,"
+                      "切斷之後的內容沒有產出。已解析出來的 finding 予以保留,但可能有缺漏,"
+                      "這次的審查結果需人工確認。",
+            "suggestion": "重新觸發審查;若持續發生,請拆分 MR,或調高審查模型的輸出上限。",
+            "citations": []})
+    else:   # unknown:端點沒回報結束原因 → 無法確認完整,比照截斷不採信(不安靜放行)
+        _put_program_finding(report, {
+            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _UNKNOWN_FINISH_TITLE,
+            "detail": "審查模型的端點沒有回報結束原因(finish_reason),也沒有回報用量,"
+                      "無法確認這次輸出是否完整。沒有依據說它完整,就不當它完整——已解析出來的"
+                      "finding 予以保留,但可能有缺漏,這次的審查結果需人工確認。",
+            "suggestion": "請通知維運確認審查模型端點是否正常回報 finish_reason 與 usage;"
+                          "若持續發生,這一條會在每份審查出現。",
+            "citations": []})
     return report
+
+
+def _is_pending(fd: dict) -> bool:
+    """「待驗證」的 finding:帶 stage 欄位的那種(環節沒跑完、仲裁沒有結論)。
+
+    待驗證不是成功、也不是**確定**的缺陷——只是某一步沒得出結論,需人工確認。
+    判斷靠 stage 欄位(跟 review_incomplete 同一個依據),不比對標題。"""
+    return isinstance(fd, dict) and bool(fd.get("stage"))
 
 
 @_isolated_stage("評分")
 def apply_rubric(report: dict) -> dict:
     """評分與 verdict 由管線按 rubric 從 severity 確定性計算——
-    實測同一 MR 模型自評分數逐輪漂移(50 vs 10),裁決權不交給模型。"""
+    實測同一 MR 模型自評分數逐輪漂移(50 vs 10),裁決權不交給模型。
+
+    **待驗證(帶 stage 的 finding)不計分**:它不是確定的缺陷,拿它扣分會讓一份 SQL
+    其實沒問題、只是某一步沒跑完的 MR 被打成低分、讓作者以為自己錯了。分數只算確定的
+    結果;有待驗證時 verdict 不給 approve(改記「未完成」),決策另由 review_incomplete
+    的硬條件擋住自動放行(不靠分數)。"""
     counts = {"blocker": 0, "major": 0, "minor": 0, "info": 0}
+    pending = 0
     for fd in report.get("findings", []):
+        if _is_pending(fd):
+            pending += 1
+            continue                      # 待驗證不計分(不加也不扣)
         sev = fd.get("severity", "info")
         counts[sev] = counts.get(sev, 0) + 1
     score = max(0, 100 - 40 * counts["blocker"] - 15 * counts["major"]
@@ -4385,15 +4488,40 @@ def apply_rubric(report: dict) -> dict:
         score = min(score, 59)
     verdict = ("approve" if score >= 80 and not counts["blocker"] and not counts["major"]
                else "reject" if score < 20 else "needs_changes")
+    if pending and verdict == "approve":
+        verdict = "incomplete"            # 有待驗證 → 不是成功,但也沒有確定缺陷
     report["_model_score"] = report.get("score")
-    report["score"], report["verdict"] = score, verdict
+    report["score"], report["verdict"], report["_pending"] = score, verdict, pending
     return report
+
+
+# 建議的第一行像程式(SQL 關鍵字、dbt 標記、註解、`欄位 運算子`)才放進程式碼區塊
+_CODE_START = re.compile(
+    r"\s*(?:(?:SELECT|WITH|INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|DECLARE|SET|EXEC|IF|BEGIN"
+    r"|AND|OR|WHERE|FROM|JOIN|LEFT|RIGHT|INNER|FULL|CROSS|ON|GROUP|ORDER|HAVING|CASE|WHEN|UNION"
+    r"|SUM|COUNT|CAST|CONVERT|COALESCE|ISNULL)\b|--|/\*|\{\{|\{%"
+    r"|(?:\[[^\]\n]+\]|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:\[[^\]\n]+\]|[A-Za-z_][A-Za-z0-9_]*))*"
+    r"\s*(?:[=<>!]|\bIN\b|\bIS\b|\bBETWEEN\b|\bLIKE\b))", re.I)
+_FENCE_LINE = re.compile(r"^[ \t]*(?:```|~~~)", re.M)
+
+
+def _suggestion_markdown(text: str) -> str:
+    """建議欄位怎麼排版:看起來是程式才放進程式碼區塊(圍欄比內容裡最長的反引號多一個),
+    說明文字照一般段落;內容自己已經帶了程式碼區塊的照原樣(不在區塊外再包一層)。"""
+    if _FENCE_LINE.search(text):
+        return text
+    first = next((line for line in text.splitlines() if line.strip()), "")
+    if not _CODE_START.match(first):
+        return text
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}sql\n{text}\n{fence}"
 
 
 def _format_comment(fd: dict) -> str:
     body = f"**{fd.get('title', '')}**\n\n{fd.get('detail', '')}"
     if fd.get("suggestion"):
-        body += f"\n\n建議修改:\n```sql\n{fd['suggestion']}\n```"
+        body += f"\n\n建議修改:\n{_suggestion_markdown(str(fd['suggestion']))}"
     for c in fd.get("citations", []):
         body += f"\n> 依據:{c.get('source', '')} {c.get('article', '')}"
     return body
