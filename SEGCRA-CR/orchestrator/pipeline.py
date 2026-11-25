@@ -926,7 +926,7 @@ def _mr_for_spec_exec(mr: dict, dbt_ctx: DbtContext | None) -> dict:
     run_spec_exec 以「檔案內容有沒有樣板標記」決定要不要送沙盒。真實 GitLab 模式拿到的只有
     diff 新增的行:只改了 macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL
     拿去生測資、執行——執行的是不完整的片段,結果沒有意義,萬一通過還會被當成驗證過。
-    帶上完整內容後,既有的判斷就會如實回報「dbt 樣板尚未支援執行驗證」。原本的 MR 不動。
+    帶上完整內容後,既有的判斷就會如實回報「dbt model 沒有展開」(待驗證)。交進來的 MR 不動。
 
     規格檔不是待測的 SQL:run_spec_exec 取最後一個檔案的內容去執行,MR 同時改了規格與
     程式時,規格檔若排在後面會被當成 SQL。有程式檔時把規格檔拿掉;只有規格檔時不動
@@ -952,8 +952,9 @@ def _dbt_exec_mr(exec_mr: dict, exec_text, spec_text, affected_specs: tuple[Spec
     model(.sql、在 model 目錄、內容是樣板),而且有規格時才展開;規格是從受影響 model 借來的
     (MR 自己沒有規格)時,還要是這個 model 對到的那份。
     回傳 (交給執行驗證的 MR, 紀錄)。紀錄是 None 表示不適用(照舊交給執行驗證);
-    {"file", "ok", "reason"}:ok 時那個檔案的內容換成展開後的 SQL,不 ok 時 MR 不動
-    (執行驗證照舊回「尚未支援」),reason 是原因。"""
+    {"file", "ok", "reason", "stand_ins"}:ok 時那個檔案的內容換成展開後的 SQL,stand_ins 是由規格
+    的測資表代替的上游 model(ref() 的對象);不 ok 時 MR 不動(執行驗證照舊回「尚未支援」),reason
+    是原因。"""
     if not dbt_cfg or dbt_cfg.get("enabled") is not True:
         return exec_mr, None
     if dbt_ctx is None or dbt_ctx.project is None or dbt_ctx.error is not None:
@@ -976,20 +977,21 @@ def _dbt_exec_mr(exec_mr: dict, exec_text, spec_text, affected_specs: tuple[Spec
         return exec_mr, None
     if not exec_text:
         return exec_mr, None                 # 沒有規格:執行驗證自己會說
-    record = {"file": path, "ok": False, "reason": None}
+    record = {"file": path, "ok": False, "reason": None, "stand_ins": []}
     if not spec_text and not (affected_specs and rel in affected_specs[0].models):
         record["reason"] = "MR 沒有自己的規格,借用的受影響 model 規格不是這個 model 的"
         return exec_mr, record
     if DBT_DATABASE_PLACEHOLDER != dbt_cfg.get("database"):
         record["reason"] = _DBT_DATABASE_MISMATCH
         return exec_mr, record
-    sql, reason = render_for_exec(path, source, exec_text, dbt_cfg["database"],
-                                  _render_project(dbt_ctx))
+    sql, reason, stand_ins = render_for_exec(path, source, exec_text, dbt_cfg["database"],
+                                             _render_project(dbt_ctx))
     if sql is None:
         record["reason"] = reason
         return exec_mr, record
     files[i] = {**f, "full_content": sql}
     record["ok"] = True
+    record["stand_ins"] = list(stand_ins)
     return {**exec_mr, "files": files}, record
 
 
@@ -1508,7 +1510,7 @@ def _spec_for_exec(spec_code, spec_text, affected_specs: tuple[SpecForModels, ..
                    exec_mr: dict) -> tuple:
     """交給執行驗證的規格。MR 自己的(或受影響的 model 全部對到的同一份)照舊;對到多份時,
     沒有一份能代表整個 MR,只在交給執行驗證的檔案**全部是 dbt 樣板**時傳第一優先的那份:
-    樣板不會被執行,執行驗證會照實回報「dbt 樣板尚未支援執行驗證」,而不是說成「無規格可驗」。
+    樣板不會被執行,執行驗證會照實回報「dbt model 沒有展開」(待驗證),而不是說成「無規格可驗」。
     其他情況照舊不傳,避免拿某個 model 的規格去驗不相干的 SQL。"""
     if spec_text or not affected_specs:
         return spec_code, spec_text
@@ -2301,7 +2303,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             with llm_deadline(spec_limit, MIN_STAGE_SECONDS):
                 spec_result = await asyncio.wait_for(
                     run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text,
-                                  progress=progress, deadline=deadline),
+                                  progress=progress, deadline=deadline,
+                                  stand_ins=_executed_stand_ins(dbt_exec)),
                     timeout=spec_limit)
         except _SpecExecSkipped as skipped:
             report.setdefault("findings", []).append(
@@ -3175,6 +3178,7 @@ def enforce_dbt_project_broken(report: dict, issues) -> dict:
 
 
 _DBT_UNEXECUTED_TITLE = "dbt 的變更沒有經過執行驗證"
+_DBT_OTHER_MODELS_TITLE = "[執行驗證] 改到的其他 model 沒有執行"
 
 
 def _mr_touches_dbt(mr: dict, dbt_ctx: DbtContext | None, dbt_cfg: dict | None) -> bool:
@@ -3204,7 +3208,31 @@ def enforce_dbt_unexecuted(report: dict, mr: dict, dbt_ctx: DbtContext | None,
     一樣適用:樣板檔與純 SQL 檔混在同一個 MR 時,通過的是純 SQL 檔。
 
     executed_dbt 是展開後真的送進沙盒、而且就是執行驗證跑的那個 model(見 _dbt_exec_mr)。
-    它是這個 MR 唯一改到 dbt 的檔案時,通過的就是這個 model 本身,不補(_only_dbt_file)。"""
+    它是這個 MR 唯一改到 dbt 的檔案時,通過的就是這個 model 本身,不補(_only_dbt_file)。
+
+    例外的例外:執行的是展開後的 model 時,MR 改到的**其他 model**(model 目錄裡的 .sql,不管有沒有
+    樣板標記)一律算沒有執行:執行驗證只跑一個 model,上游由規格的測資代替(report["_dbt_exec"] 的
+    stand_ins),其他 model 根本沒跑。純 SQL 寫成的 model 也一樣(_only_dbt_file 不會把它算成 dbt 的
+    檔案)。內文分開寫「由測資代替的上游」與「其他 model」。
+
+    補的都是**待驗證**(帶 stage):沒跑到不是確定的缺陷,不說成要修改。"""
+    upstream, others = _other_changed_models(mr, dbt_ctx, report.get("_dbt_exec"), executed_dbt)
+    if (upstream or others) and (report.get("_spec_exec") or {}).get("passed") is True:
+        parts = []
+        if upstream:
+            parts.append(f"由規格的測資代替的上游 model:{'、'.join(upstream[:10])}(執行時用測資當它們的"
+                         f"輸出,改動本身沒有執行)")
+        if others:
+            parts.append(f"其他 model:{'、'.join(others[:10])}(執行驗證只跑一個 model,它們沒有執行)")
+        finding = {
+            "file": MR_CONTENT_FILE, "line": 0, "title": _DBT_OTHER_MODELS_TITLE, "severity": "major",
+            "stage": "執行驗證",
+            "detail": f"這個 MR 也改了{';'.join(parts)}。這些改動沒有經過執行驗證,記成待驗證,"
+                      f"不得自動放行。",
+            "suggestion": "那些 model 另外依它自己的規格驗證,或以 dbt compile 取得展開後的 SQL 人工核對。",
+            "citations": []}
+        _put_program_finding(report, finding)
+        return report
     if not _mr_touches_dbt(mr, dbt_ctx, dbt_cfg):
         return report
     if executed_dbt is not None and _only_dbt_file(mr, dbt_ctx, executed_dbt):
@@ -3213,11 +3241,19 @@ def enforce_dbt_unexecuted(report: dict, mr: dict, dbt_ctx: DbtContext | None,
         return report            # 執行驗證自己已經說了沒通過 / 沒執行,不重複
     _put_program_finding(report, {
         "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _DBT_UNEXECUTED_TITLE,
+        "stage": "執行驗證",
         "detail": "這個 MR 改到 dbt 的樣板、macro 或設定,但執行驗證通過的是 MR 裡的其他內容;"
                   "dbt 樣板目前不會送進沙盒執行,這些變更沒有經過執行驗證,不得自動放行。",
         "suggestion": "以 dbt compile 取得展開後的 SQL,人工依核定規格核對。",
         "citations": []})
     return report
+
+
+def _executed_stand_ins(dbt_exec) -> tuple:
+    """展開後送進沙盒的 dbt model,ref() 指向的上游由測資代替的那些名稱;沒有展開就是空的。"""
+    if not isinstance(dbt_exec, dict) or not dbt_exec.get("ok"):
+        return ()
+    return tuple(n for n in dbt_exec.get("stand_ins") or [] if isinstance(n, str))
 
 
 def _only_dbt_file(mr: dict, dbt_ctx: DbtContext | None, path: str) -> bool:
@@ -3236,19 +3272,68 @@ def _only_dbt_file(mr: dict, dbt_ctx: DbtContext | None, path: str) -> bool:
     return True
 
 
+def _other_changed_models(mr: dict, dbt_ctx: DbtContext | None, dbt_exec,
+                          executed_dbt) -> tuple[list[str], list[str]]:
+    """執行的是展開後的 model 時,這個 MR 改到的其他 model(model 目錄裡的 .sql,不管有沒有樣板):
+    (由測資代替的上游, 其他)。model 名稱 = 檔名去掉 .sql。只看真的展開送進沙盒、而且就是執行驗證
+    跑的那次(executed_dbt)。"""
+    if executed_dbt is None or not isinstance(dbt_exec, dict) or dbt_exec.get("file") != executed_dbt:
+        return [], []
+    if dbt_ctx is None or dbt_ctx.project is None:
+        return [], []
+    stand_ins = {n for n in dbt_exec.get("stand_ins") or [] if isinstance(n, str)}
+    project = dbt_ctx.project
+    upstream, others = [], []
+    for f in mr.get("files", []):
+        path = f.get("path") if isinstance(f, dict) else None
+        if not isinstance(path, str) or path == executed_dbt:
+            continue
+        rel = dbt_ctx.relative(path)
+        if rel is None or not rel.endswith(".sql"):
+            continue
+        if path_kind(rel, project.model_paths, project.macro_paths, project.resource_paths) != "model":
+            continue
+        name = rel.rsplit("/", 1)[-1][:-len(".sql")]
+        group = upstream if name in stand_ins else others
+        if name not in group:
+            group.append(name)
+    return upstream, others
+
+
 _DBT_EXEC_NOTE_TITLE = "dbt model 沒有送進沙盒執行"
+_DBT_EXEC_STAND_IN_TITLE = "執行驗證時上游 model 由測資代替"
 
 
 @_isolated_stage("dbt 執行驗證說明")
 def enforce_dbt_exec_note(report: dict, dbt_exec: dict | None) -> dict:
     """執行驗證要跑的 dbt model 沒能展開成沙盒用的 SQL 時,補一條 info 寫出原因。
-    決策不受影響(執行驗證自己已經回了「尚未支援」的 major),只讓審查者知道差在哪裡。"""
-    if not dbt_exec or dbt_exec.get("ok") or not dbt_exec.get("reason"):
+    決策不受影響(執行驗證自己已經回了「尚未支援」的 major),只讓審查者知道差在哪裡。
+
+    展開了、但有上游 model 由規格的測資表代替時,也補一條 info:執行驗證通過的是這個 model
+    本身,上游 model 的邏輯沒有在這次執行。model 名稱過了識別字白名單,不是 MR 的任意內容。"""
+    if not dbt_exec:
+        return report
+    if dbt_exec.get("ok"):
+        stand_ins = [n for n in dbt_exec.get("stand_ins") or [] if isinstance(n, str)]
+        if stand_ins:
+            note = {
+                "file": dbt_exec["file"] or MR_CONTENT_FILE, "line": 0, "severity": "info",
+                "title": _DBT_EXEC_STAND_IN_TITLE,
+                "detail": f"執行驗證時,ref() 指向的上游 model 由規格「資料表定義」裡同名的測資表代替:"
+                          f"{'、'.join(stand_ins[:10])}"
+                          f"{f'(共 {len(stand_ins)} 個)' if len(stand_ins) > 10 else ''}。"
+                          f"這些上游 model 自己的邏輯沒有在這次執行。",
+                "suggestion": "上游 model 有改動時,要另外驗證它本身。",
+                "citations": [], "_source": PROGRAM_SOURCE}
+            _put_program_finding(report, note)
+        return report
+    if not dbt_exec.get("reason"):
         return report
     _put_program_finding(report, {
         "file": dbt_exec["file"] or MR_CONTENT_FILE, "line": 0, "severity": "info",
         "title": _DBT_EXEC_NOTE_TITLE,
-        "detail": f"執行驗證只支援只引用 source() 的 model;這個 model 沒有展開:{dbt_exec['reason']}。",
+        "detail": f"執行驗證支援引用 source() 與 ref()(上游 model 由規格裡同名的測資表代替)的 model;"
+                  f"這個 model 沒有展開:{dbt_exec['reason']}。",
         "suggestion": "以 dbt compile 取得展開後的 SQL,人工依核定規格核對。",
         "citations": [], "_source": PROGRAM_SOURCE})
     return report

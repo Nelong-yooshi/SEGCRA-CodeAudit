@@ -1412,7 +1412,7 @@ def test_只改共用設定_受影響的_model_對到兩份規格_兩份都附�
     assert "未找到對應規格檔" not in spec_part
     # 執行驗證:改到的只有樣板(macro),照實回報樣板尚未支援,不是「無規格可驗」
     titles = [f["title"] for f in report["findings"]]
-    assert "執行驗證無法進行:dbt 樣板尚未支援執行驗證" in titles
+    assert "[執行驗證] dbt model 沒有展開" in titles
     assert "無規格可驗,無法執行驗證" not in titles
     assert report["_spec_exec"]["spec_code"] == "R-201"
     assert report["decision"] != "auto_approved"
