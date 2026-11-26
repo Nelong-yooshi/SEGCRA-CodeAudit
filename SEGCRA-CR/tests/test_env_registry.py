@@ -51,6 +51,7 @@ _KNOWN_DYNAMIC = {
     # helper 本體:名稱是參數,實際的名稱在呼叫端(那些是字串常值,照樣掃得到)
     ("orchestrator/config.py", "os.environ[name]"),
     ("orchestrator/config.py", "os.environ.get(name)"),
+    ("toolbox/gitlab.py", "os.environ.get(name)"),           # _env_text 的本體
     # 把 config/sandbox.env 的內容塞進環境:鍵來自那個檔案,不是程式寫死的
     ("orchestrator/spec_exec.py", "os.environ.setdefault(k.strip(), v.strip())"),
 }
