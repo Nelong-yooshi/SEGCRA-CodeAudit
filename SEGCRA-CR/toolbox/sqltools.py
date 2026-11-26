@@ -15,6 +15,7 @@ from sqlglot.errors import SqlglotError
 
 from orchestrator.config import env_seconds
 from orchestrator.isolation import run_isolated
+from toolbox import sql_primitives
 
 logging.disable(logging.INFO)  # sqlfluff 的 INFO 輸出會灌爆 stderr
 
@@ -697,6 +698,8 @@ _MASKED_KEY_RE = re.compile(
 # 只需 \s*,巢狀註解與空白數量都繞不過(見 _text_rules)。R004(明碼憑證)仍對原文比,
 # 寫在註解裡的密碼一樣外洩。
 _GAP = r"\s*"
+# 關鍵字與關鍵字之間(`CREATE ENDPOINT`、`BACKUP DATABASE`):去註解之後只會是空白,至少一個、不設上限
+_SEP = r"\s+"
 # 識別字的三種寫法:不加引號、方括號、雙引號(SQL Server 預設 `QUOTED_IDENTIFIER ON`,
 # `"sys"."databases"` 是可用的寫法)。**共用一份**:原本每條規則各寫各的,結果補的時候
 # 補得到一條、漏掉另一條 —— 換一種引號就繞過去的洞,要一次補完所有用到識別字的規則。
@@ -741,12 +744,11 @@ _ENV_VAR_RE = re.compile(r"(?i)@@(SERVERNAME|SERVICENAME|VERSION|SPID)\b"
 # 就繞過去了。只容許「可能有引號」而不要求成對(`[sys` 也算),是因為這一條是找線索、
 # 不是解析:寫壞的引號照樣報,代價只是多一次人工確認。
 #
-# **只排除 `sys.sp_executesql`**:那一支已經由 R009(動態 SQL)報,同一句出現兩條說法
-# 不同的 finding 只會讓人以為是兩件事。其餘的 `sys.sp_*` 照樣算 —— `sp_who` 回傳每個
-# 連線的主機、登入帳號與資料庫,`sp_helpserver` 回傳伺服器名稱,跟 `HOST_NAME()`、
-# `@@SERVERNAME` 是同一類資訊;`sp_addsrvrolemember`、`sp_addrolemember` 是把帳號加進
-# sysadmin / db_owner,而 R008 只認 GRANT/REVOKE/DENY 這些新式寫法,不認它們。類別雖然
-# 不完全貼切,但報得出來比一條都不報好。
+# **排除別的規則已經報的**:`sys.sp_executesql` 已經由 R009(動態 SQL)報,同一句出現兩條說法
+# 不同的 finding 只會讓人以為是兩件事;危險原語清單上的系統預存程序(`sp_addsrvrolemember`、
+# `sp_send_dbmail`…)也一樣,由 R006–R008、R011 報(見下方 `_SP_ELSEWHERE`)。其餘的
+# `sys.sp_*` 照樣算 —— `sp_who` 回傳每個連線的主機、登入帳號與資料庫,`sp_helpserver`
+# 回傳伺服器名稱,跟 `HOST_NAME()`、`@@SERVERNAME` 是同一類資訊。
 _SYS = _named("sys")
 _OBJ = _named(r"\w+")
 # 回傳執行環境的系統預存程序:`sp_who` 給每個連線的主機名稱、登入帳號與資料庫,
@@ -767,8 +769,15 @@ def _procs(names) -> str:
 
 # `sys.<物件>` 那一條不要跟別的分支重複命中:同一句出現兩條說法不同的 finding,
 # 看的人會以為是兩件事。`sp_executesql` 由 R009 報;上面那幾支由下面自己的分支報
-# (前綴不限)。沒列到的 `sys.sp_*` 照樣由 `sys.<物件>` 那條接住。
-_SP_ELSEWHERE = ("sp_executesql",) + _ENV_PROCS
+# (前綴不限);危險原語清單裡的(`sp_addsrvrolemember` 等)由 R006–R008、R011 報。
+# 沒列到的 `sys.sp_*` 照樣由 `sys.<物件>` 那條接住。
+def _proc_name(p) -> str:
+    """清單裡一支預存程序的比對寫法(完整名稱)。"""
+    return p.pattern[0]
+
+
+_SP_ELSEWHERE = ("sp_executesql",) + _ENV_PROCS + tuple(
+    _proc_name(p) for p in sql_primitives.procs())
 _ENV_CATALOG_RE = re.compile(
     r"(?i)(?<!\w)" + _SYS + _GAP + r"\." + _GAP
     + r'(?![\["]?(?:' + "|".join(_SP_ELSEWHERE) + r')\b)' + _OBJ
@@ -790,7 +799,7 @@ def _env_probes(sql: str) -> list[str]:
     return found
 
 
-# ── 危險 SQL 原語(R006–R010)──
+# ── 危險 SQL 原語(R006–R011)──
 #
 # 這些是封閉的關鍵字與結構集合,跟自然語言注入相反:用文字比對就能做得精準,不需要
 # 靠模型。原本這幾種會被報成「語法錯誤」「效能問題」「缺暫存表」—— 類別錯了,看留言
@@ -809,9 +818,81 @@ _EXTERNAL_SRC_RE = re.compile(
 _FOUR_PART_RE = re.compile(
     _IDENT_BEFORE + _IDENT + r"\." + _IDENT + r"?\."
     + _IDENT + r"?\." + _IDENT + _IDENT_AFTER)
-# 作業系統命令。lookbehind **不排除點**:`master..xp_cmdshell` 正是最常見的寫法,
-# 排除點就等於只抓得到沒有限定名稱的那一種。
-_OS_CMD_RE = re.compile(r'(?i)(?<![\w@\["])' + _named("xp_cmdshell") + r"(?!\w)")
+# 清單(`sql_primitives.py`)裡的預存程序與語句。預存程序的比對不分前綴(`_procs`):
+# `master..xp_cmdshell` 正是最常見的寫法,只認沒有限定名稱的那一種等於加幾個字就繞過去。
+_LIST_PROCS = sql_primitives.procs()
+_LIST_PROC_RE = re.compile(r"(?i)" + _procs(_proc_name(p) for p in _LIST_PROCS))
+
+
+def _list_proc(name: str):
+    """比對到的名稱是清單裡的哪一項(不分大小寫)。"""
+    low = name.lower()
+    for p in _LIST_PROCS:
+        if low == p.pattern[0].lower():
+            return p
+    return None
+
+
+def _statement_re(p) -> "re.Pattern":
+    words = [("(?:" + "|".join(w) + ")") if isinstance(w, tuple) else w for w in p.pattern]
+    return re.compile(r"(?i)(?<![\w.@\[])" + _SEP.join(words) + r"(?!\w)")
+
+
+_LIST_STATEMENTS = {rule: [(p, _statement_re(p)) for p in sql_primitives.statements(rule)]
+                    for rule in (sql_primitives.SERVER_CONFIG, sql_primitives.EXTERNAL,
+                                 sql_primitives.HOST_EXEC, sql_primitives.PRIVILEGE)}
+# 字串常值:長度有上限(只是為了認出參數,不是解析)
+_LITERAL = r"N?'(?:[^']|''){0,200}'"
+# `sp_configure` 帶第二個參數(設定值)= 改伺服器設定。只帶一個參數是讀設定(`sp_configure` 也用來讀設定),
+# 不算。不列選項名稱:任何設定被改都算,下一版新增的設定也一樣。第一個參數可以是字串、
+# 變數,或具名參數(`@configname = N'…'`)。
+_CONFIG_WRITE_RE = re.compile(
+    r"(?i)" + _procs(["sp_configure"]) + _GAP
+    + r"(?:" + _LITERAL + r"|@\w+(?:" + _GAP + r"=" + _GAP + r"(?:" + _LITERAL
+    + r"|@\w+|[\w.+-]+))?|[\w.+-]+)" + _GAP + r",")
+# 網路路徑:字串常值以 `\\` 開頭(`'\\主機\share\…'`),不管是哪個程序用到它 —— 逐一列
+# 吃檔案路徑的程序,下一個又會漏。只有 `'\\'` 一個常值也算:`'\\' + @host + '\x'` 是拼出來的
+# 網路路徑。**不認 `//` 開頭**:XML 查詢的 XPath(`.nodes('//row')`)是正常寫法,會誤擋;
+# 會吃路徑的程序本身(`xp_dirtree`、`BACKUP`、`OPENROWSET`…)已經各自有規則。
+_UNC_RE = re.compile(r"N?'\\\\")
+# 完整的網路路徑:`\\` 後面接著主機名稱(或 IP、`$` 結尾的管理共用)。只有 `'\\'` 的常值分不出
+# 是在拼網路路徑還是在找反斜線,記成 major 交人工
+_UNC_HOST_RE = re.compile(r"N?'\\\\[\w.$-]")
+# 在 linked server 上執行:`EXEC ('…') AT 伺服器`(execute-transact-sql)。`AT TIME ZONE` 是日期時間的
+# 寫法,不算
+_EXEC_AT_RE = re.compile(r"(?i)\)\s*AT\s+(?!TIME\s+ZONE\b)[\w\[\"]")
+# Jinja 標記:**只在 dbt 樣板沒展開、改掃原文時**(run_rules_on_template),掃四段式名稱前先換掉
+# (_mask_jinja)。`{{ … }}` 換成一個佔位的名稱(`{{ var('srv') }}.db.dbo.t` 照樣是四段式),`{% … %}`、
+# `{# … #}` 換成空白(裡面的 `modules.datetime.datetime.strptime` 是 Jinja 的屬性存取,不是 linked server)。
+# 一般的 T-SQL 與展開後的 SQL 不換:T-SQL 裡沒有 Jinja,`'{{'`、`LIKE '{%'` 只是字串,換掉的話放一個在
+# 前面,後面讀寫 linked server 的語句就看不到了
+_JINJA_OPEN_RE = re.compile(r"\{[{%#]")
+_JINJA_CLOSE = {"{{": "}}", "{%": "%}", "{#": "#}"}
+
+
+def _mask_jinja(sql: str) -> str:
+    """把 Jinja 標記換掉。一次往前掃(線性時間)。沒有閉合的標記不是完整的 Jinja,後面的文字
+    照原樣留著、照樣比對:整段當成 Jinja 換掉的話,一個落單的 `{{` 就能把後面的語句藏起來。"""
+    out, pos = [], 0
+    for m in _JINJA_OPEN_RE.finditer(sql):
+        if m.start() < pos:
+            continue
+        end = sql.find(_JINJA_CLOSE[m.group(0)], m.end())
+        if end < 0:
+            break
+        out.append(sql[pos:m.start()])
+        out.append("jinja_value" if m.group(0) == "{{" else " ")
+        pos = end + 2
+    out.append(sql[pos:])
+    return "".join(out)
+# 用 EXEC 呼叫任何 `xp_` 開頭的延伸預存程序:在 SQL Server 的處理序裡執行 DLL,規則 SQL 用
+# 不到。清單裡沒列的名稱也算,所以只認呼叫的位置(`EXEC` 後面,可以有限定名稱、接回傳值),
+# 不在任意位置比對 —— `t.xp_total` 這種欄位名才不會命中。回傳執行環境的那幾支(`xp_msver`)
+# 歸 R005,這裡不重複報。
+_XP_CALL_RE = re.compile(
+    r"(?i)(?<![\w.@\[])(?:EXEC|EXECUTE)" + _SEP
+    + r"(?:@\w+" + _GAP + r"=" + _GAP + r")?"
+    + r"(?:[\w\[\]\".]{0,128}\.)?[\[\"]?(xp_\w+)")
 # 權限授予或切換。關鍵字後面要接空白,`grant_amount` 這種欄位名才不會命中。
 _PRIVILEGE_RE = re.compile(
     r"(?i)(?<![\w.@\[])(GRANT|REVOKE|DENY)\s+(?!BY\b)"
@@ -839,28 +920,80 @@ _DML_RE = re.compile(
     r"(?i)(?<![\w.@\[])(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|DROP|ALTER|CREATE)\s")
 
 
-def _dangerous_primitives(sql: str) -> list[tuple[str, str, str]]:
-    """危險 SQL 原語。回傳 [(規則碼, severity, 訊息)]。"""
+def _list_hits(sql: str) -> dict[str, list[str]]:
+    """清單裡的寫法,依規則碼分組。訊息只寫清單上的名稱,不回顯 MR 的原文(語句中間可以
+    夾註解,原文照印會把註解裡的句子貼進留言)。"""
+    found: dict[str, list[str]] = {}
+    for m in _LIST_PROC_RE.finditer(sql):
+        p = _list_proc(m.group(0).strip('[]"'))
+        if p is not None:
+            found.setdefault(p.rule, []).append(p.pattern[0])
+    for rule, pairs in _LIST_STATEMENTS.items():
+        for p, rx in pairs:
+            if rx.search(sql):
+                found.setdefault(rule, []).append(p.label)
+    if _CONFIG_WRITE_RE.search(sql):
+        found.setdefault(sql_primitives.SERVER_CONFIG, []).insert(0, "sp_configure(帶設定值)")
+    if _UNC_HOST_RE.search(sql):
+        found.setdefault(sql_primitives.EXTERNAL, []).append("網路路徑(\\\\主機\\…)")
+    if _EXEC_AT_RE.search(sql):
+        found.setdefault(sql_primitives.EXTERNAL, []).append("EXEC (…) AT(在 linked server 上執行)")
+    return {rule: list(dict.fromkeys(names)) for rule, names in found.items()}
+
+
+def _unsure_primitives(sql: str) -> list[str]:
+    """分不出是不是危險原語的寫法(固定說法,不回顯原文):清單外的 `xp_` 開頭預存程序(自己寫的 T-SQL
+    預存程序也可以叫 `xp_`)、只有 `'\\\\'` 的字串(可能在拼網路路徑,也可能只是找反斜線)。"""
+    unsure = []
+    env = {n.lower() for n in _ENV_PROCS}
+    if any(m.group(1).lower() not in env and _list_proc(m.group(1)) is None
+           for m in _XP_CALL_RE.finditer(sql)):
+        unsure.append("清單外的 xp_ 開頭預存程序(無法確認是不是延伸預存程序)")
+    if _UNC_RE.search(sql) and not _UNC_HOST_RE.search(sql):
+        unsure.append("以 \\\\ 開頭的字串(無法確認是不是網路路徑)")
+    return unsure
+
+
+def _dangerous_primitives(sql: str, template: bool = False) -> list[tuple[str, str, str]]:
+    """危險 SQL 原語。回傳 [(規則碼, severity, 訊息)]。template:sql 是沒展開的 dbt 樣板原文。"""
     hits = []
+    listed = _list_hits(sql)
     external = [" ".join(m.group(0).split()).rstrip("(").strip()
                 for m in _EXTERNAL_SRC_RE.finditer(sql)]
-    external += [m.group(0) for m in _FOUR_PART_RE.finditer(sql)]
+    if _FOUR_PART_RE.search(_mask_jinja(sql) if template else sql):
+        external.append("四段式名稱(經 linked server 讀寫)")
+    external += listed.get(sql_primitives.EXTERNAL, [])
     if external:
         hits.append(("R006", "blocker",
                      f"外部資料源讀寫:{'、'.join(dict.fromkeys(external))[:200]}——"
                      "規則 SQL 只該讀寫本資料庫裡的表。讀寫外部來源等於把資料送出去、"
                      "或把外部輸入帶進來,沙盒驗不到對方那一端。請改用既有的資料表,"
                      "或說明這條路徑的正當用途與授權"))
-    if _OS_CMD_RE.search(sql):
+    host = listed.get(sql_primitives.HOST_EXEC, [])
+    if host:
         hits.append(("R007", "blocker",
-                     "作業系統命令:規則 SQL 呼叫 xp_cmdshell——這會在資料庫主機上執行"
-                     "作業系統指令,不是查詢。一律禁止"))
+                     f"作業系統命令或外部程式:{'、'.join(host)[:200]}——這會在資料庫主機上"
+                     "執行程式,或讀寫主機的檔案、登錄檔與服務,不是查詢;排程作業則是在審查"
+                     "與執行驗證之外才執行。一律禁止"))
+    config = listed.get(sql_primitives.SERVER_CONFIG, [])
+    if config:
+        hits.append(("R011", "blocker",
+                     f"改伺服器設定或伺服器層級的狀態:{'、'.join(config)[:200]}——規則 SQL "
+                     "不需要改伺服器設定或伺服器層級的狀態(終止連線、關掉稽核、追蹤旗標等)。打開預設關閉的功能(例如 xp_cmdshell、Ole Automation)"
+                     "會讓後面的寫法可以執行作業系統命令或把資料送出去,而且影響同一台伺服器上"
+                     "所有的資料庫。一律禁止"))
+    unsure = _unsure_primitives(sql)
+    if unsure:
+        hits.append(("R007", "major",
+                     f"可能是危險 SQL 原語:{'、'.join(unsure)}——名稱或寫法看起來像,但程式分不出來。"
+                     "請說明用途;是延伸預存程序或網路路徑的話,規則 SQL 不該用"))
     priv = [" ".join(m.group(0).split()).strip() for m in _PRIVILEGE_RE.finditer(sql)]
+    priv += listed.get(sql_primitives.PRIVILEGE, [])
     if priv:
         hits.append(("R008", "major",
-                     f"權限授予或切換:{'、'.join(dict.fromkeys(priv))[:120]}——規則 SQL 不該"
-                     "變更授權,也不該換一個身分執行(換身分之後的行為沙盒驗不到)。"
-                     "請移除,或說明正當用途"))
+                     f"權限授予或切換、帳號與角色:{'、'.join(dict.fromkeys(priv))[:160]}——規則"
+                     " SQL 不該變更授權、建立或修改帳號與角色,也不該換一個身分執行(換身分之後"
+                     "的行為沙盒驗不到)。請移除,或說明正當用途"))
     if _DYNAMIC_SQL_RE.search(sql):
         hits.append(("R009", "major",
                      "動態 SQL:把字串組出來再執行(EXEC(…) 或 sp_executesql)——"
@@ -997,7 +1130,7 @@ def _secret_matches(sql: str):
     return sorted(found, key=lambda m: m.start())
 
 
-def _text_rules(sql: str):
+def _text_rules(sql: str, template: bool = False):
     hits = []
     # **每一處各自判斷**:只看第一個比對到的話,第一處剛好是「欄位 = 狀態碼」的比較
     # 而被降級時,整份就不報了 —— 後面真的寫死的密碼跟著消失,比不改還鬆。
@@ -1018,12 +1151,16 @@ def _text_rules(sql: str):
     # 不會執行,所以藏在註解裡的危險原語本來就不該報;R004(明碼憑證)例外,仍對原文比。
     no_comments = strip_comments(sql)
     probes = _env_probes(no_comments)
+    if _CONFIG_WRITE_RE.search(no_comments):
+        # 改設定由 R011 報;`sys.sp_configure` 再由系統目錄那條報一次就重複了。只讀設定
+        # (只帶一個參數)仍然算讀取執行環境。
+        probes = [t for t in probes if not t.strip('[]"').lower().endswith("sp_configure")]
     if probes:
         hits.append(("R005", "major",
                      f"規則 SQL 讀取執行環境:{'、'.join(probes[:5])}——規則不需要知道自己跑在"
                      f"哪個資料庫/主機/身分下;讀取環境的寫法可以讓規則在執行驗證的沙盒裡照規格跑、"
                      f"到正式環境才做別的事,執行驗證會因此通過。請移除,或說明正當用途"))
-    hits += _dangerous_primitives(no_comments)
+    hits += _dangerous_primitives(no_comments, template)
     hits += _env_hints(no_comments)
     if _MASKED_KEY_RE.search(sql):
         hits.append(("H005", "hint",
@@ -1064,6 +1201,17 @@ def _parse_each_statement(sql: str):
 
 def run_rules(sql: str) -> str:
     """執行 rule-base 檢查(組織既有規則的掛載點),回傳命中清單。"""
+    return _run_rules(sql, template=False)
+
+
+def run_rules_on_template(sql: str) -> str:
+    """dbt 樣板沒展開、改掃原文時的 run_rules:掃四段式名稱前先換掉 Jinja 標記(見 _mask_jinja)。
+
+    只給預掃自己用,不放進模型的工具(tool_hub 只列 run_rules):這一條路看的文字比 run_rules 少。"""
+    return _run_rules(sql, template=True)
+
+
+def _run_rules(sql: str, template: bool) -> str:
     hits = []
     statements, parse_error = _parse_each_statement(sql)
     for st in statements:
@@ -1078,7 +1226,7 @@ def run_rules(sql: str) -> str:
                 hits.append({"rule": code, "severity": severity, "message": msg,
                              "statement": st.sql(dialect=DIALECT)[:200]})
     # 文字層資安規則(R004 hardcode 憑證、R005 讀取執行環境、H004 異常查詢)
-    for code, severity, msg in _text_rules(sql):
+    for code, severity, msg in _text_rules(sql, template):
         hits.append({"rule": code, "severity": severity, "message": msg,
                      "statement": ""})
     # H003(檔案層):涉及規則編號 → 必須與核定規格逐項核對

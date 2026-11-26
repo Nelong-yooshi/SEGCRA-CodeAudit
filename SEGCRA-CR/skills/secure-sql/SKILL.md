@@ -26,14 +26,21 @@ trigger: on_demand
   知道自己跑在哪個資料庫、主機或身分下;會讀的話,就能**在執行驗證的沙盒裡照規格跑、
   到正式環境才做別的事**(例如 `AND DB_NAME() NOT LIKE 'segcra%'`),執行驗證反而會通過。
   看到這類寫法要追問用途:找不到業務上的理由就是 major,不能因為「執行驗證通過」就放行。
-- **危險 SQL 原語**(預掃 R006–R010):理由要寫明是哪一類,不要混在「語法錯誤」或
+- **危險 SQL 原語**(預掃 R006–R011):理由要寫明是哪一類,不要混在「語法錯誤」或
   「效能問題」裡報——類別錯了,看留言的人就不會知道這是資料外送或權限變更。
   - **外部資料源讀寫**:`OPENROWSET`、`OPENDATASOURCE`、`OPENQUERY`、`BULK INSERT`、
     四段式名稱(`伺服器.資料庫.schema.物件`)。規則 SQL 只該讀寫本資料庫裡的表;
     讀寫外部來源等於把資料送出去、或把外部輸入帶進來,而沙盒驗不到對方那一端。
-  - **作業系統命令**:`xp_cmdshell`(常寫成 `master..xp_cmdshell`)。這是在資料庫主機上
-    執行作業系統指令,不是查詢。
-  - **權限授予或切換**:`GRANT`/`REVOKE`/`DENY`、`EXECUTE AS`、`ALTER (SERVER) ROLE`。
+    寄信(`sp_send_dbmail`)、linked server、外部資料表、`BACKUP`/`RESTORE`、網路路徑
+    (`'\\主機\share'`)也是同一類。
+  - **作業系統命令或外部程式**:`xp_cmdshell`(常寫成 `master..xp_cmdshell`)、`sp_OA*`、
+    `sp_execute_external_script`、`CREATE ASSEMBLY`、SQL Agent 作業、`xp_reg*` 等延伸預存程序。
+    這是在資料庫主機上執行程式或讀寫主機,不是查詢。
+  - **改伺服器設定**(R011):`sp_configure` 帶設定值、`RECONFIGURE`、`ALTER DATABASE … SET`、
+    啟動程序、伺服器層級觸發程序、`CREATE ENDPOINT`。規則 SQL 不需要改伺服器設定,
+    打開預設關閉的功能會影響同一台伺服器上所有的資料庫。
+  - **權限授予或切換、帳號與角色**:`GRANT`/`REVOKE`/`DENY`、`EXECUTE AS`、`ALTER (SERVER) ROLE`、
+    舊式的 `sp_addrolemember`/`sp_addsrvrolemember`、建立或修改帳號(`CREATE LOGIN`/`USER`)。
     換身分之後的行為沙盒驗不到。
   - **動態 SQL**:`EXEC(…)`、`sp_executesql`(前面接 `sys.`、`master.dbo.` 或方括號都算),以及 `EXEC` 後面直接接變數。實際執行的內容在編譯期看不到,規則層與
     沙盒都驗不到,而且可能藏有讀取環境的寫法(`EXEC('SELECT DB_' + 'NAME()')` 這種
