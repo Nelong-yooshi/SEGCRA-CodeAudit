@@ -993,6 +993,10 @@ MUTANTS.update({
      "cold.locations[:MAX_COLD_READ_LISTED]", "cold.locations"),
  "冷讀:檔名不經 _code_span": ("pipeline.py",
      '        return f"{_code_span(path)} 的檔名"', '        return f"{path} 的檔名"'),
+ "輸入截斷:讀到的遠少於估計不當成截斷": ("agent.py",
+     "            if prompt_tokens < sent_estimate * 0.5:", "            if False:"),
+ "輸入截斷:prompt 被端點截掉開頭不交人工": ("pipeline.py",
+     '    if meta.get("input_truncated"):', "    if False:"),
 })
 
 

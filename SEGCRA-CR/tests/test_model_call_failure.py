@@ -175,6 +175,52 @@ def test_模型自己輸出同標題的info會被取代():
     assert f["severity"] == "major" and f["detail"] != "沒事"
 
 
+def _input_truncated(report):
+    return [f for f in report["findings"] if f["title"] == pipeline._INPUT_TRUNCATED_TITLE]
+
+
+def test_輸入被截斷_補major_程式來源():
+    # prompt 被端點靜默截掉開頭 → 補 major、標成程式來源(apply_policy 據此不得自動放行)
+    report = pipeline.enforce_truncation(
+        {"findings": []}, {"input_truncated": True, "finish_reason": "stop"}, 8192)
+    [f] = _input_truncated(report)
+    assert f["severity"] == "major"
+    assert f["_source"] == pipeline.PROGRAM_SOURCE
+
+
+def test_輸入沒截斷_不補():
+    report = pipeline.enforce_truncation(
+        {"findings": []}, {"input_truncated": False, "finish_reason": "stop"}, 8192)
+    assert _input_truncated(report) == []
+    # 舊的 meta 根本沒這個鍵:一樣不補,不會炸
+    assert _input_truncated(
+        pipeline.enforce_truncation({"findings": []}, {"finish_reason": "stop"}, 8192)) == []
+
+
+def test_輸入截斷和輸出截斷可以同時補():
+    # 兩者各自獨立:輸入被截、輸出又打到上限,兩條都要在(不是補了一條就 return)
+    report = pipeline.enforce_truncation(
+        {"findings": []}, {"input_truncated": True, "finish_reason": "length",
+                           "completion_tokens": 8192}, 8192)
+    assert len(_input_truncated(report)) == 1
+    assert any(f["title"] == pipeline._TRUNCATED_TITLE for f in report["findings"])
+
+
+def test_模型失敗時不另補輸入截斷_失敗那條已交人工():
+    # 失敗會提早 return:那時的用量是前幾輪的,input_truncated 不可靠,失敗那條已足夠交人工
+    report = pipeline.enforce_truncation(
+        {"findings": []}, {"failed": "connection", "input_truncated": True}, 8192)
+    assert _input_truncated(report) == []
+    assert _failed(report) != []
+
+
+def test_輸入截斷記進_output_meta():
+    # 跟 truncated / exhausted 一樣進稽核欄位,評測存檔才統計得出發生幾次;沒碰到是 False 不是缺鍵
+    rec = pipeline._output_meta_record({"input_truncated": True, "finish_reason": "stop"}, 8192)
+    assert rec["input_truncated"] is True
+    assert pipeline._output_meta_record({"finish_reason": "stop"}, 8192)["input_truncated"] is False
+
+
 # ─────────────────── 主審查的時間上限、端點無法使用時後面不再呼叫模型 ───────────────────
 
 @pytest.fixture

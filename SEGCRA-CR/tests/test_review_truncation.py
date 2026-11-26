@@ -130,6 +130,8 @@ NO_USAGE = {"prompt_tokens": None, "prompt_tokens_total": None,
             "completion_tokens_total": None, "rounds_without_usage": None}
 # 模型呼叫沒有失敗時,failed 是 None
 NOT_FAILED = {"failed": None}
+# 端點沒有截掉輸入開頭時,input_truncated 是 False
+INPUT_WHOLE = {"input_truncated": False}
 
 
 # ─────────────────── 對照組:沒有截斷時行為不變 ───────────────────
@@ -148,7 +150,7 @@ def test_沒有截斷時不補任何東西而且照常自動放行(review):
     assert report["_output_meta"] == {"finish_reason": "stop", "completion_tokens": 500,
                                       "max_output_tokens": LIMIT, "truncated": False,
                                       "completeness": "complete", "exhausted": False,
-                                      **NO_USAGE, **NOT_FAILED}
+                                      **NO_USAGE, **NOT_FAILED, **INPUT_WHOLE}
 
 
 def test_端點什麼都沒回報時當成無法確認並交人工(review):
@@ -161,7 +163,7 @@ def test_端點什麼都沒回報時當成無法確認並交人工(review):
     assert report["_output_meta"] == {"finish_reason": None, "completion_tokens": None,
                                       "max_output_tokens": LIMIT, "truncated": False,
                                       "completeness": "unknown", "exhausted": False,
-                                      **NO_USAGE, **NOT_FAILED}
+                                      **NO_USAGE, **NOT_FAILED, **INPUT_WHOLE}
 
 
 def test_完整時不補且自動放行(review):
@@ -210,7 +212,7 @@ def test_截斷時補一條_major_並擋下自動放行(review):
     assert report["_output_meta"] == {"finish_reason": "length", "completion_tokens": LIMIT,
                                       "max_output_tokens": LIMIT, "truncated": True,
                                       "completeness": "truncated", "exhausted": False,
-                                      **NO_USAGE, **NOT_FAILED}
+                                      **NO_USAGE, **NOT_FAILED, **INPUT_WHOLE}
 
 
 def test_加這一步不會改到其他_finding(review):
@@ -408,7 +410,7 @@ def test_稽核紀錄照端點回報的記_結束原因截到固定長度():
     assert record == {"finish_reason": "eos", "completion_tokens": 500,
                       "max_output_tokens": LIMIT, "truncated": False,
                       "completeness": "unknown", "exhausted": False,
-                      **NO_USAGE, **NOT_FAILED}
+                      **NO_USAGE, **NOT_FAILED, **INPUT_WHOLE}
     long = pipeline._output_meta_record({"finish_reason": "x" * 1000}, LIMIT)["finish_reason"]
     assert long == "x" * pipeline._FINISH_REASON_MAX
     json.dumps(record)      # 一定能序列化(評測會把整份報告寫成檔)
