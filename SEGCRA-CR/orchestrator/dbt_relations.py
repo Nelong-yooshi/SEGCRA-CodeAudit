@@ -124,6 +124,7 @@ def project_info_from_files(files: dict, *, model_paths=("models",), macro_paths
     macro_dirs = tuple(p.rstrip("/") for p in macro_paths)
     (project_name, global_uncertain, project_ok, all_sources_uncertain,
      models_block, schema_concat, concat_unset) = _read_dbt_project(files.get("dbt_project.yml"))
+    project_vars, vars_unclear = _project_vars(files.get("dbt_project.yml"))
     # 沒確認過根目錄的檔案,就當作「可能有套件」
     has_packages = (root_files_checked is not True
                     or any(name in files for name in _PACKAGE_FILES))
@@ -201,6 +202,8 @@ def project_info_from_files(files: dict, *, model_paths=("models",), macro_paths
         naming=naming,
         schema_concat=schema_concat,
         schema_concat_unset=concat_unset,
+        project_vars=project_vars,
+        project_vars_unclear=vars_unclear,
     )
 
 
@@ -302,6 +305,44 @@ def _literal(value):
     if isinstance(value, str) and not _templated(value):
         return value
     return _UNSET
+
+
+def _project_vars(text) -> tuple[dict, frozenset]:
+    """dbt_project.yml 最外層的 vars:(值確定的 {名稱: 值}, 無法確定的名稱)。
+
+    值是樣板(`{{ … }}`,dbt 會先展開)的名稱無法確定;值是物件時分不出是「值本身是物件」還是專案或
+    套件層級的子區塊(`vars: {my_project: {x: 1}}`),整份都當成無法確定("*")。讀不懂也是 "*"。
+    呼叫端給的值(設定檔,等於排程的 `--vars`)優先,不受這裡影響(見 dbt_render._make_var)。"""
+    if text is None:
+        return {}, frozenset()
+    try:
+        raw = _load(text)
+    except _Unreadable:
+        return {}, frozenset({"*"})
+    variables = raw.get("vars") if isinstance(raw, dict) else None
+    if variables is None:
+        return {}, frozenset()
+    if not isinstance(variables, dict):
+        return {}, frozenset({"*"})
+    plain, unclear = {}, set()
+    for name, value in variables.items():
+        if not isinstance(name, str) or isinstance(value, dict):
+            unclear.add("*")
+        elif _templated_value(value):
+            unclear.add(name)
+        else:
+            plain[name] = value
+    return plain, frozenset(unclear)
+
+
+def _templated_value(value, depth: int = 0) -> bool:
+    if depth > 20:
+        return True
+    if isinstance(value, str):
+        return _templated(value)
+    if isinstance(value, (list, tuple)):
+        return any(_templated_value(v, depth + 1) for v in value)
+    return False
 
 
 def _schema_concat(raw: dict) -> tuple[bool | None, bool]:

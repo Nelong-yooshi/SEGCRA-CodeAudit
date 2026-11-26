@@ -998,8 +998,9 @@ def _imports_of(path: pathlib.Path) -> set[str]:
 
 @pytest.mark.parametrize("module, allowed", [
     # contextvars:一份審查共用一個 invocation_id(每條執行緒各自一個值),不帶來任何對外能力
-    ("dbt_render.py", {"contextvars", "copy", "dataclasses", "difflib", "jinja2", "pathlib", "re",
-                       "secrets", "types", ".isolation"}),
+    # datetime:提供 run_started_at(只有時間值,不帶來網路、指令執行、寫檔的能力)
+    ("dbt_render.py", {"contextvars", "copy", "dataclasses", "datetime", "difflib", "jinja2",
+                       "pathlib", "re", "secrets", "types", ".isolation"}),
     # 隔離子行程裡實際跑的那一側(進入點、JSON 編解碼):json、dataclasses、math、pathlib 做編解碼,
     # importlib 照主行程指定的「模組:名稱」找回函式,sys 讀 stdin、寫 stdout,resource 設記憶體上限
     ("isolation_child.py", {"dataclasses", "importlib", "json", "math", "pathlib", "resource", "sys"}),
