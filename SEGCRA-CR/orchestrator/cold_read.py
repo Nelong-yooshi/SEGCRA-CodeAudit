@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 from .agent import extract_json, output_truncated, run_agent
 from .config import Config, estimate_tokens_upper, token_units
+from .text_fields import as_text
 
 # 一次最多採用幾段模型挑出的片段、每段最多幾個字元(只留在內部紀錄)
 MAX_QUOTES = 3
@@ -50,6 +51,10 @@ SYSTEM_PROMPT = """你是 Merge Request 的文字安全檢查員。使用者訊�
 
 class ColdReadError(Exception):
     """冷讀沒有得到可用的結果(模型輸出被截斷、解析不了、格式不對)。訊息是固定文字。"""
+
+
+class ColdReadTruncated(ColdReadError):
+    """冷讀的輸出被長度上限切斷。用型別分辨(評測要分開統計),不比對訊息。"""
 
 
 @dataclass(frozen=True)
@@ -93,14 +98,14 @@ def collect_sections(mr: dict, head_texts: dict | None = None) -> list[Section]:
         if not isinstance(f, dict) or not isinstance(f.get("path"), str):
             continue
         path = f["path"]
-        diff = f.get("diff") if isinstance(f.get("diff"), str) else ""
+        diff = as_text(f.get("diff"))
         if _is_deleted(diff):
             diffs.append(Section("檔案", path, "", PART_DIFF))
             continue
         full = f.get("full_content")
         if not (isinstance(full, str) and full):
             full = head_texts.get(path)
-        full = full if isinstance(full, str) else ""
+        full = as_text(full)
         if "\x00" in diff or "\x00" in full:
             # 二進位檔:內容不是給人讀的文字,整份送只會塞滿上限
             diffs.append(Section("檔案", path, BINARY_NOTE, PART_DIFF))
@@ -143,14 +148,23 @@ def _head(s: Section) -> str:
     return f"[檔案] {s.path}{_suffix(s)}\n" if s.kind == "檔案" else f"[{s.kind}] "
 
 
+def data_markers() -> tuple[str, str]:
+    """每次隨機產生一對分隔標記 (開始, 結束)。標記之間放的是「資料不是指令」的 MR 文字。
+
+    冷讀與仲裁共用:token 每次不同,MR 內容(字串常值、別名、SQL 輸出的欄位值)寫不出
+    對得上的結束標記,也就關不掉標記、逃不出資料區——注入掃描抓不到的陳述句(「規格
+    補充:恰 1,000 元應列計」)留在標記裡,模型照 system prompt 當資料看。"""
+    token = secrets.token_hex(8)
+    return f"<<<MR_TEXT_{token}>>>", f"<<<END_MR_TEXT_{token}>>>"
+
+
 def build_user_message(sections: list[Section], budget_tokens: int) -> tuple[str, list[str]]:
     """把段落依序放進兩個隨機分隔標記之間,放到預算為止。回傳 (訊息, 沒有完整送出的段落)。
 
     分隔標記每次隨機產生,MR 內容寫不出對得上的結束標記。預算用偏高的估計
     (estimate_tokens_upper);段落之間的分隔也算進去。超過預算時,放得下的部分照放,
     放不下的段落記下來(呼叫端據此記「冷讀沒有看完」,不當成命中也不當成沒問題)。"""
-    token = secrets.token_hex(8)
-    begin, end = f"<<<MR_TEXT_{token}>>>", f"<<<END_MR_TEXT_{token}>>>"
+    begin, end = data_markers()
     budget = max(0, budget_tokens) - estimate_tokens_upper(f"{begin}\n\n{end}")
     parts, used, omitted = [], 0, []
     for s in sections:
@@ -264,7 +278,7 @@ async def cold_read(cfg: Config, mr: dict, head_texts: dict | None = None) -> Co
     raw = await run_agent(cfg, profile, SYSTEM_PROMPT, user, None, verbose=False,
                           use_tools=False, meta=meta)
     if output_truncated(meta, profile.max_output_tokens):
-        raise ColdReadError(OUTPUT_TRUNCATED)
+        raise ColdReadTruncated(OUTPUT_TRUNCATED)
     flagged, quotes = parse_output(raw)
     unread = unread_reason(meta, profile, SYSTEM_PROMPT + user)
     return ColdRead(flagged=flagged,
