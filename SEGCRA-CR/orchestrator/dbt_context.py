@@ -37,7 +37,7 @@ from .dbt_impact import ImpactReport, normalize_path, path_kind
 from .dbt_mr_impact import analyze_mr_macro_impact
 from .dbt_project import (DbtLayout, DbtProject, DbtProjectError, check_project_dir,
                           extra_ref_names, load_dbt_project, read_layout, yaml_file_problems)
-from .dbt_relations import project_info_from_files
+from .dbt_relations import SCHEMA_CONCAT_KEY, project_info_from_files
 from .dbt_render import (DEFAULT_ISOLATED_MEMORY_MB, DEFAULT_ISOLATED_TIMEOUT_S, DbtProjectInfo,
                          is_dbt_template)
 from .isolation import run_isolated
@@ -252,7 +252,8 @@ def prepare_dbt_context(mr: dict, dbt_cfg: dict | None, *, real_mode: bool | Non
     concat = dbt_cfg.get("sqlserver_schema_concat")
     concat = concat if isinstance(concat, bool) else None
     try:
-        return _prepare(mr, prefix, load, summarize or _summarize_isolated, layout, concat)
+        return _prepare(mr, prefix, load, summarize or _summarize_isolated, layout, concat,
+                        dbt_cfg.get("vars"))
     except Exception as e:                  # noqa: BLE001 — 一律收斂成取回失敗
         return _failed(prefix, f"準備 dbt 專案時發生非預期錯誤({type(e).__name__})", layout)
 
@@ -266,17 +267,29 @@ def _failed(prefix: str, reason: str, layout: DbtLayout | None = None,
         all_models_possibly_affected=True))
 
 
-def _with_concat_default(info: DbtProjectInfo, concat: bool | None) -> DbtProjectInfo:
+def _with_concat_default(info: DbtProjectInfo, concat: bool | None,
+                         cli_vars: dict | None = None) -> DbtProjectInfo:
     """專案自己沒決定自訂 schema 要不要串接時,補上部署端設定的預設值(設定檔
     dbt.sqlserver_schema_concat;沒設就維持無法確定)。在主行程補,不讓整理專案資訊的子行程
-    去讀設定。"""
+    去讀設定。
+
+    設定檔的 dbt.vars(排程的 `--vars`)寫了 dbt_sqlserver_use_default_schema_concat 時,它比
+    dbt_project.yml 的 vars 優先(dbt 的順序):true 就串接;不是布林就無法確定;false 時,如果專案是靠
+    vars 的 true 才串接,結果要看 flags,這裡不重算,記成無法確定。"""
+    cli = cli_vars if isinstance(cli_vars, dict) else {}
+    if SCHEMA_CONCAT_KEY in cli:
+        value = cli[SCHEMA_CONCAT_KEY]
+        if value is True:
+            return dataclasses.replace(info, schema_concat=True, schema_concat_unset=False)
+        if value is not False or info.project_vars.get(SCHEMA_CONCAT_KEY) is True:
+            return dataclasses.replace(info, schema_concat=None, schema_concat_unset=False)
     if info.schema_concat_unset and concat is not None:
         return dataclasses.replace(info, schema_concat=concat)
     return info
 
 
 def _prepare(mr: dict, prefix: str, load, summarize, layout: DbtLayout | None = None,
-             concat: bool | None = None) -> DbtContext:
+             concat: bool | None = None, cli_vars: dict | None = None) -> DbtContext:
     sha, head_sha = mr.get("sha"), mr.get("head_sha")
     if not isinstance(sha, str) or not _SHA.fullmatch(sha):
         return _failed(prefix, "MR 沒有可用的 head commit 編號", layout)
@@ -297,7 +310,7 @@ def _prepare(mr: dict, prefix: str, load, summarize, layout: DbtLayout | None = 
     if summary is None:
         return _failed(prefix, "dbt 專案的屬性檔解析逾時或失敗", project.layout)
     info, macro_files = summary
-    info = _with_concat_default(info, concat)
+    info = _with_concat_default(info, concat, cli_vars)
     ctx = DbtContext(prefix=prefix, project=project, info=info, macro_files=macro_files,
                      layout=project.layout)
     # MR 在專案裡只改到 model:沒有 macro 反查要做,也就不需要變更前的專案(少一次下載、
@@ -312,7 +325,7 @@ def _prepare(mr: dict, prefix: str, load, summarize, layout: DbtLayout | None = 
     base_summary = summarize(base) if isinstance(base, DbtProject) and base.ok else None
     if base_summary is not None:           # 變更前的專案整理不出來:當成沒有可以比較的基準
         return dataclasses.replace(ctx, impact=impact, base_project=base,
-                                   base_info=_with_concat_default(base_summary[0], concat),
+                                   base_info=_with_concat_default(base_summary[0], concat, cli_vars),
                                    base_macro_files=base_summary[1])
     return dataclasses.replace(ctx, impact=impact)
 

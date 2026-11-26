@@ -373,3 +373,39 @@ def test_read_file_never_falls_back_to_write_token(real_env, fake_http, monkeypa
 def test_read_file_not_exposed_to_the_model():
     from orchestrator.tool_hub import ToolHub
     assert not any("read_file_at" in name for name in ToolHub().tools)
+
+
+# ------------------------------------------------------------------ TLS 設定(SSL_CERT_FILE)
+# 這條請求 trust_env=False,不讀任何環境變數,SSL_CERT_FILE 也不讀;現場 GitLab 是 https、
+# 憑證的根不在映像裡時,取 MR 正常、dbt 讀檔卻憑證驗證失敗。所以 TLS 設定要明確傳進去。
+def test_SSL_CERT_FILE_有設時_TLS_設定照它傳進去(real_env, fake_http, monkeypatch):
+    import ssl
+
+    import certifi
+    monkeypatch.setattr(gitlab, "_SSL_CERT_FILE_OK", set())
+    monkeypatch.setenv("SSL_CERT_FILE", certifi.where())
+    rec = fake_http()
+    gitlab.download_archive(SHA, max_bytes=100)
+    gitlab.read_file_at(SHA, "dbt_project.yml", max_bytes=100)
+    for call in rec.calls:                               # 打包下載與讀單檔兩條都要
+        assert call["trust_env"] is False
+        ctx = call["verify"]
+        assert isinstance(ctx, ssl.SSLContext) and ctx.verify_mode == ssl.CERT_REQUIRED
+        assert ctx.check_hostname is True
+        assert len(ctx.get_ca_certs()) > 0               # 載入的是那個檔裡的根憑證
+
+
+def test_沒設_SSL_CERT_FILE_時用預設的驗證(real_env, fake_http, monkeypatch):
+    monkeypatch.delenv("SSL_CERT_FILE", raising=False)
+    rec = fake_http()
+    gitlab.download_archive(SHA, max_bytes=100)
+    assert rec.calls[0]["verify"] is True
+
+
+def test_SSL_CERT_FILE_設錯時不送請求_說出是這個變數(real_env, fake_http, monkeypatch, tmp_path):
+    monkeypatch.setattr(gitlab, "_SSL_CERT_FILE_OK", set())
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "missing.pem"))
+    rec = fake_http()
+    with pytest.raises(gitlab.ArchiveDownloadError) as e:
+        gitlab.download_archive(SHA, max_bytes=100)
+    assert "SSL_CERT_FILE" in _err(e) and rec.calls == []

@@ -23,7 +23,8 @@ import orchestrator.pipeline as pipeline
 from orchestrator import dbt_context, dbt_project, spec_exec
 from orchestrator.config import DBT_DATABASE_PLACEHOLDER, load_config
 from orchestrator.dbt_affected import (IMPACT_TITLE, AffectedCheck, CheckedModel,
-                                       check_affected_models, impact_finding)
+                                       check_affected_models, impact_unverified_finding)
+from orchestrator.dbt_affected import impact_finding as _impact_main
 from orchestrator.dbt_context import DbtContext, prepare_dbt_context
 from orchestrator.dbt_impact import AffectedModel, ImpactReport
 from orchestrator.dbt_project import load_dbt_project
@@ -710,6 +711,20 @@ def test_規格代號或內容缺一_不算對到(result):
 
 # ─────────────────── 7. finding 的內容與嚴重度 ───────────────────
 
+_RANK = {"info": 0, "minor": 1, "major": 2, "blocker": 3}
+
+
+def impact_finding(check, prefix=""):
+    """兩條合起來看:主要那條,加上「無法驗證」那條(嚴重度取較重的、內文接在一起)。
+    這個檔的測試看的是整體結果;拆成兩條之後各自的樣子由 test_impact_split 驗。"""
+    main, unv = _impact_main(check, prefix), impact_unverified_finding(check, prefix)
+    if main is None or unv is None:
+        return main if unv is None else unv
+    return {**main, "severity": max(main["severity"], unv["severity"], key=_RANK.get),
+            "detail": main["detail"] + unv["detail"],
+            "suggestion": main["suggestion"] or unv["suggestion"]}
+
+
 def _fd(models=(), unchecked=(), **impact):
     return impact_finding(AffectedCheck(impact=ImpactReport(**impact), models=tuple(models),
                                         unchecked=tuple(unchecked)))
@@ -798,7 +813,8 @@ def test_不確定的原因只列前5項並清掉控制字元():
     fd = _fd(uncertain=tuple(f"原因{i}\x00\n" + "長" * 500 for i in range(7)))
     assert "原因4" in fd["detail"] and "原因5" not in fd["detail"] and "另有 2 項" in fd["detail"]
     assert "\x00" not in fd["detail"] and "\n" not in fd["detail"]
-    assert len(fd["detail"]) < 1600
+    check = AffectedCheck(impact=ImpactReport(uncertain=tuple(f"原因{i}" + "長" * 500 for i in range(7))))
+    assert all(len(f["detail"]) < 1600 for f in (_impact_main(check), impact_unverified_finding(check)))
 
 
 def test_錯誤原因過長會截斷():
@@ -1396,7 +1412,7 @@ def test_只改共用設定_受影響的_model_對到兩份規格_兩份都附�
     assert "未找到對應規格檔" not in spec_part
     # 執行驗證:改到的只有樣板(macro),照實回報樣板尚未支援,不是「無規格可驗」
     titles = [f["title"] for f in report["findings"]]
-    assert "執行驗證無法進行:dbt 樣板尚未支援執行驗證" in titles
+    assert "[執行驗證] dbt model 沒有展開" in titles
     assert "無規格可驗,無法執行驗證" not in titles
     assert report["_spec_exec"]["spec_code"] == "R-201"
     assert report["decision"] != "auto_approved"

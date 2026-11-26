@@ -206,12 +206,15 @@ RETAIL_M1 那組快了 15 分鐘,但那是因為它提早放棄拆解,不是效�
 
 ### LLM 傳輸失敗的優雅降級(彙總)
 
-單次 LLM 請求上限 3600 秒、**不自動重試**(`orchestrator/agent.py:REQUEST_TIMEOUT`,環境變數 `LLM_TIMEOUT` 可調;openai client 預設的 600s×3 次重試對本地慢推理只是把同一個慢請求連跑三遍)。在 spec_exec 內:
+**不自動重試**(openai client 預設的 600s×3 次重試對本地慢推理只是把同一個慢請求連跑三遍)。在執行驗證裡,每次請求等的是 `LLM_TIMEOUT` 與**這一段剩下的時間**取小的(見 03 篇 Agent loop);剩不到 `MIN_STAGE_SECONDS` 就不再送。在 spec_exec 內:
 
 | 失敗點 | 行為 |
 |---|---|
-| 測資生成呼叫失敗(兩次) | major「執行驗證無法完成(測資生成失敗:LLM 呼叫失敗)」→ `passed: False` → needs_human |
-| 仲裁不確定(呼叫失敗 / 被截斷或沒回報結束原因 / 靠 json-repair 救回 / `who_is_wrong` 不合法) | 該 mismatch 保守判 SQL 側(帶 `arbiter_unparseable`)→ major → needs_human |
+| 測資生成**每一次都呼叫失敗**(模型一次都沒有回應:連不上、端點錯誤、拒絕) | 記成這一環節沒跑完:major「[執行驗證(測資生成)] 審查未完整(模型呼叫失敗)」,帶 `stage`(`review_incomplete` 認得到;CI 那條路是「沒有結論」、結束碼 5) |
+| 測資生成**時間到了**(請求逾時且重試用完,或剩的時間不夠、不再送) | 同上,標題是「…審查未完整(逾時)」。剩的時間不夠時不再重試 |
+| 測資生成模型有回應、內容不能用(截斷、JSON 不合法、零合法案例) | major「執行驗證無法完成(測資生成失敗)」→ `passed: False` → needs_human。是模型能力或規格的問題,重試不一定會好,所以不算環節沒跑完 |
+| 仲裁**沒有結論**(呼叫失敗:時間到了、連不上、端點錯誤;被截斷或沒回報結束原因;輸出不是乾淨的單一 JSON;`who_is_wrong` 不合法或缺 reason) | 該案例「測資與 SQL 的結果不一致,仲裁沒有結論」,帶 `stage`(執行驗證(仲裁)),不混進「實作與規格行為不符」;`passed: False` |
+| 沙盒不可用(沒啟動、連不上、沒設密碼) | major「執行驗證無法完成(沙盒不可用)」,帶 `stage`(執行驗證(沙盒)):環境的問題,CI 結束碼 5 |
 
 兩者都不會中斷整條審查管線,也絕不會產生「假通過」。
 
@@ -310,7 +313,7 @@ mr = {"title": "調整報表", "files": [{"path": "sql/x.sql", "full_content": "
   1. **「資料表定義」段必須釘死 schema**(可直接執行的 `CREATE TABLE`)——角色一照抄建表,沒有固定 schema 整個執行驗證做不起來;
   2. **需求項目逐條原子化、含運算子**:每條具體到可直接對照實作(交易範圍、聚合、閾值、時間窗、幣別、豁免、通報粒度、輸出欄位各自成條),用語與含等一致——「達/以上」=含=`>=`、「超過」=不含=`>`,並在補充段記下核定依據;含等寫錯一定被邊界案例抓到,寫「模糊」則測資會亂猜;
   3. 時間窗一律寫半開區間(`>= @start_date AND < @end_date`),參數名固定 `@start_date`/`@end_date`;程式與規格的 SQL 一律寫 T-SQL(`BIT` 用 `= 1`、`DATEPART(HOUR, x)`、字串型別寫長度、日期時間用 `DATETIME2` 而非 `TIMESTAMP`);
-  4. 表格式規格 → md 的整理範例在 `examples/sample/RETAIL_M1_spec.md`(原則:只寫核定規格有的、實作細節列「待補」不腦補、跨源不一致以核定規格為準);dbt + Jinja 的規則程式要先展開樣板才能執行——只引用 `source()` 的 model 會先展開成沙盒用的 SQL 再執行(見 docs/09「執行驗證」),其他含樣板的檔案回報「尚未支援」、交人工(不會誤判通過)。
+  4. 表格式規格 → md 的整理範例在 `examples/sample/RETAIL_M1_spec.md`(原則:只寫核定規格有的、實作細節列「待補」不腦補、跨源不一致以核定規格為準);dbt + Jinja 的規則程式要先展開樣板才能執行——引用 `source()` 與 `ref()` 的 model 會先展開成沙盒用的 SQL 再執行(見 docs/09「執行驗證」)。**有 `ref()` 的 model,「資料表定義」裡跟上游 model 同名的那張表代表的是上游 model 的輸出**:測資直接放進那張表,上游裡做的過濾、彙總不會被執行,所以規格的條件若是在上游做的,案例不符時記成待驗證(不判成 SQL 錯)。展開不了的檔案也記成待驗證、交人工(不會誤判通過)。
 - **換模型**:`config/models.yaml` 的 `roles.testgen` / `roles.arbiter` 各自指到任一 profile;小模型常產不出合法測資 JSON(症狀:「測資生成失敗」finding),把 testgen 指回大 profile 即可(README §10)。
 - **改 prompt**:`orchestrator/spec_exec.py` 的 `TESTGEN_SYSTEM`(測資契約)與 `ARBITER_SYSTEM`(仲裁原則);執行窗常數 `WIN_START/WIN_END` 也在檔頭。改 TESTGEN 的輸出形狀時,`_shape_check` 必須同步改——形狀檢查是契約的執行者。
 - **已知限制**:
@@ -318,7 +321,8 @@ mr = {"title": "調整報表", "files": [{"path": "sql/x.sql", "full_content": "
   - 命中判定是「有無輸出列」(`len(rows) > 0`),**通報粒度**(每帳戶每日至多 1 筆)與輸出欄位語意不在執行驗證範圍,靠靜態審查的 H002/規格核對把關。
   - 覆蓋是「LLM 拆出的條件」的覆蓋:若角色一漏拆某條件,形狀檢查看不出「本來該有第 N 條」——上限由 spec 條列品質決定,這也是需求項目要逐條原子化的原因。
   - 沙盒需要先啟動(`scripts/sandbox.sh start`,約 2GB 記憶體);沙盒未啟動時執行驗證一律判不通過(major、needs_human)。
-  - dbt 樣板(`{{ ref() }}`、`{{ var() }}`、macro)尚未展開:含樣板的程式會落在 `sql_error`,不會誤判通過。
+  - dbt 樣板展開不了(規格沒有同名的表、表名無法確定、用了不支援的寫法)時不送沙盒,記成待驗證「[執行驗證] dbt model 沒有展開」,原因另列一條 info;不會落在 `sql_error`,也不會誤判通過。上游 model 由測資代替時,上游自己的邏輯沒有執行(見 docs/09 已知限制)。
+    **評測裡的真實形狀 case(`mr_701`/`mr_702`)餵的是 compile 後的 SQL**,量的是什麼見 `eval/BASELINE.md` 第 12 節。
 
 ## 結構化生成:規格的形狀分類
 

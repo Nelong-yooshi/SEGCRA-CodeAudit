@@ -25,6 +25,8 @@ import re
 import unicodedata
 from base64 import b64decode
 
+from .text_fields import as_text
+
 # 每條:(類別, 正規表示式)。命中任一即視為疑似注入。
 _PATTERNS = [
     ("instruction_override",
@@ -214,24 +216,15 @@ def scan_injection(text: str, prose: str | None = None) -> list[dict]:
     return out
 
 
-def _text(value) -> str:
-    """只接受字串,其餘(None、數字、巢狀結構)當成沒有這個欄位。
-
-    這些欄位來自 GitLab API 或 fixture,型別不保證。不是字串時 `"\n".join(...)` 會丟
-    TypeError,而**那會讓整份審查沒有輸出** —— MR 沒擋、沒放、也沒人知道。掃描少看
-    一個壞欄位的代價小得多,而且那種欄位本來也沒有可掃的文字。"""
-    return value if isinstance(value, str) else ""
-
-
 def scan_mr(mr: dict) -> list[dict]:
     """掃描整個 MR:標題 + 描述 + **檔名**(PR #10 review 指出「檔名沒有
     被掃描」)+ 每個檔案的 diff/內容(含程式註解)。
 
-    變更清單裡不是物件的項目、以及欄位值不是字串的,一律略過(見 `_text`):
+    變更清單裡不是物件的項目、以及欄位值不是字串的,一律略過(見 `text_fields.as_text`):
     這一步丟例外會中斷整份審查,而旁邊的好項目照樣要掃到。"""
     files = [f for f in (mr.get("files") or []) if isinstance(f, dict)]
-    paths = [p for f in files for p in (_text(f.get("path")), _text(f.get("old_path"))) if p]
-    code = "\n".join(_text(f.get("full_content")) or _text(f.get("diff")) for f in files)
+    paths = [p for f in files for p in (as_text(f.get("path")), as_text(f.get("old_path"))) if p]
+    code = "\n".join(as_text(f.get("full_content")) or as_text(f.get("diff")) for f in files)
     comments = "\n".join(_comments(code))
-    head = [_text(mr.get("title")), _text(mr.get("description")), *paths]
+    head = [as_text(mr.get("title")), as_text(mr.get("description")), *paths]
     return scan_injection("\n".join(head + [code]), prose="\n".join(head + [comments]))

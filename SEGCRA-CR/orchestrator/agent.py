@@ -1,19 +1,86 @@
 """Agent loop — 本地模型(OpenAI-compatible)+ ToolHub 工具呼叫迴圈。"""
+import contextlib
+import contextvars
 import json
 import os
 import re
+import time
 
 from openai import AsyncOpenAI
 
-from .config import Config, ModelProfile, estimate_tokens
+from .config import Config, ModelProfile, env_bool, env_seconds, estimate_tokens
 from .tool_hub import ToolHub
 
 MAX_ITERATIONS = 12
 
 # 本地大模型單次生成可能超過 10 分鐘(openai client 預設 timeout 600s 且自動重試
-# 2 次——對本地推理只是把同一個慢請求連跑三遍再炸 Timeout)。改為:單次請求
-# 上限 1 小時、不自動重試;可用環境變數 LLM_TIMEOUT(秒)覆蓋。
-REQUEST_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "3600"))
+# 2 次——對本地推理只是把同一個慢請求連跑三遍再炸 Timeout)。改為不自動重試;單次請求
+# 最多等 LLM_TIMEOUT(預設 1 小時),有環節的截止時間時取兩者較小的(見 request_timeout)。
+REQUEST_TIMEOUT = env_seconds("LLM_TIMEOUT", 3600)
+
+# LLM_TIMEOUT 是用戶端願意等多久。端點前面若有模型閘道(例如 LiteLLM),閘道對每次請求另有
+# 自己的上限(可能只有幾十秒),超過就切斷,用戶端等再久也沒用。LiteLLM 會照請求
+# 內容裡的 `timeout` 改用那個上限,所以 LLM_SEND_TIMEOUT=1 時把這次請求會等的時間放進請求
+# 內容。預設不送,理由同 reasoning_effort:不認得這個欄位的端點可能整個退回請求。
+SEND_TIMEOUT = env_bool("LLM_SEND_TIMEOUT", "")
+
+
+# 這一環節的截止時間(time.monotonic())。主審查、冷讀、執行驗證外面各有自己的上限
+# (`asyncio.wait_for`,見 pipeline._stage_limit),時間到是外層先取消,run_agent 不知道。
+# 請求送出去的 timeout 若比剩下的時間長,用戶端斷線走了、閘道還照收到的值等,模型繼續生成
+# 一個沒有人要的答案;端點一次只處理一個請求時,下一份審查就排在它後面。
+_DEADLINE: contextvars.ContextVar = contextvars.ContextVar("segcra_llm_deadline", default=None)
+
+
+class LlmNoTimeLeft(Exception):
+    """這一環節剩下的時間不夠送下一次請求(見 llm_deadline 的 min_left):不送,讓呼叫端照「沒跑完」記。"""
+
+
+@contextlib.contextmanager
+def llm_deadline(seconds: float | None, min_left: float = 0.0):
+    """在這個區塊裡呼叫的模型,每次請求最多等到「現在 + seconds」。巢狀時取較早的。
+    `asyncio.wait_for` 建的 task 與 `run_in_thread` 都會帶上這個值,所以要在呼叫它們**之前**設。
+
+    `min_left`:剩不到這麼多秒就不再送請求(run_agent 每次送出前比一次,丟 LlmNoTimeLeft)。
+    越後面的請求拿到的時間越少,剩幾秒送出去的請求多半等不到結果,只是讓閘道多跑一次;
+    門檻用跟「剩不到就不開始這一步」同一個值(pipeline 傳 MIN_STAGE_SECONDS 進來)。"""
+    if seconds is None:
+        yield
+        return
+    end = time.monotonic() + seconds
+    current = _DEADLINE.get()
+    if current is not None:
+        end, min_left = min(current[0], end), max(current[1], min_left)
+    token = _DEADLINE.set((end, min_left))
+    try:
+        yield
+    finally:
+        _DEADLINE.reset(token)
+
+
+def _time_left() -> tuple[float, float] | None:
+    """(這一環節還剩幾秒, 剩不到幾秒就不送);沒有截止時間時 None。"""
+    current = _DEADLINE.get()
+    if current is None:
+        return None
+    return current[0] - time.monotonic(), current[1]
+
+
+def request_timeout() -> float:
+    """這一次請求會等多久:LLM_TIMEOUT 與這一環節剩下的時間取小的,至少 1 秒。
+    用戶端(openai 套件)與送給閘道的(LLM_SEND_TIMEOUT)用同一個值,兩邊同時到。"""
+    left = _time_left()
+    if left is None:
+        return REQUEST_TIMEOUT
+    return max(1.0, min(REQUEST_TIMEOUT, left[0]))
+
+
+def is_timeout(error: BaseException) -> bool:
+    """這個例外是不是「時間到了」:請求逾時,或剩下的時間不夠、沒有送出。"""
+    import asyncio
+
+    import openai
+    return isinstance(error, (openai.APITimeoutError, asyncio.TimeoutError, TimeoutError, LlmNoTimeLeft))
 
 
 def output_completeness(meta: dict, max_output_tokens: int) -> str:
@@ -183,11 +250,19 @@ async def _run_agent(client, cfg: Config, profile: ModelProfile, system: str, us
         meta["exhausted"] = False
     for i in range(MAX_ITERATIONS):
         dump_path = _dump(profile.model, messages, i)
+        # 每一輪都重算:這一環節剩下的時間越來越少(見 request_timeout)。用戶端的 timeout
+        # 與送給閘道的(放在 extra_body,openai 套件會原樣併進請求內容)是同一個值
+        left = _time_left()
+        if left is not None and left[0] < left[1]:
+            raise LlmNoTimeLeft(f"這一環節只剩 {max(left[0], 0):.0f} 秒,不到 {left[1]:g} 秒,不再送出請求")
+        wait = request_timeout()
+        timeout_kwargs = {"extra_body": {"timeout": wait}} if SEND_TIMEOUT else {}
         resp = await client.chat.completions.create(
             model=profile.model, messages=messages, **tool_kwargs,
             temperature=profile.temperature,
             max_tokens=profile.max_output_tokens,
-            **seed_kwargs, **effort_kwargs,
+            timeout=wait,
+            **seed_kwargs, **effort_kwargs, **timeout_kwargs,
         )
         msg = resp.choices[0].message
         usage = getattr(resp, "usage", None)

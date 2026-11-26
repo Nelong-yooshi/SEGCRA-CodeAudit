@@ -15,17 +15,19 @@ from typing import NamedTuple
 from pathlib import Path
 
 
-from .agent import (MAX_ITERATIONS, extract_json, output_completeness,
+from .agent import (MAX_ITERATIONS, LlmNoTimeLeft, extract_json, llm_deadline, output_completeness,
                     output_truncated, run_agent)
 from .config import (DBT_DATABASE_PLACEHOLDER, PKG_ROOT, Config, env_seconds,
                      estimate_tokens)
 from .dbt_affected import (
-    AffectedCheck, SpecForModels, check_affected_models, impact_finding, specs_by_priority,
+    AffectedCheck, SpecForModels, check_affected_models, impact_finding, impact_unverified_finding,
+    specs_by_priority,
 )
 from .change_view import build_full_text_section
 from .cold_read import (UNREAD_NEAR_LIMIT, UNREAD_NO_USAGE, UNREAD_TOO_FEW, ColdRead,
                         cold_read as _cold_read, record as _cold_read_record)
-from .isolation import run_isolated
+from .isolation import run_in_thread, run_isolated
+from .mr_fetch_error import mr_fetch_reason
 from .dbt_impact import DEFAULT_ISOLATED_MEMORY_MB, DEFAULT_ISOLATED_TIMEOUT_S, macros_referenced
 from .dbt_context import DbtContext, prepare_dbt_context
 from .dbt_exec import render_for_exec
@@ -39,11 +41,12 @@ from .dbt_asset_names import (ASSET as _ASSET_RULE, CHECK as _CHECK_RULE, GROUP 
 from .dbt_config_change import HIGH_RISK_NEW, config_changes, default_relative, is_dbt_yaml
 from .dbt_project import DbtProjectError, check_project_dir
 from .dbt_hidden_writes import MODELS_CHECKED, UNREACHED_OUTPUT, find_hidden_writes_in_macro
-from .dbt_render import (MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, MACRO_SYNTAX,
+from .dbt_render import (MACRO_KIND_TEXT, MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, MACRO_SYNTAX,
                          check_macro_files_isolated)
 from .security import scan_mr
 from toolbox.gitlab import (WRITE_FAILED, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UNCERTAIN,
                             write_failure)
+from toolbox import gitlab as _gitlab
 from .skills_loader import always_skills, load_skills, skills_index
 from .dbt_context import PROJECT_FILE_REMOVED, PROJECT_YAML_INVALID, check_yaml_files_isolated
 from .dbt_project import YAML_MODELS_NOT_LIST, YAML_SYNTAX
@@ -52,6 +55,7 @@ from .tool_hub import ToolHub
 from toolbox.sqltools import LINT_INCOMPLETE_CODE, LINT_MAX_CHARS, LINT_TIMEOUT_SECONDS
 from toolbox.sqltools import run_rules, run_rules_on_template
 from toolbox.sqltools import DIALECT, parse_statements, parsed_chunks
+from .text_fields import MR_CONTENT_FILE, as_text
 
 SYSTEM_TEMPLATE = """你是資深資料庫工程主管,負責審查 SQL merge request。\
 你的審查將直接決定 MR 能否合入,必須精準、可回溯、給得出修改建議。
@@ -325,8 +329,8 @@ def _incomplete_finding(stage: str, exc: BaseException | None = None,
         detail = (f"{stage} 執行時發生 {type(exc).__name__},已跳過。"
                   f"這一環節的結果不在本報告內。")
         title = f"[{stage}] {INCOMPLETE_TITLE_PREFIX}"
-    return {"file": "", "line": 0, "severity": "major", "title": title,
-            "detail": detail, "stage": stage,
+    return {"file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": title,
+            "detail": detail, "stage": stage, "_source": PROGRAM_SOURCE,
             "suggestion": "請人工確認這一環節原本要檢查的內容;其餘環節的結果仍然有效。",
             "citations": []}
 
@@ -364,6 +368,16 @@ def _superseded(now: dict, reviewed_sha: str | None) -> bool:
         return False
     current = now.get("head_sha") or now.get("sha")
     return bool(current) and current != reviewed_sha
+
+
+async def _writeback_target(hub, mr_id: str, reviewed_sha: str | None) -> dict | None:
+    """這一刻還能不能把這次審查的結論寫回去?可以就回開行內討論要用的 `diff_refs`,
+    已經被新的 commit 取代就回 None。
+    """
+    now = await _current_mr(hub, mr_id)
+    if _superseded(now, reviewed_sha):
+        return None
+    return {k: str(now.get(k) or "") for k in ("base_sha", "head_sha", "start_sha")}
 
 
 # 總結裡沒有確定貼上的 finding:前幾條連標題一起列,其餘只列檔名與行號(一行一條)
@@ -413,8 +427,8 @@ def _pending_section(report: dict) -> str:
 
 
 # 回寫的步驟(寫進 report["_writeback"] 的鍵 → 報告與 log 上的名稱)與失敗的種類
-_WRITEBACK_STEPS = {"commit_status": "merge 閘門(commit status)", "label": "標籤",
-                    "summary": "總結留言"}
+_WRITEBACK_STEPS = {"inline": "行內意見", "commit_status": "merge 閘門(commit status)",
+                    "label": "標籤", "summary": "總結留言"}
 _WRITE_FAILURE_TEXT = {
     WRITE_REJECTED: "GitLab 拒絕了這個請求",
     WRITE_UNCERTAIN: "連線中斷、逾時或 GitLab 回應錯誤,不確定有沒有寫上",
@@ -535,6 +549,7 @@ def normalize_findings(report: dict) -> dict:
 
     修正與丟掉的數量記在 `_format_issues`,由 enforce_format 補一條 major(要排在
     sanitize_findings 之後,見該函式)。這個欄位只由這裡寫:模型自己輸出的同名欄位會被移除。
+    每條 finding 的 `_source`、`stage` 也只由程式寫,模型自己帶的一樣拿掉(見 sanitize_findings)。
     """
     report.pop("_format_issues", None)
     summary, _ = _as_text(report.get("summary"))
@@ -551,6 +566,10 @@ def normalize_findings(report: dict) -> dict:
         if severity is not None and not isinstance(severity, str):
             dropped += 1
             continue
+        # 「這條是程式補的」(`_source`)與「這一環節沒跑完」(`stage`)只由程式寫:模型自己帶的拿掉。
+        # 不拿掉的話,模型標成程式的 finding 去重時不會被換掉、校準也不碰它
+        fd.pop("_source", None)
+        fd.pop("stage", None)
         wrong = False
         null_title = "title" in fd and fd["title"] is None
         for key in ("title", "detail", "suggestion"):
@@ -604,7 +623,7 @@ def enforce_format(report: dict) -> dict:
         parts.append(f"有 {issues['fixed'] + issues['dropped']} 條 finding 的格式不正確"
                      f"(修正後保留 {issues['fixed']} 條、無法判讀而略過 {issues['dropped']} 條)。")
     major = {
-        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _FORMAT_TITLE,
+        "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _FORMAT_TITLE,
         "detail": "".join(parts) + "被略過或修正的內容可能不完整,這次的審查結果需人工確認。",
         "suggestion": "重新觸發審查;若持續發生,請檢查審查模型的輸出。",
         "citations": [], "_source": PROGRAM_SOURCE}
@@ -720,6 +739,20 @@ class _Expanded(NamedTuple):
     incremental_line_map: dict | None = None
     # 展開失敗的原因是樣板自己的 Jinja 語法錯誤時,錯誤所在的行;其他失敗是 None
     syntax_line: int | None = None
+
+
+def _review_variables(dbt_cfg: dict | None) -> dict:
+    """這份審查展開時給 dbt 的變數:設定檔的 dbt.vars,加上 dbt.run_date_vars 列的變數一律設成
+    執行驗證測資的日期(spec_exec.WIN_START)。日期變數在正式環境由排程每次傳入「這次執行的日期」;
+    審查時給測資的日期,展開出來的 SQL(例如 `TABLE_DATE = '{{ target_date }}'`)才撈得到沙盒裡
+    的測資。規則層看的也是同一份,不另外給一個日期。"""
+    if not isinstance(dbt_cfg, dict):
+        return {}
+    from .spec_exec import WIN_START
+    out = dict(dbt_cfg.get("vars") or {})
+    for name in dbt_cfg.get("run_date_vars") or ():
+        out[name] = WIN_START
+    return out
 
 
 def _render_project(dbt_ctx: DbtContext | None) -> dict:
@@ -893,7 +926,7 @@ def _mr_for_spec_exec(mr: dict, dbt_ctx: DbtContext | None) -> dict:
     run_spec_exec 以「檔案內容有沒有樣板標記」決定要不要送沙盒。真實 GitLab 模式拿到的只有
     diff 新增的行:只改了 macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL
     拿去生測資、執行——執行的是不完整的片段,結果沒有意義,萬一通過還會被當成驗證過。
-    帶上完整內容後,既有的判斷就會如實回報「dbt 樣板尚未支援執行驗證」。原本的 MR 不動。
+    帶上完整內容後,既有的判斷就會如實回報「dbt model 沒有展開」(待驗證)。交進來的 MR 不動。
 
     規格檔不是待測的 SQL:run_spec_exec 取最後一個檔案的內容去執行,MR 同時改了規格與
     程式時,規格檔若排在後面會被當成 SQL。有程式檔時把規格檔拿掉;只有規格檔時不動
@@ -919,8 +952,9 @@ def _dbt_exec_mr(exec_mr: dict, exec_text, spec_text, affected_specs: tuple[Spec
     model(.sql、在 model 目錄、內容是樣板),而且有規格時才展開;規格是從受影響 model 借來的
     (MR 自己沒有規格)時,還要是這個 model 對到的那份。
     回傳 (交給執行驗證的 MR, 紀錄)。紀錄是 None 表示不適用(照舊交給執行驗證);
-    {"file", "ok", "reason"}:ok 時那個檔案的內容換成展開後的 SQL,不 ok 時 MR 不動
-    (執行驗證照舊回「尚未支援」),reason 是原因。"""
+    {"file", "ok", "reason", "stand_ins"}:ok 時那個檔案的內容換成展開後的 SQL,stand_ins 是由規格
+    的測資表代替的上游 model(ref() 的對象);不 ok 時 MR 不動(執行驗證照舊回「尚未支援」),reason
+    是原因。"""
     if not dbt_cfg or dbt_cfg.get("enabled") is not True:
         return exec_mr, None
     if dbt_ctx is None or dbt_ctx.project is None or dbt_ctx.error is not None:
@@ -943,20 +977,21 @@ def _dbt_exec_mr(exec_mr: dict, exec_text, spec_text, affected_specs: tuple[Spec
         return exec_mr, None
     if not exec_text:
         return exec_mr, None                 # 沒有規格:執行驗證自己會說
-    record = {"file": path, "ok": False, "reason": None}
+    record = {"file": path, "ok": False, "reason": None, "stand_ins": []}
     if not spec_text and not (affected_specs and rel in affected_specs[0].models):
         record["reason"] = "MR 沒有自己的規格,借用的受影響 model 規格不是這個 model 的"
         return exec_mr, record
     if DBT_DATABASE_PLACEHOLDER != dbt_cfg.get("database"):
         record["reason"] = _DBT_DATABASE_MISMATCH
         return exec_mr, record
-    sql, reason = render_for_exec(path, source, exec_text, dbt_cfg["database"],
-                                  _render_project(dbt_ctx))
+    sql, reason, stand_ins = render_for_exec(path, source, exec_text, dbt_cfg["database"],
+                                             _render_project(dbt_ctx))
     if sql is None:
         record["reason"] = reason
         return exec_mr, record
     files[i] = {**f, "full_content": sql}
     record["ok"] = True
+    record["stand_ins"] = list(stand_ins)
     return {**exec_mr, "files": files}, record
 
 
@@ -1498,7 +1533,7 @@ def _spec_for_exec(spec_code, spec_text, affected_specs: tuple[SpecForModels, ..
                    exec_mr: dict) -> tuple:
     """交給執行驗證的規格。MR 自己的(或受影響的 model 全部對到的同一份)照舊;對到多份時,
     沒有一份能代表整個 MR,只在交給執行驗證的檔案**全部是 dbt 樣板**時傳第一優先的那份:
-    樣板不會被執行,執行驗證會照實回報「dbt 樣板尚未支援執行驗證」,而不是說成「無規格可驗」。
+    樣板不會被執行,執行驗證會照實回報「dbt model 沒有展開」(待驗證),而不是說成「無規格可驗」。
     其他情況照舊不傳,避免拿某個 model 的規格去驗不相干的 SQL。"""
     if spec_text or not affected_specs:
         return spec_code, spec_text
@@ -1543,8 +1578,10 @@ async def _run_main_review(cfg: Config, profile, system: str, user: str, hub, tr
         print(f"[pipeline] MR !{mr_id} 整份審查剩下的時間不夠,沒有呼叫主審查模型", flush=True)
         return None
     try:
-        return await asyncio.wait_for(
-            run_agent(cfg, profile, system, user, hub, trace=trace, meta=meta), limit)
+        # 每次請求等多久跟這個上限一致(見 agent.llm_deadline):外層取消時,閘道也不再多等
+        with llm_deadline(limit, MIN_STAGE_SECONDS):
+            return await asyncio.wait_for(
+                run_agent(cfg, profile, system, user, hub, trace=trace, meta=meta), limit)
     except Exception as e:
         meta["failed"] = _model_failure_kind(e)
         print(f"[pipeline] MR !{mr_id} 主審查模型呼叫失敗({meta['failed']})", flush=True)
@@ -1574,7 +1611,8 @@ async def _run_cold_read(cfg: Config, mr: dict, dbt_ctx: DbtContext | None, dead
     if limit is None:
         return None, _incomplete_finding("冷讀", reason=_NO_TIME_REASON)
     try:
-        return await asyncio.wait_for(_cold_read_stage(cfg, mr, dbt_ctx), limit)
+        with llm_deadline(limit, MIN_STAGE_SECONDS):
+            return await asyncio.wait_for(_cold_read_stage(cfg, mr, dbt_ctx), limit)
     except asyncio.TimeoutError:
         return None, _timeout_finding("冷讀", limit, COLD_READ_TIMEOUT_SECONDS)
 
@@ -1968,7 +2006,7 @@ def enforce_spec_change(report: dict, mr: dict) -> dict:
                    "審查沒有用到它們;")
     detail += "規格的改動需要有人確認,這個 MR 不會自動放行。"
     _put_program_finding(report, {
-        "file": "(MR 內容)", "line": 0, "severity": "info", "title": _SPEC_CHANGE_TITLE,
+        "file": MR_CONTENT_FILE, "line": 0, "severity": "info", "title": _SPEC_CHANGE_TITLE,
         "detail": detail,
         "suggestion": "請確認規格的改動有業務依據,且規格裡相關的條文都一起改到了。",
         "citations": []})
@@ -1979,7 +2017,7 @@ def enforce_spec_change(report: dict, mr: dict) -> dict:
 
 async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                     dry_run: bool = False, baseline: bool = False,
-                    capture: dict | None = None) -> dict:
+                    capture: dict | None = None, commit_status: bool = True) -> dict:
     """capture 給定時,記錄各階段中間產物(預掃前後、檢索到的知識、模型原始輸出、
     agent 工具對話、最終報告),供產生逐字 transcript。
 
@@ -1993,8 +2031,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
     clock = _StageClock()
     review_deadline = clock.start + REVIEW_BUDGET_SECONDS
     skills = load_skills()
-    # 這份審查的 dbt 展開(預掃的一般與增量、受影響 model 的前後)共用一個 invocation_id
-    start_review_invocation()
+    # 這份審查的 dbt 展開(預掃的一般與增量、受影響 model 的前後、執行驗證)共用一個 invocation_id,
+    # 與同一組 dbt 變數
+    start_review_invocation(_review_variables(cfg.dbt))
 
     async with ToolHub(tool_result_max_chars=cfg.budget["tool_result_max_chars"]) as hub:
         hub.register_local(
@@ -2007,9 +2046,22 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
              "required": ["name"]},
         )
 
-        mr = await hub.call_json("gitlab__get_mr_diff", {"mr_id": mr_id})
-        if not mr:
-            raise RuntimeError(f"無法取得 MR {mr_id}")
+        # 取 MR **不經過 ToolHub**:ToolHub 是給模型用的,工具丟的例外在那裡被轉成一行字串,
+        # 型別、TLS 的驗證代碼、errno、HTTP 狀態碼都沒了,取不到時只能比對字串猜原因。直接
+        # 呼叫拿得到原本的例外,照失敗的階段分類(orchestrator/mr_fetch_error.py)。跟 ToolHub
+        # 一樣丟到背景執行緒跑,外層的時間上限插得進來。
+        # `from None`:例外鏈裡 httpx 的訊息帶完整網址,不跟著進 log;原因已經分類寫在訊息裡。
+        try:
+            mr = json.loads(await run_in_thread(_gitlab.get_mr_diff, mr_id, name="segcra-tool"))
+        except Exception as e:                   # noqa: BLE001 — 每一種都要說出原因
+            raise RuntimeError(f"無法取得 MR {mr_id}:{mr_fetch_reason(e)}") from None
+        if not isinstance(mr, dict) or not mr:
+            raise RuntimeError(f"無法取得 MR {mr_id}:回應不是預期的 MR 資料")
+
+        # 標題與說明後面一律當字串用(組 prompt、抽規則碼、注入掃描)。GitLab 對沒填說明的 MR
+        # 回 null;不論 MR 從哪裡來(mock、評測),不是字串的都換成空字串
+        for key in ("title", "description"):
+            mr[key] = as_text(mr.get(key))
 
         # 把這次審查釘在 MR 的 head commit 上:之後 get_file 不指定 ref 時讀的就是
         # 「正在審的那一版」,而不是目標分支的現況(目標分支讀到的是**改之前**的
@@ -2018,7 +2070,6 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # **釘在這裡而不是 get_mr_diff 裡**:那個函式在模型的工具清單上,模型若被
         # MR 描述引導去呼叫別的 MR,釘住的版本就會被換掉,之後讀到的是別人的檔案。
         # 拿不到 head sha 時釘 None——get_file 會明講取不到,不會退回舊版。
-        from toolbox import gitlab as _gitlab
         _gitlab.pin_review_ref(mr.get("head_sha"))
 
         if baseline:
@@ -2270,10 +2321,14 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             exec_code, exec_text = _spec_for_exec(spec_code, spec_text, affected_specs, exec_mr)
             exec_mr, dbt_exec = _dbt_exec_mr(exec_mr, exec_text, spec_text, affected_specs,
                                              dbt_ctx, cfg.dbt)
-            spec_result = await asyncio.wait_for(
-                run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text,
-                              progress=progress, deadline=deadline),
-                timeout=spec_limit)
+            # 執行驗證裡有好幾次模型呼叫(測資生成、重試、仲裁),越後面的剩的時間越少:
+            # 每一次各自用那一刻剩下的(見 agent.llm_deadline / request_timeout)
+            with llm_deadline(spec_limit, MIN_STAGE_SECONDS):
+                spec_result = await asyncio.wait_for(
+                    run_spec_exec(cfg, hub, exec_mr, exec_code, exec_text,
+                                  progress=progress, deadline=deadline,
+                                  stand_ins=_executed_stand_ins(dbt_exec)),
+                    timeout=spec_limit)
         except _SpecExecSkipped as skipped:
             report.setdefault("findings", []).append(
                 _incomplete_finding("執行驗證", reason=str(skipped)))
@@ -2324,27 +2379,43 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             report["decision"] = "needs_human"
             report.setdefault("decision_reason", "決策閘門未完成,一律交人工")
 
-        # 回寫之前先確認這次審查還是最新的那次。
+        # 每一步寫回 GitLab 之前,都重新確認這次審查還是最新的那次。
         #
         # 取消只會在下一個真正的等待點生效,而貼留言、加 label、設狀態都是同步的工具
         # 呼叫——所以舊的那次有機會一路走到這裡。它較晚結束時,MR 上的 label 與總結
         # 會變成**舊 commit 的結論**(commit status 是跟 sha 走的,那個本來就沒問題)。
-        # 比對 MR 目前的 head sha:不一樣就不貼,報告照樣回傳給呼叫端(給 eval 與
-        # 測試用),只是不寫回 GitLab。
+        #
+        # 回寫前只查一次不夠:回寫本身要花上幾十秒(一條 finding 一個請求),新的
+        # commit 常常就是在這段時間裡推上來的——結果前面的行內意見貼得還算合理,最後
+        # 那句總結與 label 卻是舊結論。所以改成每一步都查:發現被取代就停在那裡,
+        # 已經貼出去的收不回來,但後面的不會再寫。多出來的成本是每次寫入前一個唯讀
+        # 請求(`get_mr_refs`)。
         # head_sha 是 real 模式帶的;mock 模式(eval / 測試)只有 sha,一樣拿來比
-        now = await _current_mr(hub, mr_id)
-        if _superseded(now, mr.get("head_sha") or mr.get("sha")):
-            report["writeback_skipped"] = "已有更新的 commit,這次審查的結論不再回寫"
-            print(f"[pipeline] MR !{mr_id} 已有更新的 commit,略過回寫", flush=True)
-            clock.finish()
-            if capture is not None:
-                capture["report"] = report
-            return report
+        reviewed_sha = mr.get("head_sha") or mr.get("sha")
+        wrote: list[str] = []            # 已經送出去的步驟(用來分「整次沒回寫」與「停在中途」)
+        stopped: list[str] = []
 
-        # 開行內討論的位置用剛取回的 diff_refs,不再每條重取
-        refs = {k: str(now.get(k) or "") for k in ("base_sha", "head_sha", "start_sha")}
+        async def writable(step: str) -> dict | None:
+            """這一步還能不能寫?可以就回開行內討論要用的 diff_refs。"""
+            if stopped:
+                return None
+            refs = await _writeback_target(hub, mr_id, reviewed_sha)
+            if refs is None:
+                stopped.append(step)
+                report["writeback_skipped"] = (
+                    f"回寫到「{step}」時 MR 已有更新的 commit,之後的步驟不再回寫"
+                    if wrote else "已有更新的 commit,這次審查的結論不再回寫")
+                print(f"[pipeline] MR !{mr_id} 已有更新的 commit,略過回寫"
+                      + (f"(停在:{step})" if wrote else ""), flush=True)
+            else:
+                wrote.append(step)
+            return refs
+
         unposted = []
         for fd in report.get("findings", []):
+            refs = await writable(_WRITEBACK_STEPS["inline"])
+            if refs is None:
+                break
             result = await hub.call("gitlab__post_inline_comment", {
                 "mr_id": mr_id, "file": fd.get("file", ""), "line": int(fd.get("line") or 0),
                 "severity": fd.get("severity", "info"),
@@ -2359,26 +2430,32 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         decision = report.get("decision", "needs_human")
         label = f"ai-review::{decision}"
         # commit status 與標籤先設、總結最後貼:這兩步沒寫上時要在總結寫明(看 MR 的人看得到)。
-        # commit status 回寫:CE 的 merge 閘門靠它(Pipelines must succeed)
-        _record_writeback(writeback, mr_id, "commit_status", await hub.call(
-            "gitlab__set_commit_status", {
-                "mr_id": mr_id, "sha": mr.get("sha", ""),
-                "state": "success" if decision == "auto_approved" else "failed",
-                "name": "segcra/review",
-                "description": f"{decision}:{report.get('summary', '')[:180]}",
-            }))
-        _record_writeback(writeback, mr_id, "label", await hub.call(
-            "gitlab__set_label", {"mr_id": mr_id, "label": label}))
+        # commit status 回寫:不接 CI 時 CE 的 merge 閘門靠它(Pipelines must succeed)。
+        # commit_status=False 是審查做成 CI 的一個 job 時(見 orchestrator/ci_gate.py):job 的結果
+        # 就是閘門,不寫;留言、行內意見、label 照常
+        if commit_status and await writable(_WRITEBACK_STEPS["commit_status"]) is not None:
+            _record_writeback(writeback, mr_id, "commit_status", await hub.call(
+                "gitlab__set_commit_status", {
+                    "mr_id": mr_id, "sha": mr.get("sha", ""),
+                    "state": "success" if decision == "auto_approved" else "failed",
+                    "name": "segcra/review",
+                    "description": f"{decision}:{report.get('summary', '')[:180]}",
+                }))
+        if await writable(_WRITEBACK_STEPS["label"]) is not None:
+            _record_writeback(writeback, mr_id, "label", await hub.call(
+                "gitlab__set_label", {"mr_id": mr_id, "label": label}))
         decision_text = {"auto_approved": "✅ 小幅變更且無實質問題,自動放行",
                          "needs_human": "👤 請人工確認後裁決",
                          "blocked": "⛔ 有 blocker 級問題,修正前不得合入"}[decision]
-        _record_writeback(writeback, mr_id, "summary", await hub.call("gitlab__post_summary", {
-            "mr_id": mr_id,
-            "body": f"**決策:{decision_text}**\n\n{report.get('summary', '')}"
-                    + _pending_section(report)
-                    + _unposted_section(unposted) + _writeback_section(writeback, label),
-            "score": int(report.get("score", 0)), "verdict": report.get("verdict", "needs_changes"),
-        }))
+        if await writable(_WRITEBACK_STEPS["summary"]) is not None:
+            _record_writeback(writeback, mr_id, "summary", await hub.call("gitlab__post_summary", {
+                "mr_id": mr_id,
+                "body": f"**決策:{decision_text}**\n\n{report.get('summary', '')}"
+                        + _pending_section(report)
+                        + _unposted_section(unposted) + _writeback_section(writeback, label),
+                "score": int(report.get("score", 0)),
+                "verdict": report.get("verdict", "needs_changes"),
+            }))
         clock.finish()
         if capture is not None:
             capture["report"] = report
@@ -2435,17 +2512,34 @@ def _title_grams(s: str):
 @_isolated_stage("輸出清理")
 def sanitize_findings(report: dict) -> dict:
     """清理模型輸出:(1) 丟棄非法 severity(hint 是預掃內部代碼,模型有時原樣 echo);
-    (2) 同檔內近重複標題去重,保留資訊較完整者(有 citation/suggestion)。
+    (2) 同檔內近重複標題去重,保留資訊較完整者(有 citation/suggestion)。程式補的
+    finding(`_source`)不參與比長短,一律留下。
     起因:gemma4 傾向把預掃 JSON 整包複製進 findings,造成雙份報告。"""
     findings = [f for f in report.get("findings", [])
                 if f.get("severity") in _VALID_SEV]
+
+    def similar(a: dict, b: dict) -> bool:
+        grams = _title_grams(a.get("title", ""))
+        return (a.get("file") == b.get("file") and bool(grams)
+                and len(grams & _title_grams(b.get("title", "")))
+                / max(len(grams | _title_grams(b.get("title", ""))), 1) > 0.6)
+
+    # 程式補的 finding(未完整的環節、規則命中、注入掃描…)一律留下,也不會被模型寫的換掉:
+    # 去重只看標題與建議的長短,模型照抄程式的標題、建議寫長一點,就能把「這一環節沒跑完」
+    # 換成一條沒有 stage 的 finding,決策便看不到沒跑完(標題字串在 repo 裡查得到)。
+    # 跟某條程式 finding 相近、又沒有比它嚴重的模型 finding 丟掉:程式那條已經說了同一件事。
+    # 比它嚴重的留著(兩條都在):丟掉會讓嚴重度變低,後處理只能讓決策更保守。
+    program = [f for f in findings if _is_program_finding(f)]
+    rank = lambda x: _SEVERITY_RANK.get(x.get("severity"), -1)
     kept: list[dict] = []
     for f in findings:
-        grams = _title_grams(f.get("title", ""))
+        if _is_program_finding(f):
+            kept.append(f)
+            continue
+        if any(similar(f, p) and rank(f) <= rank(p) for p in program):
+            continue
         dup_idx = next((i for i, k in enumerate(kept)
-                        if k.get("file") == f.get("file") and grams
-                        and len(grams & _title_grams(k.get("title", "")))
-                        / max(len(grams | _title_grams(k.get("title", ""))), 1) > 0.6), None)
+                        if not _is_program_finding(k) and similar(f, k)), None)
         if dup_idx is None:
             kept.append(f)
         else:  # 保留較完整者
@@ -2665,7 +2759,8 @@ def enforce_dbt_config_change(report: dict, mr: dict, dbt_ctx: DbtContext | None
 
 
 _DBT_ASSET_NAME_TITLE = "dbt 名稱不符合 Dagster 的命名規則,部署時會載入失敗"
-_DBT_ASSET_NAME_UNKNOWN_TITLE = "無法確認 dbt 名稱是否符合 Dagster 的命名規則"
+_DBT_ASSET_NAME_UNKNOWN_TITLE = "[dbt 名稱檢查] 無法驗證:無法確認 dbt 名稱是否符合 Dagster 的命名規則"
+_DBT_ASSET_NAME_UNKNOWN_STAGE = "dbt 名稱檢查"
 # 一個檔案最多列幾個不符合的名稱(屬性檔可以有很多 source)
 MAX_LISTED_ASSET_NAMES = 20
 _ASSET_RULE_ORDER = (_ASSET_RULE, _GROUP_RULE, _CHECK_RULE)
@@ -2728,6 +2823,7 @@ def enforce_dbt_asset_names(report: dict, mr: dict, dbt_ctx: DbtContext | None =
             unknown = {
                 "file": f["path"], "line": 0, "severity": "major", "citations": [],
                 "title": _DBT_ASSET_NAME_UNKNOWN_TITLE,
+                "stage": _DBT_ASSET_NAME_UNKNOWN_STAGE,
                 "detail": (f"{result.unknown},看不出這個檔案定義的名稱或設定是否符合 Dagster 的命名規則。"
                            "不符合時部署端整個載入失敗,需人工確認。"),
                 "suggestion": "確認名稱與 schema、group、meta.dagster、測試名稱的實際值:"
@@ -2736,7 +2832,8 @@ def enforce_dbt_asset_names(report: dict, mr: dict, dbt_ctx: DbtContext | None =
     return report
 
 
-_RENDER_FAIL_TITLE = "dbt 樣板展開失敗,rule-base 規則掃的是未展開的原文"
+_RENDER_FAIL_TITLE = "[dbt 展開] 無法驗證:dbt 樣板展開失敗,rule-base 規則掃的是未展開的原文"
+_RENDER_FAIL_STAGE = "dbt 展開"
 
 
 def _in_dirs(rel: str, dirs) -> bool:
@@ -2774,6 +2871,7 @@ def _render_fail_finding(entry: dict) -> dict:
                        "規則沒有命中不代表展開後沒有問題。")
     return {"file": entry["path"], "line": 0, "severity": "major",
             "title": _RENDER_FAIL_TITLE,
+            "stage": _RENDER_FAIL_STAGE,
             "detail": (f"展開失敗原因:{entry['dbt_render_error']}。{parse_note}"
                        "樣板標記即使寫在 SQL 註解、字串或引號識別字裡,dbt 執行時一樣會展開,"
                        "輸出可以跳出註解或字串、變成任何 SQL,所以這個檔案的確定性檢查不完整,"
@@ -2804,7 +2902,8 @@ def enforce_dbt_render_failure(report: dict, pre: list[dict]) -> dict:
     return report
 
 
-_HIDDEN_WRITE_TITLE = "dbt 樣板有寫入語句沒有經過規則檢查"
+_HIDDEN_WRITE_TITLE = "[dbt 展開] 無法驗證:dbt 樣板有寫入語句沒有經過規則檢查"
+_HIDDEN_WRITE_STAGE = "dbt 展開"
 _HIDDEN_WRITE_LIST_MAX = 10
 
 
@@ -2851,6 +2950,7 @@ def _hidden_write_finding(entry: dict) -> dict | None:
         return None
     return {"file": entry["path"], "line": min(lines) if lines else 0, "severity": "major",
             "title": _HIDDEN_WRITE_TITLE,
+            "stage": _HIDDEN_WRITE_STAGE,
             "detail": "".join(parts) + "規則層只檢查展開後的 SQL,這些寫入語句沒有經過規則檢查,"
                       "不得自動放行。",
             "suggestion": "人工確認這些寫入語句在什麼情況下會執行;以 dbt compile 取得實際會執行的 SQL"
@@ -2858,7 +2958,8 @@ def _hidden_write_finding(entry: dict) -> dict | None:
             "citations": []}
 
 
-_UNREACHED_BRANCH_TITLE = "dbt 樣板有沒有展開到的分支,裡面的輸出沒有經過規則檢查"
+_UNREACHED_BRANCH_TITLE = "[dbt 展開] 無法驗證:dbt 樣板有沒有展開到的分支,裡面的輸出沒有經過規則檢查"
+_UNREACHED_BRANCH_STAGE = "dbt 展開"
 
 
 def _unreached_branch_finding(entry: dict) -> dict | None:
@@ -2886,6 +2987,7 @@ def _unreached_branch_finding(entry: dict) -> dict | None:
         when = "在這次審查的展開結果裡沒有產生過(一般模式、增量模式都沒有)"
     return {"file": entry["path"], "line": min(lines), "severity": "major",
             "title": _UNREACHED_BRANCH_TITLE,
+            "stage": _UNREACHED_BRANCH_STAGE,
             "detail": f"這些分支裡的輸出{when},可能只有真正執行時才會進:{where}。"
                       "分支裡的內容可以用樣板組出寫入語句(例如把關鍵字拆成兩個字串接起來),"
                       "規則層只檢查展開後的 SQL,這些內容沒有經過規則檢查,無法確認,不得自動放行。",
@@ -2915,19 +3017,25 @@ def enforce_dbt_impact(report: dict, affected: AffectedCheck | None,
     確定性補報,不看模型有沒有自己提到:只改 macro 的 MR,diff 裡看不到任何一個受影響的
     model。標題只能由程式產生(_put_program_finding)。排在 enforce_hints / enforce_style
     之後,理由同 enforce_dbt_notice。"""
-    impact = impact_finding(affected, dbt_ctx.prefix if dbt_ctx is not None else "")
+    prefix = dbt_ctx.prefix if dbt_ctx is not None else ""
+    impact = impact_finding(affected, prefix)
     if impact is not None:
         _put_program_finding(report, impact)
+    unverified = impact_unverified_finding(affected, prefix)
+    if unverified is not None:
+        _put_program_finding(report, unverified)
     return report
 
 
 _MACRO_SYNTAX_TITLE = "macro 檔有 Jinja 語法錯誤,dbt 整個專案會編譯失敗"
-_MACRO_UNCERTAIN_TITLE = "展開器載入不了這個 macro 檔,無法確認 dbt 能不能編譯"
+_MACRO_UNCERTAIN_TITLE = "[dbt macro 檢查] 無法驗證:展開器載入不了這個 macro 檔,無法確認 dbt 能不能編譯"
+_MACRO_UNCERTAIN_STAGE = "dbt macro 檢查"
 _MACRO_CHECK_FAILED = "check_failed"      # 檢查本身沒做完(逾時、資源上限、設定不符)
+# 分類的說明引用 dbt_render.MACRO_KIND_TEXT(只有一份);檢查本身沒做完是這裡才有的情況
 _MACRO_UNCERTAIN_REASONS = {
-    MACRO_UNSUPPORTED: "用到不認得的濾器,或重複定義了同名的 block(dbt 解析得過,呼叫到這個 macro 時才會失敗)",
-    MACRO_TOO_DEEP: "巢狀太深,展開器解析不完",
-    MACRO_LOAD_FAILED: "解析得過,但載入時失敗(檔案開頭用到展開器沒有提供的東西,或讀不到內容)",
+    MACRO_UNSUPPORTED: MACRO_KIND_TEXT[MACRO_UNSUPPORTED],
+    MACRO_TOO_DEEP: MACRO_KIND_TEXT[MACRO_TOO_DEEP],
+    MACRO_LOAD_FAILED: MACRO_KIND_TEXT[MACRO_LOAD_FAILED],
     _MACRO_CHECK_FAILED: "檢查沒有做完(逾時、超過資源上限,或 dbt 的設定與預期不符)",
 }
 
@@ -2979,13 +3087,14 @@ def _macro_problem_finding(issue) -> dict | None:
     if kind == MACRO_SYNTAX:
         return {"file": issue["path"], "line": line, "severity": "blocker",
                 "title": _MACRO_SYNTAX_TITLE,
-                "detail": (f"{where}有 Jinja 語法錯誤(區塊沒有閉合、運算式寫錯等)。dbt 解析專案時"
+                "detail": (f"{where}{MACRO_KIND_TEXT[MACRO_SYNTAX]}。dbt 解析專案時"
                            "會失敗,部署端也會整個載入失敗,影響的不只用到這個 macro 的 model。"),
                 "suggestion": "修正語法後,用 dbt parse 確認整個專案解析得過。",
                 "citations": []}
     if kind in _MACRO_UNCERTAIN_REASONS:
         return {"file": issue["path"], "line": line, "severity": "major",
                 "title": _MACRO_UNCERTAIN_TITLE,
+                "stage": _MACRO_UNCERTAIN_STAGE,
                 "detail": (f"{where}:{_MACRO_UNCERTAIN_REASONS[kind]}。用到這個檔裡 macro 的 model "
                            "都檢查不到,也無法確認 dbt 能不能編譯,不得自動放行。"),
                 "suggestion": "用 dbt parse 確認整個專案解析得過,再人工確認用到這些 macro 的 model。",
@@ -3006,7 +3115,8 @@ def enforce_dbt_macro_problems(report: dict, issues) -> dict:
 
 
 _PROJECT_BROKEN_TITLE = "dbt 設定檔有 dbt 解析不了的寫法,dbt 整個專案會解析失敗"
-_YAML_UNCHECKED_TITLE = "無法確認 dbt 屬性檔 dbt 解析得過"
+_YAML_UNCHECKED_TITLE = "[dbt 屬性檔檢查] 無法驗證:無法確認 dbt 屬性檔 dbt 解析得過"
+_YAML_UNCHECKED_STAGE = "dbt 屬性檔檢查"
 _YAML_CHECK_FAILED = "check_failed"       # 檢查本身沒做完(逾時、資源上限)
 _YAML_PROBLEM_TEXT = {
     PROJECT_YAML_INVALID: "dbt_project.yml 不是合法的 YAML",
@@ -3071,6 +3181,7 @@ def _dbt_yaml_finding(issue) -> dict | None:
     if kind == _YAML_CHECK_FAILED:
         return {"file": issue["path"], "line": 0, "severity": "major",
                 "title": _YAML_UNCHECKED_TITLE,
+                "stage": _YAML_UNCHECKED_STAGE,
                 "detail": (f"{where}:檢查沒有做完(逾時或超過資源上限)。屬性檔有 YAML 語法錯誤時,"
                            "dbt 整個專案解析失敗,不得自動放行。"),
                 "suggestion": "用 dbt parse 確認整個專案解析得過。",
@@ -3090,6 +3201,7 @@ def enforce_dbt_project_broken(report: dict, issues) -> dict:
 
 
 _DBT_UNEXECUTED_TITLE = "dbt 的變更沒有經過執行驗證"
+_DBT_OTHER_MODELS_TITLE = "[執行驗證] 改到的其他 model 沒有執行"
 
 
 def _mr_touches_dbt(mr: dict, dbt_ctx: DbtContext | None, dbt_cfg: dict | None) -> bool:
@@ -3119,7 +3231,31 @@ def enforce_dbt_unexecuted(report: dict, mr: dict, dbt_ctx: DbtContext | None,
     一樣適用:樣板檔與純 SQL 檔混在同一個 MR 時,通過的是純 SQL 檔。
 
     executed_dbt 是展開後真的送進沙盒、而且就是執行驗證跑的那個 model(見 _dbt_exec_mr)。
-    它是這個 MR 唯一改到 dbt 的檔案時,通過的就是這個 model 本身,不補(_only_dbt_file)。"""
+    它是這個 MR 唯一改到 dbt 的檔案時,通過的就是這個 model 本身,不補(_only_dbt_file)。
+
+    例外的例外:執行的是展開後的 model 時,MR 改到的**其他 model**(model 目錄裡的 .sql,不管有沒有
+    樣板標記)一律算沒有執行:執行驗證只跑一個 model,上游由規格的測資代替(report["_dbt_exec"] 的
+    stand_ins),其他 model 根本沒跑。純 SQL 寫成的 model 也一樣(_only_dbt_file 不會把它算成 dbt 的
+    檔案)。內文分開寫「由測資代替的上游」與「其他 model」。
+
+    補的都是**待驗證**(帶 stage):沒跑到不是確定的缺陷,不說成要修改。"""
+    upstream, others = _other_changed_models(mr, dbt_ctx, report.get("_dbt_exec"), executed_dbt)
+    if (upstream or others) and (report.get("_spec_exec") or {}).get("passed") is True:
+        parts = []
+        if upstream:
+            parts.append(f"由規格的測資代替的上游 model:{'、'.join(upstream[:10])}(執行時用測資當它們的"
+                         f"輸出,改動本身沒有執行)")
+        if others:
+            parts.append(f"其他 model:{'、'.join(others[:10])}(執行驗證只跑一個 model,它們沒有執行)")
+        finding = {
+            "file": MR_CONTENT_FILE, "line": 0, "title": _DBT_OTHER_MODELS_TITLE, "severity": "major",
+            "stage": "執行驗證",
+            "detail": f"這個 MR 也改了{';'.join(parts)}。這些改動沒有經過執行驗證,記成待驗證,"
+                      f"不得自動放行。",
+            "suggestion": "那些 model 另外依它自己的規格驗證,或以 dbt compile 取得展開後的 SQL 人工核對。",
+            "citations": []}
+        _put_program_finding(report, finding)
+        return report
     if not _mr_touches_dbt(mr, dbt_ctx, dbt_cfg):
         return report
     if executed_dbt is not None and _only_dbt_file(mr, dbt_ctx, executed_dbt):
@@ -3127,12 +3263,20 @@ def enforce_dbt_unexecuted(report: dict, mr: dict, dbt_ctx: DbtContext | None,
     if (report.get("_spec_exec") or {}).get("passed") is not True:
         return report            # 執行驗證自己已經說了沒通過 / 沒執行,不重複
     _put_program_finding(report, {
-        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _DBT_UNEXECUTED_TITLE,
+        "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _DBT_UNEXECUTED_TITLE,
+        "stage": "執行驗證",
         "detail": "這個 MR 改到 dbt 的樣板、macro 或設定,但執行驗證通過的是 MR 裡的其他內容;"
                   "dbt 樣板目前不會送進沙盒執行,這些變更沒有經過執行驗證,不得自動放行。",
         "suggestion": "以 dbt compile 取得展開後的 SQL,人工依核定規格核對。",
         "citations": []})
     return report
+
+
+def _executed_stand_ins(dbt_exec) -> tuple:
+    """展開後送進沙盒的 dbt model,ref() 指向的上游由測資代替的那些名稱;沒有展開就是空的。"""
+    if not isinstance(dbt_exec, dict) or not dbt_exec.get("ok"):
+        return ()
+    return tuple(n for n in dbt_exec.get("stand_ins") or [] if isinstance(n, str))
 
 
 def _only_dbt_file(mr: dict, dbt_ctx: DbtContext | None, path: str) -> bool:
@@ -3151,19 +3295,68 @@ def _only_dbt_file(mr: dict, dbt_ctx: DbtContext | None, path: str) -> bool:
     return True
 
 
+def _other_changed_models(mr: dict, dbt_ctx: DbtContext | None, dbt_exec,
+                          executed_dbt) -> tuple[list[str], list[str]]:
+    """執行的是展開後的 model 時,這個 MR 改到的其他 model(model 目錄裡的 .sql,不管有沒有樣板):
+    (由測資代替的上游, 其他)。model 名稱 = 檔名去掉 .sql。只看真的展開送進沙盒、而且就是執行驗證
+    跑的那次(executed_dbt)。"""
+    if executed_dbt is None or not isinstance(dbt_exec, dict) or dbt_exec.get("file") != executed_dbt:
+        return [], []
+    if dbt_ctx is None or dbt_ctx.project is None:
+        return [], []
+    stand_ins = {n for n in dbt_exec.get("stand_ins") or [] if isinstance(n, str)}
+    project = dbt_ctx.project
+    upstream, others = [], []
+    for f in mr.get("files", []):
+        path = f.get("path") if isinstance(f, dict) else None
+        if not isinstance(path, str) or path == executed_dbt:
+            continue
+        rel = dbt_ctx.relative(path)
+        if rel is None or not rel.endswith(".sql"):
+            continue
+        if path_kind(rel, project.model_paths, project.macro_paths, project.resource_paths) != "model":
+            continue
+        name = rel.rsplit("/", 1)[-1][:-len(".sql")]
+        group = upstream if name in stand_ins else others
+        if name not in group:
+            group.append(name)
+    return upstream, others
+
+
 _DBT_EXEC_NOTE_TITLE = "dbt model 沒有送進沙盒執行"
+_DBT_EXEC_STAND_IN_TITLE = "執行驗證時上游 model 由測資代替"
 
 
 @_isolated_stage("dbt 執行驗證說明")
 def enforce_dbt_exec_note(report: dict, dbt_exec: dict | None) -> dict:
     """執行驗證要跑的 dbt model 沒能展開成沙盒用的 SQL 時,補一條 info 寫出原因。
-    決策不受影響(執行驗證自己已經回了「尚未支援」的 major),只讓審查者知道差在哪裡。"""
-    if not dbt_exec or dbt_exec.get("ok") or not dbt_exec.get("reason"):
+    決策不受影響(執行驗證自己已經回了「尚未支援」的 major),只讓審查者知道差在哪裡。
+
+    展開了、但有上游 model 由規格的測資表代替時,也補一條 info:執行驗證通過的是這個 model
+    本身,上游 model 的邏輯沒有在這次執行。model 名稱過了識別字白名單,不是 MR 的任意內容。"""
+    if not dbt_exec:
+        return report
+    if dbt_exec.get("ok"):
+        stand_ins = [n for n in dbt_exec.get("stand_ins") or [] if isinstance(n, str)]
+        if stand_ins:
+            note = {
+                "file": dbt_exec["file"] or MR_CONTENT_FILE, "line": 0, "severity": "info",
+                "title": _DBT_EXEC_STAND_IN_TITLE,
+                "detail": f"執行驗證時,ref() 指向的上游 model 由規格「資料表定義」裡同名的測資表代替:"
+                          f"{'、'.join(stand_ins[:10])}"
+                          f"{f'(共 {len(stand_ins)} 個)' if len(stand_ins) > 10 else ''}。"
+                          f"這些上游 model 自己的邏輯沒有在這次執行。",
+                "suggestion": "上游 model 有改動時,要另外驗證它本身。",
+                "citations": [], "_source": PROGRAM_SOURCE}
+            _put_program_finding(report, note)
+        return report
+    if not dbt_exec.get("reason"):
         return report
     _put_program_finding(report, {
-        "file": dbt_exec["file"] or "(MR 內容)", "line": 0, "severity": "info",
+        "file": dbt_exec["file"] or MR_CONTENT_FILE, "line": 0, "severity": "info",
         "title": _DBT_EXEC_NOTE_TITLE,
-        "detail": f"執行驗證只支援只引用 source() 的 model;這個 model 沒有展開:{dbt_exec['reason']}。",
+        "detail": f"執行驗證支援引用 source() 與 ref()(上游 model 由規格裡同名的測資表代替)的 model;"
+                  f"這個 model 沒有展開:{dbt_exec['reason']}。",
         "suggestion": "以 dbt compile 取得展開後的 SQL,人工依核定規格核對。",
         "citations": [], "_source": PROGRAM_SOURCE})
     return report
@@ -4066,7 +4259,7 @@ def enforce_scan_skipped(report: dict, skipped: int) -> dict:
     if not skipped:
         return report
     _put_program_finding(report, {
-        "file": "(MR 內容)", "line": 0, "severity": "major", "title": _SCAN_SKIPPED_TITLE,
+        "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _SCAN_SKIPPED_TITLE,
         "detail": (f"取回的完整內容與展開後的 SQL 合計超過 {MAX_EXTRA_SCAN_CHARS} 字元,其中 {skipped} 份"
                    "沒有做注入掃描(避免掃描被特製的大量內容拖住)。這些內容可能進到審查模型,"
                    "不得自動放行。"),
@@ -4097,7 +4290,7 @@ def enforce_injection(report: dict, hits: list[dict]) -> dict:
         return report
     cats = ", ".join(h["category"] for h in hits)
     report.setdefault("findings", []).insert(0, {
-        "file": "(MR 內容)", "line": 0, "severity": "blocker",
+        "file": MR_CONTENT_FILE, "line": 0, "severity": "blocker",
         "title": "疑似提示注入攻擊(確定性掃描命中)",
         "detail": f"MR 文字含疑似操縱審查器的指令,類別:{cats}。"
                   f"此類內容一律不得自動放行,已強制標記待人工資安確認。",
@@ -4137,7 +4330,7 @@ def enforce_cold_read(report: dict, cold: ColdRead | None) -> dict:
     if cold.flagged:
         places = [_cold_read_place(k, p) for k, p in cold.locations[:MAX_COLD_READ_LISTED]]
         flagged = {
-            "file": "(MR 內容)", "line": 0, "severity": "major", "citations": [],
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "citations": [],
             "title": _COLD_READ_TITLE,
             "detail": ("另一支只看 MR 文字的模型判定,有文字在對審查者或審查工具說話(要求放行、改嚴重度、"
                        "略過檢查、宣稱已核准或已測過等)。位置:" + ("、".join(places) or "位置無法確定")
@@ -4154,7 +4347,7 @@ def enforce_cold_read(report: dict, cold: ColdRead | None) -> dict:
         if cold.unread in _COLD_READ_UNREAD:        # 固定文字;不認得的不寫
             reasons.append(f"{cold.unread}。")
         truncated = {
-            "file": "(MR 內容)", "line": 0, "severity": "major", "citations": [],
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "citations": [],
             "title": _COLD_READ_TRUNCATED_TITLE,
             "detail": ("".join(reasons) or "冷讀沒有看完全部的輸入。")
                       + "沒看到的部分不知道有沒有對審查者說話的文字,需人工確認。",
@@ -4179,7 +4372,7 @@ def enforce_tool_refusals(report: dict, refused: list[str]) -> dict:
     寫的文字,寫進 finding 會被回貼到 MR 留言。標題只能由程式產生(_put_program_finding)。"""
     if not refused:
         return report
-    finding = {"file": "(MR 內容)", "line": 0, "severity": "major",
+    finding = {"file": MR_CONTENT_FILE, "line": 0, "severity": "major",
                "title": _TOOL_REFUSAL_TITLE,
                "detail": (f"審查模型要求呼叫:{', '.join(sorted(set(refused)))}。這些工具只由管線"
                           "自己執行,呼叫已被拒絕、沒有執行。模型很可能受到 MR 內容的指示,"
@@ -4230,7 +4423,7 @@ def enforce_unreviewable(report: dict, mr: dict) -> dict:
     if truncated:
         parts.append("MR 變更的檔案數超過可取得的分頁上限,部分檔案未能取得。")
     report.setdefault("findings", []).insert(0, {
-        "file": "(MR 內容)", "line": 0, "severity": "major",
+        "file": MR_CONTENT_FILE, "line": 0, "severity": "major",
         "title": _UNREVIEWABLE_TITLE,
         # 結尾那句只對「完全拿不到內容」的情況成立。取不到**完整新檔**的檔案
         # 其實有被審(diff 那幾行進了預掃與模型),只是看不到全貌——說成
@@ -4250,6 +4443,8 @@ _EXHAUSTED_TITLE = "審查模型用完工具呼叫回合,沒有產出審查結�
 _EXHAUSTED_SUMMARY = "審查模型用完工具呼叫回合、沒有產出審查結果;以下只有程式確定性檢查的結果。"
 _FAILED_TITLE = "審查模型沒有完成,這次只有程式確定性檢查的結果"
 _FAILED_SUMMARY = "呼叫審查模型失敗、沒有產出審查結果;以下只有程式確定性檢查的結果。"
+# 沒有呼叫模型(剩的時間不夠)不是「呼叫失敗」:寫成失敗,看的人會以為模型那邊出錯
+_NO_TIME_SUMMARY = "整份審查剩下的時間不夠,沒有呼叫審查模型;以下只有程式確定性檢查的結果。"
 # 模型呼叫失敗的問題類型 → 給人看的說明。只有這幾種固定文字,不放例外訊息(含主機位址、端點回應)
 _MODEL_FAILURE_TEXT = {
     "timeout": "等待審查模型的回應逾時",
@@ -4267,6 +4462,8 @@ def _model_failure_kind(error: BaseException) -> str:
     """模型呼叫失敗的問題類型(_MODEL_FAILURE_TEXT 的鍵)。由細到粗判斷:逾時是連線錯誤的子類別,
     請求過多是狀態錯誤的子類別。"""
     import openai
+    if isinstance(error, LlmNoTimeLeft):
+        return _NO_TIME_KIND           # 這一環節剩的時間不夠,請求沒有送出(見 agent.llm_deadline)
     if isinstance(error, (openai.APITimeoutError, asyncio.TimeoutError, TimeoutError)):
         return "timeout"
     if isinstance(error, openai.APIConnectionError):
@@ -4352,6 +4549,8 @@ def _parse_model_output(raw: str | None, meta: dict, max_output_tokens: int) -> 
 
     沒有截斷卻解析不出來時回 None,由呼叫端丟例外。
     """
+    if _failure_kind(meta) == _NO_TIME_KIND:
+        return {"summary": _NO_TIME_SUMMARY, "findings": []}
     if _failure_kind(meta) is not None:
         return {"summary": _FAILED_SUMMARY, "findings": []}
     if meta.get("exhausted"):
@@ -4384,19 +4583,23 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
     failed = _failure_kind(meta)
     if failed is not None:
         model_failed = {
-            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _FAILED_TITLE,
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _FAILED_TITLE,
             "detail": f"{_MODEL_FAILURE_TEXT[failed]},審查模型沒有產出結果。程式的確定性檢查照常報出;"
                       "審查模型負責的部分沒有結果,需人工確認。"
                       + ("" if failed == _NO_TIME_KIND else "這是審查環境的問題,不是這個 MR 的問題。"),
             "suggestion": ("請人工審查這個 MR;MR 很大時可以拆小後重新觸發審查。" if failed == _NO_TIME_KIND
                            else "請通知維運確認審查模型的端點狀態,恢復後重新觸發審查。"),
-            "citations": []}
+            "citations": [],
+            # 審查模型沒有產出結果(時間到了、連不上、端點錯誤、拒絕請求……):這一環節沒跑完,跟外層整段
+            # 逾時同一種。review_incomplete 靠 stage 認;CI 那條路是「沒有結論」(結束碼 5、retry 就是重審),
+            # 不是「審完了交給人」——交給人(3)可以合併,等於沒經過審查也能合
+            "stage": "主審查"}
         _put_program_finding(report, model_failed)
         # 沒有最終輸出:meta 裡的結束原因與用量是前幾輪的,不能拿來判斷截斷或用完回合
         return report
     if meta.get("exhausted"):
         exhausted = {
-            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _EXHAUSTED_TITLE,
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _EXHAUSTED_TITLE,
             "detail": f"審查模型連續 {MAX_ITERATIONS} 輪都沒有產出審查結果(一直呼叫工具,或回應是空的),"
                       "用完回合上限;最後拿到的不是審查報告,不採用。這次只有程式確定性檢查的結果,需人工確認。",
             "suggestion": "重新觸發審查;若持續發生,確認 MR 的描述或內容是否引導模型一直讀檔,"
@@ -4408,7 +4611,7 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
         return report
     if completeness == "truncated":
         _put_program_finding(report, {
-            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _TRUNCATED_TITLE,
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _TRUNCATED_TITLE,
             "detail": f"審查模型的輸出達到長度上限({max_output_tokens} tokens)而被切斷,"
                       "切斷之後的內容沒有產出。已解析出來的 finding 予以保留,但可能有缺漏,"
                       "這次的審查結果需人工確認。",
@@ -4416,7 +4619,7 @@ def enforce_truncation(report: dict, meta: dict, max_output_tokens: int) -> dict
             "citations": []})
     else:   # unknown:端點沒回報結束原因 → 無法確認完整,比照截斷不採信(不安靜放行)
         _put_program_finding(report, {
-            "file": "(MR 內容)", "line": 0, "severity": "major", "title": _UNKNOWN_FINISH_TITLE,
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "major", "title": _UNKNOWN_FINISH_TITLE,
             "detail": "審查模型的端點沒有回報結束原因(finish_reason),也沒有回報用量,"
                       "無法確認這次輸出是否完整。沒有依據說它完整,就不當它完整——已解析出來的"
                       "finding 予以保留,但可能有缺漏,這次的審查結果需人工確認。",
@@ -4464,10 +4667,33 @@ def apply_rubric(report: dict) -> dict:
     return report
 
 
+# 建議的第一行像程式(SQL 關鍵字、dbt 標記、註解、`欄位 運算子`)才放進程式碼區塊
+_CODE_START = re.compile(
+    r"\s*(?:(?:SELECT|WITH|INSERT|UPDATE|DELETE|MERGE|CREATE|ALTER|DROP|DECLARE|SET|EXEC|IF|BEGIN"
+    r"|AND|OR|WHERE|FROM|JOIN|LEFT|RIGHT|INNER|FULL|CROSS|ON|GROUP|ORDER|HAVING|CASE|WHEN|UNION"
+    r"|SUM|COUNT|CAST|CONVERT|COALESCE|ISNULL)\b|--|/\*|\{\{|\{%"
+    r"|(?:\[[^\]\n]+\]|[A-Za-z_][A-Za-z0-9_]*)(?:\.(?:\[[^\]\n]+\]|[A-Za-z_][A-Za-z0-9_]*))*"
+    r"\s*(?:[=<>!]|\bIN\b|\bIS\b|\bBETWEEN\b|\bLIKE\b))", re.I)
+_FENCE_LINE = re.compile(r"^[ \t]*(?:```|~~~)", re.M)
+
+
+def _suggestion_markdown(text: str) -> str:
+    """建議欄位怎麼排版:看起來是程式才放進程式碼區塊(圍欄比內容裡最長的反引號多一個),
+    說明文字照一般段落;內容自己已經帶了程式碼區塊的照原樣(不在區塊外再包一層)。"""
+    if _FENCE_LINE.search(text):
+        return text
+    first = next((line for line in text.splitlines() if line.strip()), "")
+    if not _CODE_START.match(first):
+        return text
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}sql\n{text}\n{fence}"
+
+
 def _format_comment(fd: dict) -> str:
     body = f"**{fd.get('title', '')}**\n\n{fd.get('detail', '')}"
     if fd.get("suggestion"):
-        body += f"\n\n建議修改:\n```sql\n{fd['suggestion']}\n```"
+        body += f"\n\n建議修改:\n{_suggestion_markdown(str(fd['suggestion']))}"
     for c in fd.get("citations", []):
         body += f"\n> 依據:{c.get('source', '')} {c.get('article', '')}"
     return body
