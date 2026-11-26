@@ -18,7 +18,7 @@ import pytest
 from orchestrator import pipeline
 from toolbox.sqltools import run_rules
 
-NEW_RULES = ("R006", "R007", "R008", "R009", "R010")
+NEW_RULES = ("R006", "R007", "R008", "R009", "R010", "R011")
 
 
 def _hits(sql: str, code: str | None = None) -> list[dict]:
@@ -114,6 +114,26 @@ def test_動態SQL的理由要提到可能藏有讀取環境的寫法():
     所以這條命中時要把那件事講出來(#41 第 4 點的補充)。"""
     msg = _hits("EXEC('SELECT DB_' + 'NAME()')", "R009")[0]["message"]
     assert "讀取執行環境" in msg
+
+
+# ── 繞過:關鍵字與括號之間夾巢狀註解、或超長空白 ──
+# 舊的 _GAP 自己容許註解,但註解比對是非巢狀的(第一個 */ 就收尾),而且空白上限 30;
+# 改成先 strip_comments(巢狀整段變空白)再比對、_GAP 只剩 \s*(不設上限)後都繞不過。
+@pytest.mark.parametrize("sql,code", [
+    ("EXEC /* a /* b */ c */ ('SELECT 1')", "R009"),
+    ("SELECT * FROM OPENROWSET /* a /* b */ c */ (BULK N'x.csv', SINGLE_CLOB) AS a", "R006"),
+    ("SELECT 1 WHERE DB_NAME /* a /* b */ c */ () NOT LIKE 'segcra%'", "R005"),
+    ("EXEC" + " " * 31 + "('SELECT 1')", "R009"),                      # 31 個空白 > 舊上限 30
+    ("SELECT 1 WHERE DB_NAME" + " " * 31 + "() <> 'x'", "R005"),
+])
+def test_夾巢狀註解或超長空白也命中(sql, code):
+    assert _hits(sql, code), sql
+
+
+def test_真的註解掉的危險原語不報():
+    """整句被註解掉的危險原語不會執行,不該報(strip_comments 後只剩空白)。"""
+    assert not _hits("SELECT 1 -- EXEC('rogue')\n", "R009")
+    assert not _hits("/* EXEC('rogue') */ SELECT 1", "R009")
 
 
 def test_不帶括號的預存程序呼叫不算動態SQL():

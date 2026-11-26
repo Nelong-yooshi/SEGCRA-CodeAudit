@@ -134,42 +134,66 @@ NOT_FAILED = {"failed": None}
 
 # ─────────────────── 對照組:沒有截斷時行為不變 ───────────────────
 
+UNKNOWN_TITLE = pipeline._UNKNOWN_FINISH_TITLE
+
+
+def _unknown_findings(report):
+    return [f for f in report["findings"] if f.get("title") == UNKNOWN_TITLE]
+
+
 def test_沒有截斷時不補任何東西而且照常自動放行(review):
     report, capture, _ = review(CLEAN_REPORT, STOP)
     assert _cut_findings(report) == []
     assert report["decision"] == "auto_approved", report.get("_policy_signals")
     assert report["_output_meta"] == {"finish_reason": "stop", "completion_tokens": 500,
                                       "max_output_tokens": LIMIT, "truncated": False,
-                                      "exhausted": False,
+                                      "completeness": "complete", "exhausted": False,
                                       **NO_USAGE, **NOT_FAILED}
 
 
-def test_端點什麼都沒回報時當成沒有截斷(review):
+def test_端點什麼都沒回報時當成無法確認並交人工(review):
+    """沒回報結束原因 → 完整度 unknown,比照截斷:補一條 major、不自動放行。
+    (舊版當成沒截斷、照樣自動放行,被切的輸出會安靜地過。)"""
     report, capture, _ = review(CLEAN_REPORT, None)
-    assert _cut_findings(report) == []
-    assert report["decision"] == "auto_approved"
+    cut = _unknown_findings(report)
+    assert len(cut) == 1 and cut[0]["severity"] == "major"
+    assert report["decision"] == "needs_human"
     assert report["_output_meta"] == {"finish_reason": None, "completion_tokens": None,
                                       "max_output_tokens": LIMIT, "truncated": False,
-                                      "exhausted": False,
+                                      "completeness": "unknown", "exhausted": False,
                                       **NO_USAGE, **NOT_FAILED}
+
+
+def test_完整時不補且自動放行(review):
+    """乾淨結束(stop)且用量沒到頂 = 完整 → 不補、照常自動放行。"""
+    report, _, _ = review(CLEAN_REPORT, {"finish_reason": "stop", "completion_tokens": LIMIT - 1})
+    assert _cut_findings(report) == [] and _unknown_findings(report) == []
+    assert report["decision"] == "auto_approved"
 
 
 @pytest.mark.parametrize("meta", [
-    {"finish_reason": None, "completion_tokens": None},
-    {"finish_reason": "stop", "completion_tokens": LIMIT - 1},
-    {"finish_reason": "eos", "completion_tokens": 10},            # 其他結束原因、沒達上限:不報
+    {"finish_reason": None, "completion_tokens": None},           # 完全沒回報
+    {"finish_reason": "eos", "completion_tokens": 10},            # stop 以外的結束原因、沒達上限
 ])
-def test_不算截斷的回報(review, meta):
+def test_無法確認時補一條並交人工(review, meta):
+    """沒乾淨結束(非 stop)、又沒有截斷訊號 → unknown,比照截斷補一條、不自動放行。"""
     report, _, _ = review(CLEAN_REPORT, meta)
-    assert _cut_findings(report) == []
-    assert report["decision"] == "auto_approved"
+    assert len(_unknown_findings(report)) == 1
+    assert report["decision"] == "needs_human"
 
 
-def test_沒有截斷卻解析不出來時照舊明確失敗(review):
+def test_完整卻解析不出來時明確失敗(review):
+    """乾淨結束(complete)卻連 JSON 都解不出來 → 真的失敗,明確報錯(不是截斷、不是無法確認)。"""
     with pytest.raises(RuntimeError, match="無法解析"):
         review("我想了一下,這個 MR 看起來沒問題。", STOP)
-    with pytest.raises(RuntimeError, match="無法解析"):
-        review("我想了一下,這個 MR 看起來沒問題。", None)
+
+
+def test_無法確認且解析不出來時不報錯而是補那條(review):
+    """沒回報結束原因又解不出 JSON:不當成「乾淨結束卻失敗」報錯,而是比照截斷走完、補
+    『無法確認』那條,交人工。"""
+    report, _, _ = review("我想了一下,這個 MR 看起來沒問題。", None)
+    assert len(_unknown_findings(report)) == 1
+    assert report["decision"] == "needs_human"
 
 
 # ─────────────────── 截斷:一定看得到、不會自動放行 ───────────────────
@@ -185,7 +209,7 @@ def test_截斷時補一條_major_並擋下自動放行(review):
     assert RESPONDED["title"] in [f["title"] for f in _others(report)]
     assert report["_output_meta"] == {"finish_reason": "length", "completion_tokens": LIMIT,
                                       "max_output_tokens": LIMIT, "truncated": True,
-                                      "exhausted": False,
+                                      "completeness": "truncated", "exhausted": False,
                                       **NO_USAGE, **NOT_FAILED}
 
 
@@ -316,8 +340,9 @@ def test_截斷的判斷(meta, limit, expected):
     assert agent.output_truncated(meta, limit) is expected
 
 
-def test_測資生成與主審查用同一個截斷判斷(monkeypatch):
-    """端點碰到上限卻回 `stop` 時,兩邊都要當成截斷;判斷只有一份,改一邊另一邊跟著變。"""
+def test_測資生成與主審查用同一個完整度判斷(monkeypatch):
+    """端點碰到上限卻回 `stop` 時,兩邊都要當成截斷;判斷只有一份(output_completeness),
+    改一邊另一邊跟著變。"""
     cfg = load_config()
     limit = cfg.role_profile("testgen").max_output_tokens
     calls = []
@@ -331,8 +356,8 @@ def test_測資生成與主審查用同一個截斷判斷(monkeypatch):
     plan, gaps, _ = asyncio.run(spec_exec.generate_cases(cfg, "R-999", "規格", max_attempts=2))
     assert len(calls) == 2 and plan["cases"] == []
     assert "截斷" in gaps[0] and "2/2" in gaps[0]
-    assert spec_exec.output_truncated is agent.output_truncated
-    assert pipeline.output_truncated is agent.output_truncated
+    assert spec_exec.output_completeness is agent.output_completeness
+    assert pipeline.output_completeness is agent.output_completeness
 
 
 def test_沒有截斷時只多一個稽核欄位():
@@ -376,7 +401,8 @@ def test_模型自己輸出的同名欄位會被蓋掉(review):
 def test_稽核紀錄照端點回報的記_結束原因截到固定長度():
     record = pipeline._output_meta_record({"finish_reason": "eos", "completion_tokens": 500}, LIMIT)
     assert record == {"finish_reason": "eos", "completion_tokens": 500,
-                      "max_output_tokens": LIMIT, "truncated": False, "exhausted": False,
+                      "max_output_tokens": LIMIT, "truncated": False,
+                      "completeness": "unknown", "exhausted": False,
                       **NO_USAGE, **NOT_FAILED}
     long = pipeline._output_meta_record({"finish_reason": "x" * 1000}, LIMIT)["finish_reason"]
     assert long == "x" * pipeline._FINISH_REASON_MAX
@@ -424,7 +450,7 @@ def test_用完回合又被截斷_兩條都補(review):
     assert len(_exhausted_findings(report)) == 1 and len(_cut_findings(report)) == 1
 
 
-@pytest.mark.parametrize("meta", [STOP, None, {**STOP, "exhausted": False}])
+@pytest.mark.parametrize("meta", [STOP, {**STOP, "exhausted": False}])
 def test_沒有用完回合時行為不變(review, meta):
     report, _, _ = review(CLEAN_REPORT, meta)
     assert _exhausted_findings(report) == [] and report["decision"] == "auto_approved"

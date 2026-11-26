@@ -98,6 +98,11 @@ def run(monkeypatch, tmp_path):
         async def fake_run_agent(cfg, profile, system, user, hub, meta=None,
                                  verbose=True, use_tools=True, trace=None):
             systems.append(system)
+            # 模擬正常端點:回報乾淨結束(finish_reason=stop)。不設的話完整度會是
+            # "unknown",主審查會(正確地)補一條「沒回報結束原因」的 major —— 那是給
+            # 不回報的端點用的,這裡要測的是正常回報下的流程。
+            if meta is not None:
+                meta["finish_reason"] = "stop"
             return report_json
 
         monkeypatch.setattr(pipeline, "run_agent", fake_run_agent)
@@ -117,7 +122,8 @@ def run(monkeypatch, tmp_path):
         mismatches = [] if spec_exec_kind == "pass" else [{
             "case_id": "C1-T", "condition_id": "C1", "direction": "true",
             "note": "邊界案例", "rows": [["transactions", 1]],
-            "expect_flagged": True, "actual_flagged": False, "actual_rows": 0}]
+            "expect_flagged": True, "actual_flagged": False,
+            "actual_rows": [["transactions", "1"]]}]      # 實際輸出的列(不是列數)
 
         async def fake_generate(cfg, code, text, profile_name=None):
             return plan, [], []
@@ -135,6 +141,11 @@ def run(monkeypatch, tmp_path):
                     "mismatches": mismatches}
 
         async def fake_arbitrate(cfg, spec_text, sql, mm, profile_name=None):
+            if spec_exec_kind == "arbiter_testdata":
+                return {"who_is_wrong": "testdata", "reason": "測資把邊界算錯了"}
+            if spec_exec_kind == "arbiter_inconclusive":
+                return {"who_is_wrong": None, "inconclusive": True, "why_kind": "unknown",
+                        "reason": "仲裁沒有結論:端點沒有回報結束原因,無法確認輸出完整"}
             return {"who_is_wrong": "sql", "reason": "閾值與規格不符"}
 
         monkeypatch.setattr(spec_exec, "generate_cases", fake_generate)
@@ -180,7 +191,42 @@ def test_執行驗證抓到不符時要變成_major_並擋下自動放行(run):
     assert report["_spec_exec"]["passed"] is False
     assert any(f["severity"] == "major" and "執行驗證失敗" in f["title"]
                for f in report["findings"]), "spec_exec 的 finding 沒有併進報告"
+    # 這條名字裡的「擋下自動放行」要真的驗到:major + 執行驗證未通過 → 不得自動放行
+    assert report["decision"] != "auto_approved"
+
+
+def test_仲裁剔除案例時覆蓋缺口寫出預期實際與理由(run):
+    """被剔除的案例要讓人看得到剔除的是什麼、憑什麼剔除:覆蓋缺口那條要帶預期、實際、
+    仲裁理由,不是只有一句「遭仲裁剔除」。"""
+    report, _, _ = run(_mr(CLEAN_SQL), spec_exec_kind="arbiter_testdata")
+    joined = " ".join(report["_spec_exec"]["coverage_gaps"])
+    assert "遭仲裁剔除" in joined
+    assert "測資預期" in joined and "SQL 實際" in joined
+    assert "測資把邊界算錯了" in joined   # 仲裁理由
     assert report["decision"] == "needs_human"
+
+
+def test_仲裁沒有結論是待驗證_不扣分不當缺陷(run):
+    """要修 5:仲裁沒有結論(帶 stage 的 finding)是『待驗證』,不是確定缺陷:
+    - 分數只算確定的結果 → SQL 本身沒問題時仍是 100,作者不會以為自己錯了
+    - verdict 不給 approve(記「未完成」)
+    - 決策不自動放行(靠 review_incomplete 的硬條件,不靠分數)
+    - 總評把待驗證單獨列一段"""
+    report, output, mr_id = run(_mr(CLEAN_SQL), RESPONDED_REPORT,
+                                spec_exec_kind="arbiter_inconclusive")
+    # 只有待驗證、沒有確定缺陷 → 滿分、但不是 approve、也不自動放行
+    assert report["score"] == 100, [f["title"] for f in report["findings"]
+                                    if f.get("severity") in ("major", "blocker")]
+    assert report["verdict"] != "approve" and report["verdict"] == "incomplete"
+    assert report["_pending"] == 1
+    assert report["decision"] != "auto_approved"
+    # 待驗證那條帶 stage,被 review_incomplete 認到
+    assert any(f.get("stage") and "仲裁沒有結論" in f.get("title", "")
+               for f in report["findings"])
+    # 總評把待驗證單獨列一段(看 MR 的人看得到)
+    summary = "".join(p.read_text(encoding="utf-8") for p in output.iterdir()
+                      if p.is_file() and "raw" not in p.name)
+    assert "待驗證" in summary
 
 
 # ─────────────────── 後處理 enforce 鏈真的在管線裡跑 ───────────────────
@@ -365,13 +411,13 @@ def test_審查結果有寫回去(run):
     assert review["inline_comments"], "findings 沒有變成 inline 留言"
     assert review["summary"]["score"] == report["score"]
     assert f"ai-review::{report['decision']}" in review["labels"]
-    # commit status 是 CE 版 merge 閘門的依據:非 auto_approved 一律 failed
+    # 不接 CI 時 merge 閘門靠 commit status:非 auto_approved 一律 failed
     assert review["commit_status"]["state"] == "failed"
     assert review["commit_status"]["name"] == "segcra/review"
 
 
 def test_自動放行時_commit_status_要是_success(run):
-    """CE 的 merge 閘門靠 commit status,這個值錯了就等於閘門失效。"""
+    """不接 CI 時 merge 閘門靠 commit status,這個值錯了就等於閘門失效。"""
     report, output, mr_id = run(_mr(CLEAN_SQL), RESPONDED_REPORT, spec_exec_kind="pass")
     assert report["decision"] == "auto_approved"
     review = json.loads((output / f"mr_{mr_id}_review.json").read_text(encoding="utf-8"))
@@ -562,6 +608,107 @@ def test_head_sha_換掉就算被取代():
     assert pipeline._superseded({"head_sha": "new"}, "old") is True
     assert pipeline._superseded({"head_sha": "same"}, "same") is False
     assert pipeline._superseded({"sha": "new"}, "old") is True          # mock 模式只有 sha
+
+
+# ───────── 回寫途中被新的 commit 取代(部署端現場 S2) ─────────
+#
+# 回寫前只查一次不夠:回寫本身要花上幾十秒(一條 finding 一個請求),新的 commit 常常
+# 就是在這段時間裡推上來的 —— 前面的行內意見貼得還算合理,最後那句總結與 label 卻是
+# 舊結論。所以每一步寫入前都要重查。
+
+def _written(output, mr_id):
+    """mock 模式回寫落檔的內容(還沒寫過任何東西時回空殼)。"""
+    f = output / f"mr_{mr_id}_review.json"
+    return (json.loads(f.read_text(encoding="utf-8")) if f.exists()
+            else {"inline_comments": [], "summary": None, "labels": [], "commit_status": None})
+
+
+def _three_findings():
+    return {**MODEL_REPORT, "verdict": "needs_changes", "findings": [
+        {"file": "sql/maintenance/x.sql", "line": n, "severity": "minor",
+         "title": f"第 {n} 行的欄位命名", "detail": "命名與同庫其他表不一致。",
+         "suggestion": "改成 account_id。", "citations": []} for n in (2, 3, 4)]}
+
+
+def _superseded_from(monkeypatch, nth: int) -> list[int]:
+    """第 `nth` 次檢查(從 0 算)開始回「已被取代」;回傳檢查次數的計數器。"""
+    calls = []
+
+    def counting(now, reviewed_sha):
+        calls.append(1)
+        return len(calls) > nth
+
+    monkeypatch.setattr(pipeline, "_superseded", counting)
+    return calls
+
+
+def test_每一步寫入前都重查一次(run, monkeypatch):
+    calls = _superseded_from(monkeypatch, 99)          # 一直都是最新的
+    report, output, mr_id = run(_mr(CLEAN_SQL), _three_findings())
+    posted = _written(output, mr_id)
+    assert len(posted["inline_comments"]) == len(report["findings"])
+    # 行內意見每條一次,加上 commit status、標籤、總結
+    assert len(calls) == len(report["findings"]) + 3
+    assert "writeback_skipped" not in report
+
+
+def _superseded_when(monkeypatch, decide) -> None:
+    """照「目前已經貼了幾條行內意見」決定何時被取代 —— 不綁 finding 的條數(後處理
+    會補報,條數不是測試說得準的)。`decide(已貼條數, 上一次檢查時的條數)` 回 True
+    就算被取代。"""
+    last = [-1]
+
+    def counting(now, reviewed_sha):
+        n = len(_written(gitlab.OUTPUT_DIR, "900")["inline_comments"])
+        was, last[0] = last[0], n
+        return decide(n, was)
+
+    monkeypatch.setattr(pipeline, "_superseded", counting)
+
+
+def test_貼到一半被取代就停下_總結與標籤不貼(run, monkeypatch):
+    """已經貼出去的行內意見收不回來(GitLab 沒有這種 API),但後面的不再寫 ——
+    label 與總結是「這個 MR 現在的結論」,舊的蓋上去最難發現。"""
+    _superseded_when(monkeypatch, lambda n, was: n >= 2)
+    report, output, mr_id = run(_mr(CLEAN_SQL), _three_findings())
+    assert len(report["findings"]) > 2, "這個測試要貼不完才驗得到「停在中途」"
+    posted = _written(output, mr_id)
+    assert len(posted["inline_comments"]) == 2
+    assert posted["summary"] is None and posted["labels"] == [] \
+        and posted["commit_status"] is None
+    assert "行內意見" in report["writeback_skipped"]
+    assert "之後的步驟不再回寫" in report["writeback_skipped"]
+
+
+def test_行內意見貼完才被取代_標籤與總結不貼(run, monkeypatch):
+    """最後一步才被取代:標籤與總結不寫。這兩個是「這個 MR 現在的結論」,舊的蓋上去
+    最難發現;commit status 是跟 sha 走的,寫在舊 sha 上不影響新的那次。
+
+    觸發點是「這次檢查之後沒有新的行內意見」—— 行內那圈與 commit status 都過了。"""
+    _superseded_when(monkeypatch, lambda n, was: n == was)
+    report, output, mr_id = run(_mr(CLEAN_SQL), _three_findings())
+    posted = _written(output, mr_id)
+    assert len(posted["inline_comments"]) == len(report["findings"])
+    assert posted["commit_status"], "commit status 跟 sha 走,這一步照寫"
+    assert posted["summary"] is None and posted["labels"] == []
+    assert "標籤" in report["writeback_skipped"]
+
+
+def test_整次都沒回寫時不說成停在中途(run, monkeypatch):
+    """一條都還沒寫就被取代 —— 訊息要跟「停在中途」分得開,不然看報告的人以為 MR 上
+    已經有一半的東西。"""
+    _superseded_from(monkeypatch, 0)
+    report, output, mr_id = run(_mr(CLEAN_SQL), _three_findings())
+    assert _written(output, mr_id)["inline_comments"] == []
+    assert "之後的步驟" not in report["writeback_skipped"]
+    assert report["writeback_skipped"] == "已有更新的 commit,這次審查的結論不再回寫"
+
+
+def test_被取代之後不再重查(run, monkeypatch):
+    """停下來以後就不要再問 GitLab:剩下的步驟都不寫了,多問幾次只是多幾個請求。"""
+    calls = _superseded_from(monkeypatch, 1)
+    run(_mr(CLEAN_SQL), _three_findings())
+    assert len(calls) == 2, "第二次查到被取代就該停,之後不再查"
 
 
 def test_注入掃描丟例外時交人工_而不是當成沒有注入(run, monkeypatch):

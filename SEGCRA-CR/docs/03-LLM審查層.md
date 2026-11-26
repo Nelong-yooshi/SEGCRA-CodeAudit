@@ -26,16 +26,16 @@
 
 逐步:
 
-1. 建 `AsyncOpenAI` client:`base_url=cfg.endpoint`(`config/models.yaml` 的 `endpoint`,可用環境變數 `OLLAMA_URL` 覆蓋;見 `orchestrator/config.py`:`load_config`)、`timeout=REQUEST_TIMEOUT`、**`max_retries=0`(不自動重試)**。`REQUEST_TIMEOUT` 由環境變數 `LLM_TIMEOUT`(秒)覆蓋,預設 3600——單次請求上限 1 小時。
+1. 建 `AsyncOpenAI` client:`base_url=cfg.endpoint`(`config/models.yaml` 的 `endpoint`,可用環境變數 `OLLAMA_URL` 覆蓋;見 `orchestrator/config.py`:`load_config`)、**`max_retries=0`(不自動重試)**。每一次請求等多久在第 3 步每輪重算(`request_timeout()`):`LLM_TIMEOUT`(預設 3600 秒)與這一環節剩下的時間(`llm_deadline`,主審查、冷讀、執行驗證各自的上限)取小的,至少 1 秒。
 2. `messages = [system, user]`;`use_tools` 且有 hub 時帶 `tools=hub.openai_tools, tool_choice="auto"`(**只含唯讀白名單**,見下方 `MODEL_TOOLS`)(baseline 模式 `use_tools=False`,純一問一答)。
-3. 迴圈至多 `MAX_ITERATIONS = 12` 輪,每輪呼叫 `chat.completions.create`(帶 profile 的 `temperature`、`max_output_tokens`),把回覆 append 進 messages。
+3. 迴圈至多 `MAX_ITERATIONS = 12` 輪,每輪呼叫 `chat.completions.create`(帶 profile 的 `temperature`、`max_output_tokens`,與 `timeout=request_timeout()`;開啟 `LLM_SEND_TIMEOUT` 時同一個值另外放進 `extra_body` 的 `timeout`,送給模型閘道),把回覆 append 進 messages。**每輪送出前先比一次剩下的時間**:這一環節剩不到 `MIN_STAGE_SECONDS`(由 `llm_deadline` 帶進來)就不送,丟 `LlmNoTimeLeft`,呼叫端照「這一環節沒跑完」記(剩幾秒送出去的請求多半等不到結果,只是讓閘道多跑一次)。
 4. **無 tool_calls 時**:若 `content` 非空 → 直接回傳(正常結束);若為空 → append 一則 user 訊息「請直接輸出最終報告 JSON,不要其他文字。」再 continue(**空回應補推**,對付推理型模型偶發的空 content)。
 5. **有 tool_calls 時**:逐個解析 `tc.function.arguments`(JSON 解析失敗退回 `{}`)、呼叫 `hub.call_from_model(name, args)`(不在白名單的工具**不執行**,回固定的拒絕文字);工具丟例外時不炸迴圈,把 `(工具執行失敗:{e})` 當工具結果餵回模型。結果以 `role="tool"` append。`trace` 參數給定時逐次記錄(工具名/args/結果前 400 字),供產生逐字 transcript。
 6. 12 輪耗盡仍沒有最終文字 → 一律回傳固定字串「(達到工具呼叫上限,未產出最終結果)」,並在 `meta["exhausted"]` 標記。**不回傳最後一則工具結果**:那則內容由 MR 決定(工具看的是 MR),是 JSON 物件時 `extract_json` 會把它當成審查報告收下,而最後一次模型呼叫的 `finish_reason` 是 `"stop"` —— 呼叫端從 `meta` 看不出發生了這件事。標記讓呼叫端比照截斷處理(不解析輸出、補一條 major、不得自動放行)。
 
 ### 輸出收取與容錯(`orchestrator/agent.py`:`extract_json`、`decode_byte_fallback`)
 
-`extract_json` 是整個管線共用的「模型輸出 → dict」收口(review、baseline、spec_exec 的測資生成與仲裁都用它):
+`extract_json` 是整個管線共用的「模型輸出 → dict」收口(review、baseline、spec_exec 的測資生成都用它;仲裁與知識起草改用更嚴格的 `strict_json_object`——整段剛好一個 JSON 物件、無重複鍵、**不走 json-repair**,因為它們要「乾淨、唯一、完整的結論」才採信):
 
 1. **`decode_byte_fallback`**:修 sentencepiece/gemma 的 byte-fallback——gemma4 偶爾把全形空格等字元吐成**字面的** `<0xE3><0x80><0x80>` 文字而非字元本身。做法:regex 抓連續 `<0xHH>` 序列,轉 bytes 後 `decode("utf-8")`;解不開就原樣保留。
 2. 剝 ` ```json ` / ` ``` ` 圍欄(行首行尾,MULTILINE)。
@@ -58,7 +58,7 @@
 - **schema 自動生成**(`function_schema` + `_annotation_schema`):由函式簽名 + docstring 生成——docstring 就是給 LLM 看的工具描述;參數型別註記對映 `str/int/bool/float → string/integer/boolean/number`,`list/set/tuple → array`(含 items),`dict → object`,未知型別退回 `string`;**有預設值的參數為非必填**(`required` 只收無預設值者)。所以「加工具」= 在 toolbox 寫一個帶型別註記與 docstring 的函式,掛進 `TOOL_GROUPS`,schema 自己長出來。
 - **`register_local(name, fn, description, parameters)`**:註冊 orchestrator 本地工具(目前只有 `load_skill`),schema 手寫,與 toolbox 工具同列;要交給模型的也必須列進 `MODEL_TOOLS`。
 - **`call(full_name, args, truncate=True)`** 分派順序:local_tools → toolbox 函式(例外不炸管線,回 `Error executing tool …: {e}` 字串,與舊 MCP server 端吞錯行為一致)→ 未知 group/工具回中文錯誤字串。結果 `str()` 後,**`truncate=True` 且超過 `max_chars`(`config/models.yaml` 的 `budget.tool_result_max_chars`,現值 6000)時截斷**,尾附「…(截斷,原長 N 字元)」。截斷**只用於餵給 LLM 的工具結果**。
-- **`call_json(full_name, args)`**:orchestrator 自用(預掃、抓 MR、檢索知識),`truncate=False` 直接解析 JSON,失敗回 `None`——不可截斷,否則大型 MR 的 JSON 會被腰斬成解析失敗。
+- **`call_json(full_name, args)`**:orchestrator 自用(預掃的規則與 lint、回寫前取 MR 的 head、檢索知識與判例),`truncate=False` 直接解析 JSON,失敗回 `None`——不可截斷,否則較大的結果(例如一份 SQL 的規則命中清單)會被腰斬成解析失敗。取 MR 本身不經過這裡:管線直接呼叫 `gitlab.get_mr_diff`,取不到時照例外說出原因(`orchestrator/mr_fetch_error.py`)。
 - `__aenter__/__aexit__` 為介面相容保留(舊版要起子行程),行程內版無事可做,但 `async with ToolHub(...)` 用法一行不改。
 
 ### Skill 機制(`orchestrator/skills_loader.py` + `skills/*/SKILL.md`)
@@ -170,12 +170,12 @@
 
    預期 stdout:`[agent] model=… tools=on prompt≈N tokens` 起頭,接著多行 `[agent] tool #i: memory__lookup_similar_reviews(…)`、`load_skill({'name': 'mr-comment-format'})` 等工具呼叫紀錄,最後印出報告 JSON;模型原始輸出存 `review_output/mr_001_raw.txt`。
 
-3. **對照組**:`python demo.py --mr 001 --baseline` — 無工具呼叫紀錄、無後處理,直接輸出裸模型 JSON,report 帶 `"_mode": "baseline"`。
+3. **對照組**:`python demo.py --mr 001 --baseline` — 無工具呼叫紀錄、無後處理,直接輸出裸模型 JSON,report 帶 `"_mode": "baseline"`,並帶 `completeness`(三態)與 `truncated`(非 `complete` 即 `True`):被切的輸出被 json-repair 修回來會當成完整報告、finding 變少,A/B 比較就會高估完整管線,所以對照組也查完整度、比較時不把它當成完整的一份。
 
 ## 擴充與注意
 
 - **換模型/調參**:只改 `config/models.yaml` 的 `profiles`(model/num_ctx/temperature/max_output_tokens);orchestrator 不綁模型。角色化(testgen/arbiter)在 `roles` 段。
-- **調 timeout**:環境變數 `LLM_TIMEOUT`(秒);迭代上限改 `orchestrator/agent.py` 的 `MAX_ITERATIONS`。
+- **調 timeout**:環境變數 `LLM_TIMEOUT`(秒);迭代上限改 `orchestrator/agent.py` 的 `MAX_ITERATIONS`。模型前面有閘道(例如 LiteLLM)時,另設 `LLM_SEND_TIMEOUT=1` 把這次請求會等的時間放進請求內容,否則閘道會照它自己的上限切斷(見 docs/10)。每次請求等的時間是 `LLM_TIMEOUT` 與那一環節剩下的時間取小的(`agent.llm_deadline` / `request_timeout`;主審查、冷讀、執行驗證外面的 `asyncio.wait_for` 用同一個上限包著),用戶端與閘道用同一個值:時間到時用戶端斷線,閘道也不會照一個更長的值繼續等、讓模型生成沒有人要的答案。
 - **加工具**:toolbox 寫純函式(型別註記 + docstring)→ 掛 `orchestrator/tool_hub.py` 的 `TOOL_GROUPS`;orchestrator 本地工具用 `register_local`。**要讓審查模型呼叫,另外加進 `MODEL_TOOLS`,而且必須確認它不會寫入**(`tests/test_model_tool_allowlist.py` 會要求每個工具都被歸類)。
 - **加 skill**:新增 `skills/<name>/SKILL.md`(front-matter 必填 `name`;`trigger: always` 慎用——會吃每次審查的 context)。要強制注入的觸發條件,加在 `pipeline.review_mr` 的 always_block 組裝段。
 - **調 context 預算**:`config/models.yaml` 的 `budget`(diff/spec/memory/tool_result_max_chars)。

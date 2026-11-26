@@ -118,6 +118,20 @@ python eval/run_eval.py --json out.json     # 另存機器可讀結果(給報告
 | `calibration_downgraded` | `_calibration.downgraded` | 校準降過嚴重度(只有「無法執行」類的指控在沙盒實際跑成功後才可以,blocker → major)。要求「沒有偷偷降級」時斷言它是 `false` |
 | `calibration_annotated` | `_calibration.annotated` | 校準加過註(規格待補、執行驗證未重現)。加註是常態動作,沒有它分不出「校準沒被走到」與「走到了但沒事可做」 |
 
+## 裸模型對照(`--baseline`)
+
+`python eval/run_eval.py --baseline --json bare.json` 用同一批題目跑**裸模型**:`review_mr` 的 baseline 模式,只給模型看 MR 的標題、描述與 diff,沒有預掃、知識庫、工具、執行驗證與後處理。跟一般模式(完整管線)的結果檔放在一起比,量的是「管線比單純問模型多做到什麼」。
+
+- **問題偵測**:兩種模式用同一套 `expected` 比對(recall / precision)。
+- **決策**:裸模型只輸出 `verdict`,對應成管線的三態再跟 `expect_decision` 比:`approve` → `auto_approved`、`needs_changes` → `needs_human`、`reject` → `blocked`;其他值記成「(無法判讀)」,不猜。結果檔的 `decision_right` / `decision_wrong` 只算有寫預期決策、而且判讀得了的題目。
+- **無法判讀**(`decision_unreadable`,每題的 `unreadable` 寫出原因):裸模型的 verdict 對不上三態;裸模型的輸出不完整(報告的 `truncated` 不是 `false`,沒有這個鍵也算 —— 被截斷後補回的 verdict 不是模型的結論);管線的報告有環節沒跑完(`review_incomplete` 不是空的,決策剛好對上預期也一樣)。這一類不算符合、不算不符,也不算 `missed_block`,單獨計數。
+- **不該放行卻自動放行**(`missed_block`):預期的決策裡沒有一個允許放行,結果卻自動放行。最危險的錯,單獨計數。
+- **層級斷言不適用**:`_golden` 驗的是管線的各道防線,裸模型沒有那些防線,逐層結果記成「不適用」(結果檔 `layers` 的 `na`),不算通過也不算失敗。
+- **格式不對照樣算完**:裸模型的報告是模型原樣輸出,算分前先用管線的 `normalize_findings` 整理(`line` 寫成 `"12-15"`、finding 是字串、`findings` 是 null 都不會讓整輪停掉)。
+- 存檔重新評分(`--from-reports`)認得裸模型的報告(`_mode: baseline`),不用另外加旗標;結果檔的 `mode` 依報告本身決定,同一個目錄混了兩種時寫成 `mixed` 並印出警告。
+
+模型的輸出會飄(見 BASELINE.md),兩種模式各跑兩次以上再比。
+
 ## 為什麼要 `_golden`,`expected` 不夠嗎
 
 不夠,而且是兩個具體的洞:
@@ -334,13 +348,12 @@ id 依層分段:`1xx` 注入、`2xx` rule-base、`3xx` binding、`4xx` spec_exec
 > 由 `run_eval.py` 的 `case_config()` 單獨換一份設定跑,**不動 `config/models.yaml`
 > 的預設值**——改預設等於把正式審查的行為一起改掉。
 >
-> **已知缺口(不是這個 case 的問題,是管線的)**:`dbt compile` 的輸出一定帶三段式
-> 表名(`"<database>"."<schema>"."<表>"`),但執行驗證的沙盒把測資建在隨機命名的
-> `segcra_sbx_*` 資料庫、表名是規格 DDL 的單純名稱,兩邊對不起來會以
-> 「Invalid object name」失敗。而「先 `dbt compile` 再送進管線」正是 README 寫的
-> **正式流程**,所以這不只是評測的問題。`mr_701` 目前是靠改寫表名繞過;真正的修法
-> (沙盒以同名資料庫承接,或在 `prepare_sql` 剝掉限定詞)要單獨設計與審。
-> 現況由 `tests/test_golden_real_shape.py` 釘住,實作了會變紅提醒回來拿掉繞道。
+> **真實形狀的三段式表名**:`mr_701` 的 case 放的是 `dbt compile` 的原樣輸出,帶三段式
+> 表名(`"<database>"."<schema>"."<表>"`),而執行驗證的沙盒把測資建在隨機命名的
+> `segcra_sbx_*` 資料庫、表名是規格 DDL 的單純名稱。執行驗證時由 `_strip_table_qualifiers`
+> 把三段式剝成 `dbo.<表>`(見 docs/05「三段式表名剝成 dbo.<表>」),所以 case 不必再改寫
+> 表名繞過。對應不到沙盒一份測資的(撞名、四段式、tokenizer 認不出的寫法)記待驗證、
+> 不是判 SQL 錯。
 
 > 標記 `known_gap` 的 case(`mr_102`、`mr_403`、`mr_408`)見下方
 > 「三個已知缺口」——斷言照跑照顯示,但不計入失敗,以免有人為了讓套件變綠而刪掉它們。
