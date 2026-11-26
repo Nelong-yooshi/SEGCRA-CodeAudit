@@ -54,7 +54,7 @@ from .dbt_project import YAML_MODELS_NOT_LIST, YAML_SYNTAX
 from .spec_exec import SpecLookup, find_spec, run_spec_exec
 from .tool_hub import ToolHub
 from toolbox.sqltools import LINT_INCOMPLETE_CODE, LINT_MAX_CHARS, LINT_TIMEOUT_SECONDS
-from toolbox.sqltools import run_rules
+from toolbox.sqltools import run_rules, run_rules_on_template
 from toolbox.sqltools import DIALECT, parse_statements, parsed_chunks
 from .text_fields import MR_CONTENT_FILE, as_text
 
@@ -1219,6 +1219,27 @@ class _LintBudget:
         return lint[:15] if isinstance(lint, list) else []
 
 
+def _template_external(rules, sql: str):
+    """dbt 樣板展開失敗、改掃原文時,R006(外部資料源讀寫)改用 run_rules_on_template 的結果:Jinja
+    裡的屬性存取(`modules.datetime.datetime.strptime`)不當成四段式名稱。只有這條路換掉 Jinja 標記:
+    沒開 dbt 的檔與展開後的 SQL 裡沒有 Jinja,`'{{'` 只是字串,換掉就看不到後面的語句。
+
+    其他規則照用 hub 的結果:兩邊只差四段式名稱那一項,而送給規則層的內容(hub 收到的)不變。
+    直接呼叫規則層、不走 hub,理由同下面「原文也要掃一次」那段。"""
+    if isinstance(rules, dict):
+        hits = rules.get("hits") if isinstance(rules.get("hits"), list) else []
+    else:
+        hits = rules if isinstance(rules, list) else []
+    try:
+        again = json.loads(run_rules_on_template(sql))
+    except Exception:            # noqa: BLE001 — 規則層出錯時照用 hub 的結果,不中斷預掃
+        return rules
+    again = again.get("hits") if isinstance(again, dict) else again
+    external = [h for h in (again or []) if isinstance(h, dict) and h.get("rule") == "R006"]
+    merged = [h for h in hits if not (isinstance(h, dict) and h.get("rule") == "R006")] + external
+    return {**rules, "hits": merged} if isinstance(rules, dict) else merged
+
+
 async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
                   dbt_ctx: DbtContext | None = None, rendered: list | None = None,
                   line_maps: dict | None = None, out: list | None = None,
@@ -1301,6 +1322,8 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
             if dbt_notice is not None:
                 entry["dbt_render_notice"] = dbt_notice
         rules = await hub.call_json("sqltools__run_rules", {"sql": rule_sql})
+        if dbt_enabled and dbt_error is not None and not is_macro and is_dbt_template(rule_sql):
+            rules = _template_external(rules, rule_sql)
         if isinstance(rules, dict):
             hits = rules.get("hits")
             entry["rules"] = hits if isinstance(hits, list) else []
@@ -2659,7 +2682,7 @@ def enforce_hints(report: dict, pre: list[dict]) -> dict:
 
 # 預掃命中這些規則時,secure-sql skill 一律注入 system prompt(不賭模型主動載)
 _SECURE_SQL_RULES = ("R004", "R005", "H004",
-                    "R006", "R007", "R008", "R009", "R010")
+                    "R006", "R007", "R008", "R009", "R010", "R011")
 
 
 def _needs_secure_sql(pre: list[dict]) -> bool:
