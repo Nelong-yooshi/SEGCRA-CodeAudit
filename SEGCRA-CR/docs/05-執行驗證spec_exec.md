@@ -313,7 +313,7 @@ mr = {"title": "調整報表", "files": [{"path": "sql/x.sql", "full_content": "
   1. **「資料表定義」段必須釘死 schema**(可直接執行的 `CREATE TABLE`)——角色一照抄建表,沒有固定 schema 整個執行驗證做不起來;
   2. **需求項目逐條原子化、含運算子**:每條具體到可直接對照實作(交易範圍、聚合、閾值、時間窗、幣別、豁免、通報粒度、輸出欄位各自成條),用語與含等一致——「達/以上」=含=`>=`、「超過」=不含=`>`,並在補充段記下核定依據;含等寫錯一定被邊界案例抓到,寫「模糊」則測資會亂猜;
   3. 時間窗一律寫半開區間(`>= @start_date AND < @end_date`),參數名固定 `@start_date`/`@end_date`;程式與規格的 SQL 一律寫 T-SQL(`BIT` 用 `= 1`、`DATEPART(HOUR, x)`、字串型別寫長度、日期時間用 `DATETIME2` 而非 `TIMESTAMP`);
-  4. 表格式規格 → md 的整理範例在 `examples/sample/RETAIL_M1_spec.md`(原則:只寫核定規格有的、實作細節列「待補」不腦補、跨源不一致以核定規格為準);dbt + Jinja 的規則程式要先展開樣板才能執行——只引用 `source()` 的 model 會先展開成沙盒用的 SQL 再執行(見 docs/09「執行驗證」),其他含樣板的檔案回報「尚未支援」、交人工(不會誤判通過)。
+  4. 表格式規格 → md 的整理範例在 `examples/sample/RETAIL_M1_spec.md`(原則:只寫核定規格有的、實作細節列「待補」不腦補、跨源不一致以核定規格為準);dbt + Jinja 的規則程式要先展開樣板才能執行——引用 `source()` 與 `ref()` 的 model 會先展開成沙盒用的 SQL 再執行(見 docs/09「執行驗證」)。**有 `ref()` 的 model,「資料表定義」裡跟上游 model 同名的那張表代表的是上游 model 的輸出**:測資直接放進那張表,上游裡做的過濾、彙總不會被執行,所以規格的條件若是在上游做的,案例不符時記成待驗證(不判成 SQL 錯)。展開不了的檔案也記成待驗證、交人工(不會誤判通過)。
 - **換模型**:使用中的模型設定檔(`SEGCRA_MODELS_CONFIG` 指的那份,沒設時是 `config/models.yaml`;見 docs/10)的 `roles.testgen` / `roles.arbiter` 各自指到任一 profile;小模型常產不出合法測資 JSON(症狀:「測資生成失敗」finding),把 testgen 指回大 profile 即可(README §10)。
 - **改 prompt**:`orchestrator/spec_exec.py` 的 `TESTGEN_SYSTEM`(測資契約)與 `ARBITER_SYSTEM`(仲裁原則);執行窗常數 `WIN_START/WIN_END` 也在檔頭。改 TESTGEN 的輸出形狀時,`_shape_check` 必須同步改——形狀檢查是契約的執行者。
 - **已知限制**:
@@ -321,7 +321,7 @@ mr = {"title": "調整報表", "files": [{"path": "sql/x.sql", "full_content": "
   - 命中判定是「有無輸出列」(`len(rows) > 0`),**通報粒度**(每帳戶每日至多 1 筆)與輸出欄位語意不在執行驗證範圍,靠靜態審查的 H002/規格核對把關。
   - 覆蓋是「LLM 拆出的條件」的覆蓋:若角色一漏拆某條件,形狀檢查看不出「本來該有第 N 條」——上限由 spec 條列品質決定,這也是需求項目要逐條原子化的原因。
   - 沙盒需要先啟動(`scripts/sandbox.sh start`,約 2GB 記憶體);沙盒未啟動時執行驗證一律判不通過(major、needs_human)。
-  - dbt 樣板:**能展開成沙盒用的 SQL 的才執行**(見 09 篇「執行驗證」),其他回「尚未支援」major 交人工,不會誤判通過。
+  - dbt 樣板展開不了(規格沒有同名的表、表名無法確定、用了不支援的寫法)時不送沙盒,記成待驗證「[執行驗證] dbt model 沒有展開」,原因另列一條 info;不會落在 `sql_error`,也不會誤判通過。上游 model 由測資代替時,上游自己的邏輯沒有執行(見 docs/09 已知限制)。
     **評測裡的真實形狀 case(`mr_701`/`mr_702`)餵的是 compile 後的 SQL**,量的是什麼見 `eval/BASELINE.md` 第 12 節。
 
 ## 結構化生成:規格的形狀分類
