@@ -448,9 +448,10 @@ def test_只引用_source_的_model_送進沙盒執行(run):
 
 REF_FILES = {"models/stg_a.sql": "SELECT 1 AS account_no",
              "models/mrt_BIG.sql": "SELECT account_no FROM {{ ref('stg_a') }}\n"}
-# 規格多一張跟上游 model 同名的表:由它代替 stg_a 的輸出
-SPEC_STG = SPEC.replace("CREATE TABLE transactions(", "CREATE TABLE stg_a(account_no INT);\n"
-                        "CREATE TABLE transactions(")
+# 規格多一張跟上游 model 同名的表:由它代替 stg_a 的輸出。序號 P02 跟 run 的 project 資料夾對上(#178)
+SPEC_STG = (SPEC.replace("CREATE TABLE transactions(", "CREATE TABLE stg_a(account_no INT);\n"
+                         "CREATE TABLE transactions(")
+            + "\n## 基本資料\n\n| 欄位 | 值 |\n|---|---|\n| 序號 / 程式名稱 | P02 / BIG |\n")
 
 
 def test_ref_指向的表規格裡沒有時_照舊交人工_並寫出原因(run):

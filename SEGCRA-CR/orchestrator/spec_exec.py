@@ -1171,6 +1171,111 @@ def _sandbox_params() -> dict:
             "login_timeout": 10, "timeout": 120}
 
 
+# 帶三段式表名(`"<資料庫>"."<schema>"."<表>"`)的 SQL 要把表名剝成 `dbo.<表>` 才對得上
+# 沙盒的測資(見 _strip_table_qualifiers 與 docs/05)。會帶三段式的不是 dbt 樣板——dbt 的
+# ref()/source() 由管線自己展開成 `[表]`,不會有三段式;會帶三段式的是 MR 裡本來就寫成
+# 三段式的 SQL(手寫的跨資料庫寫法,或直接提交 compile 的輸出),以及評測的 mr_701/702。
+def _ddl_tables(schema_ddl) -> set[str]:
+    """規格 DDL 建了哪些表(只取表名本身、小寫)。
+
+    直接用 `_ddl_columns`(同一份 sqlglot 解析,鍵就是小寫表名),不另寫一份 regex——
+    欄位型別檢查已經解析過一次,表名再解析一次只是同一件事做兩遍、還可能不一致。
+    比對用小寫:SQL Server 預設的定序不分大小寫,而編譯輸出與規格 DDL 的大小寫常常
+    不一樣(`TXN_LOG_NET` / `txn_log_net`)。"""
+    return set(_ddl_columns(schema_ddl or []))
+
+
+def _ident_spans(sql: str):
+    """SQL 裡的識別字與點號位置:[(種類, 文字, 起, 迄)]。`end` 是最後一個字元的位置(含)。
+
+    用 **T-SQL 的 tokenizer**(`sqlglot.Dialect.get_or_raise("tsql").tokenize`)而不是通用的
+    `Tokenizer(dialect="tsql")`——後者的 `dialect` 參數不會換成 T-SQL 的規則,方括號被切成
+    `L_BRACKET`,只折得了中間剛好一個 token 的,`[my db]`(有空白)、`[d]]b]`(跳脫的 `]`)
+    都認不出來。T-SQL tokenizer 直接切出 `IDENTIFIER('my db')`、`IDENTIFIER('d]b')`,整個
+    方括號/雙引號識別字是一個 token,start/end 含界定符。字串常值與註解裡的 `a.b.c` 是
+    STRING/COMMENT,不會被當成表名。tokenize 失敗時回 None,呼叫端就不剝。
+    """
+    import sqlglot
+    from sqlglot import TokenType
+    try:
+        toks = sqlglot.Dialect.get_or_raise("tsql").tokenize(sql)
+    except Exception:                        # noqa: BLE001 — 切不出 token 就不動這段 SQL
+        return None
+    out = []
+    for t in toks:
+        kind = ("ident" if t.token_type in (TokenType.VAR, TokenType.IDENTIFIER)
+                else "dot" if t.token_type == TokenType.DOT else "other")
+        out.append((kind, t.text, t.start, t.end))
+    return out
+
+
+def _quote_ident(text: str) -> str:
+    """把識別字還原成可直接寫進 SQL 的樣子:單純識別字裸寫,含空白/特殊字元的才用
+    方括號包(`]` 跳脫成 `]]`)。token 的 text 是去掉界定符後的內容(`[my t]`→`my t`)。"""
+    if re.match(r"^[A-Za-z_][A-Za-z0-9_@#$]*$", text):
+        return text
+    return "[" + text.replace("]", "]]") + "]"
+
+
+def _strip_table_qualifiers(sql: str, tables: set[str]) -> tuple[str, str | None]:
+    """把三段式表名(`<庫>.<schema>.<表>`、含 `<庫>..<表>` 省略 schema)剝成 `dbo.<表>`。
+    回 (剝過的 SQL, 無法處理的原因或 None)。
+
+    **剝成兩段式 `dbo.<表>`、不是純 `<表>`**:兩段式 SQL Server 不會解成 CTE,所以就算
+    SQL 裡有同名 CTE,`FROM dbo.txn` 讀到的仍是沙盒的表(沙盒的表由建庫的登入建、都在
+    dbo;規格沒寫 schema 的表一定在 dbo)。這樣就不必再維護一份 CTE 名單——用 regex 抓
+    CTE 名碰到 `WITH a AS (…), /* c */ txn AS (…)` 的註解就抓不到,反而把同名引入判成錯。
+
+    對應不到沙盒一份測資的,記待驗證(回傳第二個值,呼叫端轉成帶 stage 的待驗證):
+    - 同一個表名出現在不同庫/schema 下(剝完會撞成同一張);
+    - 四段式(跨 linked server)。
+    """
+    spans = _ident_spans(sql)
+    if spans is None or not tables:
+        return sql, None
+    cuts: list[tuple[int, int, str]] = []      # (起, 迄, 換成什麼)
+    seen: dict[str, set[str]] = {}             # {表名: 它前面出現過哪些限定詞}
+    four_part: set[str] = set()                # 四段式命中測資表的名稱
+    i = 0
+    while i < len(spans):
+        if spans[i][0] != "ident":
+            i += 1
+            continue
+        first, quals, j = spans[i], [spans[i]], i
+        # 收集 `ident ( . ident? )*`,`.` 後面沒有 ident 就是空段(`db..t`)
+        while j + 1 < len(spans) and spans[j + 1][0] == "dot":
+            if j + 2 < len(spans) and spans[j + 2][0] == "ident":
+                quals.append(spans[j + 2])
+                j += 2
+            else:
+                quals.append(None)             # 空段
+                j += 1
+        last = quals[-1]
+        if last is not None and last[1].lower() in tables:
+            name = last[1].lower()
+            if len(quals) == 3:                # 三段式 → 剝成 dbo.<表>
+                seen.setdefault(name, set()).add(
+                    ".".join((q[1].lower() if q else "") for q in quals[:2]))
+                cuts.append((first[2], last[3], "dbo." + _quote_ident(last[1])))
+            elif len(quals) >= 4:              # 四段式(跨 linked server)→ 待驗證
+                four_part.add(name)
+        i = j + 1
+    clashed = sorted(n for n, quals in seen.items() if len(quals) > 1)
+    if clashed:
+        return sql, ("受審 SQL 用了不同資料庫/schema 下的同名表(" + "、".join(clashed)
+                     + "),沙盒的測資只有一份,無法對應:需人工執行驗證")
+    if four_part:
+        return sql, ("受審 SQL 用了四段式(跨 linked server)表名(" + "、".join(sorted(four_part))
+                     + "),對應不到沙盒的測資:需人工執行驗證")
+    out, prev = [], 0
+    for start, end, text in cuts:
+        out.append(sql[prev:start])
+        out.append(text)
+        prev = end + 1
+    out.append(sql[prev:])
+    return "".join(out), None
+
+
 def prepare_sql(sql: str) -> str:
     """把規則 SQL 準備成可在沙盒執行的形式。**SQL 本體原樣執行,不轉譯**:
     - INSERT INTO … SELECT、CREATE [OR ALTER] VIEW … AS SELECT → 只取 SELECT
@@ -1280,6 +1385,30 @@ def _eval_conditions(cursor, conds: list[dict]) -> tuple[dict[str, bool] | None,
     return out, ""
 
 
+_EXEC_ERROR_KEYS = ("sandbox_error", "sql_error", "testdata_error", "table_error")
+
+
+def execution_error(ex: dict) -> str | None:
+    """執行結果(`execute_cases` 的回傳)裡第一個非空的錯誤,沒有就回 None。
+
+    「這次執行有沒有失敗」只留這一份判斷:散在各處各自列 `sandbox_error or sql_error or
+    testdata_error` 的話,新增一種錯誤(例如 `table_error`)就會有的地方漏接,把「沒跑成」
+    當成「驗過了」。"""
+    for k in _EXEC_ERROR_KEYS:
+        if ex.get(k):
+            return ex[k]
+    return None
+
+
+def _mssql_error_number(e: Exception) -> int | None:
+    """從 pymssql 的例外取 SQL Server 錯誤碼。`MSSQLDatabaseException` 有 `.number`;
+    `OperationalError` 之類把 (錯誤碼, 訊息) 放在 args。取不到回 None。"""
+    num = getattr(e, "number", None)
+    if num is None and getattr(e, "args", None) and isinstance(e.args[0], int):
+        num = e.args[0]
+    return num
+
+
 def execute_cases(sql: str, plan: dict, deadline: float | None = None) -> dict:
     """角色二:確定性執行(非 LLM)。
 
@@ -1295,11 +1424,17 @@ def execute_cases(sql: str, plan: dict, deadline: float | None = None) -> dict:
     import pymssql
     params = _sandbox_params()
     prepared = prepare_sql(sql)
+    # 編譯輸出的三段式表名剝成純表名(沙盒的測資就是規格 DDL 的那些名稱)
+    known_tables = _ddl_tables(plan.get("schema_ddl"))
+    prepared, table_error = _strip_table_qualifiers(prepared, known_tables)
     results, mismatches = [], []
     truth: dict[str, dict] = {}       # {case_id: 每個條件在這個案例裡的真假}
     out = {"case_results": results, "mismatches": mismatches, "sql_error": None,
-           "testdata_error": None, "sandbox_error": None, "engine": None,
-           "timed_out": False}
+           "testdata_error": None, "sandbox_error": None, "table_error": table_error,
+           "engine": None, "timed_out": False}
+    if table_error:
+        # 表名對不上測資時就不要連沙盒了:跑出來的結果不是在驗這份 SQL
+        return out
 
     if not params["password"]:
         out["sandbox_error"] = "未設定 SANDBOX_MSSQL_PASSWORD(見 config/sandbox.env.example)"
@@ -1335,6 +1470,11 @@ def execute_cases(sql: str, plan: dict, deadline: float | None = None) -> dict:
                         c.execute(ddl)
                     for row in case["rows"]:
                         table, vals = row[0], row[1:]
+                        # INSERT 不指名欄位,表名無法參數化,只能拼進語句——所以先用規格
+                        # DDL 定義過的表名當白名單擋一次(小寫比對)。測資的表名理應就是
+                        # 那幾張;不在白名單內的字串一律不拼進 SQL,記成測資側的錯。
+                        if str(table).lower() not in known_tables:
+                            raise ValueError(f"測資的表名 {table} 不在規格 DDL 定義的表內")
                         ph = ",".join(["%s"] * len(vals))
                         c.execute(f"INSERT INTO {table} VALUES ({ph})", tuple(vals))
                 except Exception as e:   # DDL / 灌資料失敗 = 測資側的錯,不是 SQL 的錯
@@ -1343,8 +1483,17 @@ def execute_cases(sql: str, plan: dict, deadline: float | None = None) -> dict:
                 try:
                     c.execute(prepared)
                     rows = c.fetchall() if c.description else []
-                except Exception as e:   # SQL 本身跑不起來(語法/欄位/方言)→ SQL 側的錯
-                    out["sql_error"] = str(e)[:300]
+                except Exception as e:
+                    # SQL Server 回「找不到物件/資料庫/linked server」(208/911/7202):多半是
+                    # tokenizer 還認不出、沒剝掉的限定表名,或規格的資料表定義漏了那張表——
+                    # 不是這份 SQL 的邏輯錯,記待驗證(table_error),不要說成「SQL 有錯」。
+                    if _mssql_error_number(e) in (208, 911, 7202):
+                        out["table_error"] = (
+                            f"沙盒找不到物件/資料庫(SQL Server 錯誤 "
+                            f"{_mssql_error_number(e)}),可能是沒剝掉的限定表名或規格 DDL 漏了"
+                            f"那張表,無法對應沙盒的測資:需人工執行驗證。{str(e)[:160]}")
+                        return out
+                    out["sql_error"] = str(e)[:300]     # 語法/欄位/方言 → SQL 側的錯
                     return out
                 # 標籤一致性(#23 第 3 點):在**同一個交易、同一份資料**上逐條算出
                 # 每個條件的真假,確認這個案例真的在測它自己宣稱的那一條。
@@ -2107,6 +2256,17 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
         ex = await run_in_thread(_execute, sql, plan, deadline, name="spec-exec-sandbox")
     finally:
         _leave(STAGE_SANDBOX, _t)
+    if ex.get("table_error"):
+        # 剝不掉的三段式表名 ≠ SQL 有錯:沙盒的測資對不上這份 SQL 要讀的表,是我們
+        # 驗不了,不是程式寫錯 —— 說成「SQL 無法在測資上執行」會讓人去改沒問題的 SQL。
+        findings.append(_finding(path, "major", "執行驗證無法完成(表名無法對應沙盒的測資)",
+                                 f"{ex['table_error']}。未經執行驗證,本 MR 不得自動放行。",
+                                 "請人工依核定規格核對實作邏輯。"))
+        return {"passed": False, "spec_code": spec_code, "engine": ex["engine"],
+                "conditions": plan["conditions"], "coverage_gaps": coverage_gaps,
+                "case_results": [], "dropped_cases": dropped_cases,
+                "table_error": ex["table_error"],
+                "stage_seconds": stage_seconds, "findings": findings}
     if ex["sandbox_error"]:
         # 沙盒不可用 ≠ 驗證通過:照樣不得自動放行,並講清楚是環境問題而非程式問題
         # 帶 stage:這一環節沒跑完(CI 結束碼 5),不是審完了交給人——交給人(3)可以合併
