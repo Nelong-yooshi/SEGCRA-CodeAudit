@@ -32,10 +32,6 @@ def parse_statements(sql: str):
     return sqlglot.parse(sql, dialect=DIALECT)
 
 
-# 舊名字:等 pipeline 與 dbt_affected 的呼叫端換過去之後移除。先留著是因為那兩個
-# 檔案現在有在途的改動,一起改會撞在一起。
-
-
 def _skip_block_comment(sql: str, i: int, end: int) -> int:
     """跳過從 i 開始的區塊註解,回傳註解後的位置。
 
@@ -230,32 +226,115 @@ def _keyword_cuts(sql: str) -> list[int]:
             if ch == "\n" and _KEYWORD_LINE_RE.match(sql, i + 1)]
 
 
-def _split_by_keyword(text: str, line_offset: int) -> list[Chunk] | None:
-    """解析不了的一段,改以行首的語句關鍵字再切一次;**每一段都解析得過才算數**。
+_GO_ONLY_RE = re.compile(r"(?i)^\s*GO\s*;?\s*$")
 
-    **只在解析失敗時才試**,而且全部解析得過才採用:正常寫法(`INSERT INTO t` 換行接
-    `SELECT …`、`UNION ALL`、CTE、`MERGE … WHEN MATCHED THEN UPDATE`)本來就解析得過,
-    根本不會走到這裡 —— 所以切錯把它們拆散的風險不存在。切完還是有一段解析不了的,
-    就當作沒切過,照舊回報那一段解析失敗,不會把「一句壞掉」變成「好幾句壞掉」。
+
+def _go_line_bounds(text: str) -> list[tuple[int, int]]:
+    """每個「只有 GO」的行的 (起, 迄含換行)。GO 是腳本分批的寫法、不是 SQL,切分時當作
+    邊界、那一行本身丟掉 —— 否則 `UPDATE … WHERE` 換行接 `GO` 換行接 `DELETE FROM t`
+    會因為 GO 黏在第一段而整段解析不了。字串或註解裡的 GO 不算(只取 `_scan_code` 看到
+    的真換行當行首)。"""
+    starts = [0] + [i + 1 for i, ch in _scan_code(text) if ch == "\n"]
+    bounds = []
+    for ls in starts:
+        le = text.find("\n", ls)
+        end = len(text) if le < 0 else le + 1
+        if _GO_ONLY_RE.match(text[ls:end]):
+            bounds.append((ls, end))
+    return bounds
+
+
+def _looks_multi_statement(text: str) -> bool:
+    """看起來是沒分號的多句:**兩行以上以語句關鍵字開頭**。
+
+    解析退回 `Command`、又長這樣的段落要試著切開跑規則(`DECLARE @x INT` 換行接
+    `SELECT * FROM t` 應報 R002),不能原樣採用、看起來跟掃過了沒問題一樣。單獨一句的
+    `SET NOCOUNT ON`、`PRINT 1` 只有一行關鍵字,不算,照原樣採用。
     """
-    cuts = _keyword_cuts(text)
-    if not cuts:
+    return len(_keyword_cuts(text)) + bool(_KEYWORD_LINE_RE.match(text)) >= 2
+
+
+def _parse_list(text: str):
+    """解析成語句清單;解析器自己的錯回 None(呼叫端當作「看不懂」)。"""
+    try:
+        return [st for st in parse_statements(text) if st is not None]
+    except (SqlglotError, RecursionError):
         return None
-    out, start = [], 0
-    for cut in list(cuts) + [len(text)]:
-        piece = text[start:cut]
-        if piece.strip(" \t\r\n;"):
-            out.append(Chunk(piece, line_offset + text.count("\n", 0, start),
-                             _first_token(text, start, cut)))
-        start = cut
-    if len(out) < 2:
+
+
+def _is_command(statements) -> bool:
+    return any(isinstance(st, exp.Command) or st.find(exp.Command) is not None
+               for st in statements)
+
+
+def _one_parsed_statement(text: str) -> bool:
+    """`text` 解析後**恰好一句、真的解析懂(不退回 `Command`)、寫入語句也沒被吃掉**。
+
+    合併判斷用它:`UPDATE dbo.accounts` 接下一行的 `SET …` 合起來是一句真正的 `UPDATE`,
+    代表那不是語句邊界、是同一句的續行,不該切。`DECLARE @x INT` 接 `SELECT *` 合起來只
+    退回 `Command`(沒真的解析懂),不算一句,要切開。`EXEC dbo.p` 接 `DELETE t` 會被併成
+    `EXECUTE … DELETE AS t`、`DELETE` 不見了(`_block_unclear`),也不算。
+    """
+    statements = _parse_list(text)
+    if statements is None or len(statements) != 1:
+        return False
+    return not _is_command(statements) and not _block_unclear(text, statements)
+
+
+def _acceptable_piece(text: str) -> bool:
+    """切出來的一段**可以採用**:要嘛是一句真正解析懂的語句,要嘛是 sqlglot 不建模、
+    單獨一行的良性 `Command`(`DECLARE`、`SET NOCOUNT ON`、`PRINT 1` 這種)。
+
+    看起來是多句、卻還退回 `Command` 的段落不算(沒真的切乾淨),回去記成無法解析,
+    不讓「DECLARE 換行接 SELECT *」原樣採用、看起來像掃過了沒問題。
+    """
+    statements = _parse_list(text)
+    if statements is None or len(statements) != 1 or _block_unclear(text, statements):
+        return False
+    if _is_command(statements):
+        return not _looks_multi_statement(text)   # 良性單句 Command 可以;多句 Command 不行
+    return True
+
+
+def _split_by_keyword(text: str, line_offset: int) -> list[Chunk] | None:
+    """解析不了的一段,改以行首的語句關鍵字再切 —— 但**先確認那裡真的是沒分號的斷句**。
+
+    `_STMT_KEYWORDS` 含 `SET`,所以 `UPDATE t` 換行接 `SET a = 1 WHERE …` 的 `SET` 也會被
+    當成切點,把一句合法的 `UPDATE` 從中間切成「沒有 WHERE 的 UPDATE」而誤報 R001。所以
+    先在每個行首關鍵字切一刀,再**貪婪合併**:相鄰兩段合起來若是一句真正解析懂的語句
+    (見 `_one_parsed_statement`),就代表沒分號、是同一句的續行,合回去;合起來不是一句
+    (兩句、退回 Command、或寫入語句被吃掉)才留成邊界。`UPDATE…SET…WHERE`、`INSERT…SELECT`
+    自動黏回一句;真正沒分號的兩句(`DELETE …` 換行接 `SELECT …`、`DECLARE` 接 `SELECT *`)
+    才切開;沒有 WHERE 的 `UPDATE t` 換行接 `SET a = 1` 合回去仍是一句沒有 WHERE 的 UPDATE,
+    照樣報 R001。
+
+    合完每段都要能採用(見 `_acceptable_piece`)才算數;任一段切不乾淨就回 None,由呼叫端
+    照舊記成解析失敗 —— 不把「一句壞掉」變成「好幾句壞掉」。
+    """
+    cuts = set(_keyword_cuts(text))
+    for ls, end in _go_line_bounds(text):   # 單行 GO 當邊界(前後都斷開)
+        cuts.update((ls, end))
+    bounds = [0] + sorted(cuts) + [len(text)]
+    spans = [(a, b) for a, b in zip(bounds, bounds[1:])
+             if text[a:b].strip(" \t\r\n;") and not _GO_ONLY_RE.match(text[a:b])]
+    if len(spans) < 2:
         return None
-    for chunk in out:
-        try:
-            if not [st for st in parse_statements(chunk.text) if st is not None]:
-                return None
-        except (SqlglotError, RecursionError):   # 有一段解析不了就當作沒切過
+    merged = [list(spans[0])]
+    for a, b in spans[1:]:
+        start = merged[-1][0]
+        if _one_parsed_statement(text[start:b]):   # 合起來是一句 → 續行,不切
+            merged[-1][1] = b
+        else:
+            merged.append([a, b])
+    if len(merged) < 2:
+        return None
+    out = []
+    for a, b in merged:
+        seg = text[a:b]
+        if not _acceptable_piece(seg):             # 有一段切不乾淨 → 當作沒切過
             return None
+        out.append(Chunk(seg, line_offset + text.count("\n", 0, a),
+                         _first_token(text, a, b)))
     return out
 
 
@@ -316,17 +395,20 @@ def _block_unclear(text: str, statements) -> bool:
                for st in statements if st is not None)
 
 
-def _strip_block_heads(text: str) -> str:
+def _strip_block_heads(text: str) -> tuple[str, int]:
     """把區塊的外框剝掉:`BEGIN TRY`、`END CATCH`、`IF 條件`、`WHILE 條件` 這些。
+    回傳(剝完的內文, 從原文開頭被剝掉的字元數)—— 後者讓切出來的段落對得回原始位置。
 
     條件剝到第一個語句關鍵字為止。剝錯了不會有事:呼叫端只在「剝完解析得過、而且原文
     寫著的寫入語句都在語法樹裡」時才採用,否則照舊記成解析失敗。
     """
+    front = 0
     prev = None
     while prev != text:
         prev = text
         m = _BLOCK_EDGE_RE.match(text) or _PROC_HEAD_RE.match(text)
         if m:
+            front += m.end()
             text = text[m.end():]
             continue
         tail = _BLOCK_TAIL_RE.search(text)
@@ -336,8 +418,9 @@ def _strip_block_heads(text: str) -> str:
         if _COND_HEAD_RE.match(text):
             after = _KEYWORD_ANY_RE.search(text, _COND_HEAD_RE.match(text).end())
             if after:
+                front += after.start()
                 text = text[after.start():]
-    return text
+    return text, front
 
 
 def parsed_chunks(sql: str, catch=(SqlglotError, RecursionError)
@@ -364,34 +447,80 @@ def parsed_chunks(sql: str, catch=(SqlglotError, RecursionError)
                   if sql.strip(" \t\r\n;") else [])
     out = []
     for chunk in chunks:
+        # 段落的原文起點(含前面空白/註解)在整份 SQL 裡的位置。chunk.start 是第一個有
+        # 意義字元,減掉段內到第一個字元的距離才是段落開頭 —— 切出來的子段位置從這裡往後
+        # 加,不會重複算到前面的空白/註解(否則行內留言的行號會偏)。
+        text_start = chunk.start - _first_token(chunk.text, 0, len(chunk.text))
         try:
             parsed = parse_statements(chunk.text)
         except catch as e:
             err = e
         else:
-            if not _block_unclear(chunk.text, parsed):
+            # 要進恢復(切/剝)的兩種:原文有寫入字樣但語法樹看不到(_block_unclear),或
+            # 解析退回 Command、又看起來是沒分號的多句 —— 後者即使沒有寫入字樣也要切開跑
+            # 規則(DECLARE 換行接 SELECT * 要報 R002),不能原樣採用當成掃過了沒問題。
+            is_command = any(isinstance(st, exp.Command) or st.find(exp.Command) is not None
+                             for st in parsed if st is not None)
+            if not (_block_unclear(chunk.text, parsed)
+                    or (is_command and _looks_multi_statement(chunk.text))):
                 out.append((chunk, parsed, None))
                 continue
-            # 程序性的區塊:裡面的寫入語句對規則層消失了。剝掉外框再解析一次。
-            inner = _strip_block_heads(chunk.text)
-            try:
-                retry = parse_statements(inner) if inner.strip() else []
-            except catch:
-                retry = None
-            if retry is not None and not _block_unclear(inner, retry):
-                out.append((Chunk(inner, chunk.line_offset, chunk.start), retry, None))
+            # 看不到裡面的寫入語句時,依序試兩種恢復方式;哪一種都要「解析得過 **而且**
+            # 原文寫著的寫入語句都回到語法樹裡」才算數,不然照舊記成解析失敗。
+            #   1. 剝掉區塊外框(BEGIN…END、IF/WHILE 的條件、程序標頭)
+            #   2. 以行首的語句關鍵字再切一次 —— `DECLARE @x INT` 換行接
+            #      `UPDATE t SET a = 1` 這種:沒有分號、整段被解析成一個看不懂的
+            #      Command(不報錯),所以「解析失敗才切」的那一層碰不到它。
+            recovered = None
+            inner, inner_front = _strip_block_heads(chunk.text)
+            stripped = bool(inner.strip()) and inner != chunk.text
+            inner_line = chunk.line_offset + chunk.text[:inner_front].count("\n")
+            if stripped:
+                try:
+                    retry = parse_statements(inner)
+                except catch:
+                    retry = None
+                if retry is not None and not _block_unclear(inner, retry):
+                    recovered = [(Chunk(inner, inner_line, text_start + inner_front
+                                        + _first_token(inner, 0, len(inner))), retry)]
+            if recovered is None:
+                # 剝出的內文還是看不懂時,就在**剝乾淨的內文**上切(2),不在帶著
+                # BEGIN…END/程序標頭雜訊的全文上切 —— 否則 UPDATE 會被末尾的 END 擋著、
+                # 跟它的 SET…WHERE 黏不回來,變回「沒有 WHERE 的 UPDATE」誤報。
+                base, base_off, base_line = ((inner, inner_front, inner_line) if stripped
+                                             else (chunk.text, 0, chunk.line_offset))
+                pieces = _split_by_keyword(base, base_line) or []
+                parsed_pieces = []
+                for piece in pieces:
+                    try:
+                        sub = parse_statements(piece.text)
+                    except catch:
+                        parsed_pieces = []
+                        break
+                    if _block_unclear(piece.text, sub):
+                        parsed_pieces = []
+                        break
+                    parsed_pieces.append((Chunk(piece.text, piece.line_offset,
+                                                text_start + base_off + piece.start), sub))
+                recovered = parsed_pieces or None
+            if recovered is not None:
+                out.extend((c, p, None) for c, p in recovered)
             else:
-                # 剝不開、或剝完還是看不到那些寫入語句:**不可以回報成沒有命中**。
-                # 記成解析失敗,由 enforce_parse 補一條「預掃無法解析」交人工。
+                # 兩種都不行:**不可以回報成沒有命中**。記成解析失敗,由 enforce_parse
+                # 補一條「預掃無法解析」交人工。訊息寫實際原因:有剝到區塊外框才寫
+                # 程序性區塊,否則是沒分號的多句切不開 —— 不要對著沒有 BEGIN/IF 的輸入
+                # 叫人去找不存在的區塊。
                 out.append((chunk, [], _BlockNotParsed(
-                    "程序性區塊(BEGIN…END / IF / WHILE / TRY…CATCH)裡的語句無法解析")))
+                    "程序性區塊(BEGIN…END / IF / WHILE / TRY…CATCH)裡的語句無法解析"
+                    if stripped else
+                    "整段無法解析:沒有分號的多句切不開,或夾著無法辨識的語法")))
             continue
         pieces = _split_by_keyword(chunk.text, chunk.line_offset)
         if pieces is None:
             out.append((chunk, [], err))
             continue
         for piece in pieces:                        # 上面已經確認每一段都解析得過
-            out.append((Chunk(piece.text, piece.line_offset, chunk.start + piece.start),
+            out.append((Chunk(piece.text, piece.line_offset, text_start + piece.start),
                         parse_statements(piece.text), None))
     return out
 
