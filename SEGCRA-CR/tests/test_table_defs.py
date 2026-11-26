@@ -167,7 +167,7 @@ def _defs():
 def test_augment_adds_table_where_spec_tables_reads_it(spec):
     text, record = augment(spec, [SQL], _defs(), spec_tables(spec))
     tables = spec_tables(text)
-    assert tables["txn_log"] == "[txn_log]"
+    assert tables["txn_log"] == "[dbo].[txn_log]"        # 沒寫 schema 的表在沙盒的 dbo(見 dbt_exec.spec_tables)
     assert ("acct" in tables) == (spec in (SPEC_FENCED, SPEC_RAW)), "規格原本的表不能不見"
     assert "## 需求\n- x" in text
     assert spec != SPEC_PENDING or "待補(欄位與型別向部署端確認)" in text

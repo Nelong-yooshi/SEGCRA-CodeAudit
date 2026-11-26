@@ -1198,6 +1198,75 @@ def test_變更前的專案資訊整理不出來_當成無法比較():
     assert impact_finding(check)["severity"] == "major"
 
 
+# MR 自己有程式檔、但對不到規格:不可以改用受影響 model 的規格(P09 的程式拿 P02 的規格驗、
+# 報告寫通過,就是 project 對應要擋的「選錯規格」)。只改 macro 的照舊用受影響 model 的那份
+# (上面的 test_只改macro_用受影響model的規格來審_但不會被當成執行驗證通過)
+@pytest.mark.parametrize("programs, reason", [
+    ({"models/P09/x.sql": PLAIN_SQL}, "project P09 沒有對應的規格"),
+    ({"models/P01/x.sql": PLAIN_SQL, "models/P03/y.sql": PLAIN_SQL}, "分屬不同 project"),
+    # 程式是 dbt 樣板時,執行驗證那一段原本會借用受影響 model 的規格(樣板不會被執行,
+    # 所以借來的規格只用在「dbt model 沒有展開」那條待驗證);對不到規格時也不可以借
+    ({"models/P09/x.sql": "{{ body() }}\n"}, "project P09 沒有對應的規格"),
+])
+def test_MR的程式對不到規格時_不改用受影響model的規格(review, programs, reason):
+    head = _in_project(_project(PLAIN_SQL))
+    head.update(programs)
+    files = [{"path": "macros/act.sql", "diff": FRAGMENT}] + [
+        {"path": p, "diff": FRAGMENT, "full_content": body} for p, body in programs.items()]
+    report, state = review(files, _Loader(head))
+    assert report["_spec_exec"]["no_spec"] is True
+    assert reason in report["_spec_exec"]["no_spec_reason"]
+    assert report["_spec_exec"]["spec_code"] != "BIG"
+    assert state["generated"] == 0, "拿受影響 model 的規格生了測資"
+    assert report["decision"] != "auto_approved"
+
+
+def _rename_spec_mr():
+    """同一個序號 P01 有兩份規格(R-201、DUP);MR 把 DUP 改名搬出 specs/,並改了 P01 的程式。"""
+    cfg = {**CFG, "project_dir": "dbt_sub"}
+    files = [{"path": "docs/DUP.md", "old_path": "specs/DUP.md", "renamed_file": True, "diff": ""},
+             {"path": "dbt_sub/models/P01/x.sql", "diff": FRAGMENT, "full_content": PLAIN_SQL}]
+    return cfg, files
+
+
+def test_規格改名搬出specs_算修改了規格_不自動放行(review):
+    (spec_exec.SPECS_DIR / "DUP.md").write_text(
+        "# DUP 規格\n\n" + _basic("P01", "DUP") + "金額達 100000 通報。\n", encoding="utf-8")
+    cfg, files = _rename_spec_mr()
+    report, state = review(files, _Loader(_project(PLAIN_SQL)), cfg_dbt=cfg)
+    assert report["_policy_signals"]["spec_changed"] is True
+    assert report["decision"] != "auto_approved"
+    (fd,) = [f for f in report["findings"] if f["title"] == pipeline._SPEC_CHANGE_TITLE]
+    assert "`specs/DUP.md` 被改名搬出規格目錄" in fd["detail"]
+    assert "不在審查讀取規格的位置" not in fd["detail"]
+    # 搬走之後 P01 只剩 R-201:審查讀的是 MR 之後的規格目錄(真實模式下載的就是那一版)
+    assert report["_spec_exec"]["spec_code"] == "R-201"
+
+
+@pytest.mark.parametrize("old_path, path", [
+    ("specs/DUP.md", "docs/DUP.md"),
+    ("specs/DUP.md", "specs/DUP.md.bak"),
+    ("specs/DUP.md", "sql/dup.sql"),
+])
+def test_改名搬出規格目錄都算修改了規格(old_path, path):
+    mr = {"files": [{"path": path, "old_path": old_path, "diff": ""}]}
+    assert pipeline._touches_specs(mr)
+    assert pipeline._spec_versions_in_mr(mr)[0] == {"DUP": ""}
+
+
+def test_規格目錄裡改名_新的照常算規格_舊代號記成刪除():
+    mr = {"files": [{"path": "specs/NEW.md", "old_path": "specs/OLD.md", "diff": "",
+                     "full_content": "# NEW"}]}
+    assert pipeline._touches_specs(mr)
+    assert pipeline._spec_versions_in_mr(mr)[0] == {"NEW": "# NEW", "OLD": ""}
+
+
+def test_改名進規格目錄以外的一般檔_不算修改了規格():
+    mr = {"files": [{"path": "sql/b.sql", "old_path": "sql/a.sql", "diff": ""}]}
+    assert not pipeline._touches_specs(mr)
+    assert pipeline._spec_versions_in_mr(mr)[0] == {}
+
+
 # ─────────────────── 11. 自檢補的案例 ───────────────────
 
 TEMPLATE_AND_PLAIN = {"files": [{"path": "models/m.sql", "full_content": "SELECT {{ 1 }}"},
