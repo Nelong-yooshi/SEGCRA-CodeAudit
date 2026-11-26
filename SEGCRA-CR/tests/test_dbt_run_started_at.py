@@ -301,6 +301,7 @@ def test_預掃用展開前的原文給提醒(monkeypatch):
 # ─────────────────── 5. 執行驗證不用它 ───────────────────
 
 def _exec(model_sql, macro_sql=None):
+    # render_for_exec 回 (SQL, 不執行的原因, 由測資代替的上游)
     from orchestrator.dbt_exec import render_for_exec
     from tests.test_dbt_exec import INFO, SPEC
     kwargs = {"project": INFO}
@@ -316,7 +317,7 @@ SOURCE_MODEL = ("SELECT account_no, amount FROM {{ source('raw','transactions') 
 
 def test_用到_run_started_at_的_model_不送沙盒():
     from orchestrator.dbt_exec import RUN_STARTED_AT_UNVERIFIED
-    assert _exec(SOURCE_MODEL) == (None, RUN_STARTED_AT_UNVERIFIED)
+    assert _exec(SOURCE_MODEL) == (None, RUN_STARTED_AT_UNVERIFIED, ())
 
 
 def test_macro_裡用到也一樣():
@@ -324,19 +325,19 @@ def test_macro_裡用到也一樣():
     macro = "{% macro today_str() %}{{ run_started_at.strftime('%Y-%m-%d') }}{% endmacro %}"
     model = ("SELECT account_no FROM {{ source('raw','transactions') }} "
              "WHERE txn_date = CAST('{{ today_str() }}' AS DATE)")
-    assert _exec(model, macro) == (None, RUN_STARTED_AT_UNVERIFIED)
+    assert _exec(model, macro) == (None, RUN_STARTED_AT_UNVERIFIED, ())
 
 
 def test_沒呼叫寫到它的_macro_照常執行():
     macro = ("{% macro today_str() %}{{ run_started_at.strftime('%Y-%m-%d') }}{% endmacro %}"
              "{% macro amount_col() %}amount{% endmacro %}")
     model = "SELECT account_no, {{ amount_col() }} FROM {{ source('raw','transactions') }}"
-    sql, reason = _exec(model, macro)
+    sql, reason, _ = _exec(model, macro)
     assert reason is None and "[transactions]" in sql
 
 
 def test_沒用到_run_started_at_的_model_照常執行():
-    sql, reason = _exec("SELECT account_no, amount FROM {{ source('raw','transactions') }}")
+    sql, reason, _ = _exec("SELECT account_no, amount FROM {{ source('raw','transactions') }}")
     assert reason is None and "[transactions]" in sql
 
 

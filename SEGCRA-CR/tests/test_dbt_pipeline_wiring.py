@@ -262,7 +262,7 @@ def test_dbt_template_never_sent_to_sandbox(no_llm_no_sandbox, sql):
     assert result["dbt_template"] is True
     [finding] = result["findings"]
     assert finding["severity"] == "major"
-    assert "dbt 樣板" in finding["title"]
+    assert finding["title"] == "[執行驗證] dbt model 沒有展開" and finding["stage"] == "執行驗證"
     assert "修正 SQL" not in finding["suggestion"]    # 不可暗示是開發者的程式有錯
 
 

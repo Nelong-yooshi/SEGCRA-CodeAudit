@@ -530,21 +530,33 @@ def model_identity(project: "DbtProjectInfo | None", name: str, schema: str) -> 
         model 名稱與 target 的 schema 展開,只是記成不確定、不讓展開失敗
 
     資料庫名不在這裡:一律用呼叫端給的 database(約定的假名,見 DbtProjectInfo)。"""
-    if project is None or project.global_uncertain or name in project.uncertain_models:
+    alias = model_alias(project, name)
+    if alias is None:
         return name, schema, False
-    naming = project.naming.get(name)
-    if naming is None:
-        return name, schema, False
-    alias = naming["alias"].strip() if naming.get("alias") else name
-    custom = naming.get("schema")
+    custom = project.naming[name].get("schema")
     if custom is None:
-        return (alias, schema, True) if _IDENT.fullmatch(alias) else (name, schema, False)
+        return alias, schema, True
     if project.schema_concat is None:
         return name, schema, False
     rel_schema = f"{schema}_{custom.strip()}" if project.schema_concat else custom.strip()
-    if not (_IDENT.fullmatch(alias) and _IDENT.fullmatch(rel_schema)):
+    if not _IDENT.fullmatch(rel_schema):
         return name, schema, False
     return alias, rel_schema, True
+
+
+def model_alias(project: "DbtProjectInfo | None", name: str) -> str | None:
+    """model 在正式環境的表名(dbt 的 generate_alias_name:alias 有值就去掉頭尾空白,沒設用 model 名稱);
+    無法確定時回 None:沒有專案資訊、專案層級無法確定、這個 model 無法確定(seed、snapshot 也列在
+    uncertain_models)、不是英數與底線(會被拼進 SQL 識別字)。model_identity 與執行驗證的代替表
+    都用這一份。"""
+    if project is None or project.global_uncertain or name in project.uncertain_models:
+        return None
+    naming = project.naming.get(name)
+    if naming is None:
+        return None
+    raw = naming.get("alias")
+    alias = raw.strip() if raw else name
+    return alias if _IDENT.fullmatch(alias) else None
 
 
 def _make_relations(database: str | None, schema: str, usage: dict,
@@ -564,7 +576,7 @@ def _make_relations(database: str | None, schema: str, usage: dict,
       * 找得到的 model 照 dbt 的規則套用 alias 與自訂 schema(model_identity)
 
     sandbox_tables 給定時是執行驗證用的展開(見 _sandbox_relations):source() 指向規格建的
-    測資表,ref() 與 {{ this }} 不支援。
+    測資表,ref() 由規格裡同名的測資表代替上游 model,{{ this }} 不支援。
     """
     if sandbox_tables is not None:
         return _sandbox_relations(usage, project, sandbox_tables)
@@ -652,8 +664,6 @@ def _make_relations(database: str | None, schema: str, usage: dict,
     return ref, source, this
 
 
-_EXEC_NO_REF = ("執行驗證尚未支援 ref():被引用的 model 要先在沙盒建出來,"
-                "或由測資代替,目前都還沒有做")
 _EXEC_NO_THIS = "執行驗證尚未支援 {{ this }}(這個 model 自己的表不在沙盒裡)"
 _EXEC_LOADING = "載入 macro 時不提供表名"
 
@@ -667,14 +677,53 @@ def _sandbox_relations(usage: dict, project: "DbtProjectInfo | None", sandbox_ta
     來源的 schema:沙盒只有規格建的那幾張表。兩個不同的來源對到同一張測資表時無法分辨,展開失敗。
     任何一項不成立就展開失敗(錯誤訊息是原因),不猜表名:猜錯的話執行結果會被當成程式的問題。
 
-    ref() 與 {{ this }} 不支援(上游 model 與增量的目標表都不在沙盒裡)。
+    ref() 由測資代替上游 model:被引用的 model 表名確定(alias 算過之後,見 model_alias),而且規格
+    裡有同名的表,就指向那張表。上游 model 自己的邏輯不在這次執行(由規格的測資當成它的輸出);
+    代替了哪些 model 記在 usage["stand_ins"],報告要寫出來。seed、snapshot、其他套件的 model、
+    表名無法確定的 model,一律展開失敗。
+    {{ this }} 不支援(增量的目標表不在沙盒裡)。
     表名物件只提供 identifier / name / table;database 與 schema 在沙盒裡跟正式環境不同,取用就失敗。"""
     seen: dict = usage.setdefault("sandbox_sources", {})
+    stand_ins: list = usage.setdefault("stand_ins", [])
+
+    def table(key, identifier: str, what: str):
+        """規格裡同名的測資表。key 用來認出「兩個不同的引用對到同一張表」。"""
+        folded = identifier.lower()
+        if folded not in sandbox_tables:
+            raise DbtRenderError(f"規格的資料表定義沒有 {what}指向的表:{identifier}")
+        if sandbox_tables[folded] is None:
+            raise DbtRenderError(f"規格的資料表定義有不只一張叫這個名稱的表:{identifier}")
+        if seen.setdefault(folded, key) != key:
+            raise DbtRenderError(f"兩個不同的 source() / ref() 都對到規格的同一張表:{identifier}")
+        return _SandboxRelation(sandbox_tables[folded], identifier)
 
     def ref(*args, **kwargs):
+        if len(args) not in (1, 2):
+            raise DbtRenderError(f"ref() 參數個數不合法:{len(args)} 個")
+        if kwargs:
+            names = ", ".join(sorted(kwargs))
+            raise DbtRenderError(
+                f"ref() 的關鍵字參數({names})會改變指向的關聯,本模組無法解析,拒絕展開。")
+        for a in args[:-1]:
+            _check_ident("套件", a)
+        name = _check_ident("表", args[-1])
         if usage.get("loading_macros"):
             return _UnavailableRelation(_EXEC_LOADING)
-        raise DbtRenderError(_EXEC_NO_REF)
+        usage["used"] = True
+        if project is None:
+            raise DbtRenderError("沒有 dbt 專案資訊,無法確定 ref() 指向的表")
+        if len(args) == 2 and args[0] != project.project_name:
+            raise DbtRenderError(f"ref() 指向其他套件的 model,不在這個專案裡:{args[0]}.{name}")
+        if name not in project.ref_names:
+            raise DbtRenderError(f"ref() 指向專案裡不存在的 model / seed / snapshot:{name}")
+        identifier = model_alias(project, name)
+        if identifier is None:
+            raise DbtRenderError(
+                f"ref() 指向的表名無法確定(seed、snapshot,或 alias 等設定是樣板值):{name}")
+        relation = table(("ref", name), identifier, "ref() ")      # 鍵的第一個元素區分 ref 與 source
+        if name not in stand_ins:
+            stand_ins.append(name)
+        return relation
 
     def source(source_name, table_name):
         _check_ident("來源", source_name)
@@ -690,14 +739,7 @@ def _sandbox_relations(usage: dict, project: "DbtProjectInfo | None", sandbox_ta
         elif key in project.uncertain_sources:
             raise DbtRenderError(f"source() 的表名無法確定(樣板值等):{source_name}.{table_name}")
         identifier = _check_ident("表", project.sources[key][1] or table_name)
-        folded = identifier.lower()
-        if folded not in sandbox_tables:
-            raise DbtRenderError(f"規格的資料表定義沒有 source() 指向的表:{identifier}")
-        if sandbox_tables[folded] is None:
-            raise DbtRenderError(f"規格的資料表定義有不只一張叫這個名稱的表:{identifier}")
-        if seen.setdefault(folded, key) != key:
-            raise DbtRenderError(f"兩個不同的 source() 都對到規格的同一張表:{identifier}")
-        return _SandboxRelation(sandbox_tables[folded], identifier)
+        return table(("source", *key), identifier, "source() ")
 
     def this(name: str):
         return _UnavailableRelation(_EXEC_NO_THIS)
@@ -1051,6 +1093,8 @@ class RenderResult:
     # 展開出的表名不保證與 dbt 逐字相同——見下方三個已知限制;呼叫端應在報告中
     # 一併呈現,而不是讓審查者誤以為表名已經過完整驗證。
     relation_notice: str | None = None
+    # 執行驗證用的展開(sandbox_tables)裡,由規格的測資表代替的上游 model(ref() 的對象,依出現順序)
+    stand_ins: list[str] = field(default_factory=list)
     # 樣板(含它呼叫的 macro)有沒有呼叫 is_incremental();沒有就不必以增量模式再展開一次
     incremental_checked: bool = False
     # 樣板(含它呼叫的 macro)寫到 run_started_at:值是審查開始的時間,跟排程的資料日期無關,
@@ -1539,7 +1583,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
     invocation_id 這次展開的 invocation_id(uuid4 的寫法);沒給時產生新的
     run_started_at 這次展開的 run_started_at(帶 UTC 時區的 ISO 字串);沒給時用現在
     sandbox_tables 執行驗證用的展開:{表名(小寫): 沙盒裡的寫法};source() 指向規格建的測資表,
-                ref() 與 {{ this }} 不支援(見 _sandbox_relations)
+                ref() 由同名的測資表代替上游 model,{{ this }} 不支援(見 _sandbox_relations)
 
     任何失敗都收斂成 ok=False 而不丟例外。
     """
@@ -1617,6 +1661,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
         source_lines=n_src,
         rendered_lines=n_out,
         relation_notice=_relation_notice(env.segcra_relation_usage, project),
+        stand_ins=list(env.segcra_relation_usage.get("stand_ins", [])),
         incremental_checked=incremental_checked,
         run_started_at_used=run_started_at_used,
     )
