@@ -1,4 +1,4 @@
-"""量收尾要多久:評分、決策、比對 head、逐條貼回 MR、設 label 與 commit status。
+"""量收尾要多久:評分、決策、逐條貼回 MR、設 label 與 commit status(每一步寫入前先比對 head)。
 
 整份審查的截止時間 = REVIEW_TIMEOUT_SECONDS − 收尾保留(FINISH_RESERVE_SECONDS),這支量的就是
 收尾保留該留多少。用真的 review_mr 與真的 toolbox/gitlab.py(real 模式),GitLab 換成本機的
@@ -54,6 +54,11 @@ class _FakeGitLab(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _route(self, method):
+        # 先把請求內容讀完再回:沒讀完就關連線的話,Windows 會送 RST,用戶端偶爾收到
+        # 「連線被中止」而重送,同一個請求就被記成兩次
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            self.rfile.read(length)
         time.sleep(self.latency)
         path = self.path.split("?", 1)[0]
         prefix = f"/api/v4/projects/{PROJECT}"
@@ -146,9 +151,12 @@ def measure(files: int, model_findings: int, latency: float) -> dict:
 
     current_mr = pipeline._current_mr
     before_finish: Counter = Counter()
+    marked: list[bool] = []
 
     async def mark_then_fetch(*a, **kw):     # 收尾的第一個 GitLab 請求在這裡:先記下之前打了幾次
-        before_finish.update(_FakeGitLab.counts)
+        if not marked:                       # 收尾會查很多次(每一步寫入前一次),只記第一次
+            marked.append(True)
+            before_finish.update(_FakeGitLab.counts)
         return await current_mr(*a, **kw)
 
     originals = (pipeline.run_agent, pipeline._cold_read, pipeline.run_spec_exec)

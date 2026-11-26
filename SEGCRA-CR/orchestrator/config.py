@@ -53,28 +53,53 @@ def _env_float(name: str, lo: float, hi: float) -> float:
     return v
 
 
-def env_seconds(name: str, default: int) -> int:
-    """讀「秒數」型的環境變數覆蓋;**讀不懂就退回預設值並印一行警告**。
+# ─── 讀環境變數的規則(這些 helper 都在這裡) ───
+# - 秒數、開關(env_seconds、env_bool):讀不懂、設了但是空的,**印一行警告(寫出變數名)並用程式的
+#   預設值**。讀它們的是 webhook 伺服器在 import 的時候,填錯一個字就起不來的話所有 MR 都收不到審查;
+#   退回的是程式的預設值,而等太短或沒送 timeout 時模型呼叫失敗也是交人工,不會因此放行。
+# - 數值的覆蓋(_env_float、_env_seed、_env_effort):手打在跑批指令前面的,讀不懂當場擋下。
 
-    跟 _env_float 的取捨刻意不同(那邊是直接擋下):這些是時間上限,而讀它們的是
-    **webhook 伺服器在 import 時**。填錯一個字就 int() 丟例外 → 伺服器根本起不來
-    → 所有 MR 都收不到審查。那比「用預設值跑」糟得多,而且錯誤只會出現在啟動時的
-    終端機上,沒人看。所以這裡往「活著並大聲說」倒。
 
-    0 或負數也退回預設:上限設成 0 等於每次都立刻逾時,不會是誰的本意。
-    """
+def env_seconds(name: str, default: float) -> float:
+    """讀「秒數」型的環境變數覆蓋:要是**有限的正數**(可以有小數)。讀不懂、`inf`、`nan`、0 或負數、
+    設了但是空的,都退回預設值並印一行警告(寫出變數名)。沒設才安靜用預設值。
+
+    設了但是空的也說:多半是部署腳本沒把值帶進來。`inf` 要擋:有的值會放進請求內容
+    (LLM_SEND_TIMEOUT),`inf` 連 JSON 都轉不出來。整數照原樣回整數。"""
+    import math
     raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
+    if raw is None:
         return default
     try:
-        v = int(raw)
-        if v <= 0:
-            raise ValueError
+        value = float(raw)
     except ValueError:
-        print(f"[config] 警告:環境變數 {name} 的值不是正整數秒數({raw!r}),"
-              f"改用預設 {default} 秒", flush=True)
+        value = math.nan
+    if not (math.isfinite(value) and value > 0):
+        print(f"[config] 警告:環境變數 {name} 的值不是有限的正數秒數({raw!r}),"
+              f"改用預設 {default:g} 秒", flush=True)
         return default
-    return v
+    return int(value) if value.is_integer() else value
+
+
+_FLAG_ON = ("1", "true", "yes", "on")
+_FLAG_OFF = ("0", "false", "no", "off")
+
+
+def env_bool(name: str, unset: str) -> bool:
+    """開關型的環境變數。沒設時看 `unset`(寫在呼叫端,docs/10 的預設值欄對照得到);
+    `1/true/yes/on` 開、`0/false/no/off` 關;**其他值(打錯字、設了但是空的)印一行警告並當成關**:
+    打錯一個字就跟沒設一樣、又沒有任何輸出的話,症狀看起來跟這個設定無關。當成關 = 跟沒有這個設定
+    一樣,不是改走別的路。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return unset.strip().lower() in _FLAG_ON
+    value = raw.strip().lower()
+    if value in _FLAG_ON:
+        return True
+    if value not in _FLAG_OFF:
+        print(f"[config] 警告:環境變數 {name} 的值讀不懂({raw!r}),當成沒開;"
+              f"要開請設 1、true、yes 或 on", flush=True)
+    return False
 
 
 # 端點接受的檔位。"none" 是「完全不要思考」,其餘是強度。
@@ -156,7 +181,7 @@ class Config:
         return self.profile(self.roles.get(role) or self.default_profile)
 
 
-def _load_dbt_section(raw: dict) -> dict:
+def _load_dbt_section(raw: dict, where: str = "設定檔") -> dict:
     """dbt 展開接線的設定。**預設關閉**——合併後現有審查流程與評測結果不受影響,
     確認後才開(見 docs/09-dbt展開與反查.md)。
 
@@ -210,10 +235,85 @@ def _load_dbt_section(raw: dict) -> dict:
         raise ValueError(
             f"設定檔 dbt.sqlserver_schema_concat 必須是布林值 true/false 或不設,目前是 {concat!r}"
             f"({type(concat).__name__})")
+    variables, run_date_vars = _dbt_variables(section, where)
     # 只有設了才帶這些鍵(讀的一方用 .get):沒設時回傳的內容與接線前相同
     return {"enabled": enabled, "database": database,
             **({"project_dir": project_dir} if project_dir else {}),
-            **({"sqlserver_schema_concat": concat} if concat is not None else {})}
+            **({"sqlserver_schema_concat": concat} if concat is not None else {}),
+            **({"vars": variables} if variables else {}),
+            **({"run_date_vars": run_date_vars} if run_date_vars else {})}
+
+
+def _dbt_variables(section: dict, where: str = "設定檔") -> tuple[dict, list]:
+    """排程(例如 Dagster)每次執行時傳進 dbt 的變數(等於 dbt 的 `--vars`)。審查時沒有人傳,沒有預設值的
+    `var()` 會展開失敗(dbt 沒傳值時也是編譯失敗),報告多一條正式環境不會發生的問題。
+
+      vars           {變數名稱: 值}。值收字串、數字、布林,以及由它們組成的清單與物件(`--vars` 也收);
+                     YAML 沒加引號的日期(`2026-01-01`)換成 `YYYY-MM-DD` 字串,跟 dbt 展開的結果相同
+      run_date_vars  代表「這次執行的日期」的變數名稱(例如 target_date)。審查時一律給執行驗證測資的
+                     日期(`YYYY-MM-DD`,等於 @start_date),展開出來的 SQL 跟沙盒的測資才對得上
+                     (見 pipeline._review_variables)
+
+    名稱只拿來查表、不會拼進 SQL,所以收任何非空字串。**寫了鍵卻沒給值就停**(多半是忘了填,或部署
+    時替換值的步驟沒跑):`vars:` / `run_date_vars:` 是空的、`vars` 裡某個值是空字串、只有空白或
+    null、同一個變數兩邊都給了。訊息寫出是哪個設定檔、哪個變數、哪裡不對。不寫這個鍵就是沒設。"""
+    variables = {}
+    if "vars" in section:
+        raw = section["vars"]
+        if raw is None or raw == {} or raw == []:
+            raise ValueError(f"{where} 的 dbt.vars 有寫但是空的;不用就把這個鍵拿掉")
+        if not isinstance(raw, dict):
+            raise ValueError(f"{where} 的 dbt.vars 要是 {{變數名稱: 值}},目前是 {type(raw).__name__}")
+        for name, value in raw.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"{where} 的 dbt.vars 有變數名稱不合法({name!r}):要是非空字串")
+            variables[name] = _var_value(value, f"{where} 的 dbt.vars.{name}")
+    run_date_vars = []
+    if "run_date_vars" in section:
+        raw = section["run_date_vars"]
+        if raw is None or raw == [] or raw == {}:
+            raise ValueError(f"{where} 的 dbt.run_date_vars 有寫但是空的;不用就把這個鍵拿掉")
+        if not isinstance(raw, list):
+            raise ValueError(f"{where} 的 dbt.run_date_vars 要是變數名稱的清單(例如 [target_date]),"
+                             f"目前是 {type(raw).__name__}")
+        for name in raw:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(f"{where} 的 dbt.run_date_vars 有變數名稱不合法({name!r}):要是非空字串")
+        run_date_vars = list(dict.fromkeys(raw))
+    both = [n for n in run_date_vars if n in variables]
+    if both:
+        raise ValueError(f"{where} 的變數 {'、'.join(both)} 同時寫在 dbt.vars 與 dbt.run_date_vars;"
+                         f"只能擇一(日期變數放 run_date_vars)")
+    return variables, run_date_vars
+
+
+def _var_value(value, where: str, depth: int = 0):
+    """dbt 變數的值:字串、數字、布林,與由它們組成的清單、物件;YAML 的日期換成 YYYY-MM-DD 字串。"""
+    import datetime
+    if depth > 20:
+        raise ValueError(f"{where} 巢狀太深")
+    if value is None:
+        raise ValueError(f"{where} 是 null(沒有值)")
+    if isinstance(value, str):
+        if depth == 0 and not value.strip():
+            raise ValueError(f"{where} 是空的;不用就把這個變數拿掉")
+        return value
+    if isinstance(value, datetime.datetime):
+        raise ValueError(f"{where} 是沒加引號的日期時間;請加引號寫成字串")
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    if isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, list):
+        return [_var_value(v, f"{where}[{i}]", depth + 1) for i, v in enumerate(value)]
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if not isinstance(k, (str, int, float, bool)):
+                raise ValueError(f"{where} 的鍵 {k!r} 型別不對")
+            out[k] = _var_value(v, f"{where}.{k}", depth + 1)
+        return out
+    raise ValueError(f"{where} 的型別是 {type(value).__name__},只收字串、數字、布林,以及它們組成的清單與物件")
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -224,7 +324,8 @@ def load_config(path: Path | None = None) -> Config:
         endpoint=endpoint, api_key=raw.get("api_key", "ollama"),
         default_profile=raw["default_profile"], profiles=raw["profiles"],
         roles=raw.get("roles", {}), budget=raw["budget"],
-        policy=raw.get("policy", {}), dbt=_load_dbt_section(raw),
+        policy=raw.get("policy", {}),
+        dbt=_load_dbt_section(raw, f"設定檔 {path or PKG_ROOT / 'config' / 'models.yaml'}"),
     )
 
 
