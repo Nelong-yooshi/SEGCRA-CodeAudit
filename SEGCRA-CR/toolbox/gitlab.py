@@ -476,8 +476,9 @@ def _check_mr_id(mr_id) -> str:
 # 描述引導去呼叫 get_mr_diff("8"),釘住的 sha 就會變成 !8 的,之後 get_file 看到的
 # 是別的 MR 的檔案,連補讀規格也會讀錯版本。改由 pipeline 在取完 MR 之後釘
 # (orchestrator/pipeline.py 的 review_mr),這個函式本身沒有副作用。
-def get_mr_diff(mr_id: str) -> str:
-    """取得 MR 的標題、描述、head commit sha 與 diff(逐檔)。
+def get_mr_diff(mr_id: str = "") -> str:
+    """取得 MR 的標題、描述、head commit sha 與 diff(逐檔)。審查模型用時 `mr_id` 不用填,
+    就是這次審查的 MR(只能讀這一張)。
 
     另外帶 GitLab `diff_refs` 的 `base_sha` / `head_sha` / `start_sha`(欄位名照 GitLab
     原樣),給「依 commit 取回程式碼」的流程用;拿不到時是 None,見 `_diff_refs`。
@@ -652,6 +653,9 @@ def fetch_file(path: str, ref: str = "", mr_id: str = "") -> tuple[str | None, s
 
 def get_file(path: str, ref: str = "", mr_id: str = "") -> str:
     """取得 repo 內檔案的完整內容(看 diff 不夠時用)。**給審查模型的工具**。
+
+    `ref` 不填就是這次 MR 的版本;也可以填目標分支的名稱、`HEAD`、這次 MR 的 commit sha
+    (至少 7 個字元)。`mr_id` 不用填。只能讀這次 MR 的版本與目標分支。
 
     模型拿到的是文字,所以把 `fetch_file` 的代碼轉成說明句。管線自己要分辨
     「拿不到」與「確實沒有」時,直接用 `fetch_file`,不要比對這裡的文字 ——

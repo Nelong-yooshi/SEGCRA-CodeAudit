@@ -66,7 +66,9 @@ SCAN_FAILED_WITHHELD = "(讀回的內容沒有完成注入掃描,不提供內容
 # 被拒絕的讀取(refused_reads 裡的固定代碼;模型給的參數不記,那可能是 MR 作者寫的文字)
 REFUSED_OTHER_MR = "other_mr"
 REFUSED_OTHER_REF = "other_ref"
-REFUSED_SCAN_FAILED = "scan_failed"
+# get_mr_diff 結果裡不交給模型的欄位:分支名稱是 MR 作者自己取的文字(可以是中文、可以是一句指示),
+# 注入掃描與冷讀都不看它。範圍判斷用的是 review_mr 自己取的那一份(set_review_scope),模型用不到
+MODEL_HIDDEN_MR_KEYS = ("source_branch", "target_branch")
 # 審查判例(record_feedback 記的人工處置)也是模型讀得到的文字:sql 欄位常是從某個 MR 貼過來的,
 # 作者寫的註解一起在裡面。每筆先過同一套注入掃描,命中的那筆不交給模型。判例不是這次 MR 帶進來的,
 # 不算成這次 MR 的命中(不 blocked),只記下來(withheld_history),讓維運的人去清判例檔。
@@ -126,9 +128,12 @@ class ToolHub:
         self.refused_calls: list[str] = []
         # 讀取範圍(set_review_scope);None 時不限制範圍,讀回的內容照樣掃描
         self.review_scope: dict | None = None
-        # 被拒絕的讀取(REFUSED_* 代碼)與讀回內容的注入掃描命中({category, tool},不帶原文)
+        # 被拒絕的讀取(REFUSED_* 代碼)與讀回內容的注入掃描命中({category, tool, this_mr},不帶原文)
         self.refused_reads: list[str] = []
         self.tool_injection_hits: list[dict] = []
+        # 讀回內容的注入掃描自己出錯的({tool, error}:error 只有例外的類型,不帶訊息)。
+        # 這是程式的檢查沒跑完,不是模型讀了範圍外的內容:管線記成環節未完整
+        self.scan_failures: list[dict] = []
         # 沒有交給模型的判例({ts, categories};ts 讀不到是 None,掃描出錯時 categories 是 None)
         self.withheld_history: list[dict] = []
         for group in self.group_names:
@@ -170,8 +175,18 @@ class ToolHub:
         """模型給的 ref → 實際要讀的 ref;不在範圍內回 None。
 
         來源分支換成釘住的 head:分支可能已經有新的 commit,那些還沒經過這次審查。釘不住時回
-        空字串,get_file 會明講取不到。目標分支照原樣讀。sha 可以縮寫,但要對得到範圍內的一個。"""
+        空字串,get_file 會明講取不到。目標分支照原樣讀。sha 可以縮寫,但要對得到範圍內的一個。
+
+        常見的寫法先換成分支名稱再比:`HEAD` 是這次 MR 的版本(釘住的 head);`refs/heads/<分支>`、
+        `origin/<分支>` 是那個分支。這些都指到範圍內的版本,拒絕的話正常的讀取也會被擋。"""
         scope = self.review_scope
+        ref = ref.strip()
+        if ref.upper() == "HEAD":
+            return scope["head"] or ""
+        for prefix in ("refs/heads/", "origin/"):
+            if ref.startswith(prefix):
+                ref = ref[len(prefix):]
+                break
         if scope["source_branch"] and ref == scope["source_branch"]:
             return scope["head"] or ""
         if scope["target_branch"] and ref == scope["target_branch"]:
@@ -188,10 +203,12 @@ class ToolHub:
         scope = self.review_scope
         if scope is None:
             return args, None
-        mr_arg = args.get("mr_id", "")
-        if full_name == "gitlab__get_mr_diff" or mr_arg not in ("", None):
-            if str(mr_arg) != scope["mr_id"]:
-                return None, REFUSED_OTHER_MR
+        # `mr_id` 不填、寫成 `!951` 或前後有空白,都是這次的 MR(prompt 裡沒有 MR 編號,模型常不填)
+        mr_arg = str(args.get("mr_id") or "").strip().lstrip("!").strip()
+        if mr_arg and mr_arg != scope["mr_id"]:
+            return None, REFUSED_OTHER_MR
+        if full_name == "gitlab__get_mr_diff" or mr_arg:
+            args = {**args, "mr_id": scope["mr_id"]}
         ref = args.get("ref", "")
         if full_name == "gitlab__get_file" and ref not in ("", None):
             resolved = self._resolve_ref(str(ref))
@@ -221,12 +238,14 @@ class ToolHub:
             hits = await run_in_thread(
                 functools.partial(scan_mr, self._scan_target(full_name, args, result)),
                 name="segcra-tool-scan")
-        except Exception:      # noqa: BLE001 — 錯誤內容可能帶著讀回的文字,不記
-            self.refused_reads.append(REFUSED_SCAN_FAILED)
+        except Exception as e:      # noqa: BLE001 — 訊息可能帶著讀回的文字,只記類型
+            self.scan_failures.append({"tool": full_name, "error": type(e).__name__})
             return SCAN_FAILED_WITHHELD
         if hits:
+            # get_mr_diff 讀的一定是這次的 MR(範圍外的已被拒絕):MR 本身管線開頭已經整份掃過
             self.tool_injection_hits.extend(
-                {"category": h.get("category"), "tool": full_name} for h in hits)
+                {"category": h.get("category"), "tool": full_name,
+                 "this_mr": full_name == "gitlab__get_mr_diff"} for h in hits)
             return INJECTION_WITHHELD
         return result
 
@@ -262,8 +281,8 @@ class ToolHub:
         targets = [self._history_target(r) for r in records] if shaped else [{"description": result}]
         try:
             hits = await run_in_thread(functools.partial(_scan_each, targets), name="segcra-tool-scan")
-        except Exception:      # noqa: BLE001 — 錯誤內容可能帶著判例的文字,不記
-            self.withheld_history.append({"ts": None, "categories": None})
+        except Exception as e:      # noqa: BLE001 — 訊息可能帶著判例的文字,只記類型
+            self.withheld_history.append({"ts": None, "categories": None, "error": type(e).__name__})
             return HISTORY_SCAN_FAILED
         if not shaped:
             if hits[0]:
@@ -312,7 +331,22 @@ class ToolHub:
             return READ_REFUSAL
         # 整份掃描,不是截斷後的那段:截斷的位置由內容長度決定,不能讓它把命中的地方切掉
         result = await self.call(full_name, scoped, truncate=False)
+        if full_name == "gitlab__get_mr_diff":
+            result = self._without_hidden_keys(result)
         return self._truncate(await self._screen(full_name, scoped, result))
+
+    @staticmethod
+    def _without_hidden_keys(result: str) -> str:
+        """get_mr_diff 的結果拿掉不交給模型的欄位(MODEL_HIDDEN_MR_KEYS:分支名稱)。不是 JSON 物件
+        (錯誤訊息)時照原樣。"""
+        try:
+            mr = json.loads(result)
+        except (TypeError, ValueError):
+            return result
+        if not isinstance(mr, dict) or not any(k in mr for k in MODEL_HIDDEN_MR_KEYS):
+            return result
+        return json.dumps({k: v for k, v in mr.items() if k not in MODEL_HIDDEN_MR_KEYS},
+                          ensure_ascii=False)
 
     @staticmethod
     async def _invoke(full_name: str, fn, args: dict):

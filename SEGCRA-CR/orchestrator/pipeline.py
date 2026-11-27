@@ -51,7 +51,7 @@ from .skills_loader import always_skills, load_skills, skills_index
 from .dbt_context import PROJECT_FILE_REMOVED, PROJECT_YAML_INVALID, check_yaml_files_isolated
 from .dbt_project import YAML_MODELS_NOT_LIST, YAML_SYNTAX
 from .spec_exec import SpecLookup, find_spec, run_spec_exec
-from .tool_hub import REFUSED_OTHER_MR, REFUSED_OTHER_REF, REFUSED_SCAN_FAILED, ToolHub
+from .tool_hub import REFUSED_OTHER_MR, REFUSED_OTHER_REF, ToolHub
 from toolbox.sqltools import LINT_INCOMPLETE_CODE, LINT_MAX_CHARS, LINT_TIMEOUT_SECONDS
 from toolbox.sqltools import run_rules, run_rules_on_template
 from toolbox.sqltools import DIALECT, parse_statements, parsed_chunks
@@ -2297,7 +2297,14 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_truncation(report, output_meta, profile.max_output_tokens)  # 輸出被截斷
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
         report = enforce_tool_refusals(report, hub.refused_calls)  # 模型要求了寫入工具
-        report = enforce_tool_reads(report, hub.refused_reads, hub.tool_injection_hits)  # 讀了範圍外或含注入的內容
+        # 模型用工具讀回的內容命中注入掃描:跟 MR 本身命中走同一個函式。MR 本身已經命中時,
+        # 模型再讀這次的 MR(get_mr_diff)命中的是同一份文字,不多一條(內容照樣沒有交給模型)
+        tool_hits = [h for h in hub.tool_injection_hits if not (injection_hits and h.get("this_mr"))]
+        if tool_hits:
+            report["_injection_scan"] = list(report.get("_injection_scan") or []) + [
+                {"category": h.get("category"), "source": "tool"} for h in tool_hits]
+        report = enforce_injection(report, tool_hits, source="tool")
+        report = enforce_tool_reads(report, hub.refused_reads, hub.scan_failures)  # 範圍外、沒掃完的讀取
         _log_withheld_history(mr_id, hub.withheld_history)  # 判例不是這次 MR 的,不進報告
 
         # 執行驗證(必跑;測資生成 → 沙盒執行 → 仲裁)——在 rubric 之前。
@@ -4273,7 +4280,7 @@ def enforce_scan_skipped(report: dict, skipped: int) -> dict:
 
 
 @_isolated_stage("注入防線")
-def enforce_injection(report: dict, hits: list[dict]) -> dict:
+def enforce_injection(report: dict, hits: list[dict], source: str = "mr") -> dict:
     """確定性注入防線:掃描器命中 → 一律加 blocker,不參考模型輸出。
 
     **更正(PR #10 review 找到的嚴重漏洞)**:上一版在補 blocker 前會先看
@@ -4291,6 +4298,22 @@ def enforce_injection(report: dict, hits: list[dict]) -> dict:
     會被回寫到 MR 留言,等於把攻擊者寫的東西原封不動貼回公開留言,沒有必要
     且可能被利用成另一個注入面。只留類別名稱(我們自己定義的固定字串)。"""
     if not hits:
+        return report
+    if source == "tool":
+        # 審查模型用工具讀回的內容命中(tool_hub._screen):內容已經沒有交給模型,處理跟 MR 本身
+        # 命中走同一個函式,之後注入掃描多一種類別、或某一類改成交人工,兩條路一起變。
+        # _injection_scan 由呼叫端在這一步之前寫好(理由同 MR 那條,見 review_mr)
+        cats = ", ".join(sorted({str(h.get("category")) for h in hits}))
+        tools = ", ".join(sorted({str(h.get("tool")) for h in hits}))
+        _put_program_finding(report, {
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "blocker",
+            "title": _TOOL_READ_INJECTION_TITLE,
+            "detail": (f"審查模型用工具({tools})讀回的內容含疑似操縱審查器的指令,類別:{cats}。"
+                       "這段內容沒有交給模型;模型會去讀它,很可能是 MR 的文字引導的,"
+                       "這次審查結果需要人工資安確認。"),
+            "suggestion": "檢查 MR 標題、描述與註解中是否有引導審查器去讀特定檔案的文字,"
+                          "以及被讀的那個檔案裡的內容。",
+            "citations": []})
         return report
     cats = ", ".join(h["category"] for h in hits)
     report.setdefault("findings", []).insert(0, {
@@ -4393,47 +4416,36 @@ _TOOL_READ_INJECTION_TITLE = "工具讀回的內容疑似含提示注入(確定�
 _REFUSED_READ_TEXT = {
     REFUSED_OTHER_MR: "要求讀別的 MR",
     REFUSED_OTHER_REF: "要求讀這次 MR 的版本與目標分支以外的版本",
-    REFUSED_SCAN_FAILED: "讀回的內容沒有完成注入掃描",
 }
 
 
 @_isolated_stage("工具讀取揭露")
-def enforce_tool_reads(report: dict, refused: list[str], hits: list[dict]) -> dict:
-    """審查模型用工具讀 MR 與檔案時,範圍外的讀取與讀回內容的注入掃描命中。
+def enforce_tool_reads(report: dict, refused: list[str], scan_failures: list[dict]) -> dict:
+    """審查模型用工具讀 MR 與檔案時,範圍外的讀取與讀回內容沒掃完的。讀回內容的注入掃描命中
+    跟 MR 本身命中走同一個函式(enforce_injection 的 `source="tool"`),不在這裡。
 
-    讀回的內容命中注入掃描,跟 MR 本身命中一樣處理:寫進 _injection_scan(apply_policy 的
-    硬條件,直接 blocked),再補一條 blocker。內容已經沒有交給模型(tool_hub 的 _screen),
-    但模型會去讀,多半是 MR 的文字引導的,這次審查的結果要人工確認。
+    - **讀回內容的注入掃描出錯**:這是程式自己的檢查沒跑完,不是模型讀了範圍外的內容,也不是
+      被 MR 引導。記成這一環節沒跑完(帶 `stage`,review_incomplete 認得到,交人工),寫出是哪個
+      工具與例外的類型(不寫例外訊息:可能帶著讀回的文字);內容已經沒有交給模型。
+    - **範圍外的讀取**(別的 MR、別的版本)已被拒絕、沒有讀到:補一條 **info**,不影響決策。
+      沒讀到就沒有內容進來;MR 的文字引導模型去讀,靠注入掃描與冷讀接住。這次 MR 的寫法
+      (`mr_id` 不填、`!951`、`HEAD`、`origin/<分支>`)已經對應到範圍內,不會走到這裡。
 
-    範圍外的讀取(別的 MR、別的版本)已被拒絕、沒有執行;補一條 major 交人工,理由同
-    enforce_tool_refusals:幾乎可以確定是照著 MR 內容的指示在做。
-
-    finding 只寫類別、工具名稱與固定的說法,不寫模型給的參數或讀回的原文(會貼回 MR)。"""
-    if hits:
-        report["_injection_scan"] = list(report.get("_injection_scan") or []) + [
-            {"category": h.get("category"), "source": "tool"} for h in hits]
-        cats = ", ".join(sorted({str(h.get("category")) for h in hits}))
-        tools = ", ".join(sorted({str(h.get("tool")) for h in hits}))
-        injected = {
-            "file": MR_CONTENT_FILE, "line": 0, "severity": "blocker",
-            "title": _TOOL_READ_INJECTION_TITLE,
-            "detail": (f"審查模型用工具({tools})讀回的內容含疑似操縱審查器的指令,類別:{cats}。"
-                       "這段內容沒有交給模型;模型會去讀它,很可能是 MR 的文字引導的,"
-                       "這次審查結果需要人工資安確認。"),
-            "suggestion": "檢查 MR 標題、描述與註解中是否有引導審查器去讀特定檔案的文字,"
-                          "以及被讀的那個檔案裡的內容。",
-            "citations": []}
-        _put_program_finding(report, injected)
+    finding 只寫固定的說法,不寫模型給的參數或讀回的原文(會貼回 MR)。"""
+    for tool in dict.fromkeys(str(s.get("tool")) for s in scan_failures):
+        types = ", ".join(dict.fromkeys(str(s.get("error")) for s in scan_failures
+                                        if str(s.get("tool")) == tool))
+        report.setdefault("findings", []).append(_incomplete_finding(
+            f"工具讀回內容的注入掃描({tool})", reason=f"掃描執行時發生 {types},讀回的內容沒有交給模型"))
     reasons = [_REFUSED_READ_TEXT[r] for r in dict.fromkeys(refused) if r in _REFUSED_READ_TEXT]
     if reasons:
-        refusal = {
-            "file": MR_CONTENT_FILE, "line": 0, "severity": "major",
+        _put_program_finding(report, {
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "info",
             "title": _TOOL_READ_REFUSAL_TITLE,
-            "detail": ("審查模型" + "、".join(reasons) + ",已被拒絕、沒有讀到。"
-                       "模型很可能受到 MR 內容的指示,這次審查結果需要人工確認。"),
-            "suggestion": "檢查 MR 標題、描述與註解中是否有指示審查器去讀其他 MR 或其他版本的文字。",
-            "citations": []}
-        _put_program_finding(report, refusal)
+            "detail": ("審查模型" + "、".join(reasons) + ",已被拒絕、沒有讀到,不影響這次的結果。"
+                       "讀取範圍是這次審查的 MR、這次 MR 的版本與目標分支。"),
+            "suggestion": "MR 的說明若引用了別的 MR 或別的版本,審查只依這次 MR 的內容判斷。",
+            "citations": []})
     return report
 
 
@@ -4444,16 +4456,19 @@ def _log_withheld_history(mr_id, withheld: list[dict]) -> None:
     只寫筆數、判例的時間(ts)與命中類別,不寫判例的內容。"""
     if not withheld:
         return
-    failed = sum(1 for w in withheld if w.get("categories") is None)
+    errors = [str(w.get("error") or "例外") for w in withheld if w.get("categories") is None]
     stamps = sorted({w["ts"] for w in withheld if w.get("ts") is not None})
     cats = sorted({c for w in withheld for c in (w.get("categories") or [])})
-    parts = [f"{len(withheld) - failed} 筆疑似含對審查工具的指令"] if len(withheld) > failed else []
-    if failed:
-        parts.append(f"{failed} 次沒有完成注入掃描")
-    print(f"[pipeline] MR !{mr_id} 查回的審查判例有" + "、".join(parts) + ",沒有交給模型"
-          + (f";類別:{', '.join(cats)}" if cats else "")
-          + (f";判例時間(ts):{', '.join(map(str, stamps))}" if stamps else "")
-          + ";請檢查判例檔", flush=True)
+    hit = len(withheld) - len(errors)
+    if hit:
+        print(f"[pipeline] MR !{mr_id} 查回的審查判例有 {hit} 筆疑似含對審查工具的指令,沒有交給模型"
+              + (f";類別:{', '.join(cats)}" if cats else "")
+              + (f";判例時間(ts):{', '.join(map(str, stamps))}" if stamps else "")
+              + ";請檢查判例檔", flush=True)
+    if errors:
+        # 壞的是掃描,不是判例檔:不叫人去檢查判例檔
+        print(f"[pipeline] MR !{mr_id} 判例的注入掃描執行失敗({', '.join(dict.fromkeys(errors))}),"
+              f"查回的判例沒有交給模型", flush=True)
 
 
 _UNREVIEWABLE_TITLE = "部分變更內容無法取得,未經審查"
