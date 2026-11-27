@@ -118,7 +118,7 @@ def test_超過上限的不收_回報略過的筆數():
 
 @pytest.mark.parametrize("unit", [
     "{{ a ", "{% x ", "{# x ", "/* x ", "' x ", "[ x ", "\" x ", "{% macro a( ", "{% set a, b ",
-    "SELECT a AS b, ",
+    "SELECT a AS b, ", "WITH a (",
 ])
 def test_沒收尾的寫法不會變成平方時間(unit):
     """約 400 KB 的特製內容要在幾秒內跑完;平方時間的寫法會跑上好幾分鐘。"""
@@ -126,6 +126,32 @@ def test_沒收尾的寫法不會變成平方時間(unit):
     start = time.monotonic()
     ids.extract(source)
     assert time.monotonic() - start < 10
+
+
+# 沒收尾的 Jinja 開頭:一般的 T-SQL 裡,字串或註解的 `{#` 不是 Jinja,不塗;dbt 樣板裡沒收尾、塗到
+# 檔尾的那一段算成沒收到,不能報成 0(結果跟「抽完了、沒有略過」一模一樣的話,看不出有一段沒抽)
+UNCLOSED = [
+    f"SELECT N'{{#' AS a, 1 AS {INJECT} FROM t",
+    f"SELECT '{{{{' AS a, 1 AS {INJECT} FROM t",
+    f"-- 範例 {{% 不要用 %" + "\n" + f"SELECT 1 AS {INJECT} FROM t",
+]
+
+
+@pytest.mark.parametrize("sql", UNCLOSED)
+def test_一般_TSQL_字串或註解裡的_Jinja_開頭不塗(sql):
+    items, skipped = ids.extract(sql, jinja=False)
+    assert INJECT in {i["name"] for i in items} and skipped == 0
+
+
+@pytest.mark.parametrize("sql", UNCLOSED)
+def test_dbt_樣板裡沒收尾的_Jinja_算成沒收到(sql):
+    items, skipped = ids.extract(sql, jinja=True)
+    assert INJECT in {i["name"] for i in items} or skipped >= 1
+
+
+def test_dbt_樣板裡收尾的_Jinja_不算沒收到():
+    items, skipped = ids.extract(f"SELECT a AS {INJECT} FROM {{{{ ref('t') }}}} x", jinja=True)
+    assert INJECT in {i["name"] for i in items} and skipped == 0
 
 
 # ─────────────────── 6. 接進預掃 ───────────────────
@@ -165,6 +191,13 @@ def test_超過上限時預掃記下略過的筆數(monkeypatch):
     sql = "SELECT a AS x1, a AS x2, a AS x3 FROM t"
     (entry,) = _prescan([{"path": "sql/a.sql", "diff": "x", "full_content": sql}])
     assert len(entry["identifiers"]) == 2 and entry["identifiers_skipped"] == 1
+
+
+@pytest.mark.parametrize("sql", UNCLOSED)
+def test_預掃_dbt_專案外的_SQL_檔_字串裡的_Jinja_開頭不影響抽取(sql):
+    (entry,) = _prescan([{"path": "sql/a.sql", "diff": "x", "full_content": sql}])
+    assert INJECT in {i["name"] for i in entry["identifiers"]}
+    assert "identifiers_skipped" not in entry
 
 
 def test_規格檔與非_SQL_檔不抽():

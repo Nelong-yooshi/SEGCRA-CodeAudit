@@ -1371,9 +1371,13 @@ def _attach_identifiers(entry: dict, f: dict, sql: str, dbt_ctx: DbtContext | No
     """MR 裡取名的識別字(欄位別名、CTE、macro 名稱…,見 mr_identifiers),給注入掃描用。
 
     `identifiers` 每筆 `{kind, name, file, line}`;`line` 只在拿到的是檔案變更後的完整內容時給
-    (只有 diff 片段時,行號是片段裡的行號,不是檔案的)。超過上限沒收的筆數記在
-    `identifiers_skipped`。沒有抽到時兩個鍵都不放。**不進 prompt**(見 _prescan_for_prompt)。"""
-    items, skipped = extract_identifiers(sql, with_lines=_is_full_text(f, sql, dbt_ctx))
+    (只有 diff 片段時,行號是片段裡的行號,不是檔案的)。沒收到的筆數(超過上限、Jinja 沒收尾
+    塗到檔尾)記在 `identifiers_skipped`。沒有抽到時兩個鍵都不放。**不進 prompt**(見
+    _prescan_for_prompt)。
+
+    只有 dbt 專案裡的檔案當成 Jinja 樣板:專案外的 T-SQL 裡,字串或註解寫的 `{#` 不是 Jinja。"""
+    in_dbt = dbt_ctx is not None and dbt_ctx.relative(f.get("path")) is not None
+    items, skipped = extract_identifiers(sql, with_lines=_is_full_text(f, sql, dbt_ctx), jinja=in_dbt)
     if items:
         entry["identifiers"] = [dict(item, file=f.get("path")) for item in items]
     if skipped:

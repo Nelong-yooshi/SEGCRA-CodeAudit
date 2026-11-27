@@ -74,15 +74,27 @@ _RESERVED = (_SELECT_CLAUSE | _TABLE_CLAUSE | _OTHER_CLAUSE | {
 _EXPR_END_WORDS = {"END", "NULL", "TRUE", "FALSE"}
 
 
-def extract(source, *, with_lines: bool = True,
-            limit: int = MAX_IDENTIFIERS) -> tuple[list[dict], int]:
-    """回傳 (識別字清單, 超過上限沒收的筆數)。source 不是字串時回 ([], 0)。"""
+def extract(source, *, with_lines: bool = True, limit: int = MAX_IDENTIFIERS,
+            jinja: bool = True) -> tuple[list[dict], int]:
+    """回傳 (識別字清單, 沒收到的筆數)。source 不是字串時回 ([], 0)。
+
+    `jinja`:這份文字是 dbt 樣板(dbt 專案裡的檔案)。不是的話(一般的 T-SQL),`{{`、`{%`、`{#`
+    只是字串或註解裡的字,不當成 Jinja、不塗掉:一個 `'{#'` 字串就讓後面整個檔都不抽,結果跟
+    「抽完了、沒有略過」一模一樣。macro、set 的名稱兩種都照收(多收只是多比對一次)。
+
+    沒收到的筆數包含超過上限沒收的名稱,以及 Jinja 標記沒收尾、塗到檔尾的那一段(算一筆:那段
+    裡的名稱沒有抽,不能報成 0)。"""
     if not isinstance(source, str) or not source:
         return [], 0
     out = _Collector(limit, with_lines)
     _jinja_names(source, out)
-    # 塗掉 Jinja 之後位置會往前移,行號要用塗過的那份算(換行照留,行數跟原始檔一樣)
-    _sql_names(_blank_jinja(source), out)
+    if jinja:
+        # 塗掉 Jinja 之後位置會往前移,行號要用塗過的那份算(換行照留,行數跟原始檔一樣)
+        blanked, unclosed = _blank_jinja(source)
+        out.skipped += unclosed
+        _sql_names(blanked, out)
+    else:
+        _sql_names(source, out)
     return out.items, out.skipped
 
 
@@ -126,12 +138,14 @@ def _jinja_names(source: str, out: _Collector) -> None:
             out.add(SET_VAR, part.group(0), m.start(1) + part.start())
 
 
-def _blank_jinja(source: str) -> str:
-    """Jinja 的區段換成不影響 SQL 掃描的內容,**換行照留**(行號跟原始檔一樣)。
+def _blank_jinja(source: str) -> tuple[str, int]:
+    """Jinja 的區段換成不影響 SQL 掃描的內容,**換行照留**(行號跟原始檔一樣)。回傳
+    (塗過的文字, 沒收尾、塗到檔尾的段數)。
 
     `{{ … }}` 換成一個名稱 `x`(它在 SQL 裡就是一個值或表,`FROM {{ ref('a') }} t` 的 `t`
-    才認得出是表的別名);`{% … %}`、`{# … #}` 換成空白。沒收尾的塗到檔尾。"""
-    parts, pos = [], 0
+    才認得出是表的別名);`{% … %}`、`{# … #}` 換成空白。沒收尾的塗到檔尾(那段沒有抽,呼叫端
+    算成沒收到)。"""
+    parts, pos, unclosed = [], 0, 0
     while True:
         m = _JINJA_OPEN.search(source, pos)
         if m is None:
@@ -139,12 +153,14 @@ def _blank_jinja(source: str) -> str:
             break
         parts.append(source[pos:m.start()])
         close = source.find(_JINJA_CLOSE[m.group(0)[1]], m.end())
+        if close < 0:
+            unclosed = 1
         end = len(source) if close < 0 else close + 2
         block = source[m.start():end]
         filler = "x" if m.group(0) == "{{" else " "
         parts.append(filler + "\n" * block.count("\n"))
         pos = end
-    return "".join(parts)
+    return "".join(parts), unclosed
 
 
 def _ident_text(kind: str, text: str) -> str:
@@ -171,6 +187,7 @@ def _tokens(sql: str):
 def _sql_names(sql: str, out: _Collector) -> None:
     out.text(sql)
     toks = list(_tokens(sql))
+    closes = _matching_parens(toks)
     clause = None              # 這一層括號裡最近的子句
     stack: list = []           # 括號外層的子句
     for i, (kind, text, offset) in enumerate(toks):
@@ -190,7 +207,7 @@ def _sql_names(sql: str, out: _Collector) -> None:
         if kind not in _IDENT or upper in _RESERVED:
             continue
         name = _ident_text(kind, text)
-        if _is_cte(toks, i, clause):            # 先判斷:`名稱 (欄位…) AS (` 後面接的也是括號
+        if _is_cte(toks, i, clause, closes):    # 先判斷:`名稱 (欄位…) AS (` 後面接的也是括號
             out.add(CTE_NAME, name, offset)
             continue
         if nxt is not None and nxt[1] in (".", "("):
@@ -208,7 +225,22 @@ def _sql_names(sql: str, out: _Collector) -> None:
             out.add(TABLE_ALIAS if clause in _TABLE_CLAUSE else COLUMN_ALIAS, name, offset)
 
 
-def _is_cte(toks: list, i: int, clause) -> bool:
+def _matching_parens(toks: list) -> dict:
+    """每個 `(` 對應的 `)` 的位置({左括號的索引: 右括號的索引}),一次掃完算好;沒收尾的不在裡面。
+    判斷 CTE 時直接查:每次往後找對應的右括號的話,`WITH a (` 重複寫、括號沒收尾就每次都找到
+    檔尾,是平方時間(抽取是同步的,外層的時間上限插不進來)。"""
+    closes, opened = {}, []
+    for j, tok in enumerate(toks):
+        if tok[0] != "punct":
+            continue
+        if tok[1] == "(":
+            opened.append(j)
+        elif tok[1] == ")" and opened:
+            closes[opened.pop()] = j
+    return closes
+
+
+def _is_cte(toks: list, i: int, clause, closes: dict) -> bool:
     """`WITH 名稱 [(欄位…)] AS (` 或接在前一個 CTE 後面的 `, 名稱 AS (`。"""
     if clause != "WITH":
         return False
@@ -216,14 +248,8 @@ def _is_cte(toks: list, i: int, clause) -> bool:
     if prev is None or not (prev[1] == "," or prev[1].upper() == "WITH"):
         return False
     j = i + 1
-    if j < len(toks) and toks[j][1] == "(":            # 欄位清單:找到對應的右括號
-        depth = 0
-        while j < len(toks):
-            depth += toks[j][1] == "("
-            depth -= toks[j][1] == ")"
-            j += 1
-            if depth == 0:
-                break
+    if j < len(toks) and toks[j][1] == "(":            # 欄位清單:跳到對應的右括號之後
+        j = closes[j] + 1 if j in closes else len(toks)
     return (j + 1 < len(toks) and toks[j][1].upper() == "AS" and toks[j + 1][1] == "(")
 
 
