@@ -163,14 +163,16 @@ class KnowledgeRepo:
     def sync_to_local(self, dest: Path, subdir: str = "knowledge") -> list[str]:
         """把知識庫 main 分支的 knowledge/*.md 拉回本地 memory/knowledge/。
         合併後的 binding 由此變成審查管線即刻遵守的規範。"""
+        from .file_perms import open_for_write      # 新建的檔 644,不跟著 umask 走(讀知識庫時會檢查)
         dest = Path(dest)
-        dest.mkdir(parents=True, exist_ok=True)
+        dest.mkdir(mode=0o755, parents=True, exist_ok=True)
         pulled = []
         for path in self.list_md(subdir=subdir):
             content = self.get_file(path, ref="main")
             if content is None:
                 continue
-            (dest / Path(path).name).write_text(content, encoding="utf-8")
+            with open_for_write(dest / Path(path).name) as f:
+                f.write(content)
             pulled.append(Path(path).name)
         return pulled
 

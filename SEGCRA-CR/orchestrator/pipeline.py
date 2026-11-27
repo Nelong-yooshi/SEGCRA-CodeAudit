@@ -517,6 +517,18 @@ def _step(report: dict, stage: str, fn, default, *args, **kwargs):
         return default
 
 
+def _kb_perm_problem() -> str | None:
+    """知識庫的權限太寬時回說明(寫進 log 用,含路徑與權限);沒問題回 None。檢查本身出錯也當成有問題:
+    確認不了知識庫沒被改過,就不能拿它來壓 finding。"""
+    from toolbox.knowledge_store import check_kb_perms   # 延遲匯入,與 _filter_citations 一致
+    from .config import ConfigError
+    try:
+        check_kb_perms()
+    except Exception as e:                  # noqa: BLE001 — 任何例外都當成沒有檢查過
+        return str(e) if isinstance(e, ConfigError) else type(e).__name__
+    return None
+
+
 def review_incomplete(report: dict) -> list[str]:
     """哪些環節沒完成(供決策與測試判讀)。回傳那幾條 finding 的標題。
 
@@ -2122,9 +2134,19 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         kb_query = " ".join(
             (f.get("full_content") or _sql_from_diff(f.get("diff", "")) or "")[:800]
             for f in mr["files"]) or mr.get("title", "")
-        know = await hub.call_json("memory__retrieve_knowledge",
-                                   {"query": kb_query, "scope": ",".join(scope),
-                                    "top_k": 4}) or {}
+        # 知識庫的權限太寬就不讀(binding 會壓掉 finding):記成未完整、交人工。在這裡先檢查一次,
+        # 因為檢索是經 hub 呼叫的工具,工具丟的例外會被 hub 收成一段文字,看起來只是「沒有知識」
+        kb_problem = _kb_perm_problem()
+        if kb_problem is not None:
+            print(f"[pipeline] MR !{mr_id} 知識庫沒有讀:{kb_problem}", flush=True)
+            report_stub.setdefault("findings", []).append(_incomplete_finding(
+                "知識庫檢索", reason="知識庫的檔案或目錄權限太寬(群組或其他帳號改得到),"
+                                    "原因寫在服務的 log;沒有套用任何團隊規範"))
+            know = {}
+        else:
+            know = await hub.call_json("memory__retrieve_knowledge",
+                                       {"query": kb_query, "scope": ",".join(scope),
+                                        "top_k": 4}) or {}
         conventions = know.get("rendered", "(無相關慣例)")
 
         # 確定性抑制:binding 恆常規範標注要抑制的檢核點(如「已淨額→H001 不適用」),

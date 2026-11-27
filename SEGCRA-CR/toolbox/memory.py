@@ -17,7 +17,8 @@ import re
 import time
 from pathlib import Path
 
-from orchestrator.config import env_path
+from orchestrator.config import ConfigError, env_path
+from orchestrator.file_perms import PermissionProblem, check_path, open_for_write
 
 from . import knowledge_store as ks
 from . import style_learn
@@ -26,6 +27,15 @@ PKG_ROOT = Path(__file__).resolve().parent.parent
 
 # 有設時要絕對路徑、設了但是空的就停(見 config.env_path):判例會影響之後的審查
 HISTORY_FILE = env_path("MEMORY_HISTORY", PKG_ROOT / "memory" / "review_history" / "history.jsonl")
+
+
+def _check_history_perms() -> None:
+    """讀寫判例前檢查權限:檔案本身(還沒建時從最近一個存在的上層開始)與一路往上,群組或其他人
+    可寫就停。有沒有設 `MEMORY_HISTORY` 都檢查:被駁回的判例會讓同型的 finding 降級或不報。"""
+    try:
+        check_path(HISTORY_FILE)
+    except PermissionProblem as e:
+        raise ConfigError(f"審查判例檔的權限:{e}") from None
 
 
 def _scope_list(scope: str) -> list[str]:
@@ -92,6 +102,7 @@ def _bigrams(s: str):
 def lookup_similar_reviews(text: str, top_k: int = 5) -> str:
     """以 finding 標題/SQL 片段查過去審查判例。回傳相似案例與人工處置
     (accepted/rejected)。曾被 rejected 的同型 finding 應降級或不報。"""
+    _check_history_perms()
     if not HISTORY_FILE.exists():
         return json.dumps({"results": []}, ensure_ascii=False)
     q = _bigrams(text)
@@ -117,10 +128,12 @@ def record_feedback(title: str, disposition: str, detail: str = "",
     if disposition not in ("accepted", "rejected"):
         return json.dumps({"error": "disposition 必須是 accepted 或 rejected"},
                           ensure_ascii=False)
-    HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    _check_history_perms()
+    HISTORY_FILE.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     rec = {"ts": int(time.time()), "title": title, "detail": detail,
            "sql": sql, "disposition": disposition, "note": note, "tag": tag}
-    with HISTORY_FILE.open("a", encoding="utf-8") as f:
+    # 新建的檔是 644、不跟著 umask 走:下一次讀的時候會檢查權限(_check_history_perms)
+    with open_for_write(HISTORY_FILE, append=True) as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     return json.dumps({"ok": True}, ensure_ascii=False)
 

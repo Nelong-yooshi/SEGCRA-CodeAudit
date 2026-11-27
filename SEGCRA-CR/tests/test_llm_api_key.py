@@ -432,6 +432,84 @@ def test_連結指到權限正確的位置照常通過(tmp_path):
     check_config_file(link, secret=False)
 
 
+# 連結一段一段走:只看 resolve() 的結果與原本的路徑,中間經過的連結所在的目錄不在這兩條路上。
+# 部署常用一個 current 連結指到目前那一版,current 放在別人改得到的目錄,換掉它就換掉了設定
+@posix_only
+def test_連結指到連結_中間那層目錄可寫就停(tmp_path):
+    deploy = _mkdir(tmp_path / "deploy", 0o755)
+    real = _write(deploy / "models.yaml", 0o644)
+    shared = _mkdir(tmp_path / "shared", 0o777)
+    (shared / "current.yaml").symlink_to(real)
+    cfg = _mkdir(tmp_path / "app" / "config", 0o755)
+    (tmp_path / "app").chmod(0o755)
+    link = cfg / "models.yaml"
+    link.symlink_to(shared / "current.yaml")
+    with pytest.raises(ConfigError) as e:
+        check_config_file(link, secret=False)
+    assert f"chmod 755 {shared}" in str(e.value) and "路徑上的連結所在的目錄" in str(e.value)
+    shared.chmod(0o755)
+    check_config_file(link, secret=False)
+
+
+@posix_only
+def test_路徑中間的目錄是連結_連結所在的目錄可寫就停(tmp_path):
+    real2 = _mkdir(tmp_path / "real2" / "n2" / "cfg", 0o755)
+    (tmp_path / "real2").chmod(0o755)
+    (tmp_path / "real2" / "n2").chmod(0o755)
+    _write(real2 / "models.yaml", 0o644)
+    m = _mkdir(tmp_path / "m", 0o777)
+    (m / "n").symlink_to(tmp_path / "real2" / "n2")
+    app = _mkdir(tmp_path / "app", 0o755)
+    (app / "config").symlink_to(m / "n" / "cfg")
+    with pytest.raises(ConfigError, match=f"chmod 755 {m}"):
+        check_config_file(app / "config" / "models.yaml", secret=False)
+    m.chmod(0o755)
+    check_config_file(app / "config" / "models.yaml", secret=False)
+
+
+@posix_only
+def test_連結循環時停_不會卡住(tmp_path):
+    d = _mkdir(tmp_path / "loop", 0o755)
+    (d / "a.yaml").symlink_to(d / "b.yaml")
+    (d / "b.yaml").symlink_to(d / "a.yaml")
+    from orchestrator import file_perms
+    with pytest.raises(file_perms.PermissionProblem, match="連結超過"):
+        file_perms.dirs_to_check(d / "a.yaml")
+
+
+@posix_only
+def test_沙盒腳本用的命令列_連結指到連結也停(tmp_path):
+    """scripts/sandbox.sh 執行的是 file_perms.py 的 main(同一份規則),sandbox.env 一樣要擋。"""
+    from orchestrator import file_perms
+    deploy = _mkdir(tmp_path / "deploy", 0o755)
+    real = _write(deploy / "sandbox.env", 0o600, "SANDBOX_MSSQL_PASSWORD=x\n")
+    shared = _mkdir(tmp_path / "shared", 0o777)
+    (shared / "current.env").symlink_to(real)
+    cfg = _mkdir(tmp_path / "app", 0o755)
+    (cfg / "sandbox.env").symlink_to(shared / "current.env")
+    assert file_perms.main(["--secret", str(cfg / "sandbox.env")]) == 1
+    shared.chmod(0o755)
+    assert file_perms.main(["--secret", str(cfg / "sandbox.env")]) == 0
+
+
+def test_一段一段解析_連結指到連結時記下每一層連結所在的目錄(tmp_path, monkeypatch):
+    """不用真的連結(Windows 也跑得到):換掉 is_symlink 與 readlink,驗解析的走法。"""
+    from orchestrator import file_perms
+    root = tmp_path.resolve()
+    links = {root / "app" / "config": root / "m" / "n" / "cfg", root / "m" / "n": root / "real2" / "n2",
+             root / "app" / "cfg2": "../m/n/cfg"}
+    monkeypatch.setattr(file_perms.Path, "is_symlink", lambda self: self in links)
+    monkeypatch.setattr(file_perms.os, "readlink", lambda p: str(links[file_perms.Path(p)]))
+    real, link_dirs = file_perms._resolve_steps(root / "app" / "config" / "models.yaml")
+    assert real == root / "real2" / "n2" / "cfg" / "models.yaml"
+    assert link_dirs == [root / "app", root / "m"]
+    real, link_dirs = file_perms._resolve_steps(root / "app" / "cfg2" / "models.yaml")
+    assert real == root / "real2" / "n2" / "cfg" / "models.yaml"      # 相對的連結接在連結所在的目錄後面
+    assert link_dirs == [root / "app", root / "m"]
+    assert set(file_perms.dirs_to_check(root / "app" / "config" / "models.yaml")) >= {
+        root / "app", root / "m", root / "real2" / "n2" / "cfg"}
+
+
 @posix_only
 def test_有_sticky_bit_的上層目錄不算太寬(tmp_path):
     sticky = _mkdir(tmp_path / "tmpish", 0o1777)
