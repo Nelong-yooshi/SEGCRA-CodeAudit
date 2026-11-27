@@ -41,7 +41,7 @@ SPEC_FILE = {"path": "specs/R-201.md", "diff": SPEC_DIFF}
 
 # 模型在檔案上回應了檢核點:沒有規格變更時這份報告會自動放行(對照組)
 RESPONDED = {"file": SQL_PATH, "line": 1, "severity": "info",
-             "title": "[H003] 已與核定規格 R-201 逐項核對",
+             "title": "[H003] 已核對:門檻與時間窗都跟規格 R-201 一致",
              "detail": "門檻 >= 100000 與規格「達」一致;時間窗與通報粒度相符。",
              "suggestion": "", "citations": []}
 MODEL_REPORT = {"score": 100, "verdict": "approve", "summary": "實作與核定規格相符。",

@@ -338,7 +338,7 @@ def test_模型回應過的檢核點不補():
     pre = _pre([{"rule": "H001", "severity": "hint", "message": "沖正是否處理"}])
     report = enforce_hints(
         {"findings": [{"severity": "info", "file": FILE,
-                       "title": "[H001] 已確認沖正資料於前置系統淨額"}]}, pre)
+                       "title": "[H001] 已核對:沖正資料於前置系統淨額"}]}, pre)
     assert len(report["findings"]) == 1
 
 
@@ -354,14 +354,14 @@ def _h001_pending(findings):
 def test_代碼只寫在內文或建議不算回應(field):
     """回應的格式是「標題帶代碼」:寫在內文或建議裡的 [H001] 可能是在引用預掃結果。"""
     finding = {"severity": "info", "file": FILE, "title": "核對結果",
-               field: "[H001] 已確認沖正資料於前置系統處理"}
+               field: "[H001] 已核對:沖正資料於前置系統處理"}
     assert len(_h001_pending([finding])) == 1
 
 
 @pytest.mark.parametrize("title", [
-    "已確認沖正資料於前置系統淨額",          # 以前的關鍵詞(沖正、淨額)都有,但沒有代碼
-    "H001 已確認沖正",                       # 沒有方括號
-    "[H0011] 已確認沖正",                    # 別的代碼
+    "已核對:沖正資料於前置系統淨額",          # 以前的關鍵詞(沖正、淨額)都有,但沒有代碼
+    "H001 已核對:沖正資料於前置系統淨額",     # 沒有方括號
+    "[H0011] 已核對:沖正資料於前置系統淨額",  # 別的代碼
 ])
 def test_標題沒有那個代碼就不算回應(title):
     """不再用字詞猜。以前同檔的 finding 只要提到「沖正」「淨額」就算回應過,
@@ -381,7 +381,7 @@ def test_關鍵詞在講別的事時不會吞掉檢核點():
 def test_程式補的_finding_標題帶代碼也不算回應():
     """程式補的那條標題就是「[H001] 檢核點待人工確認…」;它不是模型的回應。"""
     from orchestrator.pipeline import PROGRAM_SOURCE
-    prog = {"severity": "info", "file": FILE, "title": "[H001] 已確認沖正處理",
+    prog = {"severity": "info", "file": FILE, "title": "[H001] 已核對:沖正已另外處理",
             "_source": PROGRAM_SOURCE}
     assert len(_h001_pending([prog])) == 1
 
@@ -406,14 +406,17 @@ def test_prompt_規定的回應格式跟程式認的一致():
     example = re.search(r"「(\[H\d{3}\][^」]*)」", prompt)
     assert example, "system prompt 要舉一個標題帶代碼的例子"
     code = re.match(r"\[(H\d{3})\]", example.group(1)).group(1)
-    assert pipeline._is_hint_reply({"title": example.group(1)}, pipeline._hint_tag(code),
+    assert pipeline._is_hint_reply({"title": example.group(1)}, code,
                                    [{"message": "x"}])
     assert pipeline._pending_tag({"title": "規格未載明:幣別"}) == "幣別"
     assert "「規格未載明:<項目名>」" in prompt
+    # 常駐的 objective-reviewer skill 也講待補事項怎麼報(每次都放進 system prompt):兩份要一致
+    skill = (pipeline.PKG_ROOT / "skills" / "objective-reviewer" / "SKILL.md").read_text(encoding="utf-8")
+    assert "「規格未載明:<項目名>」" in skill
 
 
 def test_照抄訊息之外有寫東西的算回應():
-    finding = {"severity": "info", "file": FILE, "title": "[H001] 沖正是否處理",
+    finding = {"severity": "info", "file": FILE, "title": "[H001] 已核對:沖正是否處理",
                "detail": "已確認:前置系統已排除沖正交易。"}
     assert _h001_pending([finding]) == []
 
@@ -422,15 +425,15 @@ def test_照抄訊息之外有寫東西的算回應():
 def test_檢核點的回應不限嚴重度(severity):
     """檢核點的回應本來就可以是 info(與 enforce_rules 要求同等嚴重度不同)。"""
     report = enforce_hints(
-        {"findings": [{"severity": severity, "file": FILE, "title": "[H001] 已確認沖正處理"}]},
+        {"findings": [{"severity": severity, "file": FILE, "title": "[H001] 已核對:沖正已另外處理"}]},
         _pre([_H001]))
     assert len(report["findings"]) == 1
 
 
 @pytest.mark.parametrize("report", [
-    {"summary": "[H001] 沖正已確認無誤", "findings": []},
+    {"summary": "[H001] 已核對:沖正已另外處理", "findings": []},
     {"findings": [{"severity": "info", "file": "sql/rules/other.sql",
-                   "title": "[H001] 已確認沖正處理"}]},
+                   "title": "[H001] 已核對:沖正已另外處理"}]},
     {"findings": [{"severity": "info", "file": FILE, "title": "核對結果",
                    "citations": [{"source": "[H001] 沖正"}]}]},
 ], ids=["summary", "other-file", "other-field"])
@@ -462,7 +465,7 @@ def _hint(statement, rule="H001", message="此規則聚合交易金額,但未見
 
 
 def _reply(text, severity="info", file=FILE, code="H001"):
-    return {"severity": severity, "file": file, "title": f"[{code}] 檢核點回應", "detail": text,
+    return {"severity": severity, "file": file, "title": f"[{code}] 已核對:見內文", "detail": text,
             "suggestion": ""}
 
 
@@ -539,7 +542,7 @@ def test_不認得的嚴重度不算回應():
     所以嚴重度幾乎不影響 —— 唯一還有作用的是**不認得的嚴重度**:那種 finding 不算回應,
     檢核點照樣待確認,寧可多擋一次。"""
     pre = _pre([_H001])
-    weird = {"severity": "critical", "file": FILE, "title": "[H001] 沖正已處理"}
+    weird = {"severity": "critical", "file": FILE, "title": "[H001] 已核對:沖正已另外處理"}
     report = enforce_hints({"findings": [weird]}, pre)
     assert len(_pending(report)) == 1
 
@@ -551,9 +554,9 @@ def test_引用了語句的回應先對應():
     hits = [_hint("SELECT a FROM t1"), _hint("SELECT b FROM t2")]
     # 引用的是**第一句**:沒引用的那條若先對應,就會占走第一句,有引用的那條反而
     # 對不到 —— 結果多補一條「未回應」,而那一處其實有人回應過。
-    model = [{"severity": "info", "file": FILE, "title": "[H001] 沖正處理已確認", "detail": "",
+    model = [{"severity": "info", "file": FILE, "title": "[H001] 已核對:沖正處理沒有問題", "detail": "",
               "suggestion": ""},
-             {"severity": "info", "file": FILE, "title": "[H001] 沖正:`SELECT a FROM t1` 已確認",
+             {"severity": "info", "file": FILE, "title": "[H001] 已核對:`SELECT a FROM t1` 的沖正沒有問題",
               "detail": "", "suggestion": ""}]
     report = enforce_hints({"findings": list(model)}, _pre(hits))
     assert _pending(report) == []

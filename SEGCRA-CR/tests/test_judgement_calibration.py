@@ -302,8 +302,9 @@ def test_標了項目名_在清單裡_加註並交人工():
     r = enforce_spec_pending(_report([_tagged("幣別")]), R140)
     out = r["findings"][0]
     assert out["severity"] == "info"
-    assert "規格把它列在「待補 / 未載明」" in out["detail"] and "幣別" in out["detail"]
-    assert "如果講的就是這件事" not in out["detail"], "程式驗證過是那一項,不用寫成有條件的"
+    # 程式確認的只是「幣別」在待補清單裡,不是這條講的就是幣別:註記照樣寫成有條件的、寫明是模型標的
+    assert "模型把這條標成規格待補的「幣別」,規格的待補清單有這一項" in out["detail"]
+    assert "如果講的就是這件事" in out["detail"] and "如果其實是實作錯誤,這句註記請略過" in out["detail"]
     assert "規格未載明:幣別" in r["_needs_human"]
     assert r["_calibration"]["annotated"] == [
         {"title": "規格未載明:幣別", "topic": "幣別", "by": "spec-pending"}]
@@ -319,8 +320,8 @@ def test_標的項目名_排版不同也對得上(title):
     r = enforce_spec_pending(_report([_claim(title=title, severity="info")]), R140)
     assert r["_calibration"]["annotated"][0]["by"] == "spec-pending", r["_calibration"]
     assert "規格未載明:`cash_flag` 的來源" in r["_needs_human"]
-    # 走的是「標了名稱」那條路,不是退回用字比對(用字比對也會命中同一項,但註記是有條件的)
-    assert "如果講的就是這件事" not in r["findings"][0]["detail"], r["findings"][0]["detail"]
+    # 走的是「標了名稱」那條路,不是退回用字比對(兩條路的註記都是有條件的,寫法不同)
+    assert "模型把這條標成規格待補的" in r["findings"][0]["detail"], r["findings"][0]["detail"]
 
 
 def test_標的項目名不在清單裡_仍交人工_但不說規格列在待補():

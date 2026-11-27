@@ -36,7 +36,7 @@ PATH = "sql/maintenance/x.sql"
 
 # 模型在檔案上回應了檢核點:沒有截斷時這份報告會自動放行,是「截斷會擋下放行」的對照組
 RESPONDED = {"file": PATH, "line": 1, "severity": "info",
-             "title": "[H003] 已與核定規格 R-201 逐項核對",
+             "title": "[H003] 已核對:門檻與時間窗都跟規格 R-201 一致",
              "detail": "門檻 >= 100000 與規格「達」一致;時間窗與通報粒度相符。",
              "suggestion": "", "citations": []}
 CLEAN_REPORT = {"score": 100, "verdict": "approve", "summary": "實作與核定規格相符。",

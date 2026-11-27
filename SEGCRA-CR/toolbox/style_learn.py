@@ -71,6 +71,8 @@ def _check_leading_comma(sql: str) -> dict | None:
 
 
 _CHECKS = {"S-COMMA": _check_leading_comma}
+# 風格檢查的代碼(審查器的用語偵測用它產生比對式,見 pipeline._REVIEWER_TERMS)
+STYLE_CODES = tuple(_CHECKS)
 
 
 def check_style(sql: str, active_codes: set[str] | None = None) -> list[dict]:

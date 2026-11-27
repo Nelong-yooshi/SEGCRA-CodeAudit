@@ -16,16 +16,24 @@ import measure_hint_tags as m  # noqa: E402
 def _case_with_h003():
     for g in sorted((ROOT / "eval" / "golden").glob("mr_*.json")):
         case = json.loads(g.read_text(encoding="utf-8"))
-        pre = m._prescan(case)
+        pre = m.prescan(case)
         for e in pre:
-            if [h for h in e["rules"] if h.get("rule") == "H003"] and m._hints(pre) == 1:
+            if [h for h in e["rules"] if h.get("rule") == "H003"] and m._hint_hits(pre) == 1:
                 return g.name, e["path"]
     raise AssertionError("golden set 裡應該有只命中一處 H003 的案例")
 
 
-def _write(tmp_path, name, findings):
-    (tmp_path / name).write_text(json.dumps({"findings": findings}, ensure_ascii=False),
-                                 encoding="utf-8")
+# 只有檢核點擋自動放行的決策訊號(跟 apply_policy 寫的形狀一樣)
+ONLY_HINTS = {"change_lines": 1, "new_rule": False, "severities": ["info"], "pending_hints": True,
+              "spec_exec_passed": True, "needs_human": [], "spec_changed": False, "incomplete": [],
+              "rule_hits": [], "cold_read": False}
+
+
+def _write(tmp_path, name, findings, signals=ONLY_HINTS, decision="needs_human"):
+    report = {"findings": findings, "decision": decision, "score": 100}
+    if signals is not None:
+        report["_policy_signals"] = signals
+    (tmp_path / name).write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
 
 
 def test_只有關鍵詞的回應_舊做法算回應過_新做法補報(tmp_path, capsys):
@@ -33,17 +41,35 @@ def test_只有關鍵詞的回應_舊做法算回應過_新做法補報(tmp_path
     _write(tmp_path, name, [{"file": path, "severity": "info", "title": "已與核定規格逐項核對"}])
     assert m.main([str(tmp_path)]) == 0
     out = capsys.readouterr().out
-    assert "舊做法補 0 條、新做法補 1 條;因此改成交人工的報告 1 份" in out, out
+    assert "舊做法補 0 條、新做法補 1 條;只因為檢核點而改成交人工的報告 1 份" in out, out
 
 
 def test_標了代碼的回應_兩種做法都不補(tmp_path, capsys):
     name, path = _case_with_h003()
     _write(tmp_path, name, [{"file": path, "severity": "info",
-                             "title": "[H003] 已與核定規格逐項核對"}])
+                             "title": "[H003] 已核對:門檻與時間窗都跟規格一致"}])
     assert m.main([str(tmp_path)]) == 0
     out = capsys.readouterr().out
-    assert "舊做法補 0 條、新做法補 0 條;因此改成交人工的報告 0 份" in out, out
-    assert "模型標代碼 1 條" in out
+    assert "舊做法補 0 條、新做法補 0 條;只因為檢核點而改成交人工的報告 0 份" in out, out
+    assert "已核對 1 條" in out
+
+
+def test_本來就有別的原因擋自動放行的_不算改交人工(tmp_path, capsys):
+    """規則命中、規格有改這類報告怎樣都不會自動放行,新做法多補的檢核點沒有改變結果。"""
+    name, path = _case_with_h003()
+    _write(tmp_path, name, [{"file": path, "severity": "info", "title": "已與核定規格逐項核對"}],
+           signals={**ONLY_HINTS, "rule_hits": ["R004"]})
+    assert m.main([str(tmp_path)]) == 0
+    assert "只因為檢核點而改成交人工的報告 0 份" in capsys.readouterr().out
+
+
+def test_沒有決策訊號的舊報告另外列出_不算進改交人工(tmp_path, capsys):
+    name, path = _case_with_h003()
+    _write(tmp_path, name, [{"file": path, "severity": "info", "title": "已與核定規格逐項核對"}],
+           signals=None)
+    assert m.main([str(tmp_path)]) == 0
+    out = capsys.readouterr().out
+    assert "只因為檢核點而改成交人工的報告 0 份" in out and "判斷不了會不會改交人工的 1 份" in out
 
 
 def test_程式補的_finding_不算模型的回應(tmp_path, capsys):

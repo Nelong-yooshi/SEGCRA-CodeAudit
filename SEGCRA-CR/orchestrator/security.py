@@ -216,9 +216,65 @@ def scan_injection(text: str, prose: str | None = None) -> list[dict]:
     return out
 
 
-def scan_mr(mr: dict) -> list[dict]:
+# ───────────── 審查器自己的用語 ─────────────
+# MR 的文字用審查器自己的格式跟審查器說話(檢核點代碼、「規格未載明:」、模仿 prompt 的段落
+# 標題、要求放行),不一定是注入的句型,但 MR 裡本來不該出現:命中記成這個類別,由
+# pipeline.enforce_reviewer_terms 交人工(不是 blocked:一般 MR 也可能剛好寫到,例如說明
+# 文件介紹審查器)。代碼與段落標題由 pipeline 從自己的格式與 prompt 產生後傳進來
+# (reviewer_terms_pattern),改 prompt 時跟著變,這裡不另抄一份。
+REVIEWER_TERMS = "reviewer_terms"
+
+# 要求放行、略過檢查的說法(審查器的決策用語)
+_ASK_TO_PASS = ("可直接放行", "略過檢核", "跳過檢核", "免審")
+
+
+def reviewer_terms_pattern(codes: str, headings, pending_mark: str, hint_word: str) -> "re.Pattern":
+    """審查器用語的比對式。比對的是 NFKC 正規化之後的文字(全形括號、冒號、英數都已換成半形)。
+
+    codes        代碼的格式(regex),例如 `H\\d{3}|R\\d{3}|S-COMMA`;只認**方括號裡**的
+                 (`[H003]`),不放寬成任何方括號裡的大寫字 —— 那會中一般的標籤
+    headings     prompt 段落標題的文字(`核定規格`、`specs/` 等,不含 `#`);前面要有 `#`,
+                 而且在行首或接在註解符號、引號之後(在註解或字串裡也算)
+    pending_mark 「規格未載明」:要帶冒號才算,規格檔的「核定規格未載明」標題不算
+    hint_word    「檢核點」"""
+    heads = "|".join(re.escape(h) for h in headings)
+    parts = [
+        (r"(?P<code>\[\s*(?:" + codes + r")\s*\])"),
+        (r"(?P<pending>" + re.escape(pending_mark) + r"\s*:)"),
+        (r"(?P<hint>" + re.escape(hint_word) + ")"),
+        (r"(?P<heading>(?:^|[\n'\"]|--|/\*)[ \t]*#{1,6}[ \t]*(?:" + heads + "))") if heads else None,
+        (r"(?P<ask>" + "|".join(map(re.escape, _ASK_TO_PASS)) + ")"),
+    ]
+    return re.compile("|".join(p for p in parts if p), re.I)
+
+
+_TERM_KINDS = {"code": "審查器的代碼格式(方括號代碼)", "pending": "「規格未載明:」的格式",
+               "hint": "「檢核點」", "heading": "模仿審查 prompt 的段落標題",
+               "ask": "要求放行或略過檢查的說法"}
+
+
+def scan_reviewer_terms(text: str, pattern) -> list[dict]:
+    """MR 文字裡審查器自己的用語。`match` 只放固定的種類名稱,不放比對到的原文
+    (那段是 MR 作者寫的,會貼回 MR 留言,見 enforce_injection 的說明)。"""
+    if pattern is None:
+        return []
+    normalized = _normalize(text)
+    kinds = []
+    for m in pattern.finditer(normalized):
+        kind = _TERM_KINDS[m.lastgroup]
+        if kind not in kinds:
+            kinds.append(kind)
+    return [{"category": REVIEWER_TERMS, "match": "、".join(kinds)}] if kinds else []
+
+
+def scan_mr(mr: dict, reviewer_terms=None) -> list[dict]:
     """掃描整個 MR:標題 + 描述 + **檔名**(PR #10 review 指出「檔名沒有
     被掃描」)+ 每個檔案的 diff/內容(含程式註解)。
+
+    `reviewer_terms`(reviewer_terms_pattern 產生)給了的話,同一份文字也掃審查器自己的
+    用語(檔案內容整段都掃:註解、字串、識別字都算),命中是 REVIEWER_TERMS 類別。
+    呼叫端把要掃的東西(取回的完整內容、展開後的 SQL 等)都放進 mr 再呼叫,兩種掃描
+    就一起涵蓋,不各自組一份範圍。
 
     變更清單裡不是物件的項目、以及欄位值不是字串的,一律略過(見 `text_fields.as_text`):
     這一步丟例外會中斷整份審查,而旁邊的好項目照樣要掃到。"""
@@ -227,4 +283,6 @@ def scan_mr(mr: dict) -> list[dict]:
     code = "\n".join(as_text(f.get("full_content")) or as_text(f.get("diff")) for f in files)
     comments = "\n".join(_comments(code))
     head = [as_text(mr.get("title")), as_text(mr.get("description")), *paths]
-    return scan_injection("\n".join(head + [code]), prose="\n".join(head + [comments]))
+    text = "\n".join(head + [code])
+    return (scan_injection(text, prose="\n".join(head + [comments]))
+            + scan_reviewer_terms(text, reviewer_terms))
