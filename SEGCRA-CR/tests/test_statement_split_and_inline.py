@@ -79,7 +79,7 @@ def test_沒有對應行號時直接貼一般留言(api, line):
     assert len(api) == 1
     method, path, body = api[0]
     assert (method, path) == ("POST", "/merge_requests/12/notes")
-    assert body["body"].startswith("`models/a.sql`(無對應行號)")
+    assert body["body"].startswith(gitlab._INLINE_MARKER + "\n`models/a.sql`(無對應行號)")
     assert ":0`" not in body["body"] and "內容" in body["body"]
 
 
@@ -93,4 +93,4 @@ def test_有行號時開行內討論(api):
 def test_行號不在diff裡時退成一般留言_寫出行號(api):
     gitlab.post_inline_comment("12", "models/a.sql", 99, "內容", "major")
     assert api[-1][1] == "/merge_requests/12/notes"
-    assert api[-1][2]["body"].startswith("`models/a.sql:99`")
+    assert api[-1][2]["body"].startswith(gitlab._INLINE_MARKER + "\n`models/a.sql:99`")

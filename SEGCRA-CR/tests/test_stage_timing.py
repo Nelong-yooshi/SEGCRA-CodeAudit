@@ -148,7 +148,8 @@ def test_用正式的截止時間跑的評測要提醒(tmp_path, capsys, monkeyp
 def test_量收尾的工具跑得動_回寫走真的_gitlab_模組(tmp_path, monkeypatch):
     """假的 GitLab 只聽 127.0.0.1;收尾的請求要有逐條貼回、label 與 commit status 各一次。"""
     from toolbox import gitlab
-    keys = ("REAL_MODE", "GITLAB_URL", "GITLAB_TOKEN", "GITLAB_PROJECT", "GITLAB_READ_TOKEN")
+    keys = ("REAL_MODE", "GITLAB_URL", "GITLAB_TOKEN", "GITLAB_PROJECT", "GITLAB_READ_TOKEN",
+            "_own_user")
     before = {k: getattr(gitlab, k) for k in keys}
     monkeypatch.setenv("REVIEW_OUTPUT", str(tmp_path))
     r = measure_finish.measure(files=2, model_findings=1, latency=0.0)

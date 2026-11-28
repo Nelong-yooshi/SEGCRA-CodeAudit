@@ -723,19 +723,29 @@ _INLINE_MARKER = "<!-- segcra:review-inline -->"
 MAX_DISCUSSION_PAGES = 5
 
 
-def _our_unresolved(d: dict) -> str | None:
+def _our_unresolved(d: dict, own: int) -> str | None:
     """這個討論是不是「上一輪我們開的、而且沒有人回過」?是就回 discussion id。
 
-    三個條件都要:
+    條件都要:
       * 只有一則留言 —— **有人回覆過的是對話**,標成已解決會把人的話收起來;
-      * 那一則帶著我們的記號 —— 沒有記號的是別人開的討論,不能動;
+      * 那一則是審查自己開的:作者是 GITLAB_TOKEN 的帳號(`own`)、不是系統留言、記號在
+        內文**開頭**。記號是一段看不見、原始碼裡查得到的字串,誰都打得出來;標成已解決的
+        權限審查用的 token 一般都有,只看記號的話別人開的討論也收得掉。模型寫的文字只出現
+        在審查自己貼的留言裡,而且不在開頭,所以它在內文寫記號也收不到別人的討論;
       * 還沒被標成已解決(resolvable 且未 resolved)—— 已經解決的再送一次只是多一個請求。
     """
     notes = d.get("notes")
     if not isinstance(notes, list) or len(notes) != 1:
         return None
     n = notes[0]
-    if not isinstance(n, dict) or _INLINE_MARKER not in (n.get("body") or ""):
+    if not isinstance(n, dict) or n.get("system") is True:
+        return None
+    body = n.get("body")
+    if not isinstance(body, str) or not body.startswith(_INLINE_MARKER):
+        return None
+    author = n.get("author")
+    uid = author.get("id") if isinstance(author, dict) else None
+    if not isinstance(uid, int) or isinstance(uid, bool) or uid != own:
         return None
     if not n.get("resolvable") or n.get("resolved"):
         return None
@@ -753,6 +763,15 @@ def resolve_stale_comments(mr_id: str) -> str:
         # mock 模式沒有討論可以標(結果是落檔,不是 GitLab 上的討論)
         return json.dumps({"ok": True, "resolved": 0, "failed": 0}, ensure_ascii=False)
     mr_id = _check_mr_id(mr_id)
+    own = own_user_id()
+    if own is None:
+        reason = learn_own_user()            # CI 與 demo.py 那條路沒有經過 webhook 啟動時的查詢
+        own = own_user_id()
+        if own is None:
+            # 認不出哪些是自己開的,就一條都不收(收錯別人的討論比舊意見留著糟)
+            print(f"[gitlab] 查不到 GITLAB_TOKEN 的帳號({reason}),認不出上一輪自己開的討論,"
+                  "這次不收", flush=True)
+            return json.dumps({"ok": True, "resolved": 0, "failed": 0}, ensure_ascii=False)
     ids: list[str] = []
     for page in range(1, MAX_DISCUSSION_PAGES + 1):
         try:
@@ -762,7 +781,7 @@ def resolve_stale_comments(mr_id: str) -> str:
             break
         if not isinstance(got, list) or not got:
             break
-        ids += [i for d in got if isinstance(d, dict) and (i := _our_unresolved(d))]
+        ids += [i for d in got if isinstance(d, dict) and (i := _our_unresolved(d, own))]
         if len(got) < 100:
             break
     resolved = failed = 0
@@ -788,14 +807,16 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
     已經建立了討論、只是回應沒送到,再貼一般留言同一條就出現兩次。這時回傳
     `{"ok": false, "failure": "uncertain"}`,由呼叫端記下來。"""
     if REAL_MODE:
-        text = f"{_INLINE_MARKER}\n**[{severity}]** {body}"
+        # 記號一律放在最前面(下一輪 resolve_stale_comments 只認開頭的記號)
+        tagged = f"**[{severity}]** {body}"
+        text = f"{_INLINE_MARKER}\n{tagged}"
         if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
             # 沒有對應的行號(檔案層的 finding):直接貼一般留言,不拿第 0 行去開行內討論、
             # 再靠 API 失敗分流;開頭不寫 `檔名:0`(看起來像第 0 行)
             _api("POST", f"/merge_requests/{mr_id}/notes",
-                 json={"body": f"`{file}`(無對應行號)\n\n{text}"})
+                 json={"body": f"{_INLINE_MARKER}\n`{file}`(無對應行號)\n\n{tagged}"})
             return json.dumps({"ok": True}, ensure_ascii=False)
-        note = {"body": f"`{file}:{line}`\n\n{text}"}
+        note = {"body": f"{_INLINE_MARKER}\n`{file}:{line}`\n\n{tagged}"}
         refs = _diff_refs({"diff_refs": {"base_sha": base_sha, "head_sha": head_sha,
                                          "start_sha": start_sha}})
         if not all(refs.values()):

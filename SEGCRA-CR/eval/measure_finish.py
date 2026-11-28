@@ -63,7 +63,10 @@ class _FakeGitLab(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         prefix = f"/api/v4/projects/{PROJECT}"
         rest = path[len(prefix):] if path.startswith(prefix) else path
-        if method == "GET" and rest.endswith("/diffs"):
+        if method == "GET" and path == "/api/v4/user":
+            # GITLAB_TOKEN 的帳號:收上一輪的行內討論只認自己開的,帳號沒查過時查一次
+            kind, body, headers = "GET 帳號", {"id": 1, "username": "segcra-measure"}, {}
+        elif method == "GET" and rest.endswith("/diffs"):
             kind = "GET diffs"
             items = [{"new_path": p, "old_path": p, "diff": "@@ -0,0 +1 @@\n+" + t}
                      for p, t in self.files.items()]
@@ -131,8 +134,10 @@ def measure(files: int, model_findings: int, latency: float) -> dict:
     server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeGitLab)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     saved = {k: getattr(gitlab, k) for k in
-             ("REAL_MODE", "GITLAB_URL", "GITLAB_TOKEN", "GITLAB_PROJECT", "GITLAB_READ_TOKEN")}
+             ("REAL_MODE", "GITLAB_URL", "GITLAB_TOKEN", "GITLAB_PROJECT", "GITLAB_READ_TOKEN",
+              "_own_user")}
     gitlab.REAL_MODE = True
+    gitlab._own_user = None          # 帳號由假 GitLab 的 /user 查(量完還原,不留給同一個行程的其他人)
     gitlab.GITLAB_URL = f"http://127.0.0.1:{server.server_port}"
     gitlab.GITLAB_TOKEN = "test-write-token"
     gitlab.GITLAB_READ_TOKEN = "test-read-token"

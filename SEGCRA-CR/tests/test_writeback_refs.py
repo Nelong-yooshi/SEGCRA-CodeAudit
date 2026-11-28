@@ -26,6 +26,9 @@ REFS = {"base_sha": BASE, "head_sha": HEAD, "start_sha": START}
 SECRET = "ZZ_HOST_192.0.2.10:443_ZZ"
 
 
+OWN_ID = 42          # 測試裡 GITLAB_TOKEN 的帳號 id
+
+
 class FakeGitLab:
     """記下每個請求;`discussions` 決定開行內討論時怎麼回:狀態碼,或要丟的例外。
     `notes`、`label`、`status` 同樣;給清單時依序取用(最後一個重複用),模擬「失敗後重送成功」。"""
@@ -90,6 +93,8 @@ def real(monkeypatch):
     monkeypatch.setattr(gitlab, "GITLAB_TOKEN", "test-write-token")
 
     monkeypatch.setattr(gitlab, "RETRY_DELAY_SECONDS", 0)
+    # GITLAB_TOKEN 的帳號:只收這個帳號開的討論
+    monkeypatch.setattr(gitlab, "_own_user", {"id": OWN_ID, "username": "segcra-bot"})
 
     def install(fake):
         monkeypatch.setattr(httpx, "request", fake)
@@ -587,10 +592,12 @@ def test_通知_留言沒貼上時照樣設_commit_status_不印例外訊息(mon
 MARK = gitlab._INLINE_MARKER
 
 
-def _disc(did="d1", body=None, resolvable=True, resolved=False, notes=None):
+def _disc(did="d1", body=None, resolvable=True, resolved=False, notes=None, author=OWN_ID,
+          system=False):
     body = f"{MARK}\n**[major]** 舊意見" if body is None else body
     if notes is None:
-        notes = [{"id": 1, "body": body, "resolvable": resolvable, "resolved": resolved}]
+        notes = [{"id": 1, "body": body, "resolvable": resolvable, "resolved": resolved,
+                  "author": {"id": author}, "system": system}]
     return {"id": did, "notes": notes}
 
 
@@ -615,10 +622,14 @@ def test_上一輪我們開的討論會被標成已解決(real):
 
 
 @pytest.mark.parametrize("d,why", [
-    (_disc(notes=[{"id": 1, "body": f"{MARK}\n舊意見", "resolvable": True, "resolved": False},
+    (_disc(notes=[{"id": 1, "body": f"{MARK}\n舊意見", "resolvable": True, "resolved": False,
+                   "author": {"id": OWN_ID}},
                   {"id": 2, "body": "我覺得這條不對", "resolvable": True, "resolved": False}]),
      "有人回覆過的是對話,標成已解決會把人的話收起來"),
     (_disc(body="請看一下這段"), "沒有記號的是別人開的討論"),
+    (_disc(author=7), "別人開的、內文含記號的討論:記號誰都打得出來"),
+    (_disc(system=True), "系統留言"),
+    (_disc(body=f"`sql/a.sql:3`\n\n**[major]** 模型寫的說明 {MARK}"), "記號不在開頭"),
     (_disc(resolved=True), "已經解決的再送一次只是多一個請求"),
     (_disc(resolvable=False), "不可解決的討論(例如一般留言)標不動"),
     ({"id": "d9"}, "形狀不對(沒有 notes)"),
@@ -627,6 +638,25 @@ def test_這些討論不要動(real, d, why):
     fake = real(FakeGitLab(discussion_list=[d]))
     assert json.loads(gitlab.resolve_stale_comments("7"))["resolved"] == 0, why
     assert _resolved_ids(fake) == [], why
+
+
+def test_查不到自己的帳號時一條都不收(real, monkeypatch, capsys):
+    monkeypatch.setattr(gitlab, "_own_user", None)
+    monkeypatch.setattr(gitlab, "learn_own_user", lambda: "GET /user 回 401:GITLAB_TOKEN 被拒絕")
+    fake = real(FakeGitLab(discussion_list=[_disc("d1")]))
+    assert json.loads(gitlab.resolve_stale_comments("7"))["resolved"] == 0
+    assert _resolved_ids(fake) == []
+    assert fake.count("GET", "/discussions") == 0, "認不出自己,連清單都不用列"
+    assert "查不到 GITLAB_TOKEN 的帳號" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("line", [0, 3], ids=["沒有行號的一般留言", "行號被拒絕退成一般留言"])
+def test_一般留言那條路的記號也在最前面(real, line):
+    """下一輪只認開頭的記號;一般留言原本是檔名在前、記號在後。"""
+    fake = real(FakeGitLab(discussions=400))
+    _post(line=line, **REFS)
+    bodies = [j["body"] for m, p, j in fake.sent if m == "POST" and p.endswith("/notes")]
+    assert bodies and all(b.startswith(MARK) for b in bodies), bodies
 
 
 def test_標不掉只數一個數字_不影響其他的(real):
