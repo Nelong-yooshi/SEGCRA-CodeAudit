@@ -429,7 +429,7 @@ def test_重送之間有等待(real, monkeypatch):
 
 # ─────────────────── review_mr:每一步回寫都接住結果 ───────────────────
 
-def _review_with(monkeypatch, tmp_path, replies: dict, findings=()):
+def _review_with(monkeypatch, tmp_path, replies: dict, findings=(), agent_error=None):
     """走整條 review_mr(mock 模式),把指定的寫回工具換成回固定結果的函式;記下呼叫順序。"""
     from orchestrator import tool_hub
     from orchestrator.config import load_config
@@ -446,6 +446,8 @@ def _review_with(monkeypatch, tmp_path, replies: dict, findings=()):
         encoding="utf-8")
 
     async def run_agent(cfg, profile, system, user, hub, meta=None, **kw):
+        if agent_error is not None:
+            raise agent_error
         return json.dumps({"summary": "ok", "findings": list(findings)})
     monkeypatch.setattr(pipeline, "run_agent", run_agent)
 
@@ -533,6 +535,25 @@ def test_退成一般留言的記進報告與總結(monkeypatch, tmp_path):
         "post_inline_comment": json.dumps({"ok": True, "plain_note": True})}, findings=[finding])
     n = report["_resolve_unfinished"]["plain_notes"]
     assert n >= 1 and f"這一輪有 {n} 條意見 GitLab 不讓開討論" in bodies[-1]
+
+
+def test_這一輪沒跑完整時不收上一輪的(monkeypatch, tmp_path):
+    """收舊意見的前提是這一輪重新審過了。主審查的模型呼叫失敗(這一輪只有程式確定性檢查的
+    結果)時,上一輪報的那些沒有人重新看過,收起來的話上一輪的 blocker 就不見了。"""
+    import httpx as _httpx
+    report, order, bodies = _review_with(monkeypatch, tmp_path, {},
+                                         agent_error=_httpx.ConnectError("連不上"))
+    assert pipeline.review_incomplete(report), "前提:這一輪有環節沒跑完"
+    assert "resolve_stale_comments" not in order
+    assert report["_resolve_unfinished"] == {"skipped": "這一輪有環節沒跑完"}
+    assert "上一輪的意見這次沒有收" in bodies[-1]
+    assert order[-1] == "post_summary", "其他回寫照常"
+
+
+def test_這一輪跑完整時照樣收(monkeypatch, tmp_path):
+    report, order, _ = _review_with(monkeypatch, tmp_path, {})
+    assert not pipeline.review_incomplete(report)
+    assert order[0] == "resolve_stale_comments" and "skipped" not in report.get("_resolve_unfinished", {})
 
 
 def test_全部收乾淨時報告與總結不多寫(monkeypatch, tmp_path):

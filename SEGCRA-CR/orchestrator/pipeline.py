@@ -477,6 +477,9 @@ def _resolve_result(result) -> tuple[int | None, dict]:
 def _resolve_lines(unfinished: dict) -> list[str]:
     """總結裡寫明上一輪的意見沒收乾淨(看 MR 的人才知道上面還有舊的)。"""
     lines = []
+    if unfinished.get("skipped"):
+        lines.append(f"- {unfinished['skipped']},上一輪的意見這次沒有收(沒有重新看過的地方不當成"
+                     "已經解決),仍留在 MR 上。")
     if unfinished.get("unknown"):
         lines.append("- 不知道上一輪的意見收掉了幾條(收舊意見的結果看不懂),MR 上可能還留著上一輪的意見。")
     if unfinished.get("failed"):
@@ -2471,7 +2474,14 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 行內意見卻是每次 N 條重貼一遍 —— 不收掉的話同一行會疊好幾輪的意見,看 MR 的
         # 人分不出哪些還有效。標不掉不影響這次審查(舊意見留著,新的照樣貼),所以只
         # 記個數字,不當成回寫失敗。
-        if await writable(_WRITEBACK_STEPS["resolve"]) is not None:
+        #
+        # 這一輪有環節沒跑完時不收:收舊意見的前提是「這一輪重新審過了,上一輪報的、這一輪
+        # 沒再報,就是不用再看了」。沒跑完不是成功,不能當成這一輪已經取代上一輪 —— 上一輪的
+        # blocker 會在沒有人重新看過的情況下被收起來。
+        if review_incomplete(report):
+            report["_resolve_unfinished"] = {"skipped": "這一輪有環節沒跑完"}
+            print(f"[pipeline] MR !{mr_id} 這一輪有環節沒跑完,上一輪的意見這次不收", flush=True)
+        elif await writable(_WRITEBACK_STEPS["resolve"]) is not None:
             resolved, unfinished = _resolve_result(
                 await hub.call("gitlab__resolve_stale_comments", {"mr_id": mr_id}))
             report["_resolved_stale"] = resolved          # None = 不知道
