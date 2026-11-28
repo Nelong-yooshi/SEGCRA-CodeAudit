@@ -49,6 +49,9 @@ MAX_ERROR_CHARS = 300
 
 # 只收需要的副檔名(#15 條件 6),其餘一律丟棄。dbt 的屬性檔 .yml / .yaml 都可以
 ALLOWED_SUFFIXES = (".sql", ".yml", ".yaml")
+# 規格檔(specs/ 底下的 Markdown)。只有讀規格的呼叫端會指定,dbt 專案照舊只收上面三種
+SPEC_SUFFIXES = (".md",)
+_SUFFIX_CHOICES = (ALLOWED_SUFFIXES, SPEC_SUFFIXES)
 
 _CHUNK = 64 * 1024
 _REGULAR_TYPES = (tarfile.REGTYPE, tarfile.AREGTYPE)
@@ -73,22 +76,27 @@ class ArchiveResult:
 
 
 def extract_archive(data: bytes, prefixes: tuple[str, ...], *,
-                    list_prefixes: tuple[str, ...] = ()) -> ArchiveResult:
+                    list_prefixes: tuple[str, ...] = (),
+                    suffixes: tuple[str, ...] = ALLOWED_SUFFIXES) -> ArchiveResult:
     """解開 GitLab 打包下載的 tar.gz,只取 prefixes 目錄下的 .sql / .yml / .yaml。
 
     prefixes       要收內容的目錄(相對專案根,例如 ("models", "macros"));目錄外的成員一律丟棄
     list_prefixes  只列檔名的目錄:底下所有非目錄成員(任何副檔名、含符號連結)的名稱放進
                    names;不解出、不讀內容。預設不列
+    suffixes       要收的副檔名:ALLOWED_SUFFIXES(預設,dbt 專案)或 SPEC_SUFFIXES(規格);
+                   只接受這兩組,其他值整包失敗
     任何失敗都收斂成 ok=False,不丟例外。
     """
     try:
         if not hasattr(tarfile, "data_filter"):
             # filter="data" 是 #15 的明確要求;沒有它就不解壓,不退回無過濾的解法
             raise ArchiveError("此 Python 版本的 tarfile 沒有 data filter,拒絕解壓")
+        if suffixes not in _SUFFIX_CHOICES:
+            raise ArchiveError("要收的副檔名不在允許的組合內")
         wanted_dirs = _check_prefixes(prefixes)
         list_dirs = _check_prefixes(list_prefixes) if list_prefixes != () else ()
         with tarfile.open(fileobj=_gunzip_capped(data), mode="r:") as tar:
-            wanted, names = _select_members(tar, wanted_dirs, list_dirs)
+            wanted, names = _select_members(tar, wanted_dirs, list_dirs, suffixes)
             files = _extract_and_read(tar, wanted)
         return ArchiveResult(ok=True, files=files, names=tuple(sorted(names)))
     except Exception as e:                  # noqa: BLE001 — 一律收斂成失敗結果
@@ -187,7 +195,8 @@ def _under(rel: str, dirs: tuple[str, ...]) -> bool:
     return any(rel == d or rel.startswith(d + "/") for d in dirs)
 
 
-def _select_members(tar: tarfile.TarFile, dirs: tuple[str, ...], list_dirs: tuple[str, ...] = ()
+def _select_members(tar: tarfile.TarFile, dirs: tuple[str, ...], list_dirs: tuple[str, ...] = (),
+                    suffixes: tuple[str, ...] = ALLOWED_SUFFIXES
                     ) -> tuple[list[tuple[tarfile.TarInfo, str]], list[str]]:
     """逐一檢查成員(只讀標頭),回傳 (要收的 (成員, 去掉頂層目錄的相對路徑), 只列的檔名)。
 
@@ -244,7 +253,7 @@ def _select_members(tar: tarfile.TarFile, dirs: tuple[str, ...], list_dirs: tupl
         if m.type not in _REGULAR_TYPES:
             # 符號連結、硬連結、裝置檔、FIFO、稀疏檔……一律整包失敗(理由見模組說明)
             raise ArchiveError("指定目錄內含符號連結、硬連結或特殊檔案")
-        if not rel.lower().endswith(ALLOWED_SUFFIXES):
+        if not rel.lower().endswith(suffixes):
             continue                        # 不需要的副檔名:丟棄(例如 .md、.csv、.py)
         _split_relative(rel)                # 會解出的檔案:整條路徑嚴格檢查
         if m.size > MAX_FILE_BYTES:
@@ -293,11 +302,7 @@ def _extract_and_read(tar: tarfile.TarFile, wanted) -> dict[str, str]:
 
 def _safe_error(e: BaseException) -> str:
     """只留我們自己的固定文字;第三方例外(tarfile、gzip)的訊息可能帶成員名稱,不回顯。"""
-    if isinstance(e, ArchiveError):
-        text = f"ArchiveError: {e}"
-    elif isinstance(e, MemoryError):
-        text = "MemoryError: 解壓時記憶體不足,已中止"
-    else:
-        text = f"{type(e).__name__}: 壓縮檔無法解析或無法解出"
-    text = "".join(ch if ch.isprintable() else " " for ch in text)
-    return text[:MAX_ERROR_CHARS]
+    from .error_text import safe_error
+    return safe_error(e, own=(ArchiveError,),
+                      fixed={MemoryError: "MemoryError: 解壓時記憶體不足,已中止"},
+                      other="壓縮檔無法解析或無法解出", max_chars=MAX_ERROR_CHARS)

@@ -402,10 +402,15 @@ def test_沒有專案時照舊補(ctx):
 
 # ─────────────────── 整條 review_mr ───────────────────
 
+# 規格的「基本資料」:序號 P02 對到 models/P02/ 底下的 model
+_P02_BASIC = "\n## 基本資料\n\n| 欄位 | 值 |\n|---|---|\n| 序號 / 程式名稱 | P02 / BIG |\n"
+
+
 @pytest.fixture
 def run(review, monkeypatch):
-    """review 的替身之外:規格換成有資料表定義的,記下送進沙盒的 SQL。"""
-    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC, encoding="utf-8")
+    """review 的替身之外:規格換成有資料表定義的,記下送進沙盒的 SQL。model 放在 project
+    資料夾 models/P02/(規格的序號是 P02)。"""
+    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC + _P02_BASIC, encoding="utf-8")
     seen = {"sql": []}
     real_execute = spec_exec.execute_cases
 
@@ -415,11 +420,15 @@ def run(review, monkeypatch):
     monkeypatch.setattr(spec_exec, "execute_cases", capture)
 
     def go(paths, extra=None, contents=None):
-        files = [{"path": p, "diff": "@@ -0,0 +1 @@\n+" + (contents or {}).get(p, _files(extra).get(p, "x"))}
+        files = [{"path": _p02(p), "diff": "@@ -0,0 +1 @@\n+" + (contents or {}).get(p, _files(extra).get(p, "x"))}
                  for p in paths]
-        report, _ = review(files, _Loader(_files(extra)))
+        report, _ = review(files, _Loader({_p02(k): v for k, v in _files(extra).items()}))
         return report, seen["sql"]
     return go
+
+
+def _p02(path: str) -> str:
+    return "models/P02/" + path[len("models/"):] if path.startswith("models/") else path
 
 
 def _titles(report):
@@ -430,8 +439,8 @@ def test_只引用_source_的_model_送進沙盒執行(run):
     report, sqls = run(["models/mrt_BIG.sql"])
     assert sqls == ["SELECT account_no FROM [dbo].[transactions]"]
     assert report["_spec_exec"]["passed"] is True
-    assert report["_spec_exec"]["executed_file"] == "models/mrt_BIG.sql"
-    assert report["_dbt_exec"] == {"file": "models/mrt_BIG.sql", "ok": True, "reason": None,
+    assert report["_spec_exec"]["executed_file"] == "models/P02/mrt_BIG.sql"
+    assert report["_dbt_exec"] == {"file": "models/P02/mrt_BIG.sql", "ok": True, "reason": None,
                                    "stand_ins": []}
     assert _DBT_UNEXECUTED_TITLE not in _titles(report)
     assert not any("尚未支援" in t for t in _titles(report))
@@ -439,9 +448,10 @@ def test_只引用_source_的_model_送進沙盒執行(run):
 
 REF_FILES = {"models/stg_a.sql": "SELECT 1 AS account_no",
              "models/mrt_BIG.sql": "SELECT account_no FROM {{ ref('stg_a') }}\n"}
-# 規格多一張跟上游 model 同名的表:由它代替 stg_a 的輸出
-SPEC_STG = SPEC.replace("CREATE TABLE transactions(", "CREATE TABLE stg_a(account_no INT);\n"
-                        "CREATE TABLE transactions(")
+# 規格多一張跟上游 model 同名的表:由它代替 stg_a 的輸出。序號 P02 跟 run 的 project 資料夾對上(#178)
+SPEC_STG = (SPEC.replace("CREATE TABLE transactions(", "CREATE TABLE stg_a(account_no INT);\n"
+                         "CREATE TABLE transactions(")
+            + "\n## 基本資料\n\n| 欄位 | 值 |\n|---|---|\n| 序號 / 程式名稱 | P02 / BIG |\n")
 
 
 def test_ref_指向的表規格裡沒有時_照舊交人工_並寫出原因(run):
@@ -461,7 +471,7 @@ def test_ref_由規格裡同名的表代替_記下代替了哪些(in_process):
 
 
 def test_ref_由測資代替時送進沙盒_並寫出上游的邏輯沒有執行(run):
-    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC_STG, encoding="utf-8")
+    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC_STG + _P02_BASIC, encoding="utf-8")
     report, sqls = run(["models/mrt_BIG.sql"], REF_FILES)
     assert sqls == ["SELECT account_no FROM [dbo].[stg_a]"]
     assert report["_dbt_exec"]["stand_ins"] == ["stg_a"]
@@ -554,7 +564,7 @@ def test_模型同標題的代替說明_被程式的取代():
 
 def test_同時改了上游_model_時_通過也要補未執行(run):
     """上游 model 由測資代替,它自己的改動沒有被執行:MR 改到 dbt 的不只這個 model。"""
-    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC_STG, encoding="utf-8")
+    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC_STG + _P02_BASIC, encoding="utf-8")
     report, sqls = run(["models/stg_a.sql", "models/mrt_BIG.sql"], REF_FILES)
     assert sqls == ["SELECT account_no FROM [dbo].[stg_a]"]
     assert _DBT_OTHER_MODELS_TITLE in _titles(report)
@@ -569,7 +579,7 @@ def test_同時改了上游_model_時_通過也要補未執行(run):
 ])
 def test_改到的其他純_SQL_model_也記成待驗證_不會自動放行(run, other):
     """執行驗證只跑一個 model:MR 改到的其他 model 都沒有被執行,不管有沒有樣板。"""
-    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC_STG, encoding="utf-8")
+    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC_STG + _P02_BASIC, encoding="utf-8")
     files = {**REF_FILES, other: "SELECT account_no FROM raw_table"}
     report, sqls = run([other, "models/mrt_BIG.sql"], files)
     assert sqls == ["SELECT account_no FROM [dbo].[stg_a]"]
@@ -620,7 +630,7 @@ def test_golden_的_dbt_model_送進沙盒的是跟_mr_406_相同的_SQL(in_proc
     assert ctx.error is None and ctx.project is not None
     exec_mr = pipeline._mr_for_spec_exec(mr, ctx)
     out, record = _dbt_exec_mr(exec_mr, spec, spec, (), ctx, cfg)
-    assert record == {"file": "models/mrt_cash_inbound.sql", "ok": True, "reason": None,
+    assert record == {"file": "models/SAMPLE02/mrt_cash_inbound.sql", "ok": True, "reason": None,
                       "stand_ins": []}
     assert out["files"][-1]["full_content"] == plain.replace("FROM txn_log t", "FROM [dbo].[txn_log] t")
 
@@ -722,6 +732,6 @@ def test_代替了哪些交給執行驗證(run, monkeypatch):
         seen["stand_ins"] = kw.get("stand_ins")
         return await real(*a, **kw)
     monkeypatch.setattr(pipeline, "run_spec_exec", spy)
-    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC_STG, encoding="utf-8")
+    (spec_exec.SPECS_DIR / "BIG.md").write_text(SPEC_STG + _P02_BASIC, encoding="utf-8")
     run(["models/mrt_BIG.sql"], REF_FILES)
     assert seen["stand_ins"] == ("stg_a",)

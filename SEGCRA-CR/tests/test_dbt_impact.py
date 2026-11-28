@@ -28,9 +28,8 @@ import pytest
 from orchestrator import dbt_impact
 from orchestrator.dbt_builtin_macros import BUILTIN_MACROS
 from orchestrator.dbt_impact import (
-    MAX_REASON_CHARS, MAX_REASONS, ImpactReport, SpecMatch, _identifier_tokens,
-    analyze_macro_impact, analyze_macro_impact_isolated, normalize_path, resolve_spec,
-    resolve_specs,
+    MAX_REASON_CHARS, MAX_REASONS, ImpactReport, _identifier_tokens,
+    analyze_macro_impact, analyze_macro_impact_isolated, normalize_path,
 )
 
 PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -594,99 +593,6 @@ def test_sample_builtin_override_marks_all_models():
     report = _analyze(["macros/global/override_temp_relation.sql"], files=SAMPLE_FILES)
     assert report.all_models_possibly_affected
     assert _all(report) == {"models/mrt_RETAIL_M1.sql"}
-
-
-def test_sample_macro_change_maps_to_spec():
-    """反查到的 model 再對應規格:mrt_RETAIL_M1 → specs/RETAIL_M1.md。"""
-    report = _analyze(["macros/anomaly/config.sql"], files=SAMPLE_FILES)
-    matches = resolve_specs([m.path for m in report.affected_models],
-                            ["specs/RETAIL_M1.md", "specs/R-201.md"])
-    assert [(s.model_path, s.spec_path, s.method) for s in matches] == \
-           [("models/mrt_RETAIL_M1.sql", "specs/RETAIL_M1.md", "path")]
-
-
-# ---------------------------------------------------------------- 規格對應
-SPECS = ["specs/RETAIL_M1.md", "specs/ALPHA.md", "specs/R-201.md", "specs/R-305.md",
-         "specs/mrt_BOTH.md", "specs/BOTH.md", "specs/0042_sample.md"]
-
-
-@pytest.mark.parametrize("model, codes, spec, method", [
-    ("models/mrt_RETAIL_M1.sql", (), "specs/RETAIL_M1.md", "path"),       # Issue #7 範例
-    ("mrt_RETAIL_M1.sql", (), "specs/RETAIL_M1.md", "path"),              # 不在子目錄
-    ("models/sub/mrt_ALPHA.sql", (), "specs/ALPHA.md", "path"),
-    ("models/mrt_BOTH.sql", (), "specs/mrt_BOTH.md", "path"),             # 完整檔名優先
-    ("models/0042_sample.sql", (), "specs/0042_sample.md", "path"),         # 數字開頭的檔名
-    ("models/UNKNOWN.sql", ("R-201",), "specs/R-201.md", "rule_code"),    # R 編號備援
-    ("models/UNKNOWN.sql", "R-201", "specs/R-201.md", "rule_code"),       # 傳單一字串
-    ("models/UNKNOWN.sql", ("R-999",), None, "none"),                     # R 編號沒有對應檔
-    ("models/UNKNOWN.sql", (), None, "none"),
-    ("models/UNKNOWN.sql", ("R-201", "R-305"), None, "ambiguous"),        # 不自行擇一
-    ("models/UNKNOWN.sql", ("R-201", "R-201"), "specs/R-201.md", "rule_code"),
-])
-def test_resolve_spec(model, codes, spec, method):
-    match = resolve_spec(model, SPECS, codes)
-    assert (match.spec_path, match.method) == (spec, method)
-
-
-def test_path_mapping_wins_but_conflict_is_noted():
-    match = resolve_spec("models/mrt_ALPHA.sql", SPECS, ("R-305",))
-    assert match.spec_path == "specs/ALPHA.md"
-    assert any("R-305" in n for n in match.notes)
-
-
-def test_case_only_match_is_not_used():
-    """GitLab 路徑區分大小寫:只有大小寫不同時不採用,但要提示人工確認。"""
-    match = resolve_spec("models/mrt_retail_m1.sql", SPECS)
-    assert match.spec_path is None
-    assert any("大小寫" in n for n in match.notes)
-
-
-def test_earlyjob_is_not_guessed():
-    """earlyjob model 該對應哪份規格尚未確認:不自行猜測。"""
-    match = resolve_spec("models/mrt_RETAIL_M1_earlyjob.sql", SPECS)
-    assert match.spec_path is None
-
-
-@pytest.mark.parametrize("bad_code", ["R-1", "R-12345", "r-201", "R-20a", "R-２０１", " R-201",
-                                      "R-201/../x", "../R-201", 201, None])
-def test_invalid_rule_codes_are_ignored(bad_code):
-    assert resolve_spec("models/UNKNOWN.sql", SPECS + [f"specs/{bad_code}.md"],
-                        (bad_code,)).spec_path is None
-
-
-@pytest.mark.parametrize("model", [
-    "models/../../config/gitlab.env", "/etc/passwd", "models\\x.sql", "C:/x.sql",
-    "models/x.sql:stream", "models//x.sql", "./models/x.sql", "models/x\u202e.sql",
-    "models/x\x00.sql", "", None, 42, "a" * 2000,
-])
-def test_unsafe_model_paths_are_rejected(model):
-    match = resolve_spec(model, SPECS)
-    assert match.spec_path is None
-    assert all(ch.isprintable() for ch in match.model_path)
-
-
-@pytest.mark.parametrize("model", ["models/x-y.sql", "models/x.y.sql", "models/表.sql",
-                                   "models/x.txt", "models/.sql"])
-def test_unusual_model_names_do_not_map(model):
-    assert resolve_spec(model, SPECS + ["specs/x-y.md", "specs/表.md"]).spec_path is None
-
-
-def test_only_existing_specs_are_returned():
-    """絕不回傳清單以外的路徑(不自行拼路徑去讀檔)。"""
-    assert resolve_spec("models/mrt_RETAIL_M1.sql", []).spec_path is None
-    assert resolve_spec("models/mrt_RETAIL_M1.sql", ["specs/../specs/RETAIL_M1.md"]).spec_path is None
-
-
-@pytest.mark.parametrize("specs_dir", ["../specs", "/specs", "specs\\x", ""])
-def test_unsafe_specs_dir_is_rejected(specs_dir):
-    assert resolve_spec("models/mrt_RETAIL_M1.sql", SPECS, specs_dir=specs_dir).spec_path is None
-
-
-def test_spec_match_is_frozen():
-    match = resolve_spec("models/mrt_RETAIL_M1.sql", SPECS)
-    assert isinstance(match, SpecMatch)
-    with pytest.raises(Exception):
-        match.spec_path = "specs/other.md"
 
 
 # ---------------------------------------------------------------- 資安

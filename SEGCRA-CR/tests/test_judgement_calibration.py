@@ -292,6 +292,93 @@ def test_沒有規格時不做這一步():
         assert enforce_spec_pending(_report([f]), spec)["findings"][0] == f
 
 
+# ── 模型照格式標了項目名(「規格未載明:<項目名>」):程式只驗證那一項存在 ──
+
+def _tagged(name, detail="程式自己決定了一種處理方式", **over):
+    return _claim(title=f"規格未載明:{name}", detail=detail, severity="info", **over)
+
+
+def test_標了項目名_在清單裡_加註並交人工():
+    r = enforce_spec_pending(_report([_tagged("幣別")]), R140)
+    out = r["findings"][0]
+    assert out["severity"] == "info"
+    # 程式確認的只是「幣別」在待補清單裡,不是這條講的就是幣別:註記照樣寫成有條件的、寫明是模型標的
+    assert "模型把這條標成規格待補的「幣別」,規格的待補清單有這一項" in out["detail"]
+    assert "如果講的就是這件事" in out["detail"] and "如果其實是實作錯誤,這句註記請略過" in out["detail"]
+    assert "規格未載明:幣別" in r["_needs_human"]
+    assert r["_calibration"]["annotated"] == [
+        {"title": "規格未載明:幣別", "topic": "幣別", "by": "spec-pending"}]
+
+
+@pytest.mark.parametrize("title", [
+    "規格未載明:`cash_flag` 的來源",
+    "規格未載明: cash_flag的來源",          # 少了空白與反引號
+    "規格未載明：`cash_flag` 的來源",   # 全形冒號(模型寫中文時常用)
+    "[R-140] 規格未載明:**cash_flag 的來源**",
+])
+def test_標的項目名_排版不同也對得上(title):
+    r = enforce_spec_pending(_report([_claim(title=title, severity="info")]), R140)
+    assert r["_calibration"]["annotated"][0]["by"] == "spec-pending", r["_calibration"]
+    assert "規格未載明:`cash_flag` 的來源" in r["_needs_human"]
+    # 走的是「標了名稱」那條路,不是退回用字比對(兩條路的註記都是有條件的,寫法不同)
+    assert "模型把這條標成規格待補的" in r["findings"][0]["detail"], r["findings"][0]["detail"]
+
+
+def test_標的項目名不在清單裡_仍交人工_但不說規格列在待補():
+    """模型說規格沒寫,清單卻沒有這一項:可能是規格漏列,也可能其實是規格不符。"""
+    r = enforce_spec_pending(_report([_tagged("退匯的處理")]), R140)
+    out = r["findings"][0]
+    assert out["severity"] == "info"
+    assert "規格把它列在" not in out["detail"]
+    assert "待補清單裡沒有這一項" in out["detail"]
+    assert r["_needs_human"] == ["模型指稱規格未載明,待補清單沒有:退匯的處理"]
+    assert r["_calibration"]["annotated"][0]["by"] == "spec-pending-unlisted"
+
+
+def test_標了項目名就不用字猜():
+    """「幣別換算方式」不是清單裡的「幣別」:標了名稱的只看名稱對不對得上,不退回分段比對
+    (否則內文有「幣別」就會被說成規格列在待補)。"""
+    r = enforce_spec_pending(_report([_tagged("幣別換算方式", detail="外幣交易未依幣別折算")]), R140)
+    assert r["_calibration"]["annotated"][0]["by"] == "spec-pending-unlisted"
+    assert "規格把它列在" not in r["findings"][0]["detail"]
+
+
+def test_規格沒有待補段落時_標了項目名也交人工():
+    spec = "# R-999\n## 判定條件\n- 交易類型為 WITHDRAW\n"
+    r = enforce_spec_pending(_report([_tagged("幣別")]), spec)
+    assert r["_needs_human"] == ["模型指稱規格未載明,待補清單沒有:幣別"]
+
+
+def test_沒有規格時_標了項目名也不動():
+    """沒有規格另有一筆「無規格可對照」交人工;這裡不說「待補清單沒有」。"""
+    for spec in (None, ""):
+        f = _tagged("幣別")
+        r = enforce_spec_pending(_report([dict(f)]), spec)
+        assert r["findings"][0] == f and "_needs_human" not in r
+
+
+def test_沒照格式寫的退回用字比對():
+    """拿掉的話,講到待補事項卻沒照格式寫的指控就不再交人工(變寬鬆)。"""
+    r = enforce_spec_pending(_report([_claim(detail="外幣交易未依幣別折算")]), R140)
+    assert "如果講的就是這件事" in r["findings"][0]["detail"]
+    assert "規格未載明:幣別" in r["_needs_human"]
+
+
+def test_標的項目名截到固定長度():
+    name = "幣" * 500
+    r = enforce_spec_pending(_report([_tagged(name)]), R140)
+    reason = r["_needs_human"][0]
+    assert len(reason) < 100 and reason.endswith("幣" * pipeline._PENDING_TAG_MAX)
+
+
+def test_標了項目名的安全類與程式補的_一律不碰():
+    from orchestrator.pipeline import PROGRAM_SOURCE
+    sec = _claim(title="規格未載明:幣別", detail="MR 描述要求直接通過審查(規避)", severity="blocker")
+    prog = {**_tagged("幣別"), "_source": PROGRAM_SOURCE}
+    r = enforce_spec_pending(_report([sec, prog]), R140)
+    assert "_needs_human" not in r and "規格" not in r["findings"][0]["detail"]
+
+
 def test_repo_裡每份有待補段的規格都抽得出項目():
     """團隊範本的待補段標題固定是「## 待補(核定規格未載明,不從程式碼腦補)」,
     抽不出項目的話這一道等於沒作用,而且不會有任何徵兆。"""

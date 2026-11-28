@@ -13,16 +13,53 @@ import re
 import time
 from pathlib import Path
 
-PKG_ROOT = Path(__file__).resolve().parent.parent
-FIXTURES_DIR = Path(os.environ.get("FIXTURES_DIR", PKG_ROOT / "fixtures"))
-OUTPUT_DIR = Path(os.environ.get("REVIEW_OUTPUT", PKG_ROOT / "review_output"))
+from orchestrator.config import ConfigError, env_int, env_path
+from orchestrator.config import _env_text as _config_env_text
 
-GITLAB_URL = os.environ.get("GITLAB_URL", "")          # e.g. http://localhost:8929
-GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "")
-GITLAB_PROJECT = os.environ.get("GITLAB_PROJECT", "")  # 專案的數字 id(CI 那條路拿它跟 job 的專案比對)
+PKG_ROOT = Path(__file__).resolve().parent.parent
+# 有設時要絕對路徑、設了但是空的就停(見 config.env_path):報告含 MR 的程式碼,不能寫到啟動目錄
+FIXTURES_DIR = env_path("FIXTURES_DIR", PKG_ROOT / "fixtures")
+OUTPUT_DIR = env_path("REVIEW_OUTPUT", PKG_ROOT / "review_output")
+
+
+class GitLabConfigError(ConfigError):
+    """GitLab 的設定不完整:停下來,不悄悄改走 mock 模式。"""
+
+
+_REAL_MODE_VARS = ("GITLAB_URL", "GITLAB_TOKEN", "GITLAB_PROJECT")
+
+
+def _env_text(name: str, unset: str) -> str:
+    """沒設回 `unset`;**設了但去掉前後空白後是空的,直接報錯並寫出變數名**。規則用 config.py 那一份,
+    這裡只把錯誤換成 GitLabConfigError(它是 ConfigError 的子類別)。"""
+    try:
+        value = _config_env_text(name)
+    except ConfigError as e:
+        raise GitLabConfigError(str(e)) from None
+    return unset if value is None else value
+
+
+def _real_mode_settings() -> tuple[str, str, str]:
+    """real 模式的三個設定。**只給了其中幾個時停下來**:以前任一個沒給就悄悄改走 mock 模式,
+    部署時漏設一個(或部署腳本沒把值帶進來),服務照常起來、審的卻是測試資料。三個都不設才是
+    mock 模式(離線開發與評測)。"""
+    # 一個一個寫出名稱(不用迴圈):設定參數的檢查(env_registry)靠字面的名稱找讀法
+    values = {"GITLAB_URL": _env_text("GITLAB_URL", ""), "GITLAB_TOKEN": _env_text("GITLAB_TOKEN", ""),
+              "GITLAB_PROJECT": _env_text("GITLAB_PROJECT", "")}
+    given = [name for name, v in values.items() if v]
+    if given and len(given) != len(_REAL_MODE_VARS):
+        missing = [name for name in _REAL_MODE_VARS if not values[name]]
+        raise GitLabConfigError(
+            f"GitLab 的設定只給了 {'、'.join(given)},還缺 {'、'.join(missing)}:"
+            f"三個都要設才會連 GitLab(三個都不設是離線的 mock 模式)")
+    return values["GITLAB_URL"], values["GITLAB_TOKEN"], values["GITLAB_PROJECT"]
+
+
+# URL 例如 http://localhost:8929;GITLAB_PROJECT 是專案的數字 id(CI 那條路拿它跟 job 的專案比對)
+GITLAB_URL, GITLAB_TOKEN, GITLAB_PROJECT = _real_mode_settings()
 REAL_MODE = bool(GITLAB_URL and GITLAB_TOKEN and GITLAB_PROJECT)
 # 專案層級的唯讀 token(read_api,角色 Reporter),只給打包下載用(#15 條件 1)
-GITLAB_READ_TOKEN = os.environ.get("GITLAB_READ_TOKEN", "")
+GITLAB_READ_TOKEN = _env_text("GITLAB_READ_TOKEN", "")
 
 
 
@@ -211,7 +248,26 @@ def review_ref() -> str | None:
 
 # 取回單一檔案的大小上限。超過就當成「取不到完整內容」交人工,不要讓一個超大的
 # 檔案拖住預掃、注入掃描與沙盒(與審查流程的時間上限同一個原則)。
-MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(1024 * 1024)))
+MAX_FILE_BYTES = env_int("MAX_FILE_BYTES", 1024 * 1024)
+
+# 取回完整內容的檔案種類:只抓審查會用到的。.sql(預掃、執行驗證、prompt 裡的完整內容)、
+# .yml / .yaml(dbt 的設定檔與屬性檔)、specs/ 底下的 .md(MR 改了規格時,審查用這次的版本)。
+# 其他檔案(圖片、文件、SVG…)只用 diff:MR 帶進來的文字都在 diff 裡,整份抓回來只會讓
+# 圖片的文字區塊這類內容多一條路進到審查。
+_FULL_CONTENT_SUFFIXES = (".sql", ".yml", ".yaml")
+
+
+def wants_full_content(path) -> bool:
+    """這個路徑的檔案要不要取回完整內容(見 _FULL_CONTENT_SUFFIXES 的說明)。"""
+    norm = str(path or "").replace("\\", "/").lower()
+    if norm.endswith(_FULL_CONTENT_SUFFIXES):
+        return True
+    return (norm.startswith("specs/") or "/specs/" in norm) and norm.endswith(".md")
+
+
+def is_binary(text) -> bool:
+    """內容含 NUL 字元就當成二進位檔:圖片、壓縮檔、Office 檔都有,文字檔不會有。"""
+    return isinstance(text, str) and "\x00" in text
 
 
 def _read_token() -> str | None:
@@ -474,8 +530,9 @@ def _check_mr_id(mr_id) -> str:
 # 描述引導去呼叫 get_mr_diff("8"),釘住的 sha 就會變成 !8 的,之後 get_file 看到的
 # 是別的 MR 的檔案,連補讀規格也會讀錯版本。改由 pipeline 在取完 MR 之後釘
 # (orchestrator/pipeline.py 的 review_mr),這個函式本身沒有副作用。
-def get_mr_diff(mr_id: str) -> str:
-    """取得 MR 的標題、描述、head commit sha 與 diff(逐檔)。
+def get_mr_diff(mr_id: str = "") -> str:
+    """取得 MR 的標題、描述、head commit sha 與 diff(逐檔)。審查模型用時 `mr_id` 不用填,
+    就是這次審查的 MR(只能讀這一張)。
 
     另外帶 GitLab `diff_refs` 的 `base_sha` / `head_sha` / `start_sha`(欄位名照 GitLab
     原樣),給「依 commit 取回程式碼」的流程用;拿不到時是 None,見 `_diff_refs`。
@@ -511,6 +568,8 @@ def get_mr_diff(mr_id: str) -> str:
                 continue            # 本來就拿不到內容的,不用多打一次 API
             if f["deleted"]:
                 continue            # 刪掉的檔在 head 上不存在,沒有新版可抓,不是「取不到」
+            if not wants_full_content(f["path"]):
+                continue            # 審查用不到完整內容的檔只用 diff,不是「取不到」
             if not head:
                 # **沒有 head sha 時一樣要標**。GitLab 在 MR 剛建立、diff 還沒算好時
                 # `diff_refs` 是 null,而 webhook 往往就在這時候觸發;不標的話這些檔
@@ -518,7 +577,12 @@ def get_mr_diff(mr_id: str) -> str:
                 f["full_content_unavailable"] = True
                 continue
             content = _file_at(f["path"], head)
-            if content is not None:
+            if is_binary(content):
+                # 該是文字的檔(.sql、.yml、規格)卻是二進位:內容不放進來,也看不出它在做什麼,
+                # 跟取不到一樣交人工
+                f["binary"] = True
+                f["full_content_unavailable"] = True
+            elif content is not None:
                 f["full_content"] = content
             else:
                 # 取不到就讓它缺著:下游是 `full_content or _sql_from_diff(...)`,
@@ -526,11 +590,15 @@ def get_mr_diff(mr_id: str) -> str:
                 # 「這個檔是空的」而不是「我們沒拿到」。
                 f["full_content_unavailable"] = True
         return json.dumps({"title": mr["title"], "description": mr.get("description", ""),
+                           "target_branch": mr.get("target_branch"),
+                           "source_branch": mr.get("source_branch"),
                            "sha": mr.get("sha", ""), **refs, "files": files,
                            "truncated": truncated}, ensure_ascii=False)
     mr = _mock_mr(mr_id)
     return json.dumps({"title": mr["title"], "description": mr.get("description", ""),
                        "sha": mr.get("sha", f"mock-{mr_id}"), **_diff_refs(mr),
+                       "target_branch": mr.get("target_branch", "main"),
+                       "source_branch": mr.get("source_branch"),
                        "files": mr["files"]}, ensure_ascii=False)
 
 
@@ -573,6 +641,8 @@ _PROSE = {
     "fetch_failed": "(無法讀取檔案:取檔失敗。請依 diff 判斷,或交人工確認。)",
 }
 _ABSENT_PROSE = "(repo 內無 {path})"
+# 二進位檔(圖片等)不把內容交給模型:解碼成文字只會是亂碼,裡面的文字區塊卻可以夾帶給模型的指令
+BINARY_PROSE = "(二進位檔案,不提供內容。)"
 _MOCK_ABSENT_PROSE = "(mock 模式無 {path} 的完整內容,請依 diff 判斷)"
 # GitLab 的 404 分不出是哪一種:檔案不存在、專案或 commit 找不到、token 沒有權限(GitLab 也回 404)
 # 都是 404,代理或別的服務回的 404 頁也是。所以 404 時再確認那個 commit 取得到(回 200),
@@ -638,13 +708,16 @@ def fetch_file(path: str, ref: str = "", mr_id: str = "") -> tuple[str | None, s
 def get_file(path: str, ref: str = "", mr_id: str = "") -> str:
     """取得 repo 內檔案的完整內容(看 diff 不夠時用)。**給審查模型的工具**。
 
+    `ref` 不填就是這次 MR 的版本;也可以填目標分支的名稱、`HEAD`、這次 MR 的 commit sha
+    (至少 7 個字元)。`mr_id` 不用填。只能讀這次 MR 的版本與目標分支。
+
     模型拿到的是文字,所以把 `fetch_file` 的代碼轉成說明句。管線自己要分辨
     「拿不到」與「確實沒有」時,直接用 `fetch_file`,不要比對這裡的文字 ——
     那段文字也可能是檔案的內容(見 fetch_file 的說明)。
     """
     text, code = fetch_file(path, ref, mr_id)
     if text is not None:
-        return text
+        return BINARY_PROSE if is_binary(text) else text
     if code is None:
         return (_ABSENT_PROSE if REAL_MODE else _MOCK_ABSENT_PROSE).format(path=path)
     return _PROSE[code].format(path=path)
