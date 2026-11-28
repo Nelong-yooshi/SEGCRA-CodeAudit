@@ -58,9 +58,15 @@ class FakeGitLab:
         if method == "GET" and path.endswith("/discussions"):
             if self.discussion_list is None:
                 return httpx.Response(404, json={}, request=req)
+            if isinstance(self.discussion_list, int):        # 列清單回這個狀態碼
+                return httpx.Response(self.discussion_list, json={}, request=req)
+            # 照 GitLab 的形狀分頁:由舊到新、每頁 100 則,帶 X-Next-Page 與 X-Total-Pages
             page = int((kw.get("params") or {}).get("page", 1))
             chunk = self.discussion_list[(page - 1) * 100:page * 100]
-            return httpx.Response(200, json=chunk, request=req)
+            total = max(1, -(-len(self.discussion_list) // 100))
+            return httpx.Response(200, json=chunk, request=req, headers={
+                "X-Next-Page": str(page + 1) if page < total else "",
+                "X-Total-Pages": str(total)})
         if method == "PUT" and "/discussions/" in path:
             if isinstance(self.resolve, Exception):
                 raise self.resolve
@@ -98,6 +104,8 @@ def real(monkeypatch):
 
     def install(fake):
         monkeypatch.setattr(httpx, "request", fake)
+        # 分頁的清單(_api_pages)用 httpx.get
+        monkeypatch.setattr(httpx, "get", lambda url, **kw: fake("GET", url, **kw))
         return fake
     return install
 
@@ -418,7 +426,10 @@ def _review_with(monkeypatch, tmp_path, replies: dict, findings=()):
         fn.__name__ = name
         return fn
     groups = dict(tool_hub.TOOL_GROUPS)
-    groups["gitlab"] = [fake(f.__name__, replies.get(f.__name__, json.dumps({"ok": True})))
+    ok = {"resolve_stale_comments": json.dumps({"ok": True, "resolved": 0, "failed": 0,
+                                                "failed_kinds": {}, "incomplete": None})}
+    groups["gitlab"] = [fake(f.__name__, replies.get(f.__name__, ok.get(f.__name__,
+                                                                         json.dumps({"ok": True}))))
                         if f.__name__ in ("post_summary", "set_label", "set_commit_status",
                                           "resolve_stale_comments", "post_inline_comment") else f
                         for f in groups["gitlab"]]
@@ -444,8 +455,8 @@ def test_收掉上一輪標不掉也不影響這次(monkeypatch, tmp_path):
     report, order, bodies = _review_with(monkeypatch, tmp_path,
                                          {"resolve_stale_comments": RuntimeError(SECRET)})
     assert order[-3:] == ["set_commit_status", "set_label", "post_summary"]
-    assert report["_resolved_stale"] == 0
-    assert "_writeback" in report
+    assert report["_resolved_stale"] is None, "丟例外時不知道收掉了幾條,不記 0"
+    assert "_writeback" in report and SECRET not in bodies[-1]
 
 
 def test_收掉幾個會記進報告(monkeypatch, tmp_path):
@@ -459,11 +470,31 @@ def test_收掉幾個會記進報告(monkeypatch, tmp_path):
     json.dumps("ok"),                    # 字串
     "不是 JSON",                          # ToolHub 把例外轉成的錯誤字串
 ])
-def test_看不懂回傳就記0_不猜(monkeypatch, tmp_path, reply):
-    """`resolved` 這個數字只寫進報告給人看。看不懂回傳的時候記 0(= 不確定)比猜一個
-    數字老實——猜 1 會讓報告說「收掉了 1 個」,其實根本不知道。"""
+def test_看不懂回傳就記成不知道(monkeypatch, tmp_path, reply):
+    """`resolved` 這個數字只寫進報告給人看。看不懂回傳時記 0 跟「沒有舊的」分不出來,
+    是說了一件不知道的事;記成不知道(None),總結也寫一句。"""
     report, _, _ = _review_with(monkeypatch, tmp_path, {"resolve_stale_comments": reply})
-    assert report["_resolved_stale"] == 0
+    assert report["_resolved_stale"] is None
+    assert report["_resolve_unfinished"] == {"unknown": True}
+
+
+def test_沒收乾淨的記進報告與總結(monkeypatch, tmp_path):
+    reply = json.dumps({"ok": True, "resolved": 1, "failed": 3,
+                        "failed_kinds": {"rejected": 3},
+                        "incomplete": "討論超過 5 頁(每頁 100 則),只看了最新的,較舊的沒看"})
+    report, _, bodies = _review_with(monkeypatch, tmp_path, {"resolve_stale_comments": reply})
+    assert report["_resolved_stale"] == 1
+    assert report["_resolve_unfinished"]["failed"] == 3
+    assert "討論超過 5 頁" in report["_resolve_unfinished"]["incomplete"]
+    assert "上一輪的意見有 3 條沒有收掉" in bodies[-1] and "討論超過 5 頁" in bodies[-1]
+
+
+def test_全部收乾淨時報告與總結不多寫(monkeypatch, tmp_path):
+    reply = json.dumps({"ok": True, "resolved": 2, "failed": 0, "failed_kinds": {},
+                        "incomplete": None})
+    report, _, bodies = _review_with(monkeypatch, tmp_path, {"resolve_stale_comments": reply})
+    assert report["_resolved_stale"] == 2 and "_resolve_unfinished" not in report
+    assert "上一輪的意見" not in bodies[-1]
 
 
 def test_commit_status_沒寫上時總結與_log_寫明(monkeypatch, tmp_path, capsys):
@@ -616,7 +647,7 @@ def test_行內意見帶著記號(real):
 def test_上一輪我們開的討論會被標成已解決(real):
     fake = real(FakeGitLab(discussion_list=[_disc("d1"), _disc("d2")]))
     out = json.loads(gitlab.resolve_stale_comments("7"))
-    assert out == {"ok": True, "resolved": 2, "failed": 0}
+    assert out == {"ok": True, "resolved": 2, "failed": 0, "failed_kinds": {}, "incomplete": None}
     assert _resolved_ids(fake) == ["d1", "d2"]
     assert all(j == {"resolved": True} for m, p, j in fake.sent if m == "PUT")
 
@@ -663,21 +694,22 @@ def test_標不掉只數一個數字_不影響其他的(real):
     """舊意見留在上面不影響這次審查(新的照樣貼),所以不可以讓它中斷回寫。"""
     fake = real(FakeGitLab(discussion_list=[_disc("d1"), _disc("d2")], resolve=403))
     out = json.loads(gitlab.resolve_stale_comments("7"))
-    assert out == {"ok": True, "resolved": 0, "failed": 2}
+    assert (out["resolved"], out["failed"], out["failed_kinds"]) == (0, 2, {"rejected": 2})
     assert len(_resolved_ids(fake)) == 2, "每一個都試過"
 
 
 def test_標不掉的例外也不往外丟(real):
     real(FakeGitLab(discussion_list=[_disc("d1")], resolve=httpx.ReadTimeout(SECRET)))
     out = gitlab.resolve_stale_comments("7")
-    assert json.loads(out) == {"ok": True, "resolved": 0, "failed": 1}
+    got = json.loads(out)
+    assert (got["resolved"], got["failed"], got["failed_kinds"]) == (0, 1, {"uncertain": 1})
     assert SECRET not in out
 
 
 def test_問不出討論清單就不標(real):
     fake = real(FakeGitLab(discussion_list=None))
-    assert json.loads(gitlab.resolve_stale_comments("7")) == {"ok": True, "resolved": 0,
-                                                              "failed": 0}
+    out = json.loads(gitlab.resolve_stale_comments("7"))
+    assert out["resolved"] == 0 and "列不出討論清單(GitLab 回 404)" in out["incomplete"]
     assert _resolved_ids(fake) == []
 
 
@@ -692,9 +724,44 @@ def test_滿頁會翻下一頁(real):
 def test_翻頁有上限(real):
     """收尾有時間上限,不可以無上限追下去。"""
     fake = real(FakeGitLab(discussion_list=[_disc(f"d{i}") for i in range(100 * 8)]))
-    json.loads(gitlab.resolve_stale_comments("7"))
+    out = json.loads(gitlab.resolve_stale_comments("7"))
     got = sum(1 for m, p, _ in fake.sent if m == "GET" and p.endswith("/discussions"))
     assert got == gitlab.MAX_DISCUSSION_PAGES
+    assert "超過" in out["incomplete"], "沒取完要說,不能跟取完了一樣"
+
+
+def test_上一輪的排在第500則之後照樣收掉(real):
+    """討論清單由舊到新排:20 輪已解決的舊討論加系統留言排在前 500 則,上一輪的 20 條在
+    第 501–520 則。從第一頁往後翻、翻到上限就停的話,一條都收不到。"""
+    old = [_disc(f"old{i}", resolved=True) for i in range(400)]
+    old += [_disc(f"sys{i}", system=True, body="added 1 commit") for i in range(100)]
+    prev = [_disc(f"prev{i}") for i in range(20)]
+    fake = real(FakeGitLab(discussion_list=old + prev))
+    out = json.loads(gitlab.resolve_stale_comments("7"))
+    assert out["resolved"] == 20 and sorted(_resolved_ids(fake)) == sorted(d["id"] for d in prev)
+
+
+def test_清單比上限長時截掉的是最舊的(real):
+    """超過上限:取第一頁與最後幾頁,最新的那些(上一輪的)一定拿得到。"""
+    discs = [_disc(f"d{i}") for i in range(100 * 8)]
+    fake = real(FakeGitLab(discussion_list=discs))
+    json.loads(gitlab.resolve_stale_comments("7"))
+    assert "d799" in _resolved_ids(fake) and "d150" not in _resolved_ids(fake)
+
+
+def test_標不掉的記下條數與種類_403_寫明是權限(real, capsys):
+    real(FakeGitLab(discussion_list=[_disc("d1"), _disc("d2"), _disc("d3")], resolve=403))
+    out = json.loads(gitlab.resolve_stale_comments("7"))
+    assert (out["failed"], out["failed_kinds"]) == (3, {"rejected": 3})
+    log = capsys.readouterr().out
+    assert "3 條沒收掉" in log and "403" in log and "GITLAB_TOKEN 的權限不夠" in log
+
+
+def test_列不出清單時記下狀態碼(real, capsys):
+    real(FakeGitLab(discussion_list=403))
+    out = json.loads(gitlab.resolve_stale_comments("7"))
+    assert out["incomplete"] == "列不出討論清單(GitLab 回 403:GITLAB_TOKEN 的權限不夠)"
+    assert "列不出討論清單" in capsys.readouterr().out
 
 
 def test_不接受不合法的_MR_編號(real):

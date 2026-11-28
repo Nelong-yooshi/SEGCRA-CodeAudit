@@ -44,7 +44,7 @@ from .dbt_hidden_writes import MODELS_CHECKED, UNREACHED_OUTPUT, find_hidden_wri
 from .dbt_render import (MACRO_KIND_TEXT, MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, MACRO_SYNTAX,
                          check_macro_files_isolated)
 from .security import scan_mr
-from toolbox.gitlab import (WRITE_FAILED, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UNCERTAIN,
+from toolbox.gitlab import (WRITE_FAILED, WRITE_FAILURES, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UNCERTAIN,
                             write_failure)
 from toolbox import gitlab as _gitlab
 from .skills_loader import always_skills, load_skills, skills_index
@@ -438,14 +438,45 @@ _WRITE_FAILURE_TEXT = {
 }
 
 
-def _resolved_count(result) -> int:
-    """`resolve_stale_comments` 標掉了幾個。看不懂它回什麼就當成 0:這個數字只寫進報告
-    給人看,猜一個數字比寫 0 糟。"""
+def _resolve_result(result) -> tuple[int | None, dict]:
+    """`resolve_stale_comments` 的結果:(標掉了幾個, 沒處理完的部分)。
+
+    看不懂回傳時標掉幾個記成 None(不知道),不記 0:0 跟「沒有舊的」分不出來,這個數字
+    寫進報告給人看,寫成 0 是說了一件不知道的事。沒處理完的部分(標不掉的條數與種類、清單
+    沒取完或列不出來的原因)回成 dict,沒有就是空的。"""
     try:
         got = json.loads(result)
-        return int(got.get("resolved", 0)) if isinstance(got, dict) else 0
     except Exception:                        # noqa: BLE001 — ToolHub 把例外轉成錯誤字串
-        return 0
+        got = None
+    if not isinstance(got, dict) or not isinstance(got.get("resolved"), int) \
+            or isinstance(got.get("resolved"), bool):
+        return None, {"unknown": True}
+    unfinished = {}
+    failed = got.get("failed")
+    if isinstance(failed, int) and not isinstance(failed, bool) and failed > 0:
+        kinds = got.get("failed_kinds")
+        unfinished["failed"] = failed
+        unfinished["failed_kinds"] = {k: v for k, v in (kinds or {}).items()
+                                      if k in WRITE_FAILURES and isinstance(v, int)} \
+            if isinstance(kinds, dict) else {}
+    if isinstance(got.get("incomplete"), str) and got["incomplete"]:
+        unfinished["incomplete"] = got["incomplete"][:200]
+    return got["resolved"], unfinished
+
+
+def _resolve_lines(unfinished: dict) -> list[str]:
+    """總結裡寫明上一輪的意見沒收乾淨(看 MR 的人才知道上面還有舊的)。"""
+    lines = []
+    if unfinished.get("unknown"):
+        lines.append("- 不知道上一輪的意見收掉了幾條(收舊意見的結果看不懂),MR 上可能還留著上一輪的意見。")
+    if unfinished.get("failed"):
+        kinds = unfinished.get("failed_kinds") or {}
+        detail = "、".join(f"{_WRITE_FAILURE_TEXT.get(k, k)} {n} 條" for k, n in kinds.items())
+        lines.append(f"- 上一輪的意見有 {unfinished['failed']} 條沒有收掉"
+                     + (f"({detail})" if detail else "") + ",仍留在 MR 上。")
+    if unfinished.get("incomplete"):
+        lines.append(f"- 上一輪的意見可能沒收乾淨:{unfinished['incomplete']}。")
+    return lines
 
 
 def _record_writeback(writeback: dict, mr_id: str, step: str, result: str) -> str | None:
@@ -459,9 +490,10 @@ def _record_writeback(writeback: dict, mr_id: str, step: str, result: str) -> st
     return failure
 
 
-def _writeback_section(writeback: dict, label: str) -> str:
-    """總結裡寫明 commit status 或標籤沒有寫上(總結在這兩步之後才貼,見 review_mr)。"""
-    lines = []
+def _writeback_section(writeback: dict, label: str, resolve_unfinished: dict | None = None) -> str:
+    """總結裡寫明 commit status 或標籤沒有寫上(總結在這兩步之後才貼,見 review_mr),
+    以及上一輪的意見沒收乾淨。"""
+    lines = _resolve_lines(resolve_unfinished or {})
     if writeback.get("commit_status"):
         lines.append(f"- ⚠️ **merge 閘門沒有寫上**(commit status `segcra/review`:"
                      f"{_WRITE_FAILURE_TEXT[writeback['commit_status']]})。合併閘門上可能沒有這次"
@@ -2427,8 +2459,11 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 人分不出哪些還有效。標不掉不影響這次審查(舊意見留著,新的照樣貼),所以只
         # 記個數字,不當成回寫失敗。
         if await writable(_WRITEBACK_STEPS["resolve"]) is not None:
-            report["_resolved_stale"] = _resolved_count(
+            resolved, unfinished = _resolve_result(
                 await hub.call("gitlab__resolve_stale_comments", {"mr_id": mr_id}))
+            report["_resolved_stale"] = resolved          # None = 不知道
+            if unfinished:
+                report["_resolve_unfinished"] = unfinished
 
         unposted = []
         for fd in report.get("findings", []):
@@ -2471,7 +2506,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                 "mr_id": mr_id,
                 "body": f"**決策:{decision_text}**\n\n{report.get('summary', '')}"
                         + _pending_section(report)
-                        + _unposted_section(unposted) + _writeback_section(writeback, label),
+                        + _unposted_section(unposted)
+                        + _writeback_section(writeback, label, report.get("_resolve_unfinished")),
                 "score": int(report.get("score", 0)),
                 "verdict": report.get("verdict", "needs_changes"),
             }))
