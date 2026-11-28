@@ -36,7 +36,7 @@
 
 **Graceful 失敗(`_run_review`)**:整段包在 try/except——模型連不上、fixture 不存在、管線任何 exception 都只印 `[webhook] MR !N 審查失敗:...` 到 stdout,server 不死;`finally` 保證把 iid 從 `_inflight` 移除,失敗的 MR 之後還能再觸發。**關掉事件迴圈前先收尾**(`_close_loop`,跟 `asyncio.run` 收尾一樣):取消還沒結束的工作並等它們收完,再收掉 async generator 與預設的執行緒池,最後才關迴圈。外層逾時或新 commit 取消舊審查時,審查裡另外開的工作(背景的模型呼叫等)會一起被取消,不會留下沒人收尾、還在打模型的請求。等待有上限(`_LOOP_CLEANUP_SECONDS`,30 秒):吞掉取消、繼續跑的工作不會讓這條執行緒卡住,照樣關掉並記一筆 log。收尾出錯不往外丟,log 只寫例外類型。payload 不是合法 JSON 回 400。`log_message` 覆寫為靜音,stdout 只留自己的結構化 print。
 
-**資料流**:GitLab 事件 → `POST /gitlab-webhook`(驗 token)→ 路由抽出 `mr_iid`(Draft 不審;update 事件另外看 `oldrev` 與 `changes`)→ 等 `WEBHOOK_DEBOUNCE_SECONDS` 沒有新事件 → 取消同 MR 進行中的審查 → 背景 thread 跑 `review_mr` → 管線經 `toolbox/gitlab.py` 回寫 GitLab:逐條 finding 行內留言、總評留言(決策文字)、`ai-review::<decision>` label、commit status `segcra/review`(`auto_approved` → success,`needs_human`/`blocked` → failed,description 帶原因;見 `orchestrator/pipeline.py` 決策回寫段)。
+**資料流**:GitLab 事件 → `POST /gitlab-webhook`(驗 token)→ 路由抽出 `mr_iid`(Draft 不審;update 事件另外看 `oldrev` 與 `changes`)→ 等 `WEBHOOK_DEBOUNCE_SECONDS` 沒有新事件 → 取消同 MR 進行中的審查 → 背景 thread 跑 `review_mr` → 管線經 `toolbox/gitlab.py` 回寫 GitLab:逐條 finding 行內留言、commit status `segcra/review`(`auto_approved` → success,`needs_human`/`blocked` → failed,description 帶原因)、`ai-review::<decision>` label、把上一輪審查開的行內意見標成已解決、總評留言(決策文字);見 `orchestrator/pipeline.py` 決策回寫段與 06 篇第 3 節。
 
 **GitLab 端對應設定**(README 第 6 節有實測步驟):
 
