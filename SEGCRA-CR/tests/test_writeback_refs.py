@@ -34,7 +34,8 @@ class FakeGitLab:
     `notes`、`label`、`status` 同樣;給清單時依序取用(最後一個重複用),模擬「失敗後重送成功」。"""
 
     def __init__(self, discussions=201, mr_status=200, diff_refs=REFS, notes=201,
-                 label=200, status=201, discussion_list=None, resolve=200):
+                 label=200, status=201, discussion_list=None, resolve=200,
+                 plain_discussions=201):
         self.calls = []
         self.sent = []                  # (method, path, json body):驗送出去的內容
         self.discussions, self.mr_status, self.diff_refs, self.notes = (
@@ -42,6 +43,8 @@ class FakeGitLab:
         self.label, self.status = label, status
         # discussion_list:列討論時回的清單(None = 回 404,模擬問不出來);resolve:標已解決的回應
         self.discussion_list, self.resolve = discussion_list, resolve
+        # plain_discussions:開沒有位置的討論(沒有行號、行號被拒絕時)的回應
+        self.plain_discussions = plain_discussions
 
     @staticmethod
     def _reply(spec, req, n):
@@ -75,9 +78,10 @@ class FakeGitLab:
             return httpx.Response(self.mr_status, json={"sha": HEAD, "diff_refs": self.diff_refs},
                                   request=req)
         if method == "POST" and path.endswith("/discussions"):
-            if isinstance(self.discussions, Exception):
-                raise self.discussions
-            return httpx.Response(self.discussions, json={"id": "d"}, request=req)
+            spec = self.discussions if "position" in (kw.get("json") or {}) else self.plain_discussions
+            if isinstance(spec, Exception):
+                raise spec
+            return httpx.Response(spec, json={"id": "d"}, request=req)
         if method == "POST" and path.endswith("/notes"):
             return self._reply(self.notes, req, self.count("POST", "/notes") - 1)
         if method == "PUT" and path == "/merge_requests/7":
@@ -157,12 +161,34 @@ def test_沒帶齊或不合法時自己取一次(real, given):
     assert fake.count("GET", "/merge_requests/7") == 1 and fake.count("POST", "/discussions") == 1
 
 
+def _unpositioned(fake):
+    return [j for m, p, j in fake.sent if m == "POST" and p.endswith("/discussions")
+            and "position" not in (j or {})]
+
+
 @pytest.mark.parametrize("status", [400, 403, 404, 422, 429])
-def test_被_GitLab_拒絕時照舊退成一般留言(real, status):
-    """4xx 代表 GitLab 收到、明確拒絕(例如行號對不上 diff):一定沒有建立,改貼不會重複。"""
+def test_被_GitLab_拒絕時改開沒有位置的討論(real, status):
+    """4xx 代表 GitLab 收到、明確拒絕(例如行號對不上 diff):一定沒有建立,改開不會重複。
+    開沒有位置的討論而不是一般留言:一般留言標不成已解決,下一輪收不掉。"""
     fake = real(FakeGitLab(discussions=status))
     assert _post(**REFS) == {"ok": True}
+    assert len(_unpositioned(fake)) == 1 and fake.count("POST", "/notes") == 0
+    assert _unpositioned(fake)[0]["body"].startswith(f"{gitlab._INLINE_MARKER}\n`sql/a.sql:3`")
+
+
+@pytest.mark.parametrize("line", [0, 3], ids=["沒有行號", "行號被拒絕"])
+def test_沒有位置的討論也被拒絕才退成一般留言_回報下一輪收不掉(real, line):
+    fake = real(FakeGitLab(discussions=400, plain_discussions=403))
+    assert _post(line=line, **REFS) == {"ok": True, "plain_note": True}
     assert fake.count("POST", "/notes") == 1
+
+
+@pytest.mark.parametrize("failure", [httpx.ReadTimeout(SECRET), 502])
+def test_沒有位置的討論不確定有沒有開成時不補貼(real, failure):
+    """可能已經開好了,只是回應沒送到;補貼一般留言同一條就出現兩次。"""
+    fake = real(FakeGitLab(plain_discussions=failure))
+    out = _post(line=0, **REFS)
+    assert out == {"ok": False, "failure": "uncertain"} and fake.count("POST", "/notes") == 0
 
 
 @pytest.mark.parametrize("failure", [
@@ -181,17 +207,27 @@ def test_不知道有沒有建立時不改貼_回報沒有確定貼上(real, fai
     {"mr_status": 500},                     # 取 MR 失敗
     {"diff_refs": None},                    # GitLab 還沒算好 diff_refs
 ])
-def test_拿不到位置時直接貼一般留言(real, fake_kw):
-    """還沒送出任何行內討論,貼一般留言不會重複。"""
+def test_拿不到位置時開沒有位置的討論(real, fake_kw):
+    """還沒送出任何行內討論,開沒有位置的討論不會重複。"""
     fake = real(FakeGitLab(**fake_kw))
     assert _post() == {"ok": True}
-    assert fake.count("POST", "/discussions") == 0 and fake.count("POST", "/notes") == 1
+    assert len(_unpositioned(fake)) == 1 and fake.count("POST", "/notes") == 0
 
 
-def test_沒有行號時照舊直接貼一般留言(real):
+def test_沒有行號時直接開沒有位置的討論(real):
     fake = real(FakeGitLab())
     assert _post(line=0, **REFS) == {"ok": True}
-    assert fake.calls == [("POST", "/merge_requests/7/notes")]
+    assert fake.calls == [("POST", "/merge_requests/7/discussions")] and len(_unpositioned(fake)) == 1
+
+
+@pytest.mark.parametrize("line", [0, 3], ids=["沒有行號", "行號被拒絕"])
+def test_上一輪沒有位置的討論_下一輪收得掉(real, line):
+    """這一輪開的沒有位置的討論,就是下一輪 resolve_stale_comments 要收的那種。"""
+    fake = real(FakeGitLab(discussions=400))
+    _post(line=line, **REFS)
+    body = _unpositioned(fake)[0]["body"]
+    fake = real(FakeGitLab(discussion_list=[_disc("d1", body=body)]))
+    assert json.loads(gitlab.resolve_stale_comments("7"))["resolved"] == 1
 
 
 def test_get_mr_refs_不開放給審查模型():
@@ -489,6 +525,16 @@ def test_沒收乾淨的記進報告與總結(monkeypatch, tmp_path):
     assert "上一輪的意見有 3 條沒有收掉" in bodies[-1] and "討論超過 5 頁" in bodies[-1]
 
 
+def test_退成一般留言的記進報告與總結(monkeypatch, tmp_path):
+    """下一輪收不掉的,不能看起來像收掉了。"""
+    finding = {"file": "sql/a.sql", "line": 0, "severity": "major", "title": "檔案層的問題",
+               "detail": "x", "citations": []}
+    report, _, bodies = _review_with(monkeypatch, tmp_path, {
+        "post_inline_comment": json.dumps({"ok": True, "plain_note": True})}, findings=[finding])
+    n = report["_resolve_unfinished"]["plain_notes"]
+    assert n >= 1 and f"這一輪有 {n} 條意見 GitLab 不讓開討論" in bodies[-1]
+
+
 def test_全部收乾淨時報告與總結不多寫(monkeypatch, tmp_path):
     reply = json.dumps({"ok": True, "resolved": 2, "failed": 0, "failed_kinds": {},
                         "incomplete": None})
@@ -681,12 +727,14 @@ def test_查不到自己的帳號時一條都不收(real, monkeypatch, capsys):
     assert "查不到 GITLAB_TOKEN 的帳號" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("line", [0, 3], ids=["沒有行號的一般留言", "行號被拒絕退成一般留言"])
-def test_一般留言那條路的記號也在最前面(real, line):
+@pytest.mark.parametrize("line", [0, 3], ids=["沒有行號", "行號被拒絕"])
+@pytest.mark.parametrize("plain", [201, 400], ids=["沒有位置的討論", "退成一般留言"])
+def test_沒有位置的那幾條路記號也在最前面(real, line, plain):
     """下一輪只認開頭的記號;一般留言原本是檔名在前、記號在後。"""
-    fake = real(FakeGitLab(discussions=400))
+    fake = real(FakeGitLab(discussions=400, plain_discussions=plain))
     _post(line=line, **REFS)
-    bodies = [j["body"] for m, p, j in fake.sent if m == "POST" and p.endswith("/notes")]
+    bodies = [j["body"] for m, p, j in fake.sent if m == "POST"
+              and (p.endswith("/notes") or "position" not in (j or {}))]
     assert bodies and all(b.startswith(MARK) for b in bodies), bodies
 
 

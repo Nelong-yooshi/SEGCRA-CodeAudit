@@ -390,6 +390,16 @@ def _posted(result: str) -> bool:
     return write_failure(result) is None
 
 
+def _plain_note(result: str) -> bool:
+    """`post_inline_comment` 是不是退成了一般留言(GitLab 連沒有位置的討論都拒絕):一般留言
+    不能標成已解決,下一輪收不掉。"""
+    try:
+        got = json.loads(result)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(got, dict) and got.get("plain_note") is True
+
+
 def _place(fd: dict) -> str:
     return f"`{fd.get('file', '')}:{fd.get('line') or 0}`"
 
@@ -476,6 +486,9 @@ def _resolve_lines(unfinished: dict) -> list[str]:
                      + (f"({detail})" if detail else "") + ",仍留在 MR 上。")
     if unfinished.get("incomplete"):
         lines.append(f"- 上一輪的意見可能沒收乾淨:{unfinished['incomplete']}。")
+    if unfinished.get("plain_notes"):
+        lines.append(f"- 這一輪有 {unfinished['plain_notes']} 條意見 GitLab 不讓開討論,只能貼成"
+                     "一般留言,下一輪重審時不會自動收掉。")
     return lines
 
 
@@ -2466,6 +2479,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                 report["_resolve_unfinished"] = unfinished
 
         unposted = []
+        plain_notes = 0
         for fd in report.get("findings", []):
             refs = await writable(_WRITEBACK_STEPS["inline"])
             if refs is None:
@@ -2477,6 +2491,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             })
             if not _posted(result):
                 unposted.append(fd)
+            elif _plain_note(result):
+                plain_notes += 1
+        if plain_notes:
+            # 跟收舊意見記在同一份:下一輪收不掉,不能看起來像收掉了
+            report.setdefault("_resolve_unfinished", {})["plain_notes"] = plain_notes
+            print(f"[pipeline] MR !{mr_id} 有 {plain_notes} 條意見只能貼成一般留言,下一輪不會自動收掉",
+                  flush=True)
         writeback = {"unposted": len(unposted)}
         report["_writeback"] = writeback
         if unposted:

@@ -846,6 +846,23 @@ def resolve_stale_comments(mr_id: str) -> str:
     return reply(resolved, failed, kinds, incomplete)
 
 
+def _post_unpositioned(mr_id: str, body: str) -> str:
+    """開一個沒有位置的討論(`POST /discussions` 只給 body);GitLab 明確拒絕(4xx)才退成
+    一般留言。回傳 `{"ok": true}`,退成一般留言時多 `"plain_note": true`。
+
+    一般留言不能標成已解決,下一輪 `resolve_stale_comments` 收不掉,每輪多疊一份;沒有位置的
+    討論可以(測試 GitLab 19.1.1 上確認:`resolvable: true`,`PUT resolved` 回 200)。
+    連線中斷、逾時、5xx 時不退(GitLab 可能已經建立了討論),回 `{"ok": false, "failure": "uncertain"}`。"""
+    try:
+        _api("POST", f"/merge_requests/{mr_id}/discussions", json={"body": body})
+        return json.dumps({"ok": True}, ensure_ascii=False)
+    except Exception as e:                   # noqa: BLE001 — 種類記下來,例外訊息不往外帶
+        if not _rejected_by_gitlab(e):
+            return _write_failed(WRITE_UNCERTAIN)
+    _api("POST", f"/merge_requests/{mr_id}/notes", json={"body": body})
+    return json.dumps({"ok": True, "plain_note": True}, ensure_ascii=False)
+
+
 def post_inline_comment(mr_id: str, file: str, line: int, body: str,
                         severity: str = "info", base_sha: str = "", head_sha: str = "",
                         start_sha: str = "") -> str:
@@ -854,20 +871,20 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
     `base_sha`、`head_sha`、`start_sha`(MR 的 `diff_refs`)由呼叫端帶進來,一份審查只取一次
     (見 `get_mr_refs`);沒帶齊時才自己取。
 
-    行內討論被 GitLab 拒絕(4xx)時退成一般留言。連線中斷、逾時、5xx 時**不退**:GitLab 可能
-    已經建立了討論、只是回應沒送到,再貼一般留言同一條就出現兩次。這時回傳
-    `{"ok": false, "failure": "uncertain"}`,由呼叫端記下來。"""
+    沒有行號、拿不到 diff 的位置,或行內討論被 GitLab 拒絕(4xx,行號對不上 diff)時,開一個
+    沒有位置的討論(見 `_post_unpositioned`),再被拒絕才退成一般留言(回傳帶 `plain_note`,
+    下一輪收不掉,呼叫端記下來)。連線中斷、逾時、5xx 時**不退**:GitLab 可能已經建立了討論、
+    只是回應沒送到,再貼一次同一條就出現兩次。這時回傳 `{"ok": false, "failure": "uncertain"}`。"""
     if REAL_MODE:
         # 記號一律放在最前面(下一輪 resolve_stale_comments 只認開頭的記號)
         tagged = f"**[{severity}]** {body}"
         text = f"{_INLINE_MARKER}\n{tagged}"
         if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
-            # 沒有對應的行號(檔案層的 finding):直接貼一般留言,不拿第 0 行去開行內討論、
-            # 再靠 API 失敗分流;開頭不寫 `檔名:0`(看起來像第 0 行)
-            _api("POST", f"/merge_requests/{mr_id}/notes",
-                 json={"body": f"{_INLINE_MARKER}\n`{file}`(無對應行號)\n\n{tagged}"})
-            return json.dumps({"ok": True}, ensure_ascii=False)
-        note = {"body": f"{_INLINE_MARKER}\n`{file}:{line}`\n\n{tagged}"}
+            # 沒有對應的行號(檔案層的 finding):直接開沒有位置的討論,不拿第 0 行去開行內
+            # 討論、再靠 API 失敗分流;開頭不寫 `檔名:0`(看起來像第 0 行)
+            return _post_unpositioned(
+                mr_id, f"{_INLINE_MARKER}\n`{file}`(無對應行號)\n\n{tagged}")
+        located = f"{_INLINE_MARKER}\n`{file}:{line}`\n\n{tagged}"
         refs = _diff_refs({"diff_refs": {"base_sha": base_sha, "head_sha": head_sha,
                                          "start_sha": start_sha}})
         if not all(refs.values()):
@@ -876,9 +893,8 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
             except Exception:
                 refs = {}
         if not refs or not all(refs.values()):
-            # 拿不到行內討論的位置:還沒送出任何東西,貼一般留言不會重複
-            _api("POST", f"/merge_requests/{mr_id}/notes", json=note)
-            return json.dumps({"ok": True}, ensure_ascii=False)
+            # 拿不到行內討論的位置:還沒送出任何東西,開沒有位置的討論不會重複
+            return _post_unpositioned(mr_id, located)
         try:
             _api("POST", f"/merge_requests/{mr_id}/discussions",
                  json={"body": text, "position": {"position_type": "text", "new_path": file,
@@ -886,8 +902,8 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
         except Exception as e:
             if not _rejected_by_gitlab(e):
                 return _write_failed(WRITE_UNCERTAIN)
-            # 行號對不上 diff 時退成一般留言,不讓單一 finding 卡住整份審查
-            _api("POST", f"/merge_requests/{mr_id}/notes", json=note)
+            # 行號對不上 diff 時改開沒有位置的討論,不讓單一 finding 卡住整份審查
+            return _post_unpositioned(mr_id, located)
     else:
         _mock_output(mr_id, "inline", {"file": file, "line": line,
                                        "severity": severity, "body": body})

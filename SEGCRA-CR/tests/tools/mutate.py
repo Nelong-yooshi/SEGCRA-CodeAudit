@@ -5661,9 +5661,9 @@ MUTANTS.update({
         "        report[\"_review_deadline_seconds\"] = REVIEW_BUDGET_SECONDS",
         "        report.setdefault(\"_review_deadline_seconds\", REVIEW_BUDGET_SECONDS)"),
     "階段耗時:收尾在回寫前就記": (P,
-        "        unposted = []" + NL + "        for fd in report.get(\"findings\", []):",
+        "        unposted = []" + NL + "        plain_notes = 0" + NL,
         "        clock.finish(); clock.finish = lambda: None" + NL
-        + "        unposted = []" + NL + "        for fd in report.get(\"findings\", []):"),
+        + "        unposted = []" + NL + "        plain_notes = 0" + NL),
     "階段耗時:回寫完不記收尾": (P,
         "        clock.finish()" + NL + "        if capture is not None:" + NL + "            capture[\"report\"] = report" + NL + "        return report",
         "        if capture is not None:" + NL + "            capture[\"report\"] = report" + NL + "        return report"),
@@ -6869,11 +6869,13 @@ MUTANTS.update({
         '    if writeback.get("label"):', "    if False:"),
     "回寫結果:行內意見只在第一條之前比對一次 head": (P,
         '        unposted = []' + NL
+        + '        plain_notes = 0' + NL
         + '        for fd in report.get("findings", []):' + NL
         + '            refs = await writable(_WRITEBACK_STEPS["inline"])' + NL
         + '            if refs is None:' + NL
         + '                break',
         '        unposted = []' + NL
+        + '        plain_notes = 0' + NL
         + '        refs = await writable(_WRITEBACK_STEPS["inline"])' + NL
         + '        for fd in report.get("findings", []):' + NL
         + '            if refs is None:' + NL
@@ -7122,9 +7124,21 @@ MUTANTS.update({
  '收舊意見:查不到自己的帳號時照樣去列討論': (G,
      '                  "這次不收", flush=True)\n            return reply(',
      '                  "這次不收", flush=True)\n        if False:\n            return reply('),
- '收舊意見:一般留言的記號不在開頭': (G,
-     '        note = {"body": f"{_INLINE_MARKER}\\n`{file}:{line}`\\n\\n{tagged}"}',
-     '        note = {"body": f"`{file}:{line}`\\n\\n{text}"}'),
+ '收舊意見:沒有位置那幾條路的記號不在開頭': (G,
+     '        located = f"{_INLINE_MARKER}\\n`{file}:{line}`\\n\\n{tagged}"',
+     '        located = f"`{file}:{line}`\\n\\n{text}"'),
+ '收舊意見:沒有行號時照舊貼一般留言(下一輪收不掉)': (G,
+     '    try:\n        _api("POST", f"/merge_requests/{mr_id}/discussions", json={"body": body})\n        return json.dumps({"ok": True}, ensure_ascii=False)',
+     '    try:\n        _api("POST", f"/merge_requests/{mr_id}/notes", json={"body": body})\n        return json.dumps({"ok": True}, ensure_ascii=False)'),
+ '收舊意見:沒有位置的討論不確定時照樣補貼': (G,
+     '        if not _rejected_by_gitlab(e):\n            return _write_failed(WRITE_UNCERTAIN)\n    _api("POST", f"/merge_requests/{mr_id}/notes", json={"body": body})',
+     '        pass\n    _api("POST", f"/merge_requests/{mr_id}/notes", json={"body": body})'),
+ '收舊意見:退成一般留言不回報': (G,
+     '    return json.dumps({"ok": True, "plain_note": True}, ensure_ascii=False)',
+     '    return json.dumps({"ok": True}, ensure_ascii=False)'),
+ '收舊意見:行號被拒絕時照舊貼一般留言': (G,
+     '            # 行號對不上 diff 時改開沒有位置的討論,不讓單一 finding 卡住整份審查\n            return _post_unpositioned(mr_id, located)',
+     '            # 行號對不上 diff 時改開沒有位置的討論,不讓單一 finding 卡住整份審查\n            _api("POST", f"/merge_requests/{mr_id}/notes", json={"body": located})\n            return json.dumps({"ok": True, "plain_note": True}, ensure_ascii=False)'),
  '收舊意見:不可解決或已解決的照樣送一次': (G,
      '    if not n.get("resolvable") or n.get("resolved"):\n        return None',
      '    if False:\n        return None'),
@@ -7170,6 +7184,9 @@ MUTANTS.update({
  '收舊意見:沒收乾淨的不寫進總結': (P,
      '    lines = _resolve_lines(resolve_unfinished or {})',
      '    lines = []'),
+ '收舊意見:退成一般留言的不記': (P,
+     '            elif _plain_note(result):\n                plain_notes += 1',
+     '            elif False:\n                plain_notes += 1'),
  '收舊意見:沒收乾淨的不記進報告': (P,
      '            if unfinished:\n                report["_resolve_unfinished"] = unfinished',
      '            if False:\n                report["_resolve_unfinished"] = unfinished'),
