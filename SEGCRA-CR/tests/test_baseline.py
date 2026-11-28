@@ -620,8 +620,9 @@ def _row_with_gap(*gaps) -> dict:
 
 @pytest.mark.parametrize("gap", [
     # 實際撞到的那一筆(2026-09-23 凌晨端點中斷)
-    "測資生成失敗(LLM 呼叫失敗:APIConnectionError: Connection error.)",
-    "測資生成失敗(LLM 呼叫失敗:APITimeoutError: timed out)",
+    "測資生成失敗(LLM 呼叫失敗:APIConnectionError)",
+    "測資生成失敗(LLM 呼叫失敗:APITimeoutError)",
+    "測資生成失敗(LLM 呼叫失敗:AuthenticationError,HTTP 401)",
     "無法連線執行驗證沙盒 127.0.0.1:1433:connection refused",
     "未設定 SANDBOX_MSSQL_PASSWORD(見 config/sandbox.env.example)",
 ])

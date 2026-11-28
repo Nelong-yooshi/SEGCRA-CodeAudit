@@ -524,7 +524,7 @@ def test_database_falls_back_to_file_without_env(no_db_env):
 
 
 @pytest.mark.parametrize("bad", ['PROD"; DROP TABLE t; --', "PROD DW", "PROD-DW",
-                                 "PROD.dbo", "ＰＲＯＤ", " PROD_DW", "1PROD"])
+                                 "PROD.dbo", "ＰＲＯＤ", " PROD DW ", "1PROD"])
 def test_database_must_be_identifier(monkeypatch, bad):
     """名稱會被拼進 SQL 識別字,載入時就過白名單;填錯要在啟動時就報錯,
     不是等到每份 model 審查時才各自展開失敗。"""
@@ -535,9 +535,18 @@ def test_database_must_be_identifier(monkeypatch, bad):
     assert bad.strip() not in str(exc.value)
 
 
-def test_empty_env_var_means_unset(monkeypatch):
-    monkeypatch.setenv("SEGCRA_DBT_DATABASE", "")
-    assert _load_dbt_section({})["database"] == ""
+def test_前後的空白去掉之後才過白名單(monkeypatch):
+    monkeypatch.setenv("SEGCRA_DBT_DATABASE", "  SAMPLE_DW ")
+    assert _load_dbt_section({})["database"] == "SAMPLE_DW"
+
+
+@pytest.mark.parametrize("raw", ["", "   "])
+def test_設了但是空的要停下來_不改用設定檔的值(monkeypatch, raw):
+    """空的多半是部署腳本沒把值帶進來;改用設定檔的值等於用沒人指定的設定跑。"""
+    from orchestrator.config import ConfigError
+    monkeypatch.setenv("SEGCRA_DBT_DATABASE", raw)
+    with pytest.raises(ConfigError, match="SEGCRA_DBT_DATABASE"):
+        _load_dbt_section({"dbt": {"database": "SAMPLE_DW"}})
 
 
 def test_load_dbt_section_rejects_non_dict_section():
@@ -623,8 +632,8 @@ def test_notice_keeps_model_findings_untouched():
 
 def test_review_mr_enforces_notice_after_keyword_checks_and_before_policy():
     """review_mr() 的後處理鏈必須呼叫它:
-    * 在 enforce_hints / enforce_style 之後——它們以關鍵詞判斷模型是否已回應,
-      程式補的文字若先進報告,可能被誤當成回應而吞掉檢核點
+    * 在 enforce_hints / enforce_style 之後——它們判斷模型是否已回應,
+      程式補的文字若先進報告,可能被誤當成回應
     * 在 apply_policy 之前——決策要看得到它"""
     import inspect
     import orchestrator.pipeline as pipeline_mod

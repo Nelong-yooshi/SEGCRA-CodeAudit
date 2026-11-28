@@ -28,8 +28,12 @@ from pathlib import Path
 
 import yaml
 
+from orchestrator.config import ConfigError, env_path
+from orchestrator.file_perms import PermissionProblem, check_tree, open_for_write
+
 PKG_ROOT = Path(__file__).resolve().parent.parent
-KB_DIR = Path(os.environ.get("MEMORY_KB", PKG_ROOT / "memory" / "knowledge"))
+# 有設時要絕對路徑、設了但是空的就停(見 config.env_path):binding 會壓掉 finding,從哪裡讀不能是意外
+KB_DIR = env_path("MEMORY_KB", PKG_ROOT / "memory" / "knowledge")
 
 AUTHORITY = {
     "user-explicit": 40,
@@ -85,8 +89,19 @@ def _parse_md(path: Path) -> Item | None:
     )
 
 
+def check_kb_perms(kb_dir: Path | None = None) -> None:
+    """知識庫的權限:目錄與一路往上、底下每個子目錄與每個 `.md`,群組或其他人可寫就停(ConfigError)。
+    有沒有設 `MEMORY_KB` 都檢查:binding 會壓掉 finding,改得到知識庫裡任何一個檔的人就能讓
+    finding 消失。規則用 file_perms 那一份。"""
+    try:
+        check_tree(Path(kb_dir or KB_DIR))
+    except PermissionProblem as e:
+        raise ConfigError(f"知識庫的權限:{e}") from None
+
+
 def load_items(kb_dir: Path | None = None) -> list[Item]:
     kb_dir = kb_dir or KB_DIR
+    check_kb_perms(kb_dir)
     items = []
     for f in sorted(Path(kb_dir).glob("**/*.md")):
         it = _parse_md(f)
@@ -113,11 +128,13 @@ def dumps(it: Item) -> str:
 
 
 def save_item(it: Item, kb_dir: Path | None = None) -> Path:
-    """把一個知識項寫回磁碟(機器學到的項目與人寫的同格式)。"""
+    """把一個知識項寫回磁碟(機器學到的項目與人寫的同格式)。新建的目錄 755、檔案 644,不跟著
+    umask 走:讀知識庫時群組或其他人可寫就停(check_kb_perms)。"""
     kb_dir = Path(kb_dir or KB_DIR)
-    kb_dir.mkdir(parents=True, exist_ok=True)
+    kb_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
     path = kb_dir / f"{it.id}.md"
-    path.write_text(dumps(it), encoding="utf-8")
+    with open_for_write(path) as f:
+        f.write(dumps(it))
     return path
 
 

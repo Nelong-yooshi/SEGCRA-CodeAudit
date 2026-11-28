@@ -1144,17 +1144,14 @@ def _error_line(e: jinja2.TemplateSyntaxError, source: str) -> int:
 
 
 def _safe_error(e: BaseException) -> str:
-    """錯誤訊息可能被貼進 MR 留言或寫進日誌:不含路徑、不含控制字元、有長度上限。"""
-    if isinstance(e, _Return):
-        text = "DbtRenderError: return() 只能在 macro 內使用"
-    elif isinstance(e, MemoryError):
-        text = "MemoryError: 展開時記憶體不足(超過上限),已中止"
-    elif isinstance(e, OSError):
-        text = f"{type(e).__name__}: 無法讀取檔案({e.strerror or '未知原因'})"
-    else:
-        text = f"{type(e).__name__}: {e}"
-    text = "".join(ch if ch.isprintable() else " " for ch in text)
-    return text[:MAX_ERROR_CHARS]
+    """錯誤訊息可能被貼進 MR 留言或寫進日誌:不含路徑、不含控制字元、有長度上限。
+    展開的錯誤(語法錯、未定義的變數等)照放原文:那是 MR 作者要看的。"""
+    from .error_text import safe_error
+    return safe_error(e, fixed={
+        _Return: "DbtRenderError: return() 只能在 macro 內使用",
+        MemoryError: "MemoryError: 展開時記憶體不足(超過上限),已中止",
+        OSError: lambda e: f"{type(e).__name__}: 無法讀取檔案({e.strerror or '未知原因'})",
+    }, keep_message=True, max_chars=MAX_ERROR_CHARS)
 
 
 def is_dbt_template(text: str) -> bool:

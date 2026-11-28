@@ -19,7 +19,7 @@ from pathlib import Path
 
 import httpx
 
-from .config import PKG_ROOT
+from .config import PKG_ROOT, ConfigError, _env_text, check_config_file
 
 sys.path.insert(0, str(PKG_ROOT))
 from toolbox.knowledge_store import Item, dumps, load_items  # noqa: E402
@@ -28,6 +28,7 @@ from toolbox.knowledge_store import Item, dumps, load_items  # noqa: E402
 def _load_gitlab_env() -> dict:
     env = {}
     f = PKG_ROOT / "config" / "gitlab.env"
+    check_config_file(f, secret=True)      # 含 token:群組或其他人讀得到就停
     if f.exists():
         for line in f.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -46,11 +47,17 @@ class KnowledgeRepo:
 
     def __init__(self, url: str | None = None, token: str | None = None,
                  path: str = "root/segcra-knowledge"):
+        # 環境變數優先;設了但是空的就停(_env_text)。沒設時讀部署端自己的 config/gitlab.env
+        # (有權限檢查)。兩邊都沒有就停:不退到測試用 GitLab 的位址,也不用空的 token 去打
         env = _load_gitlab_env()
-        self.url = (url or os.environ.get("GITLAB_URL") or env.get("GITLAB_URL")
-                    or "http://localhost:8929").rstrip("/")
-        self.token = (token or os.environ.get("GITLAB_TOKEN")
-                      or env.get("GITLAB_TOKEN") or "")
+        url = url or _env_text("GITLAB_URL") or env.get("GITLAB_URL", "").strip()
+        token = token or _env_text("GITLAB_TOKEN") or env.get("GITLAB_TOKEN", "").strip()
+        missing = [n for n, v in (("GITLAB_URL", url), ("GITLAB_TOKEN", token)) if not v]
+        if missing:
+            raise ConfigError(f"知識庫 repo 的 GitLab 設定沒有給:{'、'.join(missing)}"
+                              "(環境變數,或 config/gitlab.env)")
+        self.url = url.rstrip("/")
+        self.token = token
         self.path = path
         self.pid = None
 
@@ -156,14 +163,16 @@ class KnowledgeRepo:
     def sync_to_local(self, dest: Path, subdir: str = "knowledge") -> list[str]:
         """把知識庫 main 分支的 knowledge/*.md 拉回本地 memory/knowledge/。
         合併後的 binding 由此變成審查管線即刻遵守的規範。"""
+        from .file_perms import open_for_write      # 新建的檔 644,不跟著 umask 走(讀知識庫時會檢查)
         dest = Path(dest)
-        dest.mkdir(parents=True, exist_ok=True)
+        dest.mkdir(mode=0o755, parents=True, exist_ok=True)
         pulled = []
         for path in self.list_md(subdir=subdir):
             content = self.get_file(path, ref="main")
             if content is None:
                 continue
-            (dest / Path(path).name).write_text(content, encoding="utf-8")
+            with open_for_write(dest / Path(path).name) as f:
+                f.write(content)
             pulled.append(Path(path).name)
         return pulled
 
