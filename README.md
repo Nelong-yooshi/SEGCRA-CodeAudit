@@ -27,6 +27,13 @@ python3 -m venv .venv
 | [`SEGCRA-CR/docs/`](SEGCRA-CR/docs/) | 各道檢測與關卡的設計與實作細節 |
 | [`SEGCRA-CR/examples/`](SEGCRA-CR/examples/) | 規格撰寫與程式對照的示範範例 |
 
+## 參照的資安基準
+
+規則預掃的危險 SQL 原語(改伺服器設定、資料外送、執行作業系統命令或外部程式、權限與帳號)照下面幾份整理,每一項的出處寫在清單裡([`SEGCRA-CR/toolbox/sql_primitives.py`](SEGCRA-CR/toolbox/sql_primitives.py)),規則說明見 [`SEGCRA-CR/docs/01-前處理.md`](SEGCRA-CR/docs/01-前處理.md):
+
+- Microsoft [Server configuration options](https://learn.microsoft.com/sql/database-engine/configure-windows/server-configuration-options-sql-server):預設關閉、要打開才能用的功能,以及各語法與系統預存程序的說明頁
+- MITRE ATT&CK [T1505.001 SQL Stored Procedures](https://attack.mitre.org/techniques/T1505/001/)
+
 ## 協作規範
 
 參與開發前請先閱讀 [`CONTRIBUTING.md`](CONTRIBUTING.md) — 分支策略、Pull Request 流程、Code Review 與 Issue 命名規則。

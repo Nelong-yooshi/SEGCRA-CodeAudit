@@ -59,7 +59,7 @@ def _reference_check(spec_code: str, plan: dict) -> tuple[str | None, float | No
         t0 = time.monotonic()
         ex = execute_cases(cft.reference_sql(spec_code), plan)
         secs = round(time.monotonic() - t0, 2)
-        env_err = ex["sandbox_error"] or ex["sql_error"] or ex["testdata_error"]
+        env_err = spec_exec.execution_error(ex)      # 含 table_error
         if env_err:
             print(f"[跳過正向對照] 環境問題,不是測資的錯:{str(env_err)[:120]}"
                   f"——**這份測資的預期值沒有被驗過**,有沙盒時請補跑 "
