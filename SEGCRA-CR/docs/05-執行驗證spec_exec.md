@@ -170,6 +170,15 @@ RETAIL_M1 那組快了 15 分鐘,但那是因為它提早放棄拆解,不是效�
 2. 系統日期函式(`GETDATE()`、`SYSDATETIME()`、`CURRENT_TIMESTAMP` 等)換成窗尾,確保可重現;
 3. 用到 `@start_date` / `@end_date` 時,前面補 `DECLARE @start_date DATE = '2026-06-01', @end_date DATE = '2026-06-02';`,並固定 `SET NOCOUNT ON; SET DATEFORMAT ymd;`。
 
+**三段式表名剝成 `dbo.<表>`**(`_strip_table_qualifiers`,在 `execute_cases` 裡、`prepare_sql` 之後):測資建在 `segcra_sbx_<隨機碼>` 裡、表名是規格 DDL 的單純名稱,帶 `"<資料庫>"."<schema>"."<表>"` 的三段式名就以 `Invalid object name` 失敗。會帶三段式的不是 dbt 樣板——dbt 的 `ref()`/`source()` 由管線自己展開成 `[表]`(見 09 篇「執行驗證」),不會有三段式;會帶三段式的是 **MR 裡本來就寫成三段式的 SQL**(手寫的跨資料庫寫法、或直接提交 compile 的輸出),以及評測的 `mr_701/702`(真實形狀的 compile 輸出)。剝的範圍刻意收得很窄:
+
+- **剝成兩段式 `dbo.<表>`,不是純 `<表>`**:兩段式 SQL Server 不會解成 CTE,所以就算 SQL 裡有同名 CTE,`FROM dbo.txn` 讀到的仍是沙盒的表(沙盒的表由建庫的登入建、都在 dbo;規格沒寫 schema 的表一定在 dbo)。這樣就不必再維護一份 CTE 名單——用 regex 抓 CTE 名碰到 `WITH a AS (…), /* c */ txn AS (…)` 的註解就抓不到,反而把同名引入判成錯。(沙盒實測:剝成 `dbo.txn` 後,有同名 CTE `txn` 時 `FROM dbo.txn` 讀到的是真實表。)
+- **只剝等於規格 DDL 真的建了的那張表**(`_ddl_tables`,比對不分大小寫)。剝錯會指到別的表,那種錯從結果看不出來;留著不剝只是查詢失敗,看得見。
+- **兩段式(`dbo.t`)不動**:測資建在 dbo,沙盒本來就解得開。
+- 位置用 **T-SQL 的 tokenizer**(`sqlglot.Dialect.get_or_raise("tsql").tokenize`)取,所以 `[my db]`(有空白)、`[d]]b]`(跳脫的 `]`)、`db..t`(省略 schema)都認得出來,而**字串常值與註解裡的 `a.b.c` 不會被當成表名**;切不出 token(例如字串沒收尾)就整段不剝,錯誤留給沙盒講。
+- **對應不到沙盒一份測資的,記 `table_error`**,不是說 SQL 有錯:兩個不同資料庫/schema 下的同名表(剝完會撞在一起)、四段式(跨 linked server)。撞名/四段式整段不剝、不連沙盒。另外,tokenizer 還認不出、沒剝掉的限定名,或規格 DDL 漏了那張表,送進沙盒會回 SQL Server 錯誤 208/911/7202(找不到物件/資料庫/linked server),這幾種也記 `table_error`。`run_spec_exec` 把 `table_error` 轉成一條 finding、交人工、不連沙盒,不是 major「SQL 無法在測資上執行」——說成後者會讓人去改沒問題的 SQL。「這次執行有沒有失敗」由 `execution_error()` 一處判斷(含 `table_error`),評測腳本(`coverage_check`、`freeze_testdata`…)都用它,少接一種錯誤就會把「沒跑成」當「驗過了」。
+- **「執行驗證無法完成」要記成待驗證、不計分**(表名對不上、沙盒不可用、逾時這幾種):帶 `stage`、`review_incomplete` 認得到 → 交人工;分數不扣、MR 上單獨列,照 #137 要修的 5。這一項隨 #137 的 `apply_rubric`(待驗證不計分)一起生效,見「待驗證」一節。
+
 **逐案執行**(`execute_cases`):每次執行在沙盒建一個專用資料庫(`segcra_sbx_<隨機碼>`,同時進行的審查互不干擾),結束後刪除;超過一小時的殘留資料庫會在下次執行時清掉。每個案例在**獨立交易**裡執行,結束一律 rollback,下一個案例從乾淨狀態開始:
 
 1. 跑 plan 的所有 `schema_ddl` 建表;
@@ -323,6 +332,7 @@ mr = {"title": "調整報表", "files": [{"path": "sql/x.sql", "full_content": "
   - 沙盒需要先啟動(`scripts/sandbox.sh start`,約 2GB 記憶體);沙盒未啟動時執行驗證一律判不通過(major、needs_human)。
   - dbt 樣板展開不了(規格沒有同名的表、表名無法確定、用了不支援的寫法)時不送沙盒,記成待驗證「[執行驗證] dbt model 沒有展開」,原因另列一條 info;不會落在 `sql_error`,也不會誤判通過。上游 model 由測資代替時,上游自己的邏輯沒有執行(見 docs/09 已知限制)。
     **評測裡的真實形狀 case(`mr_701`/`mr_702`)餵的是 compile 後的 SQL**,量的是什麼見 `eval/BASELINE.md` 第 12 節。
+  - **表名剝不乾淨的幾種記待驗證(`table_error`),不是判 SQL 錯**:不同庫/schema 的同名表、四段式(跨 linked server)、T-SQL tokenizer 還認不出的寫法、規格 DDL 漏了的表(靠沙盒的 208/911/7202 接住)。之後認不出的寫法一處一處補進 tokenizer 那一段。
 
 ## 結構化生成:規格的形狀分類
 
