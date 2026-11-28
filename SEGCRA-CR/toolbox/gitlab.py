@@ -733,14 +733,23 @@ def _send_with_retry(send, attempts: int) -> str | None:
 # (`resolve_stale_comments`)。總結只有一則(見 _SUMMARY_MARKERS),但行內意見是每次
 # N 條重貼一遍 —— 不收掉的話,同一行會疊五輪的意見,看 MR 的人分不出哪些還有效。
 # HTML 註解在 GitLab 的 markdown 上看不見。
+#
+# 記號帶這一輪審的 commit(head sha 前 12 碼):收舊意見排在這一輪的意見貼完之後(見 pipeline 的
+# 回寫順序),要分得出哪些是這一輪剛貼的、不能收。沒有 sha 的舊格式一律當成上一輪的。
 _INLINE_MARKER = "<!-- segcra:review-inline -->"
+_INLINE_MARK_RE = re.compile(r"<!-- segcra:review-inline(?: ([0-9a-f]{7,40}))? -->(?:\n|$)")
+
+
+def _inline_marker(head_sha: str) -> str:
+    sha = head_sha[:12] if isinstance(head_sha, str) and _SHA.fullmatch(head_sha or "") else ""
+    return f"<!-- segcra:review-inline {sha} -->" if sha else _INLINE_MARKER
 
 # 列討論最多翻幾頁(每頁 100 則)。超過這個量的 MR,重審洗版已經不是主要問題,
 # 而且收尾有時間上限,不該無上限追下去。
 MAX_DISCUSSION_PAGES = 5
 
 
-def _our_unresolved(d: dict, own: int) -> str | None:
+def _our_unresolved(d: dict, own: int, current_sha: str = "") -> str | None:
     """這個討論是不是「上一輪我們開的、而且沒有人回過」?是就回 discussion id。
 
     條件都要:
@@ -749,7 +758,8 @@ def _our_unresolved(d: dict, own: int) -> str | None:
         內文**開頭**。記號是一段看不見、原始碼裡查得到的字串,誰都打得出來;標成已解決的
         權限審查用的 token 一般都有,只看記號的話別人開的討論也收得掉。模型寫的文字只出現
         在審查自己貼的留言裡,而且不在開頭,所以它在內文寫記號也收不到別人的討論;
-      * 還沒被標成已解決(resolvable 且未 resolved)—— 已經解決的再送一次只是多一個請求。
+      * 還沒被標成已解決(resolvable 且未 resolved)—— 已經解決的再送一次只是多一個請求;
+      * 不是這一輪剛貼的:記號裡的 commit 跟 `current_sha` 相同的是這一輪的,不收。
     """
     notes = d.get("notes")
     if not isinstance(notes, list) or len(notes) != 1:
@@ -758,8 +768,11 @@ def _our_unresolved(d: dict, own: int) -> str | None:
     if not isinstance(n, dict) or n.get("system") is True:
         return None
     body = n.get("body")
-    if not isinstance(body, str) or not body.startswith(_INLINE_MARKER):
+    mark = _INLINE_MARK_RE.match(body) if isinstance(body, str) else None
+    if mark is None:
         return None
+    if mark.group(1) and current_sha and current_sha.startswith(mark.group(1)):
+        return None                          # 這一輪剛貼的
     author = n.get("author")
     uid = author.get("id") if isinstance(author, dict) else None
     if not isinstance(uid, int) or isinstance(uid, bool) or uid != own:
@@ -778,7 +791,7 @@ def _list_failure(e: Exception) -> str:
     return f"{type(e).__name__}"
 
 
-def resolve_stale_comments(mr_id: str) -> str:
+def resolve_stale_comments(mr_id: str, head_sha: str = "") -> str:
     """把上一輪審查開的行內討論標成已解決。回
     `{"ok": true, "resolved": N, "failed": M, "failed_kinds": {種類: 條數}, "incomplete": 原因或 null}`。
 
@@ -816,7 +829,7 @@ def resolve_stale_comments(mr_id: str) -> str:
         return reply(incomplete=f"列不出討論清單({why})")
     incomplete = (f"討論超過 {MAX_DISCUSSION_PAGES} 頁(每頁 100 則),只看了最新的,較舊的沒看"
                   if truncated else None)
-    ids = [i for d in got if isinstance(d, dict) and (i := _our_unresolved(d, own))]
+    ids = [i for d in got if isinstance(d, dict) and (i := _our_unresolved(d, own, head_sha))]
     resolved = 0
     kinds: dict[str, int] = {}
     codes: set[int] = set()
@@ -876,15 +889,13 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
     下一輪收不掉,呼叫端記下來)。連線中斷、逾時、5xx 時**不退**:GitLab 可能已經建立了討論、
     只是回應沒送到,再貼一次同一條就出現兩次。這時回傳 `{"ok": false, "failure": "uncertain"}`。"""
     if REAL_MODE:
-        # 記號一律放在最前面(下一輪 resolve_stale_comments 只認開頭的記號)
+        # 記號一律放在最前面(下一輪 resolve_stale_comments 只認開頭的記號),帶這一輪的 commit
         tagged = f"**[{severity}]** {body}"
-        text = f"{_INLINE_MARKER}\n{tagged}"
         if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
             # 沒有對應的行號(檔案層的 finding):直接開沒有位置的討論,不拿第 0 行去開行內
             # 討論、再靠 API 失敗分流;開頭不寫 `檔名:0`(看起來像第 0 行)
             return _post_unpositioned(
-                mr_id, f"{_INLINE_MARKER}\n`{file}`(無對應行號)\n\n{tagged}")
-        located = f"{_INLINE_MARKER}\n`{file}:{line}`\n\n{tagged}"
+                mr_id, f"{_inline_marker(head_sha)}\n`{file}`(無對應行號)\n\n{tagged}")
         refs = _diff_refs({"diff_refs": {"base_sha": base_sha, "head_sha": head_sha,
                                          "start_sha": start_sha}})
         if not all(refs.values()):
@@ -892,6 +903,9 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
                 refs = _diff_refs(_api("GET", f"/merge_requests/{mr_id}"))
             except Exception:
                 refs = {}
+        marker = _inline_marker(head_sha or (refs or {}).get("head_sha") or "")
+        text = f"{marker}\n{tagged}"
+        located = f"{marker}\n`{file}:{line}`\n\n{tagged}"
         if not refs or not all(refs.values()):
             # 拿不到行內討論的位置:還沒送出任何東西,開沒有位置的討論不會重複
             return _post_unpositioned(mr_id, located)

@@ -173,7 +173,7 @@ def test_被_GitLab_拒絕時改開沒有位置的討論(real, status):
     fake = real(FakeGitLab(discussions=status))
     assert _post(**REFS) == {"ok": True}
     assert len(_unpositioned(fake)) == 1 and fake.count("POST", "/notes") == 0
-    assert _unpositioned(fake)[0]["body"].startswith(f"{gitlab._INLINE_MARKER}\n`sql/a.sql:3`")
+    assert _unpositioned(fake)[0]["body"].startswith(f"{gitlab._inline_marker(HEAD)}\n`sql/a.sql:3`")
 
 
 @pytest.mark.parametrize("line", [0, 3], ids=["沒有行號", "行號被拒絕"])
@@ -429,6 +429,9 @@ def test_重送之間有等待(real, monkeypatch):
 
 # ─────────────────── review_mr:每一步回寫都接住結果 ───────────────────
 
+_LAST_KW: dict = {}      # 每個寫回工具最後一次收到的參數(_review_with 記)
+
+
 def _review_with(monkeypatch, tmp_path, replies: dict, findings=(), agent_error=None):
     """走整條 review_mr(mock 模式),把指定的寫回工具換成回固定結果的函式;記下呼叫順序。"""
     from orchestrator import tool_hub
@@ -456,6 +459,7 @@ def _review_with(monkeypatch, tmp_path, replies: dict, findings=(), agent_error=
     def fake(name, reply):
         def fn(**kw):
             order.append(name)
+            _LAST_KW[name] = kw
             if name == "post_summary":
                 bodies.append(kw["body"])
             if isinstance(reply, Exception):
@@ -482,8 +486,8 @@ _FAILED = json.dumps({"ok": False, "failure": "uncertain"})
 def test_commit_status_與標籤先設_總結最後貼(monkeypatch, tmp_path):
     report, order, bodies = _review_with(monkeypatch, tmp_path, {})
     # 先收掉上一輪的行內意見,再貼這一輪的;commit status 與標籤接著設,總結最後
-    assert order[0] == "resolve_stale_comments", order
-    assert order[-3:] == ["set_commit_status", "set_label", "post_summary"]
+    # 這一輪的行內意見先貼,commit status 與標籤接著設,再收掉上一輪的,總結最後
+    assert order[-4:] == ["set_commit_status", "set_label", "resolve_stale_comments", "post_summary"], order
     assert report["_writeback"] == {"unposted": 0}
     assert "回寫沒有完成" not in bodies[0]
 
@@ -492,7 +496,7 @@ def test_收掉上一輪標不掉也不影響這次(monkeypatch, tmp_path):
     """舊意見留在上面只是雜訊,新的照樣要貼、決策照樣要寫回去。"""
     report, order, bodies = _review_with(monkeypatch, tmp_path,
                                          {"resolve_stale_comments": RuntimeError(SECRET)})
-    assert order[-3:] == ["set_commit_status", "set_label", "post_summary"]
+    assert order[-4:] == ["set_commit_status", "set_label", "resolve_stale_comments", "post_summary"]
     assert report["_resolved_stale"] is None, "丟例外時不知道收掉了幾條,不記 0"
     assert "_writeback" in report and SECRET not in bodies[-1]
 
@@ -553,7 +557,13 @@ def test_這一輪沒跑完整時不收上一輪的(monkeypatch, tmp_path):
 def test_這一輪跑完整時照樣收(monkeypatch, tmp_path):
     report, order, _ = _review_with(monkeypatch, tmp_path, {})
     assert not pipeline.review_incomplete(report)
-    assert order[0] == "resolve_stale_comments" and "skipped" not in report.get("_resolve_unfinished", {})
+    assert "resolve_stale_comments" in order and "skipped" not in report.get("_resolve_unfinished", {})
+
+
+def test_收舊意見帶這一輪審的_commit(monkeypatch, tmp_path):
+    """沒帶的話分不出這一輪剛貼的,會把它們一起收掉。"""
+    _review_with(monkeypatch, tmp_path, {})
+    assert _LAST_KW["resolve_stale_comments"] == {"mr_id": "7", "head_sha": HEAD}
 
 
 def test_全部收乾淨時報告與總結不多寫(monkeypatch, tmp_path):
@@ -589,7 +599,7 @@ def test_寫回工具丟例外時記成寫入工具出錯_不印例外訊息(mon
     report, order, bodies = _review_with(monkeypatch, tmp_path, {
         "set_commit_status": RuntimeError(SECRET), "set_label": RuntimeError(SECRET)})
     assert report["_writeback"] == {"unposted": 0, "commit_status": "failed", "label": "failed"}
-    assert order[-3:] == ["set_commit_status", "set_label", "post_summary"]
+    assert order[-4:] == ["set_commit_status", "set_label", "resolve_stale_comments", "post_summary"]
     assert SECRET not in capsys.readouterr().out and SECRET not in bodies[0]
 
 
@@ -708,7 +718,7 @@ def test_行內意見帶著記號(real):
     fake = real(FakeGitLab())
     assert _post(**REFS) == {"ok": True}
     body = next(j["body"] for m, p, j in fake.sent if m == "POST" and p.endswith("/discussions"))
-    assert body.startswith(MARK)
+    assert body.startswith(gitlab._inline_marker(HEAD))
 
 
 def test_上一輪我們開的討論會被標成已解決(real):
@@ -756,7 +766,7 @@ def test_沒有位置的那幾條路記號也在最前面(real, line, plain):
     _post(line=line, **REFS)
     bodies = [j["body"] for m, p, j in fake.sent if m == "POST"
               and (p.endswith("/notes") or "position" not in (j or {}))]
-    assert bodies and all(b.startswith(MARK) for b in bodies), bodies
+    assert bodies and all(b.startswith(gitlab._inline_marker(HEAD)) for b in bodies), bodies
 
 
 def test_標不掉只數一個數字_不影響其他的(real):
@@ -831,6 +841,22 @@ def test_列不出清單時記下狀態碼(real, capsys):
     out = json.loads(gitlab.resolve_stale_comments("7"))
     assert out["incomplete"] == "列不出討論清單(GitLab 回 403:GITLAB_TOKEN 的權限不夠)"
     assert "列不出討論清單" in capsys.readouterr().out
+
+
+def test_這一輪剛貼的不收_上一輪的照收(real):
+    """收舊意見排在這一輪的意見貼完之後,靠記號裡的 commit 分開:同一個 commit 的是這一輪的。"""
+    this_round = _disc("now", body=f"{gitlab._inline_marker(HEAD)}\n**[major]** 這一輪的")
+    last_round = _disc("prev", body=f"{gitlab._inline_marker('a' * 40)}\n**[major]** 上一輪的")
+    legacy = _disc("legacy", body=f"{MARK}\n**[major]** 沒有 sha 的舊格式")
+    fake = real(FakeGitLab(discussion_list=[last_round, legacy, this_round]))
+    assert json.loads(gitlab.resolve_stale_comments("7", HEAD))["resolved"] == 2
+    assert sorted(_resolved_ids(fake)) == ["legacy", "prev"]
+
+
+def test_記號帶這一輪的_commit(real):
+    fake = real(FakeGitLab())
+    _post(line=0, **REFS)
+    assert _unpositioned(fake)[0]["body"].startswith(f"<!-- segcra:review-inline {HEAD[:12]} -->\n")
 
 
 def test_不接受不合法的_MR_編號(real):

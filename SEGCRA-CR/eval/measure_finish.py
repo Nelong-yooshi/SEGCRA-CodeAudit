@@ -8,7 +8,9 @@
 finding 的數量用 MR 的檔案數控制:每個檔案一句沒有 WHERE 的 DELETE(R001,程式確定性補報),
 另外主審查替身回 --model-findings 條。
 
-    python eval/measure_finish.py --files 10 50 100 --latency 0 0.2
+    python eval/measure_finish.py --files 10 50 100 --latency 0 0.2 --previous 0 119
+
+`--previous N`:重審時上一輪留下 N 條行內討論(收尾時逐條標成已解決,每條 1 個 PUT);0 是第一次審查。
 
 輸出每一組的 finding 數、各階段秒數(報告的 `_stage_seconds`)與收尾時打了幾次 GitLab API。
 不連任何外部服務;假伺服器只聽 127.0.0.1。
@@ -38,6 +40,7 @@ class _FakeGitLab(BaseHTTPRequestHandler):
     """只回這支用得到的端點;每個請求先睡 latency 秒,並記下是哪一種請求。"""
     latency = 0.0
     files: dict[str, str] = {}
+    previous: list[dict] = []            # 上一輪留下的行內討論(重審時要收掉的)
     counts: Counter = Counter()
     lock = threading.Lock()
 
@@ -72,8 +75,15 @@ class _FakeGitLab(BaseHTTPRequestHandler):
                      for p, t in self.files.items()]
             body, headers = items, {"X-Next-Page": ""}
         elif method == "GET" and rest.endswith("/discussions"):
-            # 重審會先把上一輪我們開的行內討論標成已解決。這裡一律回空清單 = 第一次審查
-            kind, body, headers = "GET 討論清單", [], {}
+            # 重審會先把上一輪我們開的行內討論標成已解決。previous = 0 是第一次審查(空清單);
+            # 大於 0 時回上一輪留下的那些(帶記號、作者是自己、還沒解決),照 GitLab 的形狀分頁
+            from urllib.parse import parse_qs, urlparse
+            page = int((parse_qs(urlparse(self.path).query).get("page") or ["1"])[0])
+            total = max(1, -(-len(self.previous) // 100))
+            kind = "GET 討論清單"
+            body = self.previous[(page - 1) * 100:page * 100]
+            headers = {"X-Next-Page": str(page + 1) if page < total else "",
+                       "X-Total-Pages": str(total)}
         elif method == "GET" and rest.startswith("/merge_requests/"):
             kind = "GET MR"
             body = {"title": "量測用", "description": "", "sha": HEAD,
@@ -92,6 +102,10 @@ class _FakeGitLab(BaseHTTPRequestHandler):
             kind, body, headers = "POST 行內討論", {"id": "d"}, {}
         elif method == "POST" and rest.endswith("/notes"):
             kind, body, headers = "POST 一般留言", {"id": 1}, {}
+        elif method == "PUT" and "/discussions/" in rest:
+            kind, body, headers = "PUT 標已解決", {"id": "d"}, {}
+        elif method == "PUT" and "/notes/" in rest:
+            kind, body, headers = "PUT 改寫留言", {"id": 1}, {}
         elif method == "PUT":
             kind, body, headers = "PUT label", {"iid": 1}, {}
         elif method == "POST" and "/statuses/" in rest:
@@ -122,7 +136,17 @@ def _model_report(n: int) -> str:
         ensure_ascii=False)
 
 
-def measure(files: int, model_findings: int, latency: float) -> dict:
+def _previous_round(n: int) -> list[dict]:
+    """上一輪審查開的 n 條行內討論:帶記號、作者是 GITLAB_TOKEN 的帳號(假 /user 回 id 1)、
+    只有一則留言、還沒解決 —— 重審時 resolve_stale_comments 會逐條標成已解決。"""
+    from toolbox import gitlab
+    return [{"id": f"prev{i}", "notes": [{
+        "id": i, "body": f"{gitlab._INLINE_MARKER}\n**[minor]** 上一輪的第 {i} 條",
+        "author": {"id": 1}, "system": False, "resolvable": True, "resolved": False}]}
+        for i in range(n)]
+
+
+def measure(files: int, model_findings: int, latency: float, previous: int = 0) -> dict:
     from orchestrator import pipeline
     from orchestrator.cold_read import ColdRead
     from orchestrator.config import load_config
@@ -131,6 +155,7 @@ def measure(files: int, model_findings: int, latency: float) -> dict:
     _FakeGitLab.latency = latency
     _FakeGitLab.files = {f"sql/q{i}.sql": f"DELETE FROM t{i}" for i in range(files)}
     _FakeGitLab.counts = Counter()
+    _FakeGitLab.previous = _previous_round(previous)
     server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeGitLab)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     saved = {k: getattr(gitlab, k) for k in
@@ -177,7 +202,8 @@ def measure(files: int, model_findings: int, latency: float) -> dict:
         for k, v in saved.items():
             setattr(gitlab, k, v)
         server.shutdown()
-    return {"files": files, "latency": latency, "findings": len(report["findings"]),
+    return {"files": files, "latency": latency, "previous": previous,
+            "findings": len(report["findings"]), "resolved_stale": report.get("_resolved_stale"),
             "stage_seconds": report.get("_stage_seconds"),
             "finish_requests": dict(_FakeGitLab.counts - before_finish)}
 
@@ -187,6 +213,8 @@ def main() -> None:
     ap.add_argument("--files", type=int, nargs="+", default=[10, 50, 100])
     ap.add_argument("--model-findings", type=int, default=20)
     ap.add_argument("--latency", type=float, nargs="+", default=[0.0, 0.2])
+    ap.add_argument("--previous", type=int, nargs="+", default=[0],
+                    help="上一輪留下幾條行內討論(重審時要收掉的);0 = 第一次審查")
     args = ap.parse_args()
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
@@ -194,8 +222,9 @@ def main() -> None:
         os.environ["REVIEW_OUTPUT"] = out       # 主審查原始輸出寫到暫存目錄
         for lat in args.latency:
             for n in args.files:
-                r = measure(n, args.model_findings, lat)
-                print(json.dumps(r, ensure_ascii=False), flush=True)
+                for prev in args.previous:
+                    r = measure(n, args.model_findings, lat, prev)
+                    print(json.dumps(r, ensure_ascii=False), flush=True)
 
 
 if __name__ == "__main__":

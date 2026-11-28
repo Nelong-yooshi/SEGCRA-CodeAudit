@@ -2470,24 +2470,6 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                 wrote.append(step)
             return refs
 
-        # 貼這一輪的行內意見之前,先把上一輪我們開的那些標成已解決:總結只有一則,
-        # 行內意見卻是每次 N 條重貼一遍 —— 不收掉的話同一行會疊好幾輪的意見,看 MR 的
-        # 人分不出哪些還有效。標不掉不影響這次審查(舊意見留著,新的照樣貼),所以只
-        # 記個數字,不當成回寫失敗。
-        #
-        # 這一輪有環節沒跑完時不收:收舊意見的前提是「這一輪重新審過了,上一輪報的、這一輪
-        # 沒再報,就是不用再看了」。沒跑完不是成功,不能當成這一輪已經取代上一輪 —— 上一輪的
-        # blocker 會在沒有人重新看過的情況下被收起來。
-        if review_incomplete(report):
-            report["_resolve_unfinished"] = {"skipped": "這一輪有環節沒跑完"}
-            print(f"[pipeline] MR !{mr_id} 這一輪有環節沒跑完,上一輪的意見這次不收", flush=True)
-        elif await writable(_WRITEBACK_STEPS["resolve"]) is not None:
-            resolved, unfinished = _resolve_result(
-                await hub.call("gitlab__resolve_stale_comments", {"mr_id": mr_id}))
-            report["_resolved_stale"] = resolved          # None = 不知道
-            if unfinished:
-                report["_resolve_unfinished"] = unfinished
-
         unposted = []
         plain_notes = 0
         for fd in report.get("findings", []):
@@ -2529,6 +2511,27 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         if await writable(_WRITEBACK_STEPS["label"]) is not None:
             _record_writeback(writeback, mr_id, "label", await hub.call(
                 "gitlab__set_label", {"mr_id": mr_id, "label": label}))
+        # label 設完、總結之前,把上一輪我們開的行內意見標成已解決:總結只有一則,行內意見卻是
+        # 每次 N 條重貼一遍 —— 不收掉的話同一行會疊好幾輪的意見,看 MR 的人分不出哪些還有效。
+        # 排在這一輪的意見、commit status、label 之後:上一輪越多,這一步越久,不讓它拖晚閘門;
+        # 中途被新的 commit 取代時,MR 上至少還看得到上一輪的意見,不會舊的收了、新的還沒貼。
+        # 這一輪剛貼的靠記號裡的 commit 分開(帶 reviewed_sha,同一個 commit 的不收)。
+        # 標不掉不影響這次審查(舊意見留著),記進報告與總結,不當成回寫失敗。
+        #
+        # 這一輪有環節沒跑完時不收:收舊意見的前提是「這一輪重新審過了,上一輪報的、這一輪
+        # 沒再報,就是不用再看了」。沒跑完不是成功,不能當成這一輪已經取代上一輪 —— 上一輪的
+        # blocker 會在沒有人重新看過的情況下被收起來。
+        if review_incomplete(report):
+            report["_resolve_unfinished"] = {**report.get("_resolve_unfinished", {}),
+                                             "skipped": "這一輪有環節沒跑完"}
+            print(f"[pipeline] MR !{mr_id} 這一輪有環節沒跑完,上一輪的意見這次不收", flush=True)
+        elif await writable(_WRITEBACK_STEPS["resolve"]) is not None:
+            resolved, unfinished = _resolve_result(await hub.call(
+                "gitlab__resolve_stale_comments", {"mr_id": mr_id, "head_sha": reviewed_sha or ""}))
+            report["_resolved_stale"] = resolved          # None = 不知道
+            if unfinished:
+                report["_resolve_unfinished"] = {**report.get("_resolve_unfinished", {}),
+                                                 **unfinished}
         decision_text = {"auto_approved": "✅ 小幅變更且無實質問題,自動放行",
                          "needs_human": "👤 請人工確認後裁決",
                          "blocked": "⛔ 有 blocker 級問題,修正前不得合入"}[decision]

@@ -94,4 +94,4 @@ def test_有行號時開行內討論(api):
 def test_行號不在diff裡時改開沒有位置的討論_寫出行號(api):
     gitlab.post_inline_comment("12", "models/a.sql", 99, "內容", "major")
     assert api[-1][1] == "/merge_requests/12/discussions" and "position" not in api[-1][2]
-    assert api[-1][2]["body"].startswith(gitlab._INLINE_MARKER + "\n`models/a.sql:99`")
+    assert api[-1][2]["body"].startswith(gitlab._inline_marker("c" * 40) + "\n`models/a.sql:99`")
