@@ -1,8 +1,8 @@
 """dbt 接進審查管線(#7 第 1、2 點的管線端)。
 
-檔名刻意跟 dbt_render / dbt_impact 自己的單元測試檔分開,也跟 #12 即將加入的
-tests/test_spec_exec.py 分開——這裡只測「接線」本身(find_spec 的檔名對應、
-預掃前展開、樣板不送進沙盒),不重覆模組自己的單元測試範圍。
+檔名刻意跟 dbt_render / dbt_impact / spec_index 自己的單元測試檔分開——這裡只測「接線」
+本身(find_spec 依 project 資料夾對規格、預掃前展開、樣板不送進沙盒),不重覆模組自己的
+單元測試範圍。
 
 每一步都要能獨立驗證「開關關閉時,行為與接線前完全相同」,所以大多數測試案例
 都成對出現:一個確認新行為生效,一個確認舊行為分毫不變。
@@ -109,97 +109,101 @@ def test_pipeline_passes_dbt_flag_to_find_spec():
     assert 'find_spec_mr(hub, mr, by_path=cfg.dbt.get("enabled") is True)' in src
 
 
-# --------------------------------------------------- 開啟後:先查本機 specs/
-def test_local_spec_found_when_hub_present(specs_dir):
-    """管線實際執行時 hub 一定存在(mock 模式也是)。本機 specs/ 有對應規格時必須
-    找得到——曾經只在 hub 為 None 時查本機,導致 demo 與 golden set 永遠找不到。"""
-    _write_spec(specs_dir, "RETAIL_M1", "# 本機規格")
+# ------------------------------------------- 開啟後:依 project 資料夾對規格
+def _project_spec(project: str, name: str = "RULE_X1") -> str:
+    return (f"# {name}\n\n## 基本資料\n\n| 欄位 | 值 |\n|---|---|\n"
+            f"| 序號 / 程式名稱 | {project} / {name} |\n")
+
+
+P_MR = _mr([{"path": "models/P01/mrt_RULE_X1.sql", "full_content": "SELECT 1"}])
+
+
+def test_project_folder_maps_to_spec(specs_dir):
+    """規格檔名不限:對應靠「基本資料」的序號,不靠檔名。"""
+    _write_spec(specs_dir, "RULE_X1_spec", _project_spec("P01"))
     hub = _FakeHub()
-    assert _run(find_spec(hub, DBT_MR, by_path=True)) == ("RETAIL_M1", "# 本機規格")
-    assert hub.calls == []          # 本機找到就不必再問 GitLab
+    got = _run(find_spec(hub, P_MR, by_path=True))
+    assert got == ("RULE_X1_spec", _project_spec("P01"))
+    assert got.note is None and got.unavailable is None
+    assert hub.calls == []          # 對照表一次讀好,不逐檔問 GitLab
 
 
-def test_local_spec_found_without_hub(specs_dir):
-    _write_spec(specs_dir, "RETAIL_M1", "# 本機規格")
-    assert _run(find_spec(None, DBT_MR, by_path=True)) == ("RETAIL_M1", "# 本機規格")
+def test_subfolder_belongs_to_project(specs_dir):
+    _write_spec(specs_dir, "spec_a", _project_spec("P01"))
+    mr = _mr([{"path": "models/P01/staging/earlyjob/stg_x.sql", "full_content": "SELECT 1"}])
+    assert _run(find_spec(None, mr, by_path=True))[0] == "spec_a"
 
 
-def test_local_spec_case_mismatch_not_used(specs_dir):
-    """只有大小寫不同的規格檔不採用(resolve_spec 的語意),交人工確認。"""
-    _write_spec(specs_dir, "retail_m1")
-    assert _run(find_spec(None, DBT_MR, by_path=True)) == (None, None)
+def test_rule_code_in_mr_does_not_choose_spec(specs_dir):
+    """MR 寫了別的 R 編號也不影響:那等於讓送審者自己挑規格。"""
+    _write_spec(specs_dir, "R-201", "# R-201 寬鬆的規格")
+    _write_spec(specs_dir, "RULE_X1_spec", _project_spec("P01"))
+    mr = _mr(P_MR["files"], title="R-201", description="對應 R-201")
+    assert _run(find_spec(_FakeHub(), mr, by_path=True))[0] == "RULE_X1_spec"
 
 
-def test_local_spec_directory_named_like_spec_ignored(specs_dir):
-    """specs/ 底下剛好有名為 X.md 的**資料夾**時不可當成規格(不可讀取失敗炸掉)。"""
-    (specs_dir / "RETAIL_M1.md").mkdir(parents=True)
-    assert _run(find_spec(None, DBT_MR, by_path=True)) == (None, None)
+def test_rule_code_does_not_rescue_file_outside_projects(specs_dir):
+    _write_spec(specs_dir, "R-201", "# R-201 規格")
+    mr = _mr([{"path": "models/r201.sql", "full_content": "SELECT 1"}], description="R-201")
+    got = _run(find_spec(_FakeHub(), mr, by_path=True))
+    assert got == (None, None)
+    assert "不屬於任何 project" in got.note
 
 
-def test_first_matching_file_wins(specs_dir):
-    _write_spec(specs_dir, "SECOND", "# 第二個")
-    mr = _mr([{"path": "models/mrt_FIRST.sql", "full_content": "SELECT 1"},
-              {"path": "models/mrt_SECOND.sql", "full_content": "SELECT 2"}])
-    assert _run(find_spec(None, mr, by_path=True))[0] == "SECOND"
+def test_file_name_match_is_not_used(specs_dir):
+    """以前依檔名對應(mrt_RETAIL_M1.sql → RETAIL_M1.md);現在同名也不算。"""
+    _write_spec(specs_dir, "RETAIL_M1", "# 沒有序號的規格")
+    got = _run(find_spec(None, DBT_MR, by_path=True))
+    assert got == (None, None)
+    assert "不屬於任何 project" in got.note
+
+
+@pytest.mark.parametrize("specs, files, words", [
+    ({"a": "P02"}, [{"path": "models/P01/x.sql"}], ["P01", "沒有對應的規格"]),
+    ({"a": "P01", "b": "P01"}, [{"path": "models/P01/x.sql"}], ["2 份規格", "specs/a.md", "specs/b.md"]),
+    ({"a": "P01", "b": "P02"}, [{"path": "models/P01/x.sql"}, {"path": "models/P02/y.sql"}],
+     ["分屬不同 project", "P01", "P02"]),
+    ({"a": "P01", "b": "P02"}, [{"path": "models/P02/x.sql", "old_path": "models/P01/x.sql"}],
+     ["搬到了另一個 project", "models/P01/x.sql"]),
+    ({"a": "p01"}, [{"path": "models/P01/x.sql"}], ["沒有對應的規格", "大小寫"]),
+])
+def test_unmatched_cases_need_human_with_reason(specs_dir, specs, files, words):
+    for name, project in specs.items():
+        _write_spec(specs_dir, name, _project_spec(project))
+    got = _run(find_spec(_FakeHub(), _mr(files), by_path=True))
+    assert got == (None, None)
+    assert got.unavailable is None, "對不到是 MR 的問題,不是環境取不到"
+    assert all(w in got.note for w in words), got.note
+
+
+def test_move_within_same_project_is_fine(specs_dir):
+    _write_spec(specs_dir, "a", _project_spec("P01"))
+    mr = _mr([{"path": "models/P01/new/x.sql", "old_path": "models/P01/x.sql"}])
+    assert _run(find_spec(None, mr, by_path=True))[0] == "a"
 
 
 @pytest.mark.parametrize("files", [
     [],
-    [{"path": "models/sources.yml", "full_content": "version: 2"}],   # 不是 .sql
+    [{"path": "models/P01/sources.yml", "full_content": "version: 2"}],   # 不是程式
+    [{"path": "macros/x.sql", "full_content": "{% macro x() %}{% endmacro %}"}],
 ])
 def test_nothing_to_match(specs_dir, files):
-    assert _run(find_spec(_FakeHub(), _mr(files), by_path=True)) == (None, None)
+    """沒有程式檔(只改設定或 macro):不對、也不給原因,受影響的 model 另外逐一查。"""
+    _write_spec(specs_dir, "a", _project_spec("P01"))
+    got = _run(find_spec(_FakeHub(), _mr(files), by_path=True))
+    assert got == (None, None) and got.note is None
 
 
-# ------------------------------------------ 開啟後:本機沒有才探測 GitLab
-def test_gitlab_probed_when_local_missing(specs_dir):
-    hub = _FakeHub({"specs/RETAIL_M1.md": "# 從 GitLab 讀到的規格"})
-    assert _run(find_spec(hub, DBT_MR, by_path=True)) == ("RETAIL_M1", "# 從 GitLab 讀到的規格")
-    # 候選順序是「完整檔名優先」:先探測 mrt_RETAIL_M1(不存在),才退到 RETAIL_M1
-    assert hub.calls == ["specs/mrt_RETAIL_M1.md", "specs/RETAIL_M1.md"]
-
-
-def test_gitlab_full_name_candidate_wins_first(specs_dir):
-    hub = _FakeHub({"specs/mrt_BOTH.md": "# 完整檔名優先"})
-    mr = _mr([{"path": "models/mrt_BOTH.sql", "full_content": "SELECT 1"}])
-    assert _run(find_spec(hub, mr, by_path=True)) == ("mrt_BOTH", "# 完整檔名優先")
-    assert hub.calls == ["specs/mrt_BOTH.md"]
-
-
-def test_gitlab_placeholder_or_non_spec_content_rejected(specs_dir):
-    """get_file 對不存在的路徑回傳佔位文字或錯誤頁,不是丟例外——必須確認長得像
-    規格(以 # 開頭),跟 R 編號那條路徑的判斷一致。"""
-    hub = _FakeHub({"specs/RETAIL_M1.md": "<html>not a spec</html>"})
-    assert _run(find_spec(hub, DBT_MR, by_path=True)) == (None, None)
-
-
-def test_gitlab_exception_is_swallowed_and_next_candidate_tried(specs_dir):
-    """某個候選取檔失敗時,還是要試下一個候選。
-
-    取檔失敗現在回的是代碼 `fetch_failed`(不再是丟例外出來,見 #95 review 第 4 點),
-    但「繼續試下一個」這件事不變;找到之後 `unavailable` 也不留。"""
-    hub = _FakeHub({"specs/RETAIL_M1.md": "# 第二個候選"})
-    hub.raises = {"specs/mrt_RETAIL_M1.md": True}
-    got = _run(find_spec(hub, DBT_MR, by_path=True))
-    assert got == ("RETAIL_M1", "# 第二個候選")
-    assert got.unavailable is None, "找到了就不該留著前一個候選的失敗"
-
-
-# ------------------------------------------------------ R 編號永遠優先
-@pytest.mark.parametrize("by_path", [False, True])
-def test_rule_code_path_unchanged(specs_dir, by_path):
-    """有 R 編號時走原本的路徑,不論開關——即使檔名也對得到另一份規格。"""
-    _write_spec(specs_dir, "R-201", "# R-201 規格全文")
-    _write_spec(specs_dir, "RETAIL_M1", "# 這份不該被用到")
-    mr = _mr(DBT_MR["files"], description="對應 R-201")
-    assert _run(find_spec(_FakeHub(), mr, by_path=by_path)) == ("R-201", "# R-201 規格全文")
-
-
-def test_rule_code_without_spec_not_rescued_by_path(specs_dir):
-    """MR 提到了 R 編號但那份規格不存在:要如實回報「無規格」,不能被檔名對應蓋掉。"""
-    _write_spec(specs_dir, "RETAIL_M1", "# 檔名對得到")
-    mr = _mr(DBT_MR["files"], description="對應 R-999")
-    assert _run(find_spec(_FakeHub(), mr, by_path=True)) == ("R-999", None)
+def test_spec_deleted_in_mr_is_not_used(specs_dir, monkeypatch):
+    """這個 MR 刪掉的規格不算(mock 模式疊上 MR 的版本)。"""
+    import orchestrator.spec_index as spec_index
+    _write_spec(specs_dir, "a", _project_spec("P01"))
+    spec_index.use_index(spec_index.load_index({"a": ""}))
+    try:
+        got = _run(find_spec(None, P_MR, by_path=True))
+    finally:
+        spec_index.use_index(None)
+    assert got == (None, None) and "沒有對應的規格" in got.note
 
 
 # ------------------------------------------------------------ 路徑逃逸
@@ -209,15 +213,19 @@ def test_rule_code_without_spec_not_rescued_by_path(specs_dir):
     "/etc/passwd.sql",
     "C:/Windows/win.ini.sql",
     "models/../../specs/../../../etc/shadow.sql",
+    "models/P01/../P02/x.sql",
     "models/\x00null.sql",
 ])
-def test_path_traversal_produces_no_candidates(specs_dir, malicious_path):
-    """model 路徑來自待審 MR,是攻擊者可控字串。resolve_spec 的路徑白名單必須先擋下,
-    本機不讀、GitLab 一次都不問——確認這條新接線沒有另開後門。"""
+def test_path_traversal_maps_to_nothing(specs_dir, malicious_path):
+    """model 路徑來自待審 MR,是攻擊者可控字串:路徑白名單先擋下,說明裡也不寫原樣的路徑。"""
+    _write_spec(specs_dir, "a", _project_spec("P01"))
+    _write_spec(specs_dir, "b", _project_spec("P02"))
     hub = _FakeHub()
-    mr = _mr([{"path": malicious_path, "full_content": "SELECT 1"}])
-    assert _run(find_spec(hub, mr, by_path=True)) == (None, None)
+    got = _run(find_spec(hub, _mr([{"path": malicious_path, "full_content": "SELECT 1"}]),
+                         by_path=True))
+    assert got == (None, None)
     assert hub.calls == []
+    assert malicious_path not in (got.note or "")
 
 
 # ============================================================ 執行驗證
@@ -516,7 +524,7 @@ def test_database_falls_back_to_file_without_env(no_db_env):
 
 
 @pytest.mark.parametrize("bad", ['PROD"; DROP TABLE t; --', "PROD DW", "PROD-DW",
-                                 "PROD.dbo", "ＰＲＯＤ", " PROD_DW", "1PROD"])
+                                 "PROD.dbo", "ＰＲＯＤ", " PROD DW ", "1PROD"])
 def test_database_must_be_identifier(monkeypatch, bad):
     """名稱會被拼進 SQL 識別字,載入時就過白名單;填錯要在啟動時就報錯,
     不是等到每份 model 審查時才各自展開失敗。"""
@@ -527,9 +535,18 @@ def test_database_must_be_identifier(monkeypatch, bad):
     assert bad.strip() not in str(exc.value)
 
 
-def test_empty_env_var_means_unset(monkeypatch):
-    monkeypatch.setenv("SEGCRA_DBT_DATABASE", "")
-    assert _load_dbt_section({})["database"] == ""
+def test_前後的空白去掉之後才過白名單(monkeypatch):
+    monkeypatch.setenv("SEGCRA_DBT_DATABASE", "  SAMPLE_DW ")
+    assert _load_dbt_section({})["database"] == "SAMPLE_DW"
+
+
+@pytest.mark.parametrize("raw", ["", "   "])
+def test_設了但是空的要停下來_不改用設定檔的值(monkeypatch, raw):
+    """空的多半是部署腳本沒把值帶進來;改用設定檔的值等於用沒人指定的設定跑。"""
+    from orchestrator.config import ConfigError
+    monkeypatch.setenv("SEGCRA_DBT_DATABASE", raw)
+    with pytest.raises(ConfigError, match="SEGCRA_DBT_DATABASE"):
+        _load_dbt_section({"dbt": {"database": "SAMPLE_DW"}})
 
 
 def test_load_dbt_section_rejects_non_dict_section():
@@ -615,8 +632,8 @@ def test_notice_keeps_model_findings_untouched():
 
 def test_review_mr_enforces_notice_after_keyword_checks_and_before_policy():
     """review_mr() 的後處理鏈必須呼叫它:
-    * 在 enforce_hints / enforce_style 之後——它們以關鍵詞判斷模型是否已回應,
-      程式補的文字若先進報告,可能被誤當成回應而吞掉檢核點
+    * 在 enforce_hints / enforce_style 之後——它們判斷模型是否已回應,
+      程式補的文字若先進報告,可能被誤當成回應
     * 在 apply_policy 之前——決策要看得到它"""
     import inspect
     import orchestrator.pipeline as pipeline_mod

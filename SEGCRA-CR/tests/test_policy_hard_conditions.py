@@ -77,7 +77,7 @@ def _pw_decision(model_findings, *, count_hard_hints=True):
 
 
 _PW_INFO = {"file": "sql/x.sql", "line": 1, "severity": "info",
-            "title": "密碼欄位存的是雜湊值,沒有問題", "detail": "x", "suggestion": "x"}
+            "title": "[H004] 已核對:密碼欄位存的是雜湊值,沒有問題", "detail": "x", "suggestion": "x"}
 
 
 def test_撈密碼欄位_模型一條提到密碼的_info_也不能讓它自動放行():

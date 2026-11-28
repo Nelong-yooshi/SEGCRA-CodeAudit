@@ -1,7 +1,10 @@
 # 模型設定 — orchestrator 不綁模型,換模型只改這裡。
-# endpoint 可用環境變數 OLLAMA_URL 覆蓋(預設 http://localhost:11434/v1)。
+# 部署端要改的話複製一份到程式目錄以外,用環境變數 SEGCRA_MODELS_CONFIG 指過去(換新版程式碼時這份會被蓋掉)。
+# endpoint 可用環境變數 OLLAMA_URL 覆蓋(預設 http://localhost:11434/v1;OpenAI 相容的端點都可以)。
 endpoint: http://localhost:11434/v1
-api_key: ollama          # Ollama 不驗證,佔位即可
+# 只能不寫或寫 ollama(佔位;Ollama 不驗證)。端點要驗證時金鑰用環境變數 LLM_API_KEY 給:
+# 這裡寫了別的值,載入設定就會報錯(這個檔案會進版控與離線包)。
+api_key: ollama
 default_profile: review
 
 # temperature/seed 的方針(對應 eval/README.md「發現三:測資生成覆蓋度不穩定」):

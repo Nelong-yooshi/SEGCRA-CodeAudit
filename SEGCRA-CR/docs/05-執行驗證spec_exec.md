@@ -18,6 +18,11 @@
 
 ### 第 0 步:找 spec(確定性;`spec_exec.py:extract_rule_codes` / `find_spec`)
 
+`dbt.enabled` 開啟時(部署端),`find_spec` **只**依程式所在的 project 資料夾對應規格
+(`models/<project 編號>/` ↔ 規格「基本資料」的序號,見 09 篇「規格依 project 資料夾對應」),
+下面的 R 編號兩路都不走;對不到的原因(例如「這個檔案不屬於任何 project」)寫進「無規格可驗」
+那條 finding,執行驗證結果另外記 `no_spec_reason`。dbt 關閉時照下面的方式找:
+
 1. `extract_rule_codes`:把 MR 的標題、描述、每個檔的路徑與內容(`full_content`,沒有就用 diff)串起來,用 regex `\bR-\d{2,4}\b` 抓規則碼,去重排序。
 2. `find_spec` 兩路:
    - **mock/本地路**:逐碼查本包 `specs/<code>.md`,存在即讀入回傳。
@@ -323,7 +328,7 @@ mr = {"title": "調整報表", "files": [{"path": "sql/x.sql", "full_content": "
   2. **需求項目逐條原子化、含運算子**:每條具體到可直接對照實作(交易範圍、聚合、閾值、時間窗、幣別、豁免、通報粒度、輸出欄位各自成條),用語與含等一致——「達/以上」=含=`>=`、「超過」=不含=`>`,並在補充段記下核定依據;含等寫錯一定被邊界案例抓到,寫「模糊」則測資會亂猜;
   3. 時間窗一律寫半開區間(`>= @start_date AND < @end_date`),參數名固定 `@start_date`/`@end_date`;程式與規格的 SQL 一律寫 T-SQL(`BIT` 用 `= 1`、`DATEPART(HOUR, x)`、字串型別寫長度、日期時間用 `DATETIME2` 而非 `TIMESTAMP`);
   4. 表格式規格 → md 的整理範例在 `examples/sample/RETAIL_M1_spec.md`(原則:只寫核定規格有的、實作細節列「待補」不腦補、跨源不一致以核定規格為準);dbt + Jinja 的規則程式要先展開樣板才能執行——引用 `source()` 與 `ref()` 的 model 會先展開成沙盒用的 SQL 再執行(見 docs/09「執行驗證」)。**有 `ref()` 的 model,「資料表定義」裡跟上游 model 同名的那張表代表的是上游 model 的輸出**:測資直接放進那張表,上游裡做的過濾、彙總不會被執行,所以規格的條件若是在上游做的,案例不符時記成待驗證(不判成 SQL 錯)。展開不了的檔案也記成待驗證、交人工(不會誤判通過)。
-- **換模型**:`config/models.yaml` 的 `roles.testgen` / `roles.arbiter` 各自指到任一 profile;小模型常產不出合法測資 JSON(症狀:「測資生成失敗」finding),把 testgen 指回大 profile 即可(README §10)。
+- **換模型**:使用中的模型設定檔(`SEGCRA_MODELS_CONFIG` 指的那份,沒設時是 `config/models.yaml`;見 docs/10)的 `roles.testgen` / `roles.arbiter` 各自指到任一 profile;小模型常產不出合法測資 JSON(症狀:「測資生成失敗」finding),把 testgen 指回大 profile 即可(README §10)。
 - **改 prompt**:`orchestrator/spec_exec.py` 的 `TESTGEN_SYSTEM`(測資契約)與 `ARBITER_SYSTEM`(仲裁原則);執行窗常數 `WIN_START/WIN_END` 也在檔頭。改 TESTGEN 的輸出形狀時,`_shape_check` 必須同步改——形狀檢查是契約的執行者。
 - **已知限制**:
   - 一個 MR 只驗**一份 spec、一段 SQL**:`find_spec` 回第一個找得到規格檔的規則碼;SQL 取自最後一個有內容的變更檔。一個 MR 改多條規則時,現版只驗到其一——拆 MR 是目前的正解。

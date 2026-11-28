@@ -28,9 +28,10 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "eval"))
 
 from orchestrator import pipeline  # noqa: E402
-from toolbox.sqltools import run_rules  # noqa: E402
+from saved_reports import iter_saved, mentions, model_findings, prescan  # noqa: E402
 
 # 改之前的關鍵詞表(快照,只給這支程式對照用;程式裡已經拿掉了)
 OLD_KEYWORDS = {
@@ -48,19 +49,6 @@ OLD_KEYWORDS = {
 }
 
 
-def _prescan(case: dict) -> list[dict]:
-    """拿 golden case 的檔案內容重跑規則層,得到那次審查真正的命中。"""
-    out = []
-    for f in case.get("files", []):
-        sql = f.get("full_content") or f.get("diff") or ""
-        if not sql:
-            continue
-        res = json.loads(run_rules(sql))
-        hits = res.get("hits") if isinstance(res, dict) else res
-        out.append({"path": f.get("path", ""), "rules": hits or []})
-    return out
-
-
 def _old_backfill(report: dict, pre: list[dict]) -> int:
     """舊做法補了幾條:只補「模型沒對應到」的那幾處。"""
     before = list(report.get("findings", []))
@@ -71,32 +59,25 @@ def _old_backfill(report: dict, pre: list[dict]) -> int:
             if str(h.get("rule", "")).startswith("R"):
                 by_code.setdefault(h["rule"], []).append(h)
         for code, hits in by_code.items():
-            missing, _ = pipeline._coverage(before, entry["path"],
-                                            OLD_KEYWORDS.get(code, [code]), hits)
+            said = mentions(before, OLD_KEYWORDS.get(code, [code]))
+            missing, _ = pipeline._coverage(said, entry["path"], hits)
             added += len(missing)
     return added
 
 
 def main(dirs) -> int:
     rows = []
-    for d in dirs:
-        for f in sorted(pathlib.Path(d).glob("mr_*.json")):
-            report = json.loads(f.read_text(encoding="utf-8"))
-            golden = ROOT / "eval" / "golden" / f.name
-            if not golden.exists() or "findings" not in report:
-                continue
-            # 模型自己報的 = 報告裡 _source 不是 program 的那些
-            model_only = [f for f in report.get("findings", [])
-                          if isinstance(f, dict) and f.get("_source") != "program"]
-            report = {**report, "findings": model_only}
-            pre = _prescan(json.loads(golden.read_text(encoding="utf-8")))
-            hits = sum(len([h for h in e["rules"] if str(h.get("rule", "")).startswith("R")])
-                       for e in pre)
-            old = _old_backfill(report, pre)
-            new_report = pipeline.enforce_rules(json.loads(json.dumps(report)), pre)
-            new = len(new_report["findings"]) - len(report.get("findings", []))
-            rows.append((f.name, len(model_only), hits, old, new,
-                         len(new_report["findings"])))
+    for name, report, case in iter_saved(dirs):
+        model_only = model_findings(report)     # 模型自己報的(濾掉程式補的)
+        report = {**report, "findings": model_only}
+        pre = prescan(case)
+        hits = sum(len([h for h in e["rules"] if str(h.get("rule", "")).startswith("R")])
+                   for e in pre)
+        old = _old_backfill(report, pre)
+        new_report = pipeline.enforce_rules(json.loads(json.dumps(report)), pre)
+        new = len(new_report["findings"]) - len(report.get("findings", []))
+        rows.append((name, len(model_only), hits, old, new,
+                     len(new_report["findings"])))
     if not rows:
         print("找不到可以對照的報告(需要 eval/golden 裡有同名的 case)")
         return 1

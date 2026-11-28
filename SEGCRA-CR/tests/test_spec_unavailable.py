@@ -138,29 +138,49 @@ def test_每個代碼都有給人看的說法():
         "no_read_token", "no_review_ref", "too_large", "fetch_failed"}
 
 
-# ─────────────── 依檔名對應規格那條路(dbt 的 model 沒有 R 編號)───────────────
+# ─────────────── 依 project 資料夾對應規格那條路(dbt 開啟時)───────────────
 
 DBT_MR = {"title": "調整", "description": "", "files": [
-    {"path": "models/mrt_RETAIL_M1.sql", "diff": "@@\n+SELECT 1",
+    {"path": "models/P01/mrt_RETAIL_M1.sql", "diff": "@@\n+SELECT 1",
      "full_content": "SELECT 1"}]}
 
 
-@pytest.mark.parametrize("code", ["no_read_token", "fetch_failed", "not_found"])
-def test_依檔名找規格時拿不到也要分出來(code, monkeypatch, tmp_path):
-    """dbt 的 model 沒有 R 編號,走的是這條路。只回 None 的話,token 沒設一樣會
-    變成「沒有規格」—— 跟 R 編號那條是同一個病。"""
-    monkeypatch.setattr(spec_exec, "SPECS_DIR", tmp_path)   # 本機沒有規格,才會問 GitLab
-    monkeypatch.setattr(spec_exec, "fetch_file", _fetch((None, code)))
-    lookup = asyncio.run(find_spec(object(), DBT_MR, by_path=True))
+@pytest.mark.parametrize("code", ["no_read_token", "no_review_ref", "fetch_failed"])
+def test_依project找規格時拿不到也要分出來(code):
+    """規格清單取不到是環境的問題:只回 None 的話,token 沒設一樣會變成「沒有規格」——
+    跟 R 編號那條是同一個病。"""
+    from orchestrator import spec_index
+    spec_index.use_index(spec_index.SpecIndex(error=code))
+    try:
+        lookup = asyncio.run(find_spec(object(), DBT_MR, by_path=True))
+    finally:
+        spec_index.use_index(None)
     assert lookup.unavailable == code
     assert lookup == (None, None)
+    assert lookup.note is None
 
 
-def test_依檔名找規格_檔案不存在不算拿不到(monkeypatch, tmp_path):
+def test_依project找規格_沒有對應的規格不算拿不到(monkeypatch, tmp_path):
     monkeypatch.setattr(spec_exec, "SPECS_DIR", tmp_path)
-    monkeypatch.setattr(spec_exec, "fetch_file", _fetch((None, None)))
     lookup = asyncio.run(find_spec(object(), DBT_MR, by_path=True))
     assert lookup.unavailable is None
+    assert "沒有對應的規格" in lookup.note
+
+
+def test_對不到的原因寫進無規格可驗(monkeypatch, tmp_path):
+    """原因(不屬於任何 project…)要寫進 finding;處理方式是放對資料夾,不是補 R 編號。"""
+    monkeypatch.setattr(spec_exec, "SPECS_DIR", tmp_path)
+
+    class _Cfg:
+        dbt = {"enabled": True}
+    mr = {"title": "", "description": "R-201", "files": [
+        {"path": "models/x.sql", "diff": "@@\n+SELECT 1", "full_content": "SELECT 1"}]}
+    out = asyncio.run(spec_exec.run_spec_exec(_Cfg(), object(), mr))
+    assert out["no_spec"] is True and "不屬於任何 project" in out["no_spec_reason"]
+    finding = out["findings"][0]
+    assert "不屬於任何 project" in finding["detail"]
+    assert "models/<project 編號>/" in finding["suggestion"]
+    assert "R-xxx" not in finding["detail"]
 
 
 # ─────────────────── 代碼與說法只有一份 ───────────────────

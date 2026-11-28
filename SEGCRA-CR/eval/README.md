@@ -300,7 +300,7 @@ id 依層分段:`1xx` 注入、`2xx` rule-base、`3xx` binding、`4xx` spec_exec
 
 | case | 驗什麼 |
 |---|---|
-| `mr_701` | **正向對照(真實形狀)**:`dbt compile` 的實際輸出(200 行/4 層 CTE/20 項門檻),與 `specs/RETAIL_M1_EVAL.md` 逐條相符 → 不得產生 blocker/major。同時是 spec 依 **model 檔名**對應(`mrt_RETAIL_M1_EVAL.sql` → `specs/RETAIL_M1_EVAL.md`)唯一的端到端 case |
+| `mr_701` | **正向對照(真實形狀)**:`dbt compile` 的實際輸出(200 行/4 層 CTE/20 項門檻),與 `specs/RETAIL_M1_EVAL.md` 逐條相符 → 不得產生 blocker/major。同時是 spec 依 **project 資料夾**對應(`models/SAMPLE01/` → 序號 SAMPLE01 的 `specs/RETAIL_M1_EVAL.md`)唯一的端到端 case |
 | `mr_702` | **埋雷(真實形狀)**:條件 1 的 `eod_balance <= 1000` 改成 `< 1000`,規格 1-7 明訂「≤ 1,000」→ 結餘恰好 1,000 的帳戶漏報。另外兩組條件維持 `<=`,樣式看起來一致。也是唯一「大檔裡只改一行」的維護型 diff |
 
 > **規格是評測專用的 `RETAIL_M1_EVAL`,不是 `RETAIL_M1`**:它是照範例程式改寫、讓
@@ -343,7 +343,7 @@ id 依層分段:`1xx` 注入、`2xx` rule-base、`3xx` binding、`4xx` spec_exec
 > **未計入上面那張實測結果表**:那張表是 32 個既有 case 的數字,這兩個是新增且
 > 標記 `known_gap`,混進去會讓通過率失真。
 >
-> **`dbt_enabled` 標記**:真實規則沒有 R 編號,規格只能依 model 檔名對應,而那條路
+> **`dbt_enabled` 標記**:真實規則沒有 R 編號,規格只能依 project 資料夾對應,而那條路
 > 由 `dbt.enabled` 控制(#14 的安全預設是關閉)。標了 `_golden.dbt_enabled` 的 case
 > 由 `run_eval.py` 的 `case_config()` 單獨換一份設定跑,**不動 `config/models.yaml`
 > 的預設值**——改預設等於把正式審查的行為一起改掉。
@@ -368,7 +368,7 @@ id 依層分段:`1xx` 注入、`2xx` rule-base、`3xx` binding、`4xx` spec_exec
 | case | 驗什麼 |
 |---|---|
 | `mr_861` | **只改註解**:與 `mr_701` 同一份真實形狀的程式,只改第 20、37 行兩行註解;規格要求的條件都在第 149 行以後,離改動處遠超過 diff 的上下文。prompt 有變更後的完整內容,不得出現「遺漏 / 缺少某條件」的 major 或 blocker(`forbid_findings`)。`mr_701` 的已知問題(規格 schema 型別、測資生成規模)與這件事無關,所以不斷言決策 |
-| `mr_862` | **共用門檻表被改、影響兩個各有規格的 model**:`macros/alert_threshold.sql` 被 `mrt_SHARED_A_EVAL`、`mrt_SHARED_B_EVAL` 用到,兩者依檔名各自對到規格(50,000 與 100,000);MR 把 A 的門檻從 50000 調到 60000。兩份規格都要附上、標明對應哪個 model,審查要指出 60000 與 A 的規格不符;決策 needs_human。**用到 dbt 專案**(另一個是 `mr_413`):base 與 head 兩個 commit 的專案放在 `eval/golden/dbt_archives/` 底下(目錄名是 commit 編號),MR 只有 diff,跟真實 GitLab 模式一樣 |
+| `mr_862` | **共用門檻表被改、影響兩個各有規格的 model**:`macros/alert_threshold.sql` 被 `mrt_SHARED_A_EVAL`、`mrt_SHARED_B_EVAL` 用到,兩者放在各自的 project 資料夾(`models/EVAL862/`、`models/EVAL862B/`),各自對到規格(50,000 與 100,000);MR 把 A 的門檻從 50000 調到 60000。兩份規格都要附上、標明對應哪個 model,審查要指出 60000 與 A 的規格不符;決策 needs_human。**用到 dbt 專案**(另一個是 `mr_413`):base 與 head 兩個 commit 的專案放在 `eval/golden/dbt_archives/` 底下(目錄名是 commit 編號),MR 只有 diff,跟真實 GitLab 模式一樣 |
 | `mr_863` | **同時改規格與程式**:規格條件 3 的門檻從「超過 40,000」改成「達 39,999 以上」,程式跟著改;但規格的說明與補充兩段還寫著 40,000。規格以這次 MR 的版本為準,報告最上面要有「本次 MR 修改了規格」,寫出 40,000 → 39,999 並指出舊數字仍出現在哪幾行;決策 needs_human(硬條件) |
 
 > **`eval/golden/dbt_archives/` 也在測資集指紋裡**(`eval/preflight.py` 的 `testset.dbt`):

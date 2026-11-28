@@ -14,7 +14,19 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${SANDBOX_ENV_FILE:-$HERE/../config/sandbox.env}"
-if [ -f "$ENV_FILE" ]; then set -a; . "$ENV_FILE"; set +a; fi
+
+# 讀密碼檔前先檢查權限,太寬就停。規則只有一份(orchestrator/file_perms.py,只用標準庫):
+# 檔案、實際的檔案所在的目錄一路往上、路徑上的連結所在的目錄;只看權限位元,不看擁有者。
+# 主機上沒有 python3 時停下來,不跳過檢查。
+check_secret_file() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "找不到 python3,無法檢查 $1 的權限,不往下跑(RHEL、Ubuntu 預設都有 python3)" >&2
+    exit 1
+  fi
+  python3 -I "$HERE/../orchestrator/file_perms.py" --secret "$1" || exit 1
+}
+
+if [ -f "$ENV_FILE" ]; then check_secret_file "$ENV_FILE"; set -a; . "$ENV_FILE"; set +a; fi
 
 NAME="${SANDBOX_MSSQL_CONTAINER:-segcra-sandbox}"
 IMAGE="${SANDBOX_MSSQL_IMAGE:-mcr.microsoft.com/mssql/server:2022-CU25-ubuntu-22.04}"

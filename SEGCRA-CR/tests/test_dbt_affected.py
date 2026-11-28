@@ -1024,8 +1024,18 @@ def test_模型同標題的finding蓋不掉未執行的major():
 
 # ─────────────────── 10. 整條 review_mr ───────────────────
 
-SPEC_TEXT = "# BIG 規格\n\n## 說明\n金額達 100000 通報。\n"
+def _basic(project: str, name: str) -> str:
+    return f"## 基本資料\n\n| 欄位 | 值 |\n|---|---|\n| 序號 / 程式名稱 | {project} / {name} |\n\n"
+
+
+SPEC_TEXT = "# BIG 規格\n\n" + _basic("P02", "BIG") + "## 說明\n金額達 100000 通報。\n"
 PLAIN_SQL = "SELECT t.account_no\nFROM transactions t\nWHERE t.account_no = @account_no;"
+
+
+def _in_project(files: dict, project: str = "P02") -> dict:
+    """把 models/ 底下的 model 搬進 project 資料夾(dbt 開啟時規格依資料夾對應)。"""
+    return {(f"models/{project}/" + k[len("models/"):] if k.startswith("models/") else k): v
+            for k, v in files.items()}
 
 
 @pytest.fixture
@@ -1041,7 +1051,8 @@ def review(monkeypatch, tmp_path):
     monkeypatch.setenv("REVIEW_OUTPUT", str(output))
     monkeypatch.setattr(spec_exec, "SPECS_DIR", specs)
     (specs / "BIG.md").write_text(SPEC_TEXT, encoding="utf-8")
-    (specs / "R-201.md").write_text("# R-201 規格\n\n金額達 100000 通報。\n", encoding="utf-8")
+    (specs / "R-201.md").write_text("# R-201 規格\n\n" + _basic("P01", "R-201")
+                                    + "金額達 100000 通報。\n", encoding="utf-8")
     state = {"generated": 0, "prompt": None}
     plan = {"schema_ddl": ["CREATE TABLE transactions (id INT);"],
             "conditions": [{"id": "C1", "desc": "條件 C1"}],
@@ -1107,7 +1118,7 @@ def test_只改macro_用受影響model的規格來審_但不會被當成執行�
     """改到的幾行是一句完整、沒有樣板標記的 SQL;受影響的 model 對得到規格;執行驗證的替身
     只要被呼叫就回報通過。以前這種 MR 沒有規格、一定交人工;現在有了規格,更不可以因為
     「片段跑得過」就放行。"""
-    loader = _Loader(_project(PLAIN_SQL))
+    loader = _Loader(_in_project(_project(PLAIN_SQL)))
     report, state = review([{"path": "macros/act.sql", "diff": FRAGMENT}], loader)
     assert report["_spec_exec"]["spec_code"] == "BIG"
     assert "BIG 規格" in state["prompt"]                       # 模型拿到的是這份規格
@@ -1118,20 +1129,32 @@ def test_只改macro_用受影響model的規格來審_但不會被當成執行�
     assert report["_spec_exec"].get("dbt_template") is True and report["_spec_exec"]["passed"] is False
     assert report["decision"] == "needs_human"
     (fd,) = _impact(report)
-    assert "models/mrt_BIG.sql → BIG" in fd["detail"]
+    assert "models/P02/mrt_BIG.sql → BIG" in fd["detail"]
 
 
-def test_MR自己提到規則碼時_不改用受影響model的規格(review):
-    loader = _Loader(_project(PLAIN_SQL))
+def test_MR提到別的規則碼也不影響_照樣用受影響model的規格(review):
+    """R 編號不決定規格(那等於送審者自己挑);只改 macro 時照樣用受影響 model 的那份。"""
+    loader = _Loader(_in_project(_project(PLAIN_SQL)))
     report, state = review([{"path": "macros/act.sql", "diff": FRAGMENT}], loader,
-                           title="R-999 調整")
-    assert report["_spec_exec"]["spec_code"] == "R-999" and report["_spec_exec"].get("no_spec") is True
+                           title="R-201 調整")
+    assert report["_spec_exec"]["spec_code"] == "BIG"
 
 
-def test_對照組_沒有dbt的變更時_同一個純SQL檔會自動放行(review):
+def test_dbt開啟時_不在任何project資料夾的純SQL檔_無規格交人工(review):
+    """dbt 專案外的 SQL 寫了 R 編號也不算:規格只依 project 資料夾對應。"""
     cfg = {**CFG, "project_dir": "dbt_sub"}
     files = [{"path": "sql/maintenance/x.sql", "diff": FRAGMENT, "full_content": PLAIN_SQL}]
     report, state = review(files, _Loader(_project(PLAIN_SQL)), title="R-201 例行調整", cfg_dbt=cfg)
+    assert report["decision"] == "needs_human"
+    assert report["_spec_exec"]["no_spec"] is True
+    assert "不在 dbt 專案的目錄裡" in report["_spec_exec"]["no_spec_reason"]
+    assert state["generated"] == 0
+
+
+def test_對照組_project資料夾裡沒有樣板的model_會自動放行(review):
+    cfg = {**CFG, "project_dir": "dbt_sub"}
+    files = [{"path": "dbt_sub/models/P01/x.sql", "diff": FRAGMENT, "full_content": PLAIN_SQL}]
+    report, state = review(files, _Loader(_project(PLAIN_SQL)), cfg_dbt=cfg)
     assert report["decision"] == "auto_approved", report.get("_policy_signals")
     assert state["generated"] == 1 and _impact(report) == []
 
@@ -1140,8 +1163,8 @@ def test_同一個MR混了純SQL檔_執行驗證通過的是純SQL_dbt的變更�
     """run_spec_exec 取的是最後一個檔;它通過不代表 macro 的變更被驗證過。"""
     cfg = {**CFG, "project_dir": "dbt_sub"}
     files = [{"path": "dbt_sub/macros/act.sql", "diff": FRAGMENT},
-             {"path": "sql/maintenance/x.sql", "diff": FRAGMENT, "full_content": PLAIN_SQL}]
-    report, state = review(files, _Loader(_project(PLAIN_SQL)), title="R-201 例行調整", cfg_dbt=cfg)
+             {"path": "dbt_sub/models/P01/x.sql", "diff": FRAGMENT, "full_content": PLAIN_SQL}]
+    report, state = review(files, _Loader(_project(PLAIN_SQL)), cfg_dbt=cfg)
     assert report["_spec_exec"]["passed"] is True              # 被執行的是純 SQL 檔
     assert any(f["title"] == _DBT_UNEXECUTED_TITLE and f["severity"] == "major"
                for f in report["findings"])
@@ -1175,6 +1198,75 @@ def test_變更前的專案資訊整理不出來_當成無法比較():
     assert impact_finding(check)["severity"] == "major"
 
 
+# MR 自己有程式檔、但對不到規格:不可以改用受影響 model 的規格(P09 的程式拿 P02 的規格驗、
+# 報告寫通過,就是 project 對應要擋的「選錯規格」)。只改 macro 的照舊用受影響 model 的那份
+# (上面的 test_只改macro_用受影響model的規格來審_但不會被當成執行驗證通過)
+@pytest.mark.parametrize("programs, reason", [
+    ({"models/P09/x.sql": PLAIN_SQL}, "project P09 沒有對應的規格"),
+    ({"models/P01/x.sql": PLAIN_SQL, "models/P03/y.sql": PLAIN_SQL}, "分屬不同 project"),
+    # 程式是 dbt 樣板時,執行驗證那一段原本會借用受影響 model 的規格(樣板不會被執行,
+    # 所以借來的規格只用在「dbt model 沒有展開」那條待驗證);對不到規格時也不可以借
+    ({"models/P09/x.sql": "{{ body() }}\n"}, "project P09 沒有對應的規格"),
+])
+def test_MR的程式對不到規格時_不改用受影響model的規格(review, programs, reason):
+    head = _in_project(_project(PLAIN_SQL))
+    head.update(programs)
+    files = [{"path": "macros/act.sql", "diff": FRAGMENT}] + [
+        {"path": p, "diff": FRAGMENT, "full_content": body} for p, body in programs.items()]
+    report, state = review(files, _Loader(head))
+    assert report["_spec_exec"]["no_spec"] is True
+    assert reason in report["_spec_exec"]["no_spec_reason"]
+    assert report["_spec_exec"]["spec_code"] != "BIG"
+    assert state["generated"] == 0, "拿受影響 model 的規格生了測資"
+    assert report["decision"] != "auto_approved"
+
+
+def _rename_spec_mr():
+    """同一個序號 P01 有兩份規格(R-201、DUP);MR 把 DUP 改名搬出 specs/,並改了 P01 的程式。"""
+    cfg = {**CFG, "project_dir": "dbt_sub"}
+    files = [{"path": "docs/DUP.md", "old_path": "specs/DUP.md", "renamed_file": True, "diff": ""},
+             {"path": "dbt_sub/models/P01/x.sql", "diff": FRAGMENT, "full_content": PLAIN_SQL}]
+    return cfg, files
+
+
+def test_規格改名搬出specs_算修改了規格_不自動放行(review):
+    (spec_exec.SPECS_DIR / "DUP.md").write_text(
+        "# DUP 規格\n\n" + _basic("P01", "DUP") + "金額達 100000 通報。\n", encoding="utf-8")
+    cfg, files = _rename_spec_mr()
+    report, state = review(files, _Loader(_project(PLAIN_SQL)), cfg_dbt=cfg)
+    assert report["_policy_signals"]["spec_changed"] is True
+    assert report["decision"] != "auto_approved"
+    (fd,) = [f for f in report["findings"] if f["title"] == pipeline._SPEC_CHANGE_TITLE]
+    assert "`specs/DUP.md` 被改名搬出規格目錄" in fd["detail"]
+    assert "不在審查讀取規格的位置" not in fd["detail"]
+    # 搬走之後 P01 只剩 R-201:審查讀的是 MR 之後的規格目錄(真實模式下載的就是那一版)
+    assert report["_spec_exec"]["spec_code"] == "R-201"
+
+
+@pytest.mark.parametrize("old_path, path", [
+    ("specs/DUP.md", "docs/DUP.md"),
+    ("specs/DUP.md", "specs/DUP.md.bak"),
+    ("specs/DUP.md", "sql/dup.sql"),
+])
+def test_改名搬出規格目錄都算修改了規格(old_path, path):
+    mr = {"files": [{"path": path, "old_path": old_path, "diff": ""}]}
+    assert pipeline._touches_specs(mr)
+    assert pipeline._spec_versions_in_mr(mr)[0] == {"DUP": ""}
+
+
+def test_規格目錄裡改名_新的照常算規格_舊代號記成刪除():
+    mr = {"files": [{"path": "specs/NEW.md", "old_path": "specs/OLD.md", "diff": "",
+                     "full_content": "# NEW"}]}
+    assert pipeline._touches_specs(mr)
+    assert pipeline._spec_versions_in_mr(mr)[0] == {"NEW": "# NEW", "OLD": ""}
+
+
+def test_改名進規格目錄以外的一般檔_不算修改了規格():
+    mr = {"files": [{"path": "sql/b.sql", "old_path": "sql/a.sql", "diff": ""}]}
+    assert not pipeline._touches_specs(mr)
+    assert pipeline._spec_versions_in_mr(mr)[0] == {}
+
+
 # ─────────────────── 11. 自檢補的案例 ───────────────────
 
 TEMPLATE_AND_PLAIN = {"files": [{"path": "models/m.sql", "full_content": "SELECT {{ 1 }}"},
@@ -1202,13 +1294,13 @@ def test_變更清單裡形狀不對的項目_不丟例外():
 
 
 def test_mock模式_樣板檔混著純SQL檔_整條管線不自動放行(review):
-    files = [{"path": "models/m.sql", "diff": "@@ -1 +1 @@\n+SELECT {{ 1 }} AS id",
+    files = [{"path": "models/P01/m.sql", "diff": "@@ -1 +1 @@\n+SELECT {{ 1 }} AS id",
               "full_content": "SELECT {{ 1 }} AS id"},
-             {"path": "sql/maintenance/x.sql", "diff": FRAGMENT, "full_content": PLAIN_SQL}]
+             {"path": "models/P01/x.sql", "diff": FRAGMENT, "full_content": PLAIN_SQL}]
 
     def never(*a, **kw):
         raise AssertionError("mock 模式不應該取回專案")
-    report, state = review(files, never, title="R-201 例行調整", real_mode=False)
+    report, state = review(files, never, real_mode=False)
     assert report["_spec_exec"]["passed"] is True
     assert any(f["title"] == _DBT_UNEXECUTED_TITLE for f in report["findings"])
     assert report["decision"] == "needs_human"
