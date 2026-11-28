@@ -25,7 +25,7 @@ sys.path.insert(0, str(PKG_ROOT))
 
 from orchestrator.spec_exec import (_label_gaps, _shape_check,  # noqa: E402
                                     _unverified, execute_cases,
-                                    gaps_and_passed)
+                                    execution_error, gaps_and_passed)
 
 import testdata_cache  # noqa: E402 - 與本檔同目錄(eval/),執行時已在 sys.path[0]
 
@@ -64,7 +64,7 @@ MUTANTS = {
         ("拿掉小額入帳排除",
          "        AND amount > 1000\n", "", "*/2"),
         ("拿掉 EarlyJob 排除",
-         "WHERE NOT EXISTS (\n    SELECT 1\n    FROM retail_m1_earlyjob e\n"
+         "WHERE NOT EXISTS (\n    SELECT 1\n    FROM \"SAMPLE_DW\".\"dbo\".\"retail_m1_earlyjob\" e\n"
          "    WHERE e.account_id = f.account_id\n"
          "    AND e.TABLE_DATE = DATEADD(DAY, -1, @start_date)\n)",
          "WHERE 1 = 1"),
@@ -195,7 +195,7 @@ def main() -> int:
 
     sql = reference_sql(code)
     ok = execute_cases(sql, plan)
-    for k in ("sandbox_error", "sql_error", "testdata_error"):
+    for k in ("sandbox_error", "sql_error", "testdata_error", "table_error"):
         if ok[k]:
             print(f"正確的 SQL 跑不起來({k}):{ok[k]}")
             return 1
@@ -234,7 +234,7 @@ def main() -> int:
     print("|---|---|---|")
     for name, old, new, *rest in MUTANTS[code]:
         ex = execute_cases(mutate(sql, old, new, *rest), plan)
-        err = ex["sandbox_error"] or ex["sql_error"] or ex["testdata_error"]
+        err = execution_error(ex)
         if err:
             print(f"| {name} | 無法判斷(執行失敗) | {err[:80]} |")
             survived.append(name)

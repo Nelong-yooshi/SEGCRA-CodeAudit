@@ -45,13 +45,34 @@
    - `ref()` / `source()` 展開成 `"<資料庫>"."<綱要>"."<表>"`(資料庫名由呼叫端傳入,不猜);
      沒有專案資訊時綱要固定為 `dbo`,有專案資訊時見下方「`ref()` / `source()` 的精確度」
    - `config()` 回傳空字串、`var()` 取呼叫端給的值、`execute` 為 True、
-     `is_incremental()` 預設為 False(比照 compile 期)。以 `incremental=True` 展開時回 True;
+     `is_incremental()` 預設為 False(比照 compile 期)。`var()` 的值照 dbt 的順序:設定檔的 `dbt.vars`
+     與 `dbt.run_date_vars`(見 10 篇;等於排程的 `--vars`)> `dbt_project.yml` 最外層的 `vars` > `var()`
+     的預設值;都沒有就展開失敗(dbt 也是)。`dbt_project.yml` 的值是樣板、或 `vars` 裡有子區塊(專案或
+     套件層級,哪個 model 吃到哪個值不判斷)時無法確定,用到就展開失敗並寫原因。正式環境由排程每次
+     傳入的變數(例如 `target_date`)審查時沒有人傳;日期變數一律給執行驗證測資的日期,展開出來的 SQL
+     才撈得到沙盒裡的測資。一份審查開始時記下這組值(`start_review_invocation`),之後的展開都帶同一組。
+     `modules` 只提供 `modules.datetime`(`datetime`、`date`、`timedelta`):用日期變數算前一天、上個月的
+     寫法展得開;`now()`、`today()`、`utcnow()`、`fromtimestamp()` 這類看主機時間的擋下(跟 `run_started_at`
+     同一道防線)。其他模組(`pytz`、`re`、`itertools`)不提供,用到就展開失敗並寫出是哪一個以 `incremental=True` 展開時回 True;
      `RenderResult.incremental_checked` 說明樣板(含它呼叫的 macro)有沒有呼叫 `is_incremental()`
    - `this`:跟 dbt 一樣兩種模式都提供(這個 model 自己的表,規則與 `ref()` 相同),所以
      `{% if this is defined %}` 裡的 SQL 一般模式就展開得出來,非增量的 model 直接寫 `{{ this }}`
      (例如自我 join)也不會展開失敗。沒有 database、或 model 名稱不能當表名(例如有連字號、點、數字開頭,dbt 都接受)時給不出值:仍然算有定義(`this is defined` 為 True,跟 dbt 一樣,否則寫在裡面的語句會被藏起來),但任何使用都失敗,錯誤訊息不帶檔名;沒用到的 model 照常展開。
      用到時帶表名提醒:增量模式一律算;一般模式看 model 本身有沒有寫到 `this`(只看語法樹,寫在
      沒進去的分支裡也算),或呼叫了定義裡寫到 `this` 的 macro(macro 檔最外層的程式碼不算)
+   - `run_started_at`:帶 UTC 時區的 datetime,值是審查開始的真實時間,一份審查裡的展開共用一個
+     (見 `start_review_invocation`)。dbt-core 1.12 是 `datetime.now(tz=pytz.utc)`,時區物件是 pytz 的
+     `UTC`,這裡是 `datetime.timezone.utc`:兩者的屬性與部分方法的結果不同,所以**它與從它算出來的值
+     (date / time / timedelta)只放行照實模擬、結果跟 dbt 相同的屬性與方法**(`_TIME_ATTRS_ALLOWED`:年月日
+     時分秒、`weekday()`、`isoformat()`、`strftime()`、`date()`、`time()`、`timestamp()`、`utcoffset()`、
+     `tzname()`、`replace()`、相減得到的 timedelta 的 `days` / `seconds` / `total_seconds()` 等),直接輸出也
+     跟 dbt 相同。其他一律展開失敗、交人工(`is defined` 也是,比照表名物件),例如 `tzinfo`、`dst()`、
+     `timetuple()`、`min` / `max`、`now()` / `today()` / `utcnow()` / `fromtimestamp()` 這類類別方法、
+     `astimezone()`(不給時區時換成主機的時區;給時區要有時區物件,拿不到)。`pprint` 遇到時間值也展開
+     失敗(帶出的 repr 跟 dbt 不同)。防線在沙箱取屬性那一層(`_guard_time_access`),所以從
+     `run_started_at.min`、`.date()` 這類拿到的值也擋得到。呼叫端指定的值要是帶 UTC 時區的 ISO 字串。
+     **執行驗證不用它**:model(含它呼叫的 macro)寫到 `run_started_at` 時不送沙盒,記成無法驗證
+     (`RenderResult.run_started_at_used`,見「執行驗證」與下方已知限制);規則層的展開照舊用審查開始的時間
    - `env_var` **刻意不定義**:會把審查機的環境變數寫進 SQL;未定義則由 `StrictUndefined` 大聲失敗。
      `target.database` 在未提供 database 時同理
    - **所有 macro 檔共用同一個命名空間**:dbt 解析 macro 與檔案順序無關,逐檔各自展開
@@ -192,6 +213,8 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 | **變更前內容不齊** | 有給 `base_files` 卻缺了被改的檔案,且未宣告為新增檔 |
 | 其他 | 專案 hook、檔案解析失敗、路徑不合法、超過資源上限 |
 
+檔案解析失敗時寫出是哪一種(`dbt_impact.SCAN_SYNTAX` / `SCAN_TOO_DEEP`):**Jinja 語法錯誤**(dbt 一樣解析不了,整個專案失敗;改到的 macro 檔另有 blocker,見下方「改到的 macro 檔本身」)與**巢狀太深**(分析用的遞迴上限,dbt 不一定失敗)。macro 檔、model、snapshot、變更前後的比對都一樣。超過資源上限不在這裡:整個反查直接保守判定,另有說明。
+
 同時確認**常見的正常寫法不會誤報**(否則每個 macro MR 都得交人工):與範例相同的
 `{% set config = {...} %}` 註冊表、寫死的 hook、`config.get`、`set_sql_header(config)`、
 `join('_')`、`sort(attribute='name')` 等 22 種,且都確認過 dbt 接受。
@@ -213,7 +236,7 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 | 指向錯誤的關聯 | `ref('t', version=2)` 在 dbt 是另一張表,我們忽略參數 | 拒絕展開(沒有 manifest 可解析版本) |
 | 偽造行號標記 | MR 放入仿冒標記,行號對應降級 | 標記使用每次隨機產生的權杖 |
 | 資訊洩漏 | 錯誤訊息帶出審查機完整路徑;`{{ ref }}` 輸出記憶體位址 | 錯誤訊息不含路徑、不含控制字元、有長度上限;不輸出函式物件;給不出值的 `this` 連 `repr`(`pprint`)都失敗 |
-| 樣板辨認自己在展開器裡,把語句藏起來 | `{% if invocation_id != '固定值' %}`、`{% if this is not string %}`、`{% if this.keys is defined %}` 裡的 DELETE 審查時不出現、執行時照跑 | `invocation_id` 每份審查不同(格式同 dbt 的 uuid4);同一份審查裡的展開(預掃的一般與增量、受影響 model 的前後)共用一個值,跟 dbt 一次執行一個一樣,兩種模式的同一句才不會被算成兩句。`this` / `ref()` / `source()` 回傳表名物件(`_Relation`):對它們做 `defined` / `undefined` 以外的 `is` 判斷(含放在判斷的參數、清單、dict 裡),或取 `database`、`schema`、`identifier`、`name`、`table` 以外的屬性與索引(含 `attr`、`map(attribute=…)`),一律展開失敗、交人工——dbt 的 Relation 物件跟字串的型別判斷結果、有哪些屬性都不同,逐個模擬模擬不完。`string` 濾器把表名物件轉成一般字串,跟 dbt 一樣 |
+| 樣板辨認自己在展開器裡,把語句藏起來 | `{% if invocation_id != '固定值' %}`、`{% if run_started_at.year > 2000 %}`、`{% if run_started_at.tzinfo.zone is defined %}`、`{% if this is not string %}`、`{% if this.keys is defined %}` 裡的 DELETE 審查時不出現、執行時照跑 | `invocation_id` 每份審查不同(格式同 dbt 的 uuid4),`run_started_at` 是真實時間(不是固定值),時間值只放行結果跟 dbt 相同的屬性與方法(時區物件、`dst()` 這類跟 dbt 不同的一律展開失敗,見上面 `run_started_at` 那段);同一份審查裡的展開(預掃的一般與增量、受影響 model 的前後)共用一個值,跟 dbt 一次執行一個一樣,兩種模式的同一句才不會被算成兩句。`this` / `ref()` / `source()` 回傳表名物件(`_Relation`):對它們做 `defined` / `undefined` 以外的 `is` 判斷(含放在判斷的參數、清單、dict 裡),或取 `database`、`schema`、`identifier`、`name`、`table` 以外的屬性與索引(含 `attr`、`map(attribute=…)`),一律展開失敗、交人工——dbt 的 Relation 物件跟字串的型別判斷結果、有哪些屬性都不同,逐個模擬模擬不完。`string` 濾器把表名物件轉成一般字串,跟 dbt 一樣 |
 | 樣板改到呼叫端資料 | `{% do var('x').append(...) %}` 改到呼叫端的 list | 變數每次取用都給複本;`target` 唯讀 |
 | ReDoS | 內部正規表達式是平方時間,40 萬字元約 40 分鐘 | 改為線性時間掃描 |
 | 資源耗盡 | `((9**256)**256)**256`、超大字串、無窮迴圈 | 原始碼 / macro / 輸出 / 整數運算上限;子行程隔離 |
@@ -255,6 +278,32 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 
 ### 已知限制
 
+- **展開器與反查做不到的,記成待驗證**(帶 `stage`,`review_incomplete` 認得到、決策不放行;分數不扣由
+  計分那邊收):展開失敗但不是 Jinja 語法錯誤(`[dbt 展開] 無法驗證`)、樣板原文有寫入語句或有分支沒展開到
+  (同一個環節)、改到的 macro 檔載入不了(`[dbt macro 檢查] 無法驗證`:不認得的濾器、巢狀太深、載入失敗、
+  檢查沒做完)、屬性檔的檢查沒做完(`[dbt 屬性檔檢查] 無法驗證`)、看不出名稱是否符合 Dagster 的規則
+  (`[dbt 名稱檢查] 無法驗證`)、反查的影響範圍無法確定或受影響 model 沒檢查到、沒查規格、取不到規格、
+  變更後展開失敗、無法跟變更前比較(`[macro 反查] 無法驗證`,跟「多出的規則命中」分成兩條)。**確定的**
+  照規則本身的嚴重度:Jinja 語法錯誤(dbt 一樣解析不了)、多出的規則命中。這些是還做不到的地方,之後一處一處補。
+- 反查確定不了呼叫對象時,原因分開寫、寫出是哪個檔:樣板字串有 Jinja 語法錯誤、巢狀太深、有可能藏住名稱的
+  YAML 跳脫字元、真的動態呼叫(`dbt_impact.scope_reason`);外層接到遞迴上限時寫出是反查這一步、當時在處理
+  哪個檔(不知道時寫「不確定是哪個檔」)。
+- **`run_started_at` 只照實模擬了常用的屬性與方法**:時區物件(`tzinfo`)、`dst()`、`timetuple()`、
+  `min` / `max` 等沒有照實模擬,用到就展開失敗、交人工(不會展開成功卻跟 dbt 不同)。之後要補的話一處
+  一處對 dbt(pytz 的 UTC)實測後再放行。
+- **用到 `run_started_at` 的 model 不做執行驗證**:展開時的值是審查開始的時間,測資固定在 `WIN_START`,
+  排程拿 `run_started_at` 當資料日還是資料日的隔天,各個 model 不同,審查猜不到;換成固定值也一樣猜。
+  所以記成無法驗證(「model 用到 run_started_at,審查不知道排程時間跟資料日期的關係」)。要補的方向:
+  部署端在設定寫出排程時間跟資料日期的關係(像 `run_date_vars`),有設就照它換算,沒設才記無法驗證。
+- **日期變數跟 `run_started_at` 比較的寫法一定交人工**:`{% if var('target_date') == run_started_at.strftime('%Y-%m-%d') %}`
+  這種分「當天執行 / 補跑」的寫法,審查時日期變數是測資的日期、`run_started_at` 是真實時間,永遠不相等,
+  規則層走「不是當天」那一邊,另一邊是沒展開到的分支;執行驗證這邊,用到 `run_started_at` 的 model 不送沙盒
+  (見上一點)。
+- **前一天的資料要寫進規格**:測資預設都在 `WIN_START` 當天(測資生成的第 6 點);model 讀前一天(例如
+  `DATEADD(DAY, -1, '{{ var("target_date") }}')`)時,那一天的資料要由規格的資料表定義與案例寫出來,
+  `spec_exec` 不自動產生。
+- **`modules` 只提供 `datetime`**:`pytz`、`re`、`itertools` 等用到就展開失敗。
+
 **本模組是審查輔助,不是資安邊界。** dbt 執行樣板時不在沙箱內,刻意以 Python 物件內省
 在多層資料流中隱藏呼叫(例如把 macro 當參數傳給另一個 macro,再以執行期組出的名稱取
 屬性),靜態分析無法完全判定。常見與低成本的手法都已擋下;真正的防線是執行沙盒與資安
@@ -272,7 +321,7 @@ MR 中的 R 編號當備援。只回傳呼叫端提供的「實際存在的規�
 | 預掃前展開 | 已接上 | 含樣板的檔案先以 `render_model_isolated()` 展開再交給規則層;展開失敗則原樣退回,由 `enforce_dbt_render_failure()` 一律補 major(見下方)。lint 跑原始文字:lint 管的是開發者寫的程式,展開後的 SQL 不是他們寫、也不會看到的 |
 | 依檔名對應規格 | 已接上 | 完全沒有 R 編號時,先查本機 `specs/`、再逐一探測 GitLab 的候選路徑 |
 | `ref()`/`source()` 精確度提醒 | 已接上 | 預掃結果帶 `dbt_render_notice`,後處理由 `enforce_dbt_notice()` 確定性補成 info finding(正式路徑與 dry-run 皆同) |
-| 執行驗證(沙盒) | **只支援只引用 `source()` 的 model** | 展開成沙盒用的 SQL 再執行(見「執行驗證」)。其他樣板不送進沙盒,回報「尚未支援」major、交人工——原樣執行只會得到語法錯誤,會錯誤地指控程式有誤。改到 dbt 而執行驗證卻通過時,`enforce_dbt_unexecuted()` 補 major(通過的就是展開執行的那個 model、而且 MR 只改了它時不補) |
+| 執行驗證(沙盒) | **支援引用 `source()` 與 `ref()` 的 model**(`ref()` 的上游 model 由規格裡同名的測資表代替) | 展開成沙盒用的 SQL 再執行(見「執行驗證」)。其他樣板不送進沙盒,回報「尚未支援」major、交人工——原樣執行只會得到語法錯誤,會錯誤地指控程式有誤。改到 dbt 而執行驗證卻通過時,`enforce_dbt_unexecuted()` 補 major(通過的就是展開執行的那個 model、而且 MR 只改了它時不補) |
 | 專案的 macro 與專案資訊 | 已接上(真實 GitLab 模式) | 依 MR 的 head commit 取回專案;取不回來一律交人工。mock 模式要在 fixture 目錄放專案才有(見「接進審查管線」),沒放時呼叫專案 macro 的 model 展開失敗 |
 | macro 反查 | 已接上(真實 GitLab 模式) | MR 改到 macro、屬性檔或專案設定檔時反查受影響的 model,比較變更前後的規則命中,由 `enforce_dbt_impact()` 補成一條 finding |
 
@@ -441,8 +490,8 @@ review_mr
  ├─ …模型審查…
  ├─ enforce_dbt_impact     影響範圍與檢查結果 → 一條 finding
  ├─ enforce_dbt_config_change 只改設定(config()、dbt_project.yml、屬性檔)→ 每個檔案一條(見 04 篇)
- ├─ run_spec_exec          樣板檔帶上完整內容再交給它(如實回報「尚未支援」)
- └─ enforce_dbt_unexecuted 改到 dbt 而執行驗證卻通過 → major
+ ├─ run_spec_exec          樣板檔展開後交給它;展開不了記成待驗證
+ └─ enforce_dbt_unexecuted 改到 dbt(含其他 model)而執行驗證卻通過 → 待驗證
 ```
 
 | 模組 | 做什麼 |
@@ -489,7 +538,7 @@ macro 載入一次(隔離子行程),看改到的檔載入得了嗎:
 - dbt 加的五個濾器(`as_text`、`as_bool`、`as_native`、`as_number`、`is_list`,dbt_common 的 `TEXT_FILTERS`)
   展開器照 dbt 的行為提供:前四個原樣回傳,`is_list` 判斷是不是 list。用到它們的 macro 與 model 照常展開
 - 只看改到的檔:專案裡本來就壞的檔不是這個 MR 造成的,用到它的 model 展開失敗時已經會報
-- 只寫種類與行號,不帶 Jinja 的錯誤訊息(裡面有樣板內容)
+- 只寫種類與行號,不帶 Jinja 的錯誤訊息(裡面有樣板內容)。載入失敗只記這一份分類(`segcra_macro_issues`);展開結果的 `macro_problems`(`路徑:原因(第 N 行)`)由分類產生(`macro_problem_text`),不另外記一份
 
 **改到的 dbt 設定檔本身。** dbt 解析專案時一定失敗的寫法補 **blocker**「dbt 設定檔有 dbt 解析不了的寫法,
 dbt 整個專案會解析失敗」(`enforce_dbt_project_broken`;dbt-core 1.12 的行為):
@@ -548,7 +597,7 @@ dbt 整個專案會解析失敗」(`enforce_dbt_project_broken`;dbt-core 1.12 �
     第一份就放不下時截斷著放,至少給一份。排序只決定先放哪份,不影響判斷
   - 引用白名單(`validate_citations`)接受附上的每一個代號;指名了沒附上的代號照舊剔除
   - 執行驗證:沒有一份能代表整個 MR。交給它的檔案**全部是 dbt 樣板**時傳第一優先的那份——樣板
-    不會被執行,它會照實回報「dbt 樣板尚未支援執行驗證」,而不是說成「無規格可驗」;其他情況照舊
+    不會被執行,它會照實回報「dbt model 沒有展開」(待驗證),而不是說成「無規格可驗」;其他情況照舊
     不傳,避免拿某個 model 的規格去驗不相干的 SQL
 
 **dbt 的變更不會被當成「執行驗證通過」。** dbt 樣板不送沙盒,所以這種 MR 的執行驗證應該是
@@ -558,11 +607,14 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 1. 交給 `run_spec_exec` 的 MR 副本裡,專案的樣板檔帶上 head 的完整內容 → 既有邏輯如實回報
    「尚未支援」,也不會白花一次測資生成
 2. `enforce_dbt_unexecuted`:MR 改到 dbt 的東西(樣板、macro、屬性檔、專案設定檔、或專案取不回來),
-   而執行驗證的結果是通過 → 補 major(被執行的是同一個 MR 裡別的內容)。這一層在 mock 模式
-   也生效:沒有取回專案時,改看手上的內容有沒有樣板標記(樣板檔與純 SQL 檔混在同一個 MR、
-   通過的是純 SQL 檔)。沒開 dbt 時不介入。例外:執行驗證跑的就是展開後送進沙盒的那個 model
-   (見下方「執行驗證」),而且 MR 改到 dbt 的只有它(沒改 macro、屬性檔、設定檔,其他檔案也不是
-   樣板)時,通過的就是這個 model 本身,不補
+   而執行驗證的結果是通過 → 補一條待驗證(帶 stage「執行驗證」;被執行的是同一個 MR 裡別的內容)。
+   這一層在 mock 模式也生效:沒有取回專案時,改看手上的內容有沒有樣板標記(樣板檔與純 SQL 檔混在
+   同一個 MR、通過的是純 SQL 檔)。沒開 dbt 時不介入。
+   執行驗證跑的是展開後送進沙盒的那個 model(見下方「執行驗證」)時:MR 改到的**其他 model**(model
+   目錄裡的 `.sql`,不管有沒有樣板標記)一律算沒有執行,補待驗證「[執行驗證] 改到的其他 model 沒有
+   執行」,內文分開寫「由測資代替的上游」與「其他 model」——執行驗證只跑一個 model,上游由測資代替、
+   其他 model 根本沒跑。MR 改到 dbt 的只有它(沒改其他 model、macro、屬性檔、設定檔)時,通過的就是
+   這個 model 本身,不補
 
 ### 執行驗證
 
@@ -572,19 +624,20 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 
 | 寫法 | 展開成 |
 |---|---|
-| `source()` | sources.yml 有宣告、表名確定(identifier 沒宣告就是 table 名,不是樣板值),而且規格「資料表定義」有同名的表(不分大小寫)→ 規格裡的寫法(`[txn]`、`[stage].[txn]`)。不看來源的 schema:沙盒只有規格建的表 |
-| `ref()` | 不支援(上游 model 要先在沙盒建出來,或由測資代替,還沒做) |
+| `source()` | sources.yml 有宣告、表名確定(identifier 沒宣告就是 table 名,不是樣板值),而且規格「資料表定義」有同名的表(不分大小寫)→ 規格裡的表,一律兩段式(`[dbo].[txn]`、`[stage].[txn]`;規格沒寫 schema 的是 dbo):單段的 `[txn]` 會被同名的 CTE 蓋掉。不看來源的 schema:沙盒只有規格建的表 |
+| `ref()` | **由測資代替上游 model**:被引用的 model 表名確定(alias 算過之後;不看自訂 schema,沙盒只有規格建的表),而且規格「資料表定義」有同名的表(不分大小寫)→ 規格裡的寫法。上游 model 自己的邏輯不在這次執行,執行通過時補一條 info「執行驗證時上游 model 由測資代替」列出是哪些 model(紀錄在 `_dbt_exec.stand_ins`)。seed、snapshot、其他套件的 model、表名是樣板值或專案層級無法確定時不對 |
 | `{{ this }}` | 不支援(有定義,用到就失敗) |
 | 表名物件的 `database` / `schema` | 取用就失敗(沙盒的值跟正式環境不同) |
 
 下列情況不展開,執行驗證照舊回「尚未支援」major,另外補一條 info「dbt model 沒有送進沙盒執行」
-寫出原因:上面任一項不成立、規格裡同名的表不只一張、兩個不同的來源對到同一張表、呼叫了
-`is_incremental()`(增量那段要先放一份上一次執行後的目標表,還沒做)、專案有同名的 macro、展開後
+寫出原因:上面任一項不成立、規格裡同名的表不只一張、兩個不同的 `source()` / `ref()` 對到同一張表、呼叫了
+`is_incremental()`(增量那段要先放一份上一次執行後的目標表,還沒做)、寫到 `run_started_at`(含它呼叫的
+macro;審查不知道排程時間跟資料日期的關係,見上方已知限制)、專案有同名的 macro、展開後
 仍有樣板標記、MR 沒有自己的規格而借來的受影響 model 規格不是這個 model 的、資料庫名稱不是約定的假名。
 不猜表名:猜錯的話執行失敗或結果不符,會被說成程式的問題。
 
 要跑的檔案不是 model(純 SQL、macro 檔、seed 等)、不是樣板、沒有取回專案或沒有規格時,照舊交給
-執行驗證,行為不變。紀錄寫在報告的 `_dbt_exec`(`{file, ok, reason}`;不適用時是 null)。
+執行驗證,行為不變。紀錄寫在報告的 `_dbt_exec`(`{file, ok, reason, stand_ins}`;不適用時是 null)。
 
 檢查受影響的 model 時若發生非預期的錯誤,審查不中斷:結果收斂成「全部 model 可能受影響」→ major,
 只留錯誤的類型、不回顯內容。
@@ -678,8 +731,11 @@ major。加上非 SQL 檔的處理之後,改由非 SQL 檔的分類與設定比�
 
 ## 後續
 
-- 執行驗證:只引用 `source()` 的 model 已經會展開後送進沙盒(見「執行驗證」);`ref()` 到其他
-  model(上游 model 要先建出來或由測資代替)與增量 model(一般模式與增量模式各驗一次)還沒做。
+- 執行驗證:引用 `source()` 與 `ref()` 的 model 已經會展開後送進沙盒(見「執行驗證」;`ref()` 的上游
+  model 由測資代替)。下面這些情況記成待驗證(帶 stage「執行驗證」,交人工):展開不了(規格沒有
+  同名的表、表名無法確定、兩個引用對到同一張表…)、MR 也改了上游或其他 model、有上游由測資代替時
+  案例不符(規格的條件可能在上游做,仲裁看不到上游,判 `sql` 也不採用)。要補的方向:上游 model 依
+  相依順序先在沙盒建出來(連同它的邏輯一起驗),以及增量 model(一般模式與增量模式各驗一次)。
   展開後的 SQL 還沒有在 MS SQL 沙盒上用正式規則實際跑過
 - 真實 GitLab 模式下,dbt 專案以外的 SQL 檔(與專案裡不是樣板的 SQL 檔)仍只有 diff 新增的行,
   完整內容由 #22 以 Files API 依 head sha 取得

@@ -17,9 +17,9 @@ PKG_ROOT = pathlib.Path(__file__).resolve().parents[1]
 # 參數不會被要求寫進文件。範圍跟進入點檢查那一條測試對齊。
 SCAN_DIRS = ("orchestrator", "toolbox", "scripts", "eval", "tools")
 SCAN_FILES = ("demo.py",)
-# 讀環境變數的 helper(定義在 config.py)。名稱前面可能有底線(模組內私有的版本)。
-ENV_HELPERS = frozenset({"env_seconds", "env_float", "env_seed", "env_effort",
-                         "env_int", "env_bool"})
+# 讀環境變數的 helper(都定義在 config.py)。名稱前面可能有底線(模組內私有的版本)。
+# 只列存在的:列了不存在的名稱,別處同名的函式會被當成讀環境變數
+ENV_HELPERS = frozenset({"env_seconds", "env_float", "env_seed", "env_effort", "env_bool"})
 
 
 def const_value(expr: str | None):

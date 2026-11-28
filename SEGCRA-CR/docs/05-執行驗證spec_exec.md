@@ -170,6 +170,15 @@ RETAIL_M1 那組快了 15 分鐘,但那是因為它提早放棄拆解,不是效�
 2. 系統日期函式(`GETDATE()`、`SYSDATETIME()`、`CURRENT_TIMESTAMP` 等)換成窗尾,確保可重現;
 3. 用到 `@start_date` / `@end_date` 時,前面補 `DECLARE @start_date DATE = '2026-06-01', @end_date DATE = '2026-06-02';`,並固定 `SET NOCOUNT ON; SET DATEFORMAT ymd;`。
 
+**三段式表名剝成 `dbo.<表>`**(`_strip_table_qualifiers`,在 `execute_cases` 裡、`prepare_sql` 之後):測資建在 `segcra_sbx_<隨機碼>` 裡、表名是規格 DDL 的單純名稱,帶 `"<資料庫>"."<schema>"."<表>"` 的三段式名就以 `Invalid object name` 失敗。會帶三段式的不是 dbt 樣板——dbt 的 `ref()`/`source()` 由管線自己展開成 `[表]`(見 09 篇「執行驗證」),不會有三段式;會帶三段式的是 **MR 裡本來就寫成三段式的 SQL**(手寫的跨資料庫寫法、或直接提交 compile 的輸出),以及評測的 `mr_701/702`(真實形狀的 compile 輸出)。剝的範圍刻意收得很窄:
+
+- **剝成兩段式 `dbo.<表>`,不是純 `<表>`**:兩段式 SQL Server 不會解成 CTE,所以就算 SQL 裡有同名 CTE,`FROM dbo.txn` 讀到的仍是沙盒的表(沙盒的表由建庫的登入建、都在 dbo;規格沒寫 schema 的表一定在 dbo)。這樣就不必再維護一份 CTE 名單——用 regex 抓 CTE 名碰到 `WITH a AS (…), /* c */ txn AS (…)` 的註解就抓不到,反而把同名引入判成錯。(沙盒實測:剝成 `dbo.txn` 後,有同名 CTE `txn` 時 `FROM dbo.txn` 讀到的是真實表。)
+- **只剝等於規格 DDL 真的建了的那張表**(`_ddl_tables`,比對不分大小寫)。剝錯會指到別的表,那種錯從結果看不出來;留著不剝只是查詢失敗,看得見。
+- **兩段式(`dbo.t`)不動**:測資建在 dbo,沙盒本來就解得開。
+- 位置用 **T-SQL 的 tokenizer**(`sqlglot.Dialect.get_or_raise("tsql").tokenize`)取,所以 `[my db]`(有空白)、`[d]]b]`(跳脫的 `]`)、`db..t`(省略 schema)都認得出來,而**字串常值與註解裡的 `a.b.c` 不會被當成表名**;切不出 token(例如字串沒收尾)就整段不剝,錯誤留給沙盒講。
+- **對應不到沙盒一份測資的,記 `table_error`**,不是說 SQL 有錯:兩個不同資料庫/schema 下的同名表(剝完會撞在一起)、四段式(跨 linked server)。撞名/四段式整段不剝、不連沙盒。另外,tokenizer 還認不出、沒剝掉的限定名,或規格 DDL 漏了那張表,送進沙盒會回 SQL Server 錯誤 208/911/7202(找不到物件/資料庫/linked server),這幾種也記 `table_error`。`run_spec_exec` 把 `table_error` 轉成一條 finding、交人工、不連沙盒,不是 major「SQL 無法在測資上執行」——說成後者會讓人去改沒問題的 SQL。「這次執行有沒有失敗」由 `execution_error()` 一處判斷(含 `table_error`),評測腳本(`coverage_check`、`freeze_testdata`…)都用它,少接一種錯誤就會把「沒跑成」當「驗過了」。
+- **「執行驗證無法完成」要記成待驗證、不計分**(表名對不上、沙盒不可用、逾時這幾種):帶 `stage`、`review_incomplete` 認得到 → 交人工;分數不扣、MR 上單獨列,照 #137 要修的 5。這一項隨 #137 的 `apply_rubric`(待驗證不計分)一起生效,見「待驗證」一節。
+
 **逐案執行**(`execute_cases`):每次執行在沙盒建一個專用資料庫(`segcra_sbx_<隨機碼>`,同時進行的審查互不干擾),結束後刪除;超過一小時的殘留資料庫會在下次執行時清掉。每個案例在**獨立交易**裡執行,結束一律 rollback,下一個案例從乾淨狀態開始:
 
 1. 跑 plan 的所有 `schema_ddl` 建表;
@@ -192,23 +201,29 @@ RETAIL_M1 那組快了 15 分鐘,但那是因為它提早放棄拆解,不是效�
 
 **何時出動**:只對 `mismatches` 逐案呼叫——全符時零 LLM 呼叫。模型由 `roles.arbiter` 指定(預設同 review)。
 
-**prompt**(`ARBITER_SYSTEM` + user):給它核定規格全文(標明「唯一真值」)、MR 的 SQL、該案例的條件/方向/測資說明/資料列/預期 vs 實際(含 SQL 實際輸出列)。原則:只以 spec 條文判斷、不腦補;逐步核對「這筆資料在 spec 之下應該命中嗎」再看 SQL 為何相反;**測資與 SQL 都可能錯,不預設任何一方;無法確定時傾向判測資錯**——理由是代價不對稱:誤殺一個測資案例只是少驗一個角(且會記成覆蓋缺口,照樣擋自動放行),誤指控 SQL 會生出假 major。輸出嚴格 JSON:`{"who_is_wrong": "testdata"|"sql", "reason": "<依 spec 條文的推理>"}`。
+**prompt**(`ARBITER_SYSTEM` + user):給它核定規格全文(標明「唯一真值」),以及 MR 的 SQL 與案例資料——**SQL 先拿掉註解**,**SQL 與資料列放進每次隨機產生的分隔標記之間**(標記之間是 MR 作者寫的內容、是資料不是規格,裡面自稱「核定規格/補充」的文字都不算規格;token 每次不同,內容寫不出對得上的結束標記);case 的條件/方向/測資說明/預期 vs 實際放在標記外。拿掉註解只擋一個位置,字串常值、別名、SQL 輸出的欄位值都能塞陳述句又不能刪,所以要靠標記讓仲裁分得出哪些字是 MR 寫的。原則:只以 spec 條文判斷、不腦補;逐步核對「這筆資料在 spec 之下應該命中嗎」再看 SQL 為何相反;**測資與 SQL 都可能錯,無法確定時判 SQL 側(交人工),不倒向測資錯**——判 SQL 側只是多看一眼,判測資錯會把案例剔除、當成驗過。輸出嚴格 JSON:`{"who_is_wrong": "testdata"|"sql", "reason": "<依 spec 條文的推理>"}`。
 
-**兩種結局**:
+**三種結局**(`who_is_wrong` = `testdata` / `sql` / `None`):
 
-- 判 `testdata` → 該案進 `dropped_cases`(`by: "arbiter"` + 理由),對應 `case_results` 標 `dropped: True`,**並在 `coverage_gaps` 補一條**「案例 X(條件 C,某向)遭仲裁剔除(測資錯),該向未驗證」——被剔除 ≠ 通過,該條件該向就是沒驗到,不可據以自動放行。
-- 判 `sql` → 收進 `sql_faults`,最後彙整成**一條 major「執行驗證失敗:實作與規格行為不符」**,detail 逐案列出預期/實際與仲裁理由,建議對照規格修正(含/不含、時段、過濾、粒度)。
+- 判 `testdata` **且確定**(見下)→ 該案進 `dropped_cases`(`by: "arbiter"` + 理由),對應 `case_results` 標 `dropped: True`,**並在 `coverage_gaps` 補一條**帶預期、實際與仲裁理由的「案例 X(條件 C,某向)遭仲裁剔除(測資錯),該向未驗證」——被剔除 ≠ 通過,該條件該向就是沒驗到,不可據以自動放行,缺口那條也讓人看得到剔除的是什麼。
+- 判 `sql`(確定)→ 收進 `sql_faults`,最後彙整成**一條 major「執行驗證失敗:實作與規格行為不符」**,detail 逐案列出預期/實際與仲裁理由,建議對照規格修正(含/不含、時段、過濾、粒度)。
+- **沒有結論**(`who_is_wrong` 是 `None`、`inconclusive: True`)→ 既不剔除也不當 SQL 確定錯,落成**一條帶 `stage` 的 finding「測資與 SQL 的結果不一致,仲裁沒有結論」**(`review_incomplete` 認得到 → 決策交人工),並在 `coverage_gaps` 標該向未驗證。這一類是「待驗證」:不計分、不當確定缺陷(見 06 篇),`why_kind` 記是哪一種不確定。
 
-**無法解析時的保守路徑**:仲裁 LLM 呼叫失敗(傳輸層例外)或輸出解析不出合法 `who_is_wrong` → 回 `{"who_is_wrong": "sql", "reason": "(仲裁…失敗,保守列為 SQL 側待人工確認)", "arbiter_unparseable": True}`——寧可多一條待人工確認的 major(→ needs_human),不可把 mismatch 靜默吞掉。
+**只有確定才採信**(`_arbitrate_call`):要同時滿足 ① 輸出完整(`output_completeness` 是 `complete`:被截斷或「沒回報結束原因」都不算)② 整段剛好是一個 JSON 物件、沒有重複鍵(`strict_json_object`,不走 json-repair,前後有字、兩個物件、重複鍵、靠 repair 補回來都不算)③ `who_is_wrong` 是 `testdata`/`sql`、`reason` 是非空字串。少任何一項(含 LLM 呼叫失敗)都是「沒有結論」。這跟主審查一致:主審查現在也把「沒回報結束原因」當成不完整、不採信(見 04 篇)。
+
+**判 `testdata` 要再問一次(`arbitrate`)**:剔除案例是仲裁唯一會拿掉證據的結論。分隔標記擋得住字串裡的陳述句,但擋不住「字串裡關掉圍欄、寫一整段像規格的段落、再開圍欄接回去」(實測真模型 3/3 被說動)。所以第一次判 `testdata` 時,用**遮掉 MR 作者能寫字的位置**(字串常值、識別字內容換代號,實際輸出只給列數;`_mask_mr_text` 走 `_segments`)的版本**再問一次**:兩次都確定 `testdata` 才剔除;遮掉後改判、或資訊不足判不出(照 ARBITER 倒向 SQL 側),都列 SQL 側交人工——結果是多交人工,不會多剔除。
 
 ### LLM 傳輸失敗的優雅降級(彙總)
 
-單次 LLM 請求上限 3600 秒、**不自動重試**(`orchestrator/agent.py:REQUEST_TIMEOUT`,環境變數 `LLM_TIMEOUT` 可調;openai client 預設的 600s×3 次重試對本地慢推理只是把同一個慢請求連跑三遍)。在 spec_exec 內:
+**不自動重試**(openai client 預設的 600s×3 次重試對本地慢推理只是把同一個慢請求連跑三遍)。在執行驗證裡,每次請求等的是 `LLM_TIMEOUT` 與**這一段剩下的時間**取小的(見 03 篇 Agent loop);剩不到 `MIN_STAGE_SECONDS` 就不再送。在 spec_exec 內:
 
 | 失敗點 | 行為 |
 |---|---|
-| 測資生成呼叫失敗(兩次) | major「執行驗證無法完成(測資生成失敗:LLM 呼叫失敗)」→ `passed: False` → needs_human |
-| 仲裁呼叫失敗 / 輸出無法解析 | 該 mismatch 保守判 SQL 側(帶 `arbiter_unparseable`)→ major → needs_human |
+| 測資生成**每一次都呼叫失敗**(模型一次都沒有回應:連不上、端點錯誤、拒絕) | 記成這一環節沒跑完:major「[執行驗證(測資生成)] 審查未完整(模型呼叫失敗)」,帶 `stage`(`review_incomplete` 認得到;CI 那條路是「沒有結論」、結束碼 5) |
+| 測資生成**時間到了**(請求逾時且重試用完,或剩的時間不夠、不再送) | 同上,標題是「…審查未完整(逾時)」。剩的時間不夠時不再重試 |
+| 測資生成模型有回應、內容不能用(截斷、JSON 不合法、零合法案例) | major「執行驗證無法完成(測資生成失敗)」→ `passed: False` → needs_human。是模型能力或規格的問題,重試不一定會好,所以不算環節沒跑完 |
+| 仲裁**沒有結論**(呼叫失敗:時間到了、連不上、端點錯誤;被截斷或沒回報結束原因;輸出不是乾淨的單一 JSON;`who_is_wrong` 不合法或缺 reason) | 該案例「測資與 SQL 的結果不一致,仲裁沒有結論」,帶 `stage`(執行驗證(仲裁)),不混進「實作與規格行為不符」;`passed: False` |
+| 沙盒不可用(沒啟動、連不上、沒設密碼) | major「執行驗證無法完成(沙盒不可用)」,帶 `stage`(執行驗證(沙盒)):環境的問題,CI 結束碼 5 |
 
 兩者都不會中斷整條審查管線,也絕不會產生「假通過」。
 
@@ -307,7 +322,7 @@ mr = {"title": "調整報表", "files": [{"path": "sql/x.sql", "full_content": "
   1. **「資料表定義」段必須釘死 schema**(可直接執行的 `CREATE TABLE`)——角色一照抄建表,沒有固定 schema 整個執行驗證做不起來;
   2. **需求項目逐條原子化、含運算子**:每條具體到可直接對照實作(交易範圍、聚合、閾值、時間窗、幣別、豁免、通報粒度、輸出欄位各自成條),用語與含等一致——「達/以上」=含=`>=`、「超過」=不含=`>`,並在補充段記下核定依據;含等寫錯一定被邊界案例抓到,寫「模糊」則測資會亂猜;
   3. 時間窗一律寫半開區間(`>= @start_date AND < @end_date`),參數名固定 `@start_date`/`@end_date`;程式與規格的 SQL 一律寫 T-SQL(`BIT` 用 `= 1`、`DATEPART(HOUR, x)`、字串型別寫長度、日期時間用 `DATETIME2` 而非 `TIMESTAMP`);
-  4. 表格式規格 → md 的整理範例在 `examples/sample/RETAIL_M1_spec.md`(原則:只寫核定規格有的、實作細節列「待補」不腦補、跨源不一致以核定規格為準);dbt + Jinja 的規則程式要先展開樣板才能執行——只引用 `source()` 的 model 會先展開成沙盒用的 SQL 再執行(見 docs/09「執行驗證」),其他含樣板的檔案回報「尚未支援」、交人工(不會誤判通過)。
+  4. 表格式規格 → md 的整理範例在 `examples/sample/RETAIL_M1_spec.md`(原則:只寫核定規格有的、實作細節列「待補」不腦補、跨源不一致以核定規格為準);dbt + Jinja 的規則程式要先展開樣板才能執行——引用 `source()` 與 `ref()` 的 model 會先展開成沙盒用的 SQL 再執行(見 docs/09「執行驗證」)。**有 `ref()` 的 model,「資料表定義」裡跟上游 model 同名的那張表代表的是上游 model 的輸出**:測資直接放進那張表,上游裡做的過濾、彙總不會被執行,所以規格的條件若是在上游做的,案例不符時記成待驗證(不判成 SQL 錯)。展開不了的檔案也記成待驗證、交人工(不會誤判通過)。
 - **換模型**:`config/models.yaml` 的 `roles.testgen` / `roles.arbiter` 各自指到任一 profile;小模型常產不出合法測資 JSON(症狀:「測資生成失敗」finding),把 testgen 指回大 profile 即可(README §10)。
 - **改 prompt**:`orchestrator/spec_exec.py` 的 `TESTGEN_SYSTEM`(測資契約)與 `ARBITER_SYSTEM`(仲裁原則);執行窗常數 `WIN_START/WIN_END` 也在檔頭。改 TESTGEN 的輸出形狀時,`_shape_check` 必須同步改——形狀檢查是契約的執行者。
 - **已知限制**:
@@ -315,7 +330,9 @@ mr = {"title": "調整報表", "files": [{"path": "sql/x.sql", "full_content": "
   - 命中判定是「有無輸出列」(`len(rows) > 0`),**通報粒度**(每帳戶每日至多 1 筆)與輸出欄位語意不在執行驗證範圍,靠靜態審查的 H002/規格核對把關。
   - 覆蓋是「LLM 拆出的條件」的覆蓋:若角色一漏拆某條件,形狀檢查看不出「本來該有第 N 條」——上限由 spec 條列品質決定,這也是需求項目要逐條原子化的原因。
   - 沙盒需要先啟動(`scripts/sandbox.sh start`,約 2GB 記憶體);沙盒未啟動時執行驗證一律判不通過(major、needs_human)。
-  - dbt 樣板(`{{ ref() }}`、`{{ var() }}`、macro)尚未展開:含樣板的程式會落在 `sql_error`,不會誤判通過。
+  - dbt 樣板展開不了(規格沒有同名的表、表名無法確定、用了不支援的寫法)時不送沙盒,記成待驗證「[執行驗證] dbt model 沒有展開」,原因另列一條 info;不會落在 `sql_error`,也不會誤判通過。上游 model 由測資代替時,上游自己的邏輯沒有執行(見 docs/09 已知限制)。
+    **評測裡的真實形狀 case(`mr_701`/`mr_702`)餵的是 compile 後的 SQL**,量的是什麼見 `eval/BASELINE.md` 第 12 節。
+  - **表名剝不乾淨的幾種記待驗證(`table_error`),不是判 SQL 錯**:不同庫/schema 的同名表、四段式(跨 linked server)、T-SQL tokenizer 還認不出的寫法、規格 DDL 漏了的表(靠沙盒的 208/911/7202 接住)。之後認不出的寫法一處一處補進 tokenizer 那一段。
 
 ## 結構化生成:規格的形狀分類
 
