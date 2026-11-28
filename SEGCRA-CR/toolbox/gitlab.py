@@ -156,10 +156,28 @@ def _as_changes(changes):
     return changes
 
 
+# 一行去掉行首空白後是 `/` 接英文字母:GitLab 會把它當成快捷指令(/approve、/merge、/label …)
+_QUICK_ACTION_LINE = re.compile(r"^([ \t]*)/(?=[A-Za-z])", re.MULTILINE)
+
+
+def defuse_quick_actions(text: str) -> str:
+    """留言內文裡會被 GitLab 當成快捷指令的行,在 `/` 前面加一個反斜線。
+
+    GitLab 對 MR 留言(不論用 API 建立或改寫)會先執行快捷指令再存,用的是留言帳號
+    (GITLAB_TOKEN)的權限。總結與行內意見裡接的是模型寫的文字,MR 內容只要讓模型另起一行
+    寫 `/approve` 或 `/merge`,就會用審查帳號執行。Markdown 把 `\\/` 顯示成 `/`,看的人看到的
+    內容不變。`/*` 這種 SQL 註解(`/` 後面不是英文字母)不受影響。"""
+    return _QUICK_ACTION_LINE.sub(r"\1\\/", text)
+
+
 def _api(method: str, path: str, **kwargs):
     import httpx
     check_gitlab_url()
     check_ssl_cert_file()
+    body = (kwargs.get("json") or {}).get("body") if isinstance(kwargs.get("json"), dict) else None
+    if method in ("POST", "PUT") and isinstance(body, str):
+        # 所有寫回 MR 的留言(總結、行內意見、一般留言、未完成通知、改寫)都經過這裡,只在這一處做
+        kwargs["json"] = {**kwargs["json"], "body": defuse_quick_actions(body)}
     r = httpx.request(
         method, f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}{path}",
         headers={"PRIVATE-TOKEN": GITLAB_TOKEN}, timeout=30, **kwargs)
@@ -831,13 +849,80 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
     return json.dumps({"ok": True}, ensure_ascii=False)
 
 
-def post_summary(mr_id: str, body: str, score: int, verdict: str) -> str:
-    """發布審查總結留言(總評 + 分數 + 結論)。
+# 總結留言裡的記號:重審時用它找回上一則、**原地改寫**,而不是再貼一則。同一個 MR 推五次
+# 就有五則總結的話,最新的結論被埋在中間,看 MR 的人得自己比時間;而且 GitLab 的通知也被
+# 洗掉。HTML 註解在 GitLab 的 markdown 上看不見。
+#
+# 審查未完成的通知用另一個記號:它會自己覆蓋自己(連續失敗不洗版),但不會蓋掉一份完整的
+# 審查報告——那份報告是看 MR 的人唯一能看到的結論。
+_SUMMARY_MARKERS = {"review": "<!-- segcra:review-summary -->",
+                    "incomplete": "<!-- segcra:review-incomplete -->"}
+
+
+def _summary_note_id(mr_id: str, marker: str) -> int | None:
+    """這個 MR 上我們自己貼的、帶著 `marker` 的那則留言的 id;沒有、或問不出來時回 None。
+
+    只認**審查自己貼的**:作者是 GITLAB_TOKEN 的帳號(`own_user_id()`)、不是系統留言、
+    記號在內文**開頭**。記號是一段看不見的文字,誰都打得出來:開發者留一則含記號的留言,
+    重審時報告就會寫進那則(之後他可以再改成任何內容,MR 上看起來卻是審查報告);模型
+    寫進 finding 的記號會用審查帳號貼成一般留言,所以作者對了還要看記號在不在開頭
+    (我們的總結開頭就是記號,finding 的留言開頭是檔名)。
+
+    查不到自己的帳號時當作沒有上一則。問不出來也當作沒有(改貼新的一則):多一則總結是
+    看得見的雜訊,總結完全沒貼上去是無聲失敗,後者嚴重得多。只看第一頁(最新的 100 則)。
+    """
+    try:
+        notes = _api("GET", f"/merge_requests/{mr_id}/notes",
+                     params={"per_page": 100, "order_by": "created_at", "sort": "desc"})
+    except Exception:                        # noqa: BLE001 — 問不出來就當作沒有
+        return None
+    candidates = [n for n in (notes if isinstance(notes, list) else [])
+                  if isinstance(n, dict) and n.get("system") is not True
+                  and isinstance(n.get("body"), str) and n["body"].startswith(marker)]
+    if not candidates:
+        return None
+    own = own_user_id()
+    if own is None:
+        # CI 與 demo.py 那條路沒有經過 webhook 啟動時的查詢,這裡才查(有候選才查,
+        # 沒有上一則時不多一個請求)
+        reason = learn_own_user()
+        own = own_user_id()
+        if own is None:
+            print(f"[gitlab] 查不到 GITLAB_TOKEN 的帳號({reason}),認不出哪一則是審查自己貼的,"
+                  "總結改貼新的一則", flush=True)
+            return None
+    for n in candidates:
+        author = n.get("author")
+        uid = author.get("id") if isinstance(author, dict) else None
+        if isinstance(uid, int) and not isinstance(uid, bool) and uid == own:
+            return n.get("id")
+    return None
+
+
+def post_summary(mr_id: str, body: str, score: int, verdict: str, kind: str = "review") -> str:
+    """發布審查總結留言(總評 + 分數 + 結論);同一個 MR 重審時改寫上一則,不再貼一則。
+
+    `kind` 決定改寫哪一則:`review` 是審查報告,`incomplete` 是審查未完成的通知
+    (見 `_SUMMARY_MARKERS`)。
 
     失敗時回 `{"ok": false, "failure": 種類}`(見 WRITE_FAILURES),**不重送**:逾時、5xx 時
-    GitLab 可能已經建立了留言、只是回應沒送到,再送同一份總結就出現兩次。"""
-    text = f"## 🤖 AI 審查報告\n\n**評分:{score}/100 — {verdict}**\n\n{body}"
+    GitLab 可能已經改寫/建立了留言、只是回應沒送到,再送一次就出現兩次。改寫被明確拒絕
+    (4xx,例如上一則被刪了)是例外:那時一定沒有改到,改貼新的一則才不會整份總結消失。"""
+    marker = _SUMMARY_MARKERS.get(kind)
+    if marker is None:
+        return json.dumps({"error": f"kind 必須是 {'/'.join(_SUMMARY_MARKERS)}"},
+                          ensure_ascii=False)
+    text = f"{marker}\n## 🤖 AI 審查報告\n\n**評分:{score}/100 — {verdict}**\n\n{body}"
     if REAL_MODE:
+        mr_id = _check_mr_id(mr_id)          # 會接進三個 API 路徑(列留言、改寫、新貼)
+        note_id = _summary_note_id(mr_id, marker)
+        if note_id is not None:
+            try:
+                _api("PUT", f"/merge_requests/{mr_id}/notes/{note_id}", json={"body": text})
+                return json.dumps({"ok": True}, ensure_ascii=False)
+            except Exception as e:           # noqa: BLE001 — 種類記下來,例外訊息不往外帶
+                if not _rejected_by_gitlab(e):
+                    return _write_failed(WRITE_UNCERTAIN)
         try:
             _api("POST", f"/merge_requests/{mr_id}/notes", json={"body": text})
         except Exception as e:               # noqa: BLE001 — 種類記下來,例外訊息不往外帶

@@ -7079,8 +7079,8 @@ MUTANTS.update({
  "取MR:MR 編號不對用一般的 ValueError": (G,
      '        raise InvalidMrId("MR 編號必須是數字")', '        raise ValueError("MR 編號必須是數字")'),
  "取MR:不先檢查 SSL_CERT_FILE": (G,
-     "    check_gitlab_url()" + NL + "    check_ssl_cert_file()" + NL + "    r = httpx.request(",
-     "    check_gitlab_url()" + NL + "    r = httpx.request("),
+     "    check_gitlab_url()" + NL + "    check_ssl_cert_file()" + NL + "    body = (kwargs.get(",
+     "    check_gitlab_url()" + NL + "    body = (kwargs.get("),
  "取MR:SSL_CERT_FILE 不存在不說": (G,
      "    if not os.path.exists(raw):" + NL + "        raise SslCertFileError(",
      "    if False:" + NL + "        raise SslCertFileError("),
@@ -7156,7 +7156,40 @@ MUTANTS.update({
         '        refs = {"base_sha": base_sha, "head_sha": head_sha,' + NL
         + '                                         "start_sha": start_sha}'),
     "回寫位置:不知道有沒有建立時照樣改貼": (G,
-        "            if not _rejected_by_gitlab(e):", "            if False:"),
+        "            if not _rejected_by_gitlab(e):" + NL
+        + "                return _write_failed(WRITE_UNCERTAIN)" + NL
+        + "            # 行號對不上 diff 時退成一般留言",
+        "            if False:" + NL + "                return _write_failed(WRITE_UNCERTAIN)" + NL
+        + "            # 行號對不上 diff 時退成一般留言"),
+    # ---- 一則總結改寫自己(部署端現場 S3):重審不再一則一則貼
+    "總結:重審再貼一則而不是改寫上一則": (G,
+        '                _api("PUT", f"/merge_requests/{mr_id}/notes/{note_id}", json={"body": text})' + NL
+        + '                return json.dumps({"ok": True}, ensure_ascii=False)',
+        '                pass'),
+    "總結:記號沒寫進留言(下次就找不到上一則)": (G,
+        r'text = f"{marker}\n## 🤖 AI 審查報告',
+        r'text = f"## 🤖 AI 審查報告'),
+    "總結:改寫被拒絕(上一則被刪了)就不補貼": (G,
+        "                if not _rejected_by_gitlab(e):" + NL
+        + "                    return _write_failed(WRITE_UNCERTAIN)",
+        "                return _write_failed(_failure_kind(e))"),
+    "總結:不知道有沒有改到時照樣再貼一則": (G,
+        "                if not _rejected_by_gitlab(e):" + NL
+        + "                    return _write_failed(WRITE_UNCERTAIN)",
+        "                if False:" + NL + "                    return _write_failed(WRITE_UNCERTAIN)"),
+    "總結:審查未完成的通知蓋掉審查報告": (G,
+        '_SUMMARY_MARKERS = {"review": "<!-- segcra:review-summary -->",' + NL
+        + '                    "incomplete": "<!-- segcra:review-incomplete -->"}',
+        '_SUMMARY_MARKERS = {"review": "<!-- segcra:review-summary -->",' + NL
+        + '                    "incomplete": "<!-- segcra:review-summary -->"}'),
+    "總結:找上一則時不看記號": (G,
+        '                  and isinstance(n.get("body"), str) and n["body"].startswith(marker)]',
+        '                  and isinstance(n.get("body"), str)]'),
+    "總結:問不出留言清單時當成改寫失敗": (G,
+        "    except Exception:                        # noqa: BLE001 — 問不出來就當作沒有" + NL
+        + "        return None",
+        "    except Exception:                        # noqa: BLE001 — 問不出來就當作沒有" + NL
+        + "        raise"),
     "回寫位置:拿不到位置時照樣開行內討論": (G,
         "        if not refs or not all(refs.values()):", "        if False:"),
     "回寫位置:每條自己重取 diff_refs": (P,
@@ -7390,8 +7423,10 @@ MUTANTS.update({
         '    report["_writeback"] = writeback' + NL + "    return report",
         "    return report"),
     "回寫結果:通知不看留言的結果": (W,
-        '        failure = gitlab.write_failure(gitlab.post_summary(str(mr_iid), body, 0, "審查未完成"))',
-        '        failure = None and gitlab.post_summary(str(mr_iid), body, 0, "審查未完成")'),
+        "        failure = gitlab.write_failure(gitlab.post_summary(" + NL
+        + '            str(mr_iid), body, 0, "審查未完成", kind="incomplete"))',
+        "        failure = None and gitlab.post_summary(" + NL
+        + '            str(mr_iid), body, 0, "審查未完成", kind="incomplete")'),
     "回寫結果:通知不看 commit status 的結果": (W,
         "        failure = gitlab.write_failure(gitlab.set_commit_status(",
         "        failure = None and (gitlab.set_commit_status("),
@@ -7594,6 +7629,41 @@ MUTANTS.update({
      + "        # 測試與評測會換上自己的假用戶端,不一定有 close();收尾失敗也不該讓一份",
      "    except BaseException:" + NL
      + "        # 測試與評測會換上自己的假用戶端,不一定有 close();收尾失敗也不該讓一份"),
+})
+
+
+
+# ---- 總結只改寫審查自己貼的那則(#155 review):作者是 GITLAB_TOKEN 的帳號、不是系統留言、記號在開頭
+MUTANTS.update({
+ '總結:不看作者(別人含記號的留言也改寫)': ("../toolbox/gitlab.py",
+     '        if isinstance(uid, int) and not isinstance(uid, bool) and uid == own:',
+     '        if True:'),
+ '總結:系統留言也算': ("../toolbox/gitlab.py",
+     '                  if isinstance(n, dict) and n.get("system") is not True',
+     '                  if isinstance(n, dict)'),
+ '總結:記號出現在任何位置都算': ("../toolbox/gitlab.py",
+     '                  and isinstance(n.get("body"), str) and n["body"].startswith(marker)]',
+     '                  and isinstance(n.get("body"), str) and marker in n["body"]]'),
+ '總結:查不到自己的帳號時照樣改寫第一則': ("../toolbox/gitlab.py",
+     '                  "總結改貼新的一則", flush=True)' + NL + '            return None',
+     '                  "總結改貼新的一則", flush=True)' + NL + '            return candidates[0].get("id")'),
+})
+
+
+# ---- 寫回 MR 的留言不能被 GitLab 當成快捷指令執行(#155 review 要修的 2)
+MUTANTS.update({
+ '快捷指令:送出前不處理': ("../toolbox/gitlab.py",
+     '        kwargs["json"] = {**kwargs["json"], "body": defuse_quick_actions(body)}',
+     '        pass'),
+ '快捷指令:行首有空白的不處理': ("../toolbox/gitlab.py",
+     '_QUICK_ACTION_LINE = re.compile(r"^([ \\t]*)/(?=[A-Za-z])", re.MULTILINE)',
+     '_QUICK_ACTION_LINE = re.compile(r"^()/(?=[A-Za-z])", re.MULTILINE)'),
+ '快捷指令:改寫留言(PUT)不處理': ("../toolbox/gitlab.py",
+     '    if method in ("POST", "PUT") and isinstance(body, str):',
+     '    if method == "POST" and isinstance(body, str):'),
+ '快捷指令:/* 註解也被改': ("../toolbox/gitlab.py",
+     '_QUICK_ACTION_LINE = re.compile(r"^([ \\t]*)/(?=[A-Za-z])", re.MULTILINE)',
+     '_QUICK_ACTION_LINE = re.compile(r"^([ \\t]*)/(?=\\S)", re.MULTILINE)'),
 })
 
 

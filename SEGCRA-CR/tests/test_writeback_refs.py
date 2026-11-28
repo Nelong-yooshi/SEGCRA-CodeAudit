@@ -14,6 +14,7 @@ GitLab 的回應用替換 `httpx.request` 模擬(位址用 .invalid,token 用測
 """
 import asyncio
 import json
+import re
 
 import httpx
 import pytest
@@ -26,16 +27,22 @@ REFS = {"base_sha": BASE, "head_sha": HEAD, "start_sha": START}
 SECRET = "ZZ_HOST_192.0.2.10:443_ZZ"
 
 
+OWN_ID = 42          # 測試裡 GITLAB_TOKEN 的帳號 id
+
+
 class FakeGitLab:
     """記下每個請求;`discussions` 決定開行內討論時怎麼回:狀態碼,或要丟的例外。
     `notes`、`label`、`status` 同樣;給清單時依序取用(最後一個重複用),模擬「失敗後重送成功」。"""
 
     def __init__(self, discussions=201, mr_status=200, diff_refs=REFS, notes=201,
-                 label=200, status=201):
+                 label=200, status=201, existing_notes=None, edit=200):
         self.calls = []
+        self.sent = []                  # (method, path, json body):驗留言內容
         self.discussions, self.mr_status, self.diff_refs, self.notes = (
             discussions, mr_status, diff_refs, notes)
         self.label, self.status = label, status
+        # existing_notes:列留言時回的清單(None = 回 404,模擬問不出來);edit:改寫留言的回應
+        self.existing_notes, self.edit = existing_notes, edit
 
     @staticmethod
     def _reply(spec, req, n):
@@ -47,7 +54,16 @@ class FakeGitLab:
     def __call__(self, method, url, **kw):
         path = url.split("/api/v4/projects/1", 1)[1]
         self.calls.append((method, path))
+        self.sent.append((method, path, kw.get("json")))
         req = httpx.Request(method, url)
+        if method == "GET" and path.startswith("/merge_requests/7/notes"):
+            if self.existing_notes is None:
+                return httpx.Response(404, json={}, request=req)
+            return httpx.Response(200, json=self.existing_notes, request=req)
+        if method == "PUT" and "/notes/" in path:
+            if isinstance(self.edit, Exception):
+                raise self.edit
+            return httpx.Response(self.edit, json={"id": 1}, request=req)
         if method == "GET" and path == "/merge_requests/7":
             return httpx.Response(self.mr_status, json={"sha": HEAD, "diff_refs": self.diff_refs},
                                   request=req)
@@ -76,6 +92,8 @@ def real(monkeypatch):
     monkeypatch.setattr(gitlab, "GITLAB_TOKEN", "test-write-token")
 
     monkeypatch.setattr(gitlab, "RETRY_DELAY_SECONDS", 0)
+    # GITLAB_TOKEN 的帳號:總結只改寫這個帳號貼的那則
+    monkeypatch.setattr(gitlab, "_own_user", {"id": OWN_ID, "username": "segcra-bot"})
 
     def install(fake):
         monkeypatch.setattr(httpx, "request", fake)
@@ -298,6 +316,152 @@ def test_總結貼上了(real):
     assert fake.count("POST", "/notes") == 1
 
 
+# ─────────────────── 一則總結改寫自己(重審不洗版) ───────────────────
+#
+# 同一個 MR 推五次就有五則總結的話,最新的結論被埋在中間,看 MR 的人得自己比時間。
+# 總結留言裡放一個 HTML 註解當記號,重審時找回上一則、原地改寫。
+
+REVIEW_MARKER = gitlab._SUMMARY_MARKERS["review"]
+INCOMPLETE_MARKER = gitlab._SUMMARY_MARKERS["incomplete"]
+
+
+def _edited(fake):
+    """改寫過的留言:[(note_id, 內文)]。"""
+    return [(p.rsplit("/", 1)[1], (j or {}).get("body", ""))
+            for m, p, j in fake.sent if m == "PUT" and "/notes/" in p]
+
+
+def _posted_notes(fake):
+    return [(j or {}).get("body", "") for m, p, j in fake.sent
+            if m == "POST" and p.endswith("/notes")]
+
+
+def test_總結留言帶著記號_下次才找得回來(real):
+    fake = real(FakeGitLab(existing_notes=[]))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert _posted_notes(fake) == [f"{REVIEW_MARKER}\n## 🤖 AI 審查報告\n\n"
+                                   "**評分:80/100 — ok**\n\n內容"]
+
+
+def test_重審改寫上一則_不再貼一則(real):
+    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": f"{REVIEW_MARKER}\n舊的結論", "author": {"id": OWN_ID}}]))
+    assert json.loads(gitlab.post_summary("7", "新的結論", 70, "needs_changes")) == {"ok": True}
+    assert len(_edited(fake)) == 1 and _edited(fake)[0][0] == "55"
+    assert "新的結論" in _edited(fake)[0][1] and REVIEW_MARKER in _edited(fake)[0][1]
+    assert _posted_notes(fake) == [], "改寫成功就不該再貼一則"
+
+
+def test_只改寫我們自己貼的那則(real):
+    """沒有記號的留言是別人的 —— 人的留言被我們改掉是最糟的失敗。"""
+    fake = real(FakeGitLab(existing_notes=[{"id": 9, "body": "麻煩看一下這段"}]))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert _edited(fake) == [] and len(_posted_notes(fake)) == 1
+
+
+def test_別人留的含記號留言不會被改寫(real):
+    """記號誰都打得出來:開發者留一則含記號的留言,重審時報告不能寫進那則。"""
+    fake = real(FakeGitLab(existing_notes=[
+        {"id": 9, "body": f"{REVIEW_MARKER}\n我自己寫的", "author": {"id": 7}}]))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert _edited(fake) == [] and len(_posted_notes(fake)) == 1
+
+
+def test_系統留言不算上一則(real):
+    fake = real(FakeGitLab(existing_notes=[
+        {"id": 9, "body": REVIEW_MARKER, "author": {"id": OWN_ID}, "system": True}]))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert _edited(fake) == [] and len(_posted_notes(fake)) == 1
+
+
+def test_記號不在開頭的不算上一則_模型寫進_finding_的記號改不到(real):
+    """模型寫的 finding 會用審查帳號貼成一般留言(開頭是檔名);它內文帶記號時,下一次
+    改寫的仍然是上一則總結,不是那條 finding。"""
+    fake = real(FakeGitLab(existing_notes=[
+        {"id": 70, "body": f"`sql/a.sql`(無對應行號)\n\n**[major]** 說明 {REVIEW_MARKER}",
+         "author": {"id": OWN_ID}},
+        {"id": 55, "body": f"{REVIEW_MARKER}\n上一則總結", "author": {"id": OWN_ID}}]))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert [i for i, _ in _edited(fake)] == ["55"]
+
+
+def test_查不到自己的帳號時當作沒有上一則(real, monkeypatch, capsys):
+    monkeypatch.setattr(gitlab, "_own_user", None)
+    monkeypatch.setattr(gitlab, "learn_own_user", lambda: "GET /user 回 401:GITLAB_TOKEN 被拒絕")
+    fake = real(FakeGitLab(existing_notes=[
+        {"id": 55, "body": REVIEW_MARKER, "author": {"id": OWN_ID}}]))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert _edited(fake) == [] and len(_posted_notes(fake)) == 1
+    assert "查不到 GITLAB_TOKEN 的帳號" in capsys.readouterr().out
+
+
+def test_帳號還沒查過時_有候選才查一次(real, monkeypatch):
+    """CI 與 demo.py 那條路沒有經過 webhook 啟動時的查詢。"""
+    monkeypatch.setattr(gitlab, "_own_user", None)
+    asked = []
+
+    def learn():
+        asked.append(1)
+        gitlab._own_user = {"id": OWN_ID, "username": "segcra-bot"}
+        return None
+    monkeypatch.setattr(gitlab, "learn_own_user", learn)
+    fake = real(FakeGitLab(existing_notes=[
+        {"id": 55, "body": REVIEW_MARKER, "author": {"id": OWN_ID}}]))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert asked == [1] and [i for i, _ in _edited(fake)] == ["55"]
+    asked.clear()
+    real(FakeGitLab(existing_notes=[]))
+    gitlab._own_user = None
+    gitlab.post_summary("7", "內容", 80, "ok")
+    assert asked == [], "沒有上一則時不多查一次帳號"
+
+
+def test_上一則被刪掉時改貼新的一則(real):
+    """改寫被明確拒絕(4xx):一定沒有改到,補貼才不會整份總結消失。"""
+    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": REVIEW_MARKER, "author": {"id": OWN_ID}}], edit=404))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert len(_edited(fake)) == 1 and len(_posted_notes(fake)) == 1
+
+
+@pytest.mark.parametrize("failure", _UNCERTAIN)
+def test_不知道有沒有改到就不補貼(real, failure):
+    """逾時、5xx:GitLab 可能已經改好了,只是回應沒送到。補貼會變成兩則。"""
+    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": REVIEW_MARKER, "author": {"id": OWN_ID}}], edit=failure))
+    out = gitlab.post_summary("7", "內容", 80, "ok")
+    assert json.loads(out) == {"ok": False, "failure": "uncertain"}
+    assert _posted_notes(fake) == [] and SECRET not in out
+
+
+def test_問不出留言清單就貼新的一則(real):
+    """多一則總結是看得見的雜訊;總結完全沒貼上去是無聲失敗,後者嚴重得多。"""
+    fake = real(FakeGitLab(existing_notes=None))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert _edited(fake) == [] and len(_posted_notes(fake)) == 1
+
+
+def test_審查未完成的通知不蓋掉審查報告(real):
+    """那份報告是看 MR 的人唯一看得到的結論,不可以被「審查未完成」取代。"""
+    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": f"{REVIEW_MARKER}\n完整的報告", "author": {"id": OWN_ID}}]))
+    assert json.loads(gitlab.post_summary("7", "逾時", 0, "審查未完成",
+                                          kind="incomplete")) == {"ok": True}
+    assert _edited(fake) == []
+    assert len(_posted_notes(fake)) == 1 and INCOMPLETE_MARKER in _posted_notes(fake)[0]
+
+
+def test_未完成的通知改寫自己那一則(real):
+    """連續失敗也不洗版。"""
+    fake = real(FakeGitLab(existing_notes=[{"id": 60, "body": f"{INCOMPLETE_MARKER}\n上次失敗", "author": {"id": OWN_ID}}]))
+    assert json.loads(gitlab.post_summary("7", "逾時", 0, "審查未完成",
+                                          kind="incomplete")) == {"ok": True}
+    assert len(_edited(fake)) == 1 and _edited(fake)[0][0] == "60"
+    assert _posted_notes(fake) == []
+
+
+def test_不認得的種類不打任何請求(real):
+    fake = real(FakeGitLab(existing_notes=[]))
+    assert "kind" in json.loads(gitlab.post_summary("7", "內容", 80, "ok", kind="別的"))["error"]
+    assert fake.calls == []
+
+
 @pytest.mark.parametrize("failure", _UNCERTAIN)
 def test_標籤失敗重送一次(real, failure):
     fake = real(FakeGitLab(label=[failure, 200]))
@@ -472,8 +636,9 @@ def _notify(monkeypatch, summary, status, head_sha=None, refs=None):
     import scripts.webhook_server as ws
     calls = []
 
-    def post_summary(*a):
-        calls.append("post_summary")
+    def post_summary(*a, **k):
+        # kind:未完成的通知改寫自己那一則,不會蓋掉已經貼上的審查報告
+        calls.append(("post_summary", k.get("kind")))
         if isinstance(summary, Exception):
             raise summary
         return summary
@@ -504,13 +669,14 @@ _OK = json.dumps({"ok": True})
 def test_通知_兩步都寫上(monkeypatch, capsys):
     calls = _notify(monkeypatch, _OK, _OK, head_sha=HEAD)
     out = capsys.readouterr().out
-    assert calls == ["post_summary", ("set_commit_status", HEAD)]
+    assert calls == [("post_summary", "incomplete"), ("set_commit_status", HEAD)]
     assert "已留言告知審查未完成" in out and "commit status 設為失敗" in out
 
 
 def test_通知_沒有_sha_時只取_MR_的位置(monkeypatch):
     calls = _notify(monkeypatch, _OK, _OK)
-    assert calls == ["post_summary", "get_mr_refs", ("set_commit_status", HEAD)]
+    assert calls == [("post_summary", "incomplete"), "get_mr_refs",
+                     ("set_commit_status", HEAD)]
 
 
 @pytest.mark.parametrize("status", [
@@ -532,3 +698,59 @@ def test_通知_留言沒貼上時照樣設_commit_status_不印例外訊息(mon
     out = capsys.readouterr().out
     assert ("set_commit_status", HEAD) in calls
     assert "留言沒有貼上" in out and "已留言" not in out and SECRET not in out
+
+
+# ───────── 模型寫的字不能被 GitLab 當成快捷指令執行(#155 review 要修的 2) ─────────
+# GitLab 對 MR 留言(建立或改寫)會先執行快捷指令(/approve、/merge、/label …,自己一行就算)
+# 再存,用的是 GITLAB_TOKEN 帳號的權限;總結與行內意見裡接的是模型寫的文字。
+
+_COMMAND_LINE = re.compile(r"^[ \t]*/[A-Za-z]", re.MULTILINE)
+
+
+def _bodies(fake):
+    return [(j or {}).get("body", "") for m, p, j in fake.sent
+            if m in ("POST", "PUT") and isinstance((j or {}).get("body"), str)]
+
+
+_FINDING = {"title": "/approve", "detail": "說明\n/merge\n  /label ~test",
+            "suggestion": "/unassign", "citations": []}
+
+
+def test_總結裡模型寫的快捷指令不會送出(real):
+    fake = real(FakeGitLab(existing_notes=[]))
+    gitlab.post_summary("7", "總評\n/approve\n /merge", 80, "ok")
+    assert _bodies(fake) and not any(_COMMAND_LINE.search(b) for b in _bodies(fake)), _bodies(fake)
+
+
+def test_改寫總結時也處理(real):
+    fake = real(FakeGitLab(existing_notes=[
+        {"id": 55, "body": REVIEW_MARKER, "author": {"id": OWN_ID}}]))
+    gitlab.post_summary("7", "/approve", 80, "ok")
+    assert _edited(fake) and not _COMMAND_LINE.search(_edited(fake)[0][1])
+
+
+@pytest.mark.parametrize("line", [3, 0], ids=["行內討論", "沒有行號的一般留言"])
+def test_行內意見的標題_說明_建議裡的快捷指令不會送出(real, line):
+    fake = real(FakeGitLab())
+    _post(line=line, body=pipeline._format_comment(_FINDING), **REFS)
+    bodies = _bodies(fake)
+    assert bodies and not any(_COMMAND_LINE.search(b) for b in bodies), bodies
+
+
+def test_行內討論被拒絕_退成一般留言時也處理(real):
+    fake = real(FakeGitLab(discussions=400))
+    _post(body=pipeline._format_comment(_FINDING), **REFS)
+    assert len(_bodies(fake)) == 2 and not any(_COMMAND_LINE.search(b) for b in _bodies(fake))
+
+
+def test_一般留言也處理(real):
+    fake = real(FakeGitLab())
+    gitlab.post_note("7", "審查未完成\n/approve")
+    assert _bodies(fake) and not _COMMAND_LINE.search(_bodies(fake)[0])
+
+
+def test_處理之後看的人看到的內容不變_SQL_註解不動():
+    text = "說明\n/approve\n  /merge 之後\n/* 註解 */\nSELECT 1 -- a/b\n路徑 /tmp/x"
+    out = gitlab.defuse_quick_actions(text)
+    assert out == "說明\n\\/approve\n  \\/merge 之後\n/* 註解 */\nSELECT 1 -- a/b\n路徑 /tmp/x"
+    assert not _COMMAND_LINE.search(out)
