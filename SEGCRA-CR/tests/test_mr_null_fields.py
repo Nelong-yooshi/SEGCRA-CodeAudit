@@ -108,7 +108,7 @@ def test_MR_內容的檔名只有一份定義():
     hits = [(p.name, n) for p in sorted(src.glob("*.py"))
             for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1)
             if '"(MR 內容)"' in line]
-    assert hits == [("text_fields.py", 10)], hits
+    assert [name for name, _ in hits] == ["text_fields.py"], hits
 
 
 # ─────────────────── 5. 模型的一條不能換掉程式補的「審查未完整」 ───────────────────

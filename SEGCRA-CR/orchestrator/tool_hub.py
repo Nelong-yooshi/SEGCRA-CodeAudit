@@ -30,6 +30,7 @@ from toolbox import gitlab, memory, sqltools
 from .error_text import error_label
 from .isolation import run_in_thread
 from .security import scan_mr
+from .text_fields import strip_hidden
 
 # 工具組:group 名 → 該組要暴露的函式(全名 = f"{group}__{fn.__name__}")
 TOOL_GROUPS = {
@@ -338,16 +339,20 @@ class ToolHub:
 
     @staticmethod
     def _without_hidden_keys(result: str) -> str:
-        """get_mr_diff 的結果拿掉不交給模型的欄位(MODEL_HIDDEN_MR_KEYS:分支名稱)。不是 JSON 物件
+        """get_mr_diff 的結果拿掉不交給模型的欄位(MODEL_HIDDEN_MR_KEYS:分支名稱)與說明裡畫面上
+        看不到的部分(text_fields.strip_hidden)。不是 JSON 物件
         (錯誤訊息)時照原樣。"""
         try:
             mr = json.loads(result)
         except (TypeError, ValueError):
             return result
-        if not isinstance(mr, dict) or not any(k in mr for k in MODEL_HIDDEN_MR_KEYS):
+        if not isinstance(mr, dict):
             return result
-        return json.dumps({k: v for k, v in mr.items() if k not in MODEL_HIDDEN_MR_KEYS},
-                          ensure_ascii=False)
+        view = {k: v for k, v in mr.items() if k not in MODEL_HIDDEN_MR_KEYS}
+        # 說明裡畫面上看不到的部分(HTML 註解、連結定義行)跟主審查的 prompt 一樣拿掉
+        if "description" in view:
+            view["description"] = strip_hidden(view["description"])[0]
+        return json.dumps(view, ensure_ascii=False)
 
     @staticmethod
     async def _invoke(full_name: str, fn, args: dict):
