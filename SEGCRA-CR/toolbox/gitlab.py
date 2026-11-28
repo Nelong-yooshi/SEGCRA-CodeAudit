@@ -119,10 +119,28 @@ def _as_changes(changes):
     return changes
 
 
+# 一行去掉行首空白後是 `/` 接英文字母:GitLab 會把它當成快捷指令(/approve、/merge、/label …)
+_QUICK_ACTION_LINE = re.compile(r"^([ \t]*)/(?=[A-Za-z])", re.MULTILINE)
+
+
+def defuse_quick_actions(text: str) -> str:
+    """留言內文裡會被 GitLab 當成快捷指令的行,在 `/` 前面加一個反斜線。
+
+    GitLab 對 MR 留言(不論用 API 建立或改寫)會先執行快捷指令再存,用的是留言帳號
+    (GITLAB_TOKEN)的權限。總結與行內意見裡接的是模型寫的文字,MR 內容只要讓模型另起一行
+    寫 `/approve` 或 `/merge`,就會用審查帳號執行。Markdown 把 `\\/` 顯示成 `/`,看的人看到的
+    內容不變。`/*` 這種 SQL 註解(`/` 後面不是英文字母)不受影響。"""
+    return _QUICK_ACTION_LINE.sub(r"\1\\/", text)
+
+
 def _api(method: str, path: str, **kwargs):
     import httpx
     check_gitlab_url()
     check_ssl_cert_file()
+    body = (kwargs.get("json") or {}).get("body") if isinstance(kwargs.get("json"), dict) else None
+    if method in ("POST", "PUT") and isinstance(body, str):
+        # 所有寫回 MR 的留言(總結、行內意見、一般留言、未完成通知、改寫)都經過這裡,只在這一處做
+        kwargs["json"] = {**kwargs["json"], "body": defuse_quick_actions(body)}
     r = httpx.request(
         method, f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}{path}",
         headers={"PRIVATE-TOKEN": GITLAB_TOKEN}, timeout=30, **kwargs)

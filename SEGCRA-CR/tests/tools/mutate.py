@@ -6726,8 +6726,8 @@ MUTANTS.update({
  "取MR:MR 編號不對用一般的 ValueError": (G,
      '        raise InvalidMrId("MR 編號必須是數字")', '        raise ValueError("MR 編號必須是數字")'),
  "取MR:不先檢查 SSL_CERT_FILE": (G,
-     "    check_gitlab_url()" + NL + "    check_ssl_cert_file()" + NL + "    r = httpx.request(",
-     "    check_gitlab_url()" + NL + "    r = httpx.request("),
+     "    check_gitlab_url()" + NL + "    check_ssl_cert_file()" + NL + "    body = (kwargs.get(",
+     "    check_gitlab_url()" + NL + "    body = (kwargs.get("),
  "取MR:SSL_CERT_FILE 不存在不說": (G,
      "    if not os.path.exists(raw):" + NL + "        raise SslCertFileError(",
      "    if False:" + NL + "        raise SslCertFileError("),
@@ -7151,6 +7151,23 @@ MUTANTS.update({
  '總結:查不到自己的帳號時照樣改寫第一則': ("../toolbox/gitlab.py",
      '                  "總結改貼新的一則", flush=True)' + NL + '            return None',
      '                  "總結改貼新的一則", flush=True)' + NL + '            return candidates[0].get("id")'),
+})
+
+
+# ---- 寫回 MR 的留言不能被 GitLab 當成快捷指令執行(#155 review 要修的 2)
+MUTANTS.update({
+ '快捷指令:送出前不處理': ("../toolbox/gitlab.py",
+     '        kwargs["json"] = {**kwargs["json"], "body": defuse_quick_actions(body)}',
+     '        pass'),
+ '快捷指令:行首有空白的不處理': ("../toolbox/gitlab.py",
+     '_QUICK_ACTION_LINE = re.compile(r"^([ \\t]*)/(?=[A-Za-z])", re.MULTILINE)',
+     '_QUICK_ACTION_LINE = re.compile(r"^()/(?=[A-Za-z])", re.MULTILINE)'),
+ '快捷指令:改寫留言(PUT)不處理': ("../toolbox/gitlab.py",
+     '    if method in ("POST", "PUT") and isinstance(body, str):',
+     '    if method == "POST" and isinstance(body, str):'),
+ '快捷指令:/* 註解也被改': ("../toolbox/gitlab.py",
+     '_QUICK_ACTION_LINE = re.compile(r"^([ \\t]*)/(?=[A-Za-z])", re.MULTILINE)',
+     '_QUICK_ACTION_LINE = re.compile(r"^([ \\t]*)/(?=\\S)", re.MULTILINE)'),
 })
 
 if __name__ == "__main__":

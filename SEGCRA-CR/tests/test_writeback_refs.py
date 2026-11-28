@@ -14,6 +14,7 @@ GitLab 的回應用替換 `httpx.request` 模擬(位址用 .invalid,token 用測
 """
 import asyncio
 import json
+import re
 
 import httpx
 import pytest
@@ -697,3 +698,59 @@ def test_通知_留言沒貼上時照樣設_commit_status_不印例外訊息(mon
     out = capsys.readouterr().out
     assert ("set_commit_status", HEAD) in calls
     assert "留言沒有貼上" in out and "已留言" not in out and SECRET not in out
+
+
+# ───────── 模型寫的字不能被 GitLab 當成快捷指令執行(#155 review 要修的 2) ─────────
+# GitLab 對 MR 留言(建立或改寫)會先執行快捷指令(/approve、/merge、/label …,自己一行就算)
+# 再存,用的是 GITLAB_TOKEN 帳號的權限;總結與行內意見裡接的是模型寫的文字。
+
+_COMMAND_LINE = re.compile(r"^[ \t]*/[A-Za-z]", re.MULTILINE)
+
+
+def _bodies(fake):
+    return [(j or {}).get("body", "") for m, p, j in fake.sent
+            if m in ("POST", "PUT") and isinstance((j or {}).get("body"), str)]
+
+
+_FINDING = {"title": "/approve", "detail": "說明\n/merge\n  /label ~test",
+            "suggestion": "/unassign", "citations": []}
+
+
+def test_總結裡模型寫的快捷指令不會送出(real):
+    fake = real(FakeGitLab(existing_notes=[]))
+    gitlab.post_summary("7", "總評\n/approve\n /merge", 80, "ok")
+    assert _bodies(fake) and not any(_COMMAND_LINE.search(b) for b in _bodies(fake)), _bodies(fake)
+
+
+def test_改寫總結時也處理(real):
+    fake = real(FakeGitLab(existing_notes=[
+        {"id": 55, "body": REVIEW_MARKER, "author": {"id": OWN_ID}}]))
+    gitlab.post_summary("7", "/approve", 80, "ok")
+    assert _edited(fake) and not _COMMAND_LINE.search(_edited(fake)[0][1])
+
+
+@pytest.mark.parametrize("line", [3, 0], ids=["行內討論", "沒有行號的一般留言"])
+def test_行內意見的標題_說明_建議裡的快捷指令不會送出(real, line):
+    fake = real(FakeGitLab())
+    _post(line=line, body=pipeline._format_comment(_FINDING), **REFS)
+    bodies = _bodies(fake)
+    assert bodies and not any(_COMMAND_LINE.search(b) for b in bodies), bodies
+
+
+def test_行內討論被拒絕_退成一般留言時也處理(real):
+    fake = real(FakeGitLab(discussions=400))
+    _post(body=pipeline._format_comment(_FINDING), **REFS)
+    assert len(_bodies(fake)) == 2 and not any(_COMMAND_LINE.search(b) for b in _bodies(fake))
+
+
+def test_一般留言也處理(real):
+    fake = real(FakeGitLab())
+    gitlab.post_note("7", "審查未完成\n/approve")
+    assert _bodies(fake) and not _COMMAND_LINE.search(_bodies(fake)[0])
+
+
+def test_處理之後看的人看到的內容不變_SQL_註解不動():
+    text = "說明\n/approve\n  /merge 之後\n/* 註解 */\nSELECT 1 -- a/b\n路徑 /tmp/x"
+    out = gitlab.defuse_quick_actions(text)
+    assert out == "說明\n\\/approve\n  \\/merge 之後\n/* 註解 */\nSELECT 1 -- a/b\n路徑 /tmp/x"
+    assert not _COMMAND_LINE.search(out)
