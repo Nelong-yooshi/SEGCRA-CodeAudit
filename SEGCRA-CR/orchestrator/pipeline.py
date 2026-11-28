@@ -55,7 +55,7 @@ from .tool_hub import REFUSED_OTHER_MR, REFUSED_OTHER_REF, ToolHub
 from toolbox.sqltools import LINT_INCOMPLETE_CODE, LINT_MAX_CHARS, LINT_TIMEOUT_SECONDS
 from toolbox.sqltools import run_rules, run_rules_on_template
 from toolbox.sqltools import DIALECT, parse_statements, parsed_chunks
-from .text_fields import MR_CONTENT_FILE, as_text
+from .text_fields import MR_CONTENT_FILE, as_text, strip_hidden
 
 SYSTEM_TEMPLATE = """你是資深資料庫工程主管,負責審查 SQL merge request。\
 你的審查將直接決定 MR 能否合入,必須精準、可回溯、給得出修改建議。
@@ -2062,6 +2062,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 回 null;不論 MR 從哪裡來(mock、評測),不是字串的都換成空字串
         for key in ("title", "description"):
             mr[key] = as_text(mr.get(key))
+        # 說明裡畫面上看不到的部分(HTML 註解、連結定義行)不交給審查模型;注入掃描與冷讀看原文
+        model_description, hidden_parts = strip_hidden(mr["description"])
 
         # 把這次審查釘在 MR 的 head commit 上:之後 get_file 不指定 ref 時讀的就是
         # 「正在審的那一版」,而不是目標分支的現況(目標分支讀到的是**改之前**的
@@ -2217,7 +2219,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         full_text = _step(report_stub, "完整內容段落", _full_text_section, "",
                           code_files, dbt_ctx, cfg.budget.get("full_content", 6000))
         user = USER_TEMPLATE.format(
-            title=mr["title"], description=mr.get("description", ""),
+            title=mr["title"], description=model_description,
             diff_section=build_diff_section(code_files, cfg.budget["diff"]) + full_text,
             prescan=json.dumps(pre, ensure_ascii=False),
             spec_section=spec_section + spec_changes,
@@ -2305,6 +2307,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                 {"category": h.get("category"), "source": "tool"} for h in tool_hits]
         report = enforce_injection(report, tool_hits, source="tool")
         report = enforce_tool_reads(report, hub.refused_reads, hub.scan_failures)  # 範圍外、沒掃完的讀取
+        report = enforce_hidden_description(report, hidden_parts)  # 說明裡看不到的部分沒給模型
         _log_withheld_history(mr_id, hub.withheld_history)  # 判例不是這次 MR 的,不進報告
 
         # 執行驗證(必跑;測資生成 → 沙盒執行 → 仲裁)——在 rubric 之前。
@@ -4445,6 +4448,27 @@ def enforce_tool_reads(report: dict, refused: list[str], scan_failures: list[dic
             "detail": ("審查模型" + "、".join(reasons) + ",已被拒絕、沒有讀到,不影響這次的結果。"
                        "讀取範圍是這次審查的 MR、這次 MR 的版本與目標分支。"),
             "suggestion": "MR 的說明若引用了別的 MR 或別的版本,審查只依這次 MR 的內容判斷。",
+            "citations": []})
+    return report
+
+
+_HIDDEN_DESCRIPTION_TITLE = "MR 說明有畫面上看不到的內容,沒有交給審查模型"
+
+
+@_isolated_stage("說明隱藏內容揭露")
+def enforce_hidden_description(report: dict, hidden_parts: int) -> dict:
+    """MR 說明裡 GitLab 畫面上看不到的部分(HTML 註解、Markdown 的連結定義行)沒有交給主審查與
+    `get_mr_diff`(text_fields.strip_hidden),在這裡讓審核者知道有這些內容。
+
+    **info**,不影響決策:GitLab 的說明範本本來就常有 `<!-- 請填寫… -->`。內容本身照樣經過注入掃描
+    (命中就 blocked)與冷讀(看的是原文)。不寫被拿掉的原文:那是 MR 作者寫的、會貼回 MR 留言。"""
+    if hidden_parts:
+        _put_program_finding(report, {
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "info",
+            "title": _HIDDEN_DESCRIPTION_TITLE,
+            "detail": (f"MR 說明有 {hidden_parts} 段 GitLab 畫面上不顯示的內容(HTML 註解 `<!-- -->` 或"
+                       "連結定義行),審查模型沒有看到;注入掃描與冷讀照樣檢查了原文。"),
+            "suggestion": "要給審核者看的說明請寫成看得到的文字;用「編輯」打開說明可以看到這些內容。",
             "citations": []})
     return report
 

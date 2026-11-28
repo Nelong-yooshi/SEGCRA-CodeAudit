@@ -107,6 +107,8 @@
 
 ### Prompt 組裝(`orchestrator/pipeline.py`:`SYSTEM_TEMPLATE`、`USER_TEMPLATE`、`build_diff_section`)
 
+**user prompt** 的「描述」是拿掉畫面上看不到的部分(HTML 註解、連結定義行)之後的說明,`get_mr_diff` 交給模型的也一樣(見 04 篇 enforce_hidden_description);冷讀與注入掃描看原文。
+
 **system prompt**(`SYSTEM_TEMPLATE`)段落:
 
 1. 角色設定:資深資料庫工程主管,審查直接決定 MR 能否合入。
