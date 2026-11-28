@@ -137,8 +137,10 @@
      在屬性檔出現兩次、明寫 null / None 想蓋掉上層設的值(dbt 是清掉還是保留沒有逐一查證)、
      Python model(內容不讀)、macro 裡呼叫的 `config()`(作用在呼叫它的
      model 上,看不出是哪些,整個專案都無法確定)、看不懂的屬性檔(裡面可能就有某個 model 的
-     alias,整個專案都無法確定);屬性檔與 `dbt_project.yml` 的 `seeds:` / `snapshots:` 區段
-     有表名設定時同樣無法確定。有這類設定就保留提醒
+     alias,整個專案都無法確定);屬性檔與 `dbt_project.yml` 的 `seeds:` 區段、屬性檔的 `snapshots:`
+     有表名設定時同樣無法確定(`dbt_project.yml` 的 `snapshots:` 區段的 alias / schema / database
+     不算:snapshot 本來就一律無法確定,這幾個設定只改得到 snapshot 自己;停用與 ephemeral
+     照樣算)。有這類設定就保留提醒
    - **呼叫端提供的名稱(seed / snapshot / Python model)只代表存在,表名一律無法確定**
      (#19 review):只有名稱、看不到內容,而 snapshot 的 `target_schema`、Python model 的
      `dbt.config()` 都寫在內容裡。`ref()` 得到名單上沒有的名稱時照樣判成不存在
@@ -272,8 +274,69 @@ CREATE To」的輸出(可以包在 ```sql 圍欄裡,也可以不包)。新增或
 沒採用的表照舊沒有定義,執行驗證跟以前一樣回報(例如測資建不起來),不會猜。dbt 關閉時不讀
 `specs/tables/`。
 
-**限制**:`ref()` 的上游 model 輸出表是 dbt 建的,部署端不會手寫 CREATE,這一節幫不上;沒有更新的表定義
-(表改了、檔案沒改)程式看不出來。
+**限制**:沒有更新的表定義(表改了、檔案沒改)程式看不出來。`ref()` 的上游 model 與 snapshot 不用寫在這裡,
+見下一節。
+
+### 上游 model 與 snapshot 的表結構沿 `ref()` 推出(`orchestrator/upstream_tables.py`)
+
+`ref()` 的上游由同名的測資表代替(見「執行驗證」那一節的表),但上游的輸出欄位不在資料字典裡,
+部署端也不會手寫 CREATE。規格(含 `specs/tables/`)沒有那張表時,改由 dbt 展開推出它的結構,補進
+**執行驗證用的**規格「資料表定義」(測資生成與沙盒執行都照它;主審查的 prompt 不加):
+
+1. 以 collect 模式展開要驗的 model(`dbt_exec.upstream_refs`):`ref()` 指向規格沒有、但表名確定的
+   model / snapshot 不讓展開失敗,記下名稱,先指向 `[dbo].[表名]`。
+2. 沿 `ref()` 往上:每個上游同樣以 collect 模式展開,依相依順序排好。上游只能是 SQL model 或用
+   `{% snapshot %}` 區塊寫的 snapshot;seed、Python model、其他套件、表名無法確定的不建。
+3. 在沙盒建一個暫用的資料庫(`segcra_sbx_<隨機碼>`,用完刪掉):先建規格的表,以及 `specs/tables/`
+   裡上游展開後讀得到名稱的表(**完整欄位**:上游讀的原始表多半只有上游讀,不在要驗的 model 裡,
+   `table_defs.augment` 不會補進規格;上游讀的欄位也不一定是要驗的 model 讀的,所以不裁),再依序用
+   `sys.dm_exec_describe_first_result_set` 描述每個上游展開後的 SQL 會輸出哪些欄位與型別(不執行查詢、
+   不需要資料;`WITH` 開頭的也描述得了),照著 `CREATE TABLE [dbo].[表名]`,下一層就讀得到。型別由
+   SQL Server 推出(例如 `SUM(DECIMAL(14,2))` 是 `numeric(38,2)`),只收 `specs/tables/` 也收的型別。
+4. snapshot 照 dbt-sqlserver 建 snapshot 表的寫法(`select *` 後面接四個管理欄位)補上
+   `dbt_scd_id varchar(32)`(`CONVERT(VARCHAR(32), HashBytes('MD5', …), 2)`)與 `dbt_updated_at`、
+   `dbt_valid_from`、`dbt_valid_to`,三個的型別跟 strategy 的 updated_at 相同:timestamp 是 `updated_at`
+   那一欄的型別;check 有設 `updated_at` 時同上,沒設時是 `snapshot_get_time()` 的
+   `CAST(SYSDATETIME() AS DATETIME2(6))`,也就是 `datetime2(6)`。
+5. **只把要驗的 model 直接 `ref()` 的上游補進規格**(測資只放在這幾張);更上層的只在推結構時用。
+   直接讀的上游欄位超過 30 個時,跟 `specs/tables/` 一樣只留要驗的 model 裡看得到名稱的欄位(有
+   `SELECT *` 或 `別名.*` 時不裁);沙盒說缺的欄位正是被裁掉的,改寫成「執行驗證無法完成(測資表少了
+   欄位)」,不說成 SQL 的錯。規格的「資料表定義」只寫「待補」時照樣推,補上的表包在新的圍欄裡。
+6. 推出的表記在報告的 `_upstream_tables`(`direct` 標出是不是直接讀的、`dropped` 是裁掉的欄位),補一條 info「執行驗證的上游表結構(沿 ref() 推出)」寫明
+   哪些、只推了結構、上游的邏輯沒有執行。snapshot 推出來後,展開時表名也算確定(`sandbox_upstream`
+   的 `snapshots`),由那張測資表代替。
+7. **給測資生成的上游說明**(`upstream_tables._context_section`):補過的規格最後加一段「執行驗證的上游表說明
+   (程式補上,不是需求)」,寫要驗的 model 直接讀哪幾張表、每張直接讀的上游展開後的 SQL(每張最多
+   `MAX_DEFINITION_CHARS` 字元、整段最多 `MAX_CONTEXT_CHARS`),並要求同一筆業務資料在各表一致、定義不要拆成
+   條件。放在規格最後、`資料表定義` 之外,不影響表的解析;測資生成的 system prompt 不變。給的是上游的 SQL,不是要驗的
+   model 的 SQL,測資生成仍然看不到被審的程式。
+8. **測資沒放齊時不算不符**(`spec_exec.run_spec_exec`,只在上游由測資代替時):測資生成只看得到規格與表結構,
+   不知道規則讀哪幾張、各表怎麼來;真模型實測時資料只放進看起來像明細的表,規則直接讀的加總表是空的,
+   正確的 SQL 也「應命中卻沒命中」。所以:
+   - `schema_ddl` 照規格補齊(`_with_spec_ddl`):規格有、模型沒列的表補上,不然 SQL 讀到沙盒沒有的表。
+   - 應命中卻沒命中、而規則**一定要有資料**的表(`_required_tables`:最外層的 FROM 與 INNER / CROSS JOIN,
+     讀的是 CTE 或子查詢時往裡找;LEFT JOIN 右邊、RIGHT JOIN 左邊、FULL JOIN、WHERE 裡的子查詢、UNION 都
+     不算,解析不了時一張都不算)有一張在案例裡沒有資料(`_empty_read_misses`):剔除(`dropped_cases` 的
+     `by` 是 `empty-read`)、列覆蓋缺口,不交給仲裁、不報不符。`NOT EXISTS` 讀的排除名單本來就該是空的,
+     不算;真模型實測時,資料放齊、排除名單空著的案例,埋錯(`>=` 改 `>`)的 SQL 沒命中,照樣交給仲裁。
+   - 資料列的表名寫成 `dbo.x`、`[dbo].[x]` 時去掉 `dbo.`(`_bare_row_tables`,所有執行驗證都適用):規格的表
+     結構是 `[dbo].[x]`,模型常照抄;以前整個案例當成表名非法丟掉、重新生成,真模型實測一輪多花 20 多分鐘。
+
+**snapshot 的設定照 dbt 的優先順序合併**:`dbt_project.yml` 的 `snapshots:` 區段(專案名底下一層層
+資料夾,越深的蓋掉越淺的;`+鍵` 或值不是物件的鍵是設定)< 屬性檔(yml)的 `config:` < 區塊裡的
+`config()`。合併後的 `alias` 是固定的表名時,建出來的表就叫那個名稱(展開時 `ref()` 也指到它)。其他設定要能確定,否則不建、寫出原因:`config()` 只能有一個、參數都要是常值;只認不影響表名
+與欄位的設定(`strategy`、`unique_key`、`updated_at`、`check_cols`、`target_schema`、hook 等),不是固定表名的 `alias`、
+`snapshot_table_column_names`、`dbt_valid_to_current`、`hard_deletes`、`enabled` 與認不得的一律無法確定;
+strategy 要是 timestamp 或 check,timestamp 要有 `updated_at` 而且是查詢輸出的欄位。任何一層看不懂、
+用 yml 定義的 snapshot(有 `relation:`,沒有 SQL 區塊)、同名的不只一個,也不建。查詢自己就有管理欄位
+名稱的也不建。
+
+**推不出來時**(上述情況、展開不了、增量或用到 `run_started_at` 的上游、`ref()` 繞回自己、超過
+20 張或 8 層、沙盒沒設密碼或連不上、描述出錯、沒有名稱或重名的欄位、不支援的型別):規格不補,
+補一條同標題的 info 寫出原因;要驗的 model 照舊因為缺表展開失敗,記待驗證交人工。
+
+**只解決「表長什麼樣」**:測資直接放進上游表,上游的邏輯照舊沒有執行;上游要連同邏輯一起驗,要
+依相依順序在沙盒真的跑上游的 SQL,是下一步。
 
 ### 三、fail closed:無法確定時一律交人工
 
@@ -704,7 +767,7 @@ macro 或 model 裡幾行純 SQL 時,片段沒有標記,會被當成一般 SQL �
 | 寫法 | 展開成 |
 |---|---|
 | `source()` | sources.yml 有宣告、表名確定(identifier 沒宣告就是 table 名,不是樣板值),而且規格「資料表定義」有同名的表(不分大小寫)→ 規格裡的表,一律兩段式(`[dbo].[txn]`、`[stage].[txn]`;規格沒寫 schema 的是 dbo):單段的 `[txn]` 會被同名的 CTE 蓋掉。不看來源的 schema:沙盒只有規格建的表 |
-| `ref()` | **由測資代替上游 model**:被引用的 model 表名確定(alias 算過之後;不看自訂 schema,沙盒只有規格建的表),而且規格「資料表定義」有同名的表(不分大小寫)→ 規格裡的寫法。上游 model 自己的邏輯不在這次執行,執行通過時補一條 info「執行驗證時上游 model 由測資代替」列出是哪些 model(紀錄在 `_dbt_exec.stand_ins`)。seed、snapshot、其他套件的 model、表名是樣板值或專案層級無法確定時不對 |
+| `ref()` | **由測資代替上游 model**:被引用的 model 表名確定(alias 算過之後;不看自訂 schema,沙盒只有規格建的表),而且規格「資料表定義」有同名的表(不分大小寫)→ 規格裡的寫法;規格沒有時,上游是 SQL model 或 snapshot 的由 `upstream_tables` 推出結構補進規格(見「上游 model 與 snapshot 的表結構沿 `ref()` 推出」)。上游 model 自己的邏輯不在這次執行,執行通過時補一條 info「執行驗證時上游 model 由測資代替」列出是哪些 model(紀錄在 `_dbt_exec.stand_ins`)。seed、其他套件的 model、表名是樣板值或專案層級無法確定、設定無法確定的 snapshot 時不對 |
 | `{{ this }}` | 不支援(有定義,用到就失敗) |
 | 表名物件的 `database` / `schema` | 取用就失敗(沙盒的值跟正式環境不同) |
 
@@ -813,9 +876,9 @@ major。加上非 SQL 檔的處理之後,改由非 SQL 檔的分類與設定比�
 - 執行驗證:引用 `source()` 與 `ref()` 的 model 已經會展開後送進沙盒(見「執行驗證」;`ref()` 的上游
   model 由測資代替)。下面這些情況記成待驗證(帶 stage「執行驗證」,交人工):展開不了(規格沒有
   同名的表、表名無法確定、兩個引用對到同一張表…)、MR 也改了上游或其他 model、有上游由測資代替時
-  案例不符(規格的條件可能在上游做,仲裁看不到上游,判 `sql` 也不採用)。要補的方向:上游 model 依
-  相依順序先在沙盒建出來(連同它的邏輯一起驗),以及增量 model(一般模式與增量模式各驗一次)。
-  展開後的 SQL 還沒有在 MS SQL 沙盒上用正式規則實際跑過
+  案例不符(規格的條件可能在上游做,仲裁看不到上游,判 `sql` 也不採用)。上游的表結構已經會沿 `ref()`
+  推出(見「上游 model 與 snapshot 的表結構沿 `ref()` 推出」)。要補的方向:上游 model 連同它的邏輯
+  依相依順序在沙盒真的跑,以及增量 model(一般模式與增量模式各驗一次)。
 - 真實 GitLab 模式下,dbt 專案以外的 SQL 檔(與專案裡不是樣板的 SQL 檔)仍只有 diff 新增的行,
   完整內容由 #22 以 Files API 依 head sha 取得
 - 不分析第三方套件內的 macro;目錄由呼叫端指定

@@ -162,14 +162,23 @@ def test_wrong_input_shapes_give_fully_uncertain_default(kwargs):
     assert info == DbtProjectInfo()
 
 
-@pytest.mark.parametrize("yml", [
-    "seeds:\n  shop:\n    +schema: ref_data\n",
-    "snapshots:\n  shop:\n    schema: snaps\n",
-], ids=["seeds", "snapshots"])
-def test_dbt_project_seed_snapshot_name_settings_make_every_ref_uncertain(yml):
-    """seed / snapshot 的表名設定不模擬(它們的內容看不到);models 區塊的照資料夾算,
-    見 tests/test_dbt_relation_names.py。"""
-    info = _info(BASE | {"dbt_project.yml": "name: shop\n" + yml})
+def test_dbt_project_seed_name_settings_make_every_ref_uncertain():
+    """seed 的表名設定不模擬(內容看不到);models 區塊的照資料夾算,見 tests/test_dbt_relation_names.py。"""
+    info = _info(BASE | {"dbt_project.yml": "name: shop\nseeds:\n  shop:\n    +schema: ref_data\n"})
+    assert info.global_uncertain
+
+
+@pytest.mark.parametrize("key", ["alias", "schema", "database"])
+def test_dbt_project_snapshot_name_settings_keep_models_certain(key):
+    """snapshots 區塊的表名設定只改得到 snapshot 自己;snapshot 本來就一律無法確定。"""
+    project = "name: shop\nsnapshots:\n  shop:\n    +" + key + ": snaps\n"
+    info = _info(BASE | {"dbt_project.yml": project}, other=("orders_snapshot",))
+    assert info.global_uncertain is None
+    assert "orders_snapshot" in info.uncertain_models
+
+
+def test_dbt_project_snapshot_disabled_still_makes_every_ref_uncertain():
+    info = _info(BASE | {"dbt_project.yml": "name: shop\nsnapshots:\n  shop:\n    +enabled: false\n"})
     assert info.global_uncertain
 
 

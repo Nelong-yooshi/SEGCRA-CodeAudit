@@ -490,7 +490,9 @@ def _read_dbt_project(text):
     沒有 dbt_project.yml 也算讀不懂;讀不懂時 sources 區塊的設定(例如停用)也看不到。
 
     models 區塊的 alias / schema / database 不在這裡判成整個專案無法確定:逐一照資料夾算
-    (_project_naming);ephemeral 與停用仍然是整個專案無法確定。"""
+    (_project_naming);ephemeral 與停用仍然是整個專案無法確定。snapshots 區塊的 alias / schema /
+    database 也不算:snapshot 的表名本來就一律無法確定(名稱來自呼叫端),這幾個設定只改得到 snapshot
+    自己,不能因此讓整個專案的 model 都失去表名驗證(target_schema 同理)。"""
     if text is None:
         return None, None, False, True, None, None, False
     try:
@@ -504,7 +506,7 @@ def _read_dbt_project(text):
     models_block = raw.get("models")
     sources_uncertain = _sets_names(raw.get("sources"))
     for block in ("models", "seeds", "snapshots", "sources"):
-        if _sets_names(raw.get(block), names=block != "models"):
+        if _sets_names(raw.get(block), names=block not in ("models", "snapshots")):
             return (name, f"dbt_project.yml 的 {block} 設定了 alias / schema / database、"
                           "ephemeral 或停用", True, sources_uncertain, models_block, concat, unset)
     return name, None, True, sources_uncertain, models_block, concat, unset

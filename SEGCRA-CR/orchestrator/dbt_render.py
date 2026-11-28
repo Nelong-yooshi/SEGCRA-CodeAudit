@@ -560,7 +560,8 @@ def model_alias(project: "DbtProjectInfo | None", name: str) -> str | None:
 
 
 def _make_relations(database: str | None, schema: str, usage: dict,
-                    project: "DbtProjectInfo | None" = None, sandbox_tables: dict | None = None):
+                    project: "DbtProjectInfo | None" = None, sandbox_tables: dict | None = None,
+                    sandbox_upstream: dict | None = None):
     """dbt 的 ref() / source(),比照正式環境展開成 "<database>"."<schema>"."<表>"。
 
     usage 是呼叫端給的共用字典:呼叫到 ref()/source() 記 used;有專案資訊但這次
@@ -579,7 +580,7 @@ def _make_relations(database: str | None, schema: str, usage: dict,
     測資表,ref() 由規格裡同名的測資表代替上游 model,{{ this }} 不支援。
     """
     if sandbox_tables is not None:
-        return _sandbox_relations(usage, project, sandbox_tables)
+        return _sandbox_relations(usage, project, sandbox_tables, sandbox_upstream)
 
     def relation(name, rel_schema=schema) -> str:
         usage["used"] = True
@@ -668,7 +669,8 @@ _EXEC_NO_THIS = "執行驗證尚未支援 {{ this }}(這個 model 自己的表�
 _EXEC_LOADING = "載入 macro 時不提供表名"
 
 
-def _sandbox_relations(usage: dict, project: "DbtProjectInfo | None", sandbox_tables: dict):
+def _sandbox_relations(usage: dict, project: "DbtProjectInfo | None", sandbox_tables: dict,
+                       sandbox_upstream: dict | None = None):
     """執行驗證用的 ref() / source() / this。sandbox_tables 是規格「資料表定義」建的表
     {表名(小寫): 沙盒裡的寫法(每段加上方括號);同名的表不只一張時是 None}。
 
@@ -682,9 +684,24 @@ def _sandbox_relations(usage: dict, project: "DbtProjectInfo | None", sandbox_ta
     代替了哪些 model 記在 usage["stand_ins"],報告要寫出來。seed、snapshot、其他套件的 model、
     表名無法確定的 model,一律展開失敗。
     {{ this }} 不支援(增量的目標表不在沙盒裡)。
-    表名物件只提供 identifier / name / table;database 與 schema 在沙盒裡跟正式環境不同,取用就失敗。"""
+    表名物件只提供 identifier / name / table;database 與 schema 在沙盒裡跟正式環境不同,取用就失敗。
+
+    sandbox_upstream(沿 ref() 建上游表用,見 upstream_tables):
+      * "snapshots":表名確定的 snapshot,每一項是名稱(表名就是區塊名稱)或 (名稱, 表名)(設了固定的
+        alias);呼叫端確認過設定
+      * "collect":True 時,ref() 指向的表規格裡沒有、但表名確定的 model / snapshot 不讓展開失敗,
+        記在 usage["missing_refs"] 並先指向 `[dbo].[表名]`,讓呼叫端知道要先建哪些上游表"""
     seen: dict = usage.setdefault("sandbox_sources", {})
     stand_ins: list = usage.setdefault("stand_ins", [])
+    upstream = sandbox_upstream or {}
+    snapshots: dict = {}
+    for item in upstream.get("snapshots") or ():
+        if isinstance(item, str):
+            snapshots[item] = item
+        elif isinstance(item, (tuple, list)) and len(item) == 2:
+            snapshots[item[0]] = item[1]
+    collect = upstream.get("collect") is True
+    missing_refs: list = usage.setdefault("missing_refs", [])
 
     def table(key, identifier: str, what: str):
         """規格裡同名的測資表。key 用來認出「兩個不同的引用對到同一張表」。"""
@@ -717,9 +734,17 @@ def _sandbox_relations(usage: dict, project: "DbtProjectInfo | None", sandbox_ta
         if name not in project.ref_names:
             raise DbtRenderError(f"ref() 指向專案裡不存在的 model / seed / snapshot:{name}")
         identifier = model_alias(project, name)
+        if identifier is None and name in snapshots:
+            identifier = _check_ident("表", snapshots[name])
         if identifier is None:
             raise DbtRenderError(
                 f"ref() 指向的表名無法確定(seed、snapshot,或 alias 等設定是樣板值):{name}")
+        if collect and identifier.lower() not in sandbox_tables:
+            if seen.setdefault(identifier.lower(), ("ref", name)) != ("ref", name):
+                raise DbtRenderError(f"兩個不同的 source() / ref() 都對到同一張表:{identifier}")
+            if name not in missing_refs:
+                missing_refs.append(name)
+            return _SandboxRelation(f"[dbo].[{identifier}]", identifier)
         relation = table(("ref", name), identifier, "ref() ")      # 鍵的第一個元素區分 ref 與 source
         if name not in stand_ins:
             stand_ins.append(name)
@@ -1095,6 +1120,8 @@ class RenderResult:
     relation_notice: str | None = None
     # 執行驗證用的展開(sandbox_tables)裡,由規格的測資表代替的上游 model(ref() 的對象,依出現順序)
     stand_ins: list[str] = field(default_factory=list)
+    # sandbox_upstream 的 collect 模式下,規格裡沒有、要先沿 ref() 建出來的上游(依出現順序)
+    missing_refs: list[str] = field(default_factory=list)
     # 樣板(含它呼叫的 macro)有沒有呼叫 is_incremental();沒有就不必以增量模式再展開一次
     incremental_checked: bool = False
     # 樣板(含它呼叫的 macro)寫到 run_started_at:值是審查開始的時間,跟排程的資料日期無關,
@@ -1205,7 +1232,7 @@ def build_env(code_root=None, variables: dict | None = None,
               project: DbtProjectInfo | None = None, macro_files: dict | None = None,
               model_name: str | None = None, incremental: bool = False,
               invocation_id: str | None = None, sandbox_tables: dict | None = None,
-              run_started_at: str | None = None):
+              run_started_at: str | None = None, sandbox_upstream: dict | None = None):
     """建好含 dbt 樁與 macro 的 Environment。code_root 與 macro_files 都沒給時不載入任何 macro。
 
     macro_files 專案的檔案 {相對專案根的路徑: 內容}(從 GitLab 取回、不在磁碟上的專案用)。
@@ -1219,6 +1246,7 @@ def build_env(code_root=None, variables: dict | None = None,
     invocation_id 這次展開的 invocation_id(uuid4 的寫法);沒給時產生新的
     run_started_at 這次展開的 run_started_at(帶 UTC 時區的 ISO 字串);沒給時用現在
     sandbox_tables 執行驗證用:source() 指向規格建的測資表(見 _sandbox_relations)
+    sandbox_upstream 沿 ref() 建上游表用的選項(見 _sandbox_relations)
 
     回傳 (env, macro 名稱清單, 同名衝突清單)。
     """
@@ -1250,7 +1278,7 @@ def build_env(code_root=None, variables: dict | None = None,
         raise DbtRenderError("project 必須是 DbtProjectInfo")
     env.segcra_relation_usage = {"used": False, "uncertain": False}
     ref, source, this = _make_relations(database, schema, env.segcra_relation_usage, project,
-                                        sandbox_tables)
+                                        sandbox_tables, sandbox_upstream)
     env.globals["ref"] = ref
     env.globals["source"] = source
     if incremental and model_name is None:
@@ -1559,7 +1587,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
                  macro_files: dict | None = None, incremental: bool = False,
                  invocation_id: str | None = None,
                  sandbox_tables: dict | None = None,
-                 run_started_at: str | None = None) -> RenderResult:
+                 run_started_at: str | None = None,
+                 sandbox_upstream: dict | None = None) -> RenderResult:
     """在同一行程內展開一份 dbt model。**待審的 MR 內容請改用 render_model_isolated()。**
 
     model_path  model 檔路徑(相對 code_root 或絕對路徑皆可)
@@ -1581,6 +1610,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
     run_started_at 這次展開的 run_started_at(帶 UTC 時區的 ISO 字串);沒給時用現在
     sandbox_tables 執行驗證用的展開:{表名(小寫): 沙盒裡的寫法};source() 指向規格建的測資表,
                 ref() 由同名的測資表代替上游 model,{{ this }} 不支援(見 _sandbox_relations)
+    sandbox_upstream 沿 ref() 建上游表用的選項(見 _sandbox_relations)
 
     任何失敗都收斂成 ok=False 而不丟例外。
     """
@@ -1602,7 +1632,8 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
                                                      model_path.stem, incremental,
                                                      invocation_id=invocation_id,
                                                      sandbox_tables=sandbox_tables,
-                                                     run_started_at=run_started_at)
+                                                     run_started_at=run_started_at,
+                                                     sandbox_upstream=sandbox_upstream)
         # dbt 讀檔時會去掉頭尾空白再渲染(開頭空行不會出現在編譯結果裡)
         body = source.strip()
         try:
@@ -1659,6 +1690,7 @@ def render_model(model_path, code_root=None, variables: dict | None = None,
         rendered_lines=n_out,
         relation_notice=_relation_notice(env.segcra_relation_usage, project),
         stand_ins=list(env.segcra_relation_usage.get("stand_ins", [])),
+        missing_refs=list(env.segcra_relation_usage.get("missing_refs", [])),
         incremental_checked=incremental_checked,
         run_started_at_used=run_started_at_used,
     )

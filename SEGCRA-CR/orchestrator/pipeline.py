@@ -51,7 +51,7 @@ from toolbox.gitlab import (WRITE_FAILED, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UN
                             write_failure)
 from toolbox import gitlab as _gitlab
 from .skills_loader import always_skills, load_skills, skills_index
-from . import spec_index, table_defs
+from . import spec_index, table_defs, upstream_tables
 from .dbt_context import PROJECT_FILE_REMOVED, PROJECT_YAML_INVALID, check_yaml_files_isolated
 from .dbt_project import YAML_MODELS_NOT_LIST, YAML_SYNTAX
 from .spec_exec import SpecLookup, find_spec, run_spec_exec
@@ -1005,8 +1005,54 @@ def _mr_for_spec_exec(mr: dict, dbt_ctx: DbtContext | None) -> dict:
     return {**mr, "files": files}
 
 
+def _dbt_exec_target(exec_mr: dict, dbt_ctx: DbtContext | None, dbt_cfg: dict | None):
+    """執行驗證要跑的 dbt model:(索引, 變更項目, 原始碼, 路徑);不是取回的 dbt 專案裡的樣板 model 回 None。
+    要跑的是哪個檔案跟 run_spec_exec 一樣:最後一個有內容的檔案。"""
+    if not dbt_cfg or dbt_cfg.get("enabled") is not True:
+        return None
+    if dbt_ctx is None or dbt_ctx.project is None or dbt_ctx.error is not None:
+        return None
+    last = None
+    for i, f in enumerate(exec_mr.get("files", [])):
+        got = (f.get("full_content") or _sql_from_diff(f.get("diff", ""))) if isinstance(f, dict) else ""
+        if got:
+            last = (i, f, got)
+    if last is None:
+        return None
+    i, f, source = last
+    path = f.get("path") or ""
+    rel = dbt_ctx.relative(path)
+    project = dbt_ctx.project
+    if (rel is None or not rel.endswith(".sql") or not is_dbt_template(source)
+            or path_kind(rel, project.model_paths, project.macro_paths,
+                         project.resource_paths) != "model"):
+        return None
+    return i, f, source, path
+
+
+def _with_upstream_tables(exec_text, exec_mr: dict, dbt_ctx: DbtContext | None,
+                          dbt_cfg: dict | None) -> tuple:
+    """執行驗證用的規格補上沿 ref() 推出的上游表結構(見 upstream_tables)。回傳 (規格, 紀錄或 None)。
+    紀錄 {"tables": [...], "snapshots": [...], "reason": 推不出來的原因};不適用(不是 dbt model、
+    沒有規格、規格裡已經有全部的上游)時是 None。"""
+    target = _dbt_exec_target(exec_mr, dbt_ctx, dbt_cfg)
+    if target is None or not exec_text or DBT_DATABASE_PLACEHOLDER != dbt_cfg.get("database"):
+        return exec_text, None
+    _, _, source, path = target
+    index = spec_index.current_index()
+    repo_defs = (table_defs.load(index.tables)[0]
+                 if index is not None and not index.error and index.tables else None)
+    result = upstream_tables.build(path, source, exec_text, dbt_cfg["database"],
+                                   _render_project(dbt_ctx), dbt_ctx.project, repo_defs=repo_defs)
+    if not result.tables and not result.reason:
+        return exec_text, None
+    return result.spec_text, {"tables": result.tables, "snapshots": list(result.snapshots),
+                              "reason": result.reason}
+
+
 def _dbt_exec_mr(exec_mr: dict, exec_text, spec_text, affected_specs: tuple[SpecForModels, ...],
-                 dbt_ctx: DbtContext | None, dbt_cfg: dict | None) -> tuple[dict, dict | None]:
+                 dbt_ctx: DbtContext | None, dbt_cfg: dict | None,
+                 snapshots=()) -> tuple[dict, dict | None]:
     """執行驗證要跑的檔案是 dbt model 時,先展開成沙盒用的純 SQL(見 dbt_exec)。
 
     要跑的是哪個檔案跟 run_spec_exec 一樣:最後一個有內容的檔案。它是取回的 dbt 專案裡的
@@ -1016,26 +1062,12 @@ def _dbt_exec_mr(exec_mr: dict, exec_text, spec_text, affected_specs: tuple[Spec
     {"file", "ok", "reason", "stand_ins"}:ok 時那個檔案的內容換成展開後的 SQL,stand_ins 是由規格
     的測資表代替的上游 model(ref() 的對象);不 ok 時 MR 不動(執行驗證照舊回「尚未支援」),reason
     是原因。"""
-    if not dbt_cfg or dbt_cfg.get("enabled") is not True:
-        return exec_mr, None
-    if dbt_ctx is None or dbt_ctx.project is None or dbt_ctx.error is not None:
+    target = _dbt_exec_target(exec_mr, dbt_ctx, dbt_cfg)
+    if target is None:
         return exec_mr, None
     files = list(exec_mr.get("files", []))
-    last = None
-    for i, f in enumerate(files):
-        got = (f.get("full_content") or _sql_from_diff(f.get("diff", ""))) if isinstance(f, dict) else ""
-        if got:
-            last = (i, f, got)
-    if last is None:
-        return exec_mr, None
-    i, f, source = last
-    path = f.get("path") or ""
+    i, f, source, path = target
     rel = dbt_ctx.relative(path)
-    project = dbt_ctx.project
-    if (rel is None or not rel.endswith(".sql") or not is_dbt_template(source)
-            or path_kind(rel, project.model_paths, project.macro_paths,
-                         project.resource_paths) != "model"):
-        return exec_mr, None
     if not exec_text:
         return exec_mr, None                 # 沒有規格:執行驗證自己會說
     record = {"file": path, "ok": False, "reason": None, "stand_ins": []}
@@ -1046,7 +1078,7 @@ def _dbt_exec_mr(exec_mr: dict, exec_text, spec_text, affected_specs: tuple[Spec
         record["reason"] = _DBT_DATABASE_MISMATCH
         return exec_mr, record
     sql, reason, stand_ins = render_for_exec(path, source, exec_text, dbt_cfg["database"],
-                                             _render_project(dbt_ctx))
+                                             _render_project(dbt_ctx), snapshots)
     if sql is None:
         record["reason"] = reason
         return exec_mr, record
@@ -1903,6 +1935,50 @@ def enforce_repo_tables(report: dict, record) -> dict:
     return report
 
 
+_UPSTREAM_TITLE = "執行驗證的上游表結構(沿 ref() 推出)"
+
+
+@_isolated_stage("上游表紀錄")
+def enforce_upstream_tables(report: dict, record) -> dict:
+    """記下沿 ref() 推出了哪些上游表結構(`_upstream_tables`,模型輸出的同名欄位蓋掉),補一條 info:
+    推出來的,寫明只推了表結構、上游的邏輯沒有執行;推不出來的,寫出原因(執行驗證自己會因為
+    缺表回「尚未支援」交人工,決策不受這條影響)。名稱都過了識別字白名單。"""
+    report["_upstream_tables"] = record
+    if not record:
+        return report
+    built = [t for t in record.get("tables") or [] if isinstance(t, dict)]
+    tables = [t for t in built if t.get("direct")]
+    trimmed = {c.lower() for t in tables for c in t.get("dropped") or [] if isinstance(c, str)}
+    for fd in report.get("findings", []):
+        if fd.get("_source") != "program" or fd.get("title") != _SQL_RUN_TITLE:
+            continue
+        hit = _MISSING_COLUMN.search(str(fd.get("detail", "")))
+        if hit is not None and hit.group(1).lower() in trimmed:
+            fd["title"] = "執行驗證無法完成(測資表少了欄位)"
+            fd["detail"] = (f"沙盒說欄位 {hit.group(1)} 不存在,但沿 ref() 推出的上游表有這個欄位:這張表欄位很多,"
+                            "執行驗證只建了 SQL 裡看得到名稱的欄位,這不是 SQL 的錯。未經執行驗證,本 MR 不得自動放行。")
+            fd["suggestion"] = "在規格的「資料表定義」寫出這張上游表要用到的欄位。"
+    if tables:
+        names = "、".join(f"{t.get('name')}({'snapshot' if t.get('kind') == 'snapshot' else 'model'})"
+                         for t in tables[:10])
+        more = f"(共 {len(tables)} 個)" if len(tables) > 10 else ""
+        deeper = len(built) - len(tables)
+        detail = (f"規格沒有寫結構的上游,由 dbt 展開後在沙盒推出輸出欄位與型別、建成測資表:{names}{more}"
+                  f"{f'(推的時候另外沿 ref() 往上建了 {deeper} 張上游的上游,只用來推結構)' if deeper else ''}。"
+                  "只推了表結構,測資直接放進這些表,上游自己的邏輯沒有在這次執行;snapshot 另外補了 dbt 的"
+                  "管理欄位(dbt_scd_id、dbt_updated_at、dbt_valid_from、dbt_valid_to)。")
+        suggestion = "上游有改動時要另外驗證它本身;結構跟正式環境不同時,在規格或 specs/tables/ 寫出那張表。"
+    elif record.get("reason"):
+        detail = f"規格沒有寫結構的上游,沿 ref() 也推不出來:{record['reason']}。"
+        suggestion = "在規格的「資料表定義」或 specs/tables/ 寫出上游表的結構。"
+    else:
+        return report
+    _put_program_finding(report, {
+        "file": MR_CONTENT_FILE, "line": 0, "severity": "info", "title": _UPSTREAM_TITLE,
+        "detail": detail, "suggestion": suggestion, "citations": [], "_source": PROGRAM_SOURCE})
+    return report
+
+
 def _is_deleted(diff) -> bool:
     """整個檔案被刪掉:diff 只有一段,變更後是 0 行。"""
     heads = _HUNK_HEAD.findall(diff) if isinstance(diff, str) else []
@@ -2550,6 +2626,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         deadline = time.monotonic() + (spec_limit or 0)
         dbt_exec = None
         repo_tables = None                 # 執行驗證用到的 specs/tables/ 表定義(見 table_defs)
+        upstream = None                    # 沿 ref() 推出的上游表結構(見 upstream_tables)
         try:
             # 端點無法使用時整段不跑:測資生成要呼叫模型。找不到規格等不用模型的結果這次不會出現,
             # 但它們本來就是交人工,決策不受影響;端點恢復後重新審查就看得到
@@ -2563,8 +2640,10 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             exec_specs = () if own_note else affected_specs
             exec_code, exec_text = _spec_for_exec(spec_code, spec_text, exec_specs, exec_mr)
             exec_text, repo_tables = _with_repo_tables(exec_text, exec_mr)
+            exec_text, upstream = _with_upstream_tables(exec_text, exec_mr, dbt_ctx, cfg.dbt)
             exec_mr, dbt_exec = _dbt_exec_mr(exec_mr, exec_text, spec_text, exec_specs,
-                                             dbt_ctx, cfg.dbt)
+                                             dbt_ctx, cfg.dbt,
+                                             (upstream or {}).get("snapshots") or ())
             # 執行驗證裡有好幾次模型呼叫(測資生成、重試、仲裁),越後面的剩的時間越少:
             # 每一次各自用那一刻剩下的(見 agent.llm_deadline / request_timeout)
             with llm_deadline(spec_limit, MIN_STAGE_SECONDS):
@@ -2606,6 +2685,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                         and spec_result.get("executed_file") == dbt_exec["file"] else None)
         report = enforce_dbt_exec_note(report, dbt_exec)  # dbt model 沒有送進沙盒的原因
         report = enforce_repo_tables(report, repo_tables)  # 用了哪些 specs/tables/ 的表定義
+        report = enforce_upstream_tables(report, upstream)  # 沿 ref() 推出了哪些上游表結構
         report = enforce_dbt_unexecuted(report, mr, dbt_ctx, cfg.dbt, executed_dbt)  # dbt 的變更沒被執行驗證到
         report = enforce_spec_change(report, mr)  # MR 改到規格檔:改了什麼、前後是否一致
         # SQL_DIALECT 不是 tsql(開發測試用):規則層用別的方言解析,結果會跟正式環境不同。

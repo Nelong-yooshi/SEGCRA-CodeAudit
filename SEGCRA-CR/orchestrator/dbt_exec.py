@@ -4,7 +4,8 @@
 model 裡的 source() 要指向那幾張表,而不是正式環境的表名,所以另外展開一次:
   * source():sources.yml 有宣告、表名確定,而且規格裡有同名的表 → 展開成規格裡的寫法
   * ref():被引用的 model 表名確定,而且規格裡有同名的表 → 由那張測資表代替上游 model
-    (上游 model 自己的邏輯不在這次執行;代替了哪些記在結果裡,報告會寫出來)
+    (上游 model 自己的邏輯不在這次執行;代替了哪些記在結果裡,報告會寫出來)。規格沒有那張表時,
+    由 upstream_tables 沿 ref() 推出上游 model / snapshot 的表結構補進規格(見 upstream_refs)
   * {{ this }}:不支援(增量的目標表不在沙盒裡)
   * 有 is_incremental() 的 model:不支援(增量那段要先放一份上一次執行後的目標表)
 任何一項不成立就不展開、回報原因,執行驗證照舊回「尚未支援」交人工。不猜表名:
@@ -82,18 +83,21 @@ RUN_STARTED_AT_UNVERIFIED = "model 用到 run_started_at,審查不知道排程�
 
 
 def render_for_exec(path: str, source: str, spec_text: str, database: str,
-                    project_kwargs: dict) -> tuple[str | None, str | None, tuple[str, ...]]:
+                    project_kwargs: dict, snapshots=()) -> tuple[str | None, str | None, tuple[str, ...]]:
     """展開成沙盒執行用的 SQL。回傳 (SQL, None, 由測資代替的上游 model) 或 (None, 不能展開的原因, ())。
 
     project_kwargs 是展開時要帶的專案資訊(macro 與 DbtProjectInfo,見 pipeline._render_project);
-    沒有專案資訊時 source() 無法確定,一律不能展開。"""
+    沒有專案資訊時 source() 無法確定,一律不能展開。snapshots 是表名確定的 snapshot(upstream_tables
+    建出了它的表),ref() 指向它們時照同名的測資表代替。"""
     if not project_kwargs.get("project"):
         return None, "沒有 dbt 專案資訊,無法確定 source() / ref() 指向的表", ()
     tables = spec_tables(spec_text)
     if not tables:
         return None, "規格的「資料表定義」段落沒有可以解析的 CREATE TABLE", ()
     rendered = render_model_isolated(path, source=source, database=database,
-                                     sandbox_tables=tables, **project_kwargs)
+                                     sandbox_tables=tables,
+                                     sandbox_upstream={"snapshots": tuple(snapshots)},
+                                     **project_kwargs)
     if not rendered.ok:
         return None, rendered.error or "展開失敗", ()
     if rendered.macro_conflicts:
@@ -109,3 +113,26 @@ def render_for_exec(path: str, source: str, spec_text: str, database: str,
     if not rendered.sql.strip():
         return None, "展開後沒有 SQL", ()
     return rendered.sql, None, tuple(rendered.stand_ins)
+
+
+def upstream_refs(path: str, source: str, tables: dict, database: str, project_kwargs: dict,
+                  snapshots=()) -> tuple[tuple[str, ...] | None, str | None, str]:
+    """沿 ref() 建上游表用:以 collect 模式展開一次。回傳 (規格裡沒有、要先建的上游名稱, None, 展開後的 SQL),
+    或 (None, 不能展開的原因, "")。tables 是目前已有的表(規格與已經建出的上游),snapshots 是表名確定的
+    snapshot。展開檢查(同名 macro、增量、run_started_at、殘留樣板)跟 render_for_exec 相同。"""
+    if not project_kwargs.get("project"):
+        return None, "沒有 dbt 專案資訊,無法確定 source() / ref() 指向的表", ""
+    rendered = render_model_isolated(path, source=source, database=database, sandbox_tables=tables,
+                                     sandbox_upstream={"snapshots": tuple(snapshots), "collect": True},
+                                     **project_kwargs)
+    if not rendered.ok:
+        return None, rendered.error or "展開失敗", ""
+    if rendered.macro_conflicts:
+        return None, f"dbt 專案裡有 {len(rendered.macro_conflicts)} 組同名的 macro,無法確定展開結果", ""
+    if rendered.incremental_checked:
+        return None, "增量 model(呼叫了 is_incremental())的執行驗證尚未支援", ""
+    if rendered.run_started_at_used:
+        return None, RUN_STARTED_AT_UNVERIFIED, ""
+    if is_dbt_template(rendered.sql) or not rendered.sql.strip():
+        return None, "展開後的 SQL 仍含樣板標記或是空的", ""
+    return tuple(rendered.missing_refs), None, rendered.sql
