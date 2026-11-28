@@ -74,12 +74,13 @@ def api(monkeypatch):
 
 
 @pytest.mark.parametrize("line", [0, -1, True, None, "3"])
-def test_沒有對應行號時直接貼一般留言(api, line):
+def test_沒有對應行號時開沒有位置的討論(api, line):
+    """不拿第 0 行去開行內討論;開沒有位置的討論(下一輪收得掉),不貼一般留言。"""
     gitlab.post_inline_comment("12", "models/a.sql", line, "內容", "major")
     assert len(api) == 1
     method, path, body = api[0]
-    assert (method, path) == ("POST", "/merge_requests/12/notes")
-    assert body["body"].startswith("`models/a.sql`(無對應行號)")
+    assert (method, path) == ("POST", "/merge_requests/12/discussions") and "position" not in body
+    assert body["body"].startswith(gitlab._INLINE_MARKER + "\n`models/a.sql`(無對應行號)")
     assert ":0`" not in body["body"] and "內容" in body["body"]
 
 
@@ -90,7 +91,7 @@ def test_有行號時開行內討論(api):
     assert api[1][2]["position"]["new_line"] == 5
 
 
-def test_行號不在diff裡時退成一般留言_寫出行號(api):
+def test_行號不在diff裡時改開沒有位置的討論_寫出行號(api):
     gitlab.post_inline_comment("12", "models/a.sql", 99, "內容", "major")
-    assert api[-1][1] == "/merge_requests/12/notes"
-    assert api[-1][2]["body"].startswith("`models/a.sql:99`")
+    assert api[-1][1] == "/merge_requests/12/discussions" and "position" not in api[-1][2]
+    assert api[-1][2]["body"].startswith(gitlab._inline_marker("c" * 40) + "\n`models/a.sql:99`")

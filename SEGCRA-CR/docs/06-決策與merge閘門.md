@@ -72,12 +72,19 @@ LLM 審完、執行驗證跑完之後,管線用兩個**確定性函式**把「�
 
 ### 3. 回寫(`orchestrator/pipeline.py:review_mr` 尾段)
 
-`review_mr` 在決策後先取一次 MR(`gitlab__get_mr_refs`,只取 head 與 `diff_refs`、不取檔案內容):head 已經換了就不回寫(`_superseded`,見 07 篇),同一份 `diff_refs` 拿來開行內討論。接著依序回寫四樣東西:
+`review_mr` 在決策後依序回寫。**每一步寫入前**都取一次 MR(`gitlab__get_mr_refs`,只取 head 與 `diff_refs`、不取檔案內容)比對 head:已經有更新的 commit 就停在那一步,後面的不再寫(`_writeback_target`,見 07 篇);取回的 `diff_refs` 拿來開行內討論。順序:
 
-1. 逐 finding `gitlab__post_inline_comment`(行內留言,`_format_comment` 排版:標題/說明/建議/引用。建議的第一行像程式(SQL 關鍵字、dbt 標記、註解、`欄位 運算子`)才放進 sql 程式碼區塊,圍欄比內容裡最長的反引號多一個;說明文字照一般段落;內容自己已經有程式碼區塊的照原樣。位置用剛取回的 `diff_refs`,不再每條重取)。行內討論**被 GitLab 拒絕(4xx,例如行號對不上 diff)**時退成一般留言;**連線中斷、逾時、5xx 時不退**:GitLab 可能已經建立了討論、只是回應沒送到,改貼的話同一條會出現兩次。這種記成「沒有確定貼上」(`report["_writeback"]["unposted"]`),在總結**每一條都列出**(前 20 條連標題,其餘只列檔名與行號:看 MR 的人拿不到伺服器上的報告檔)。
+1. 逐 finding `gitlab__post_inline_comment`(行內留言,`_format_comment` 排版:標題/說明/建議/引用。建議的第一行像程式(SQL 關鍵字、dbt 標記、註解、`欄位 運算子`)才放進 sql 程式碼區塊,圍欄比內容裡最長的反引號多一個;說明文字照一般段落;內容自己已經有程式碼區塊的照原樣)。留言開頭是看不見的記號 `<!-- segcra:review-inline <commit> -->`(HTML 註解,帶這一輪審的 head sha 前 12 碼),第 4 步靠它認出哪些是審查開的、哪些是這一輪剛貼的。沒有行號、拿不到 diff 的位置,或行內討論**被 GitLab 拒絕(4xx,例如行號對不上 diff)**時,開**沒有位置的討論**(`POST /discussions` 只給 body,下一輪收得掉);它也被拒絕才退成一般留言(一般留言標不成已解決,下一輪收不掉:條數記進 `report["_resolve_unfinished"]["plain_notes"]`,總結寫一句)。**連線中斷、逾時、5xx 時不退**:GitLab 可能已經建立了討論、只是回應沒送到,改貼的話同一條會出現兩次。這種記成「沒有確定貼上」(`report["_writeback"]["unposted"]`),在總結**每一條都列出**(前 20 條連標題,其餘只列檔名與行號:看 MR 的人拿不到伺服器上的報告檔)。
 2. `gitlab__set_commit_status`:**只在不接 CI 時**(`review_mr(commit_status=True)`,webhook 那條路;部署端的 CI 那條路不寫,job 的結果就是閘門,見第 4 節)。對 `mr["sha"]`(MR head commit)回寫 status,`name="segcra/review"`,**state 的映射:`auto_approved → success`,其餘(`needs_human`、`blocked`)→ `failed`**,description 帶 `decision:summary 前 180 字`。
 3. `gitlab__set_label`:`ai-review::<decision>`,同一個請求用 `remove_labels` 拿掉另外兩種決策標籤(scoped label 互斥是 GitLab 付費版功能,沒有授權時重審後舊結論會留著)。只拿掉 `auto_approved`、`needs_human`、`blocked` 三種,不先查 MR 現有的標籤;舊版程式用過的其他名稱不會被清掉。
-4. `gitlab__post_summary`:總評 + 三態決策文案(✅ 自動放行 / 👤 請人工確認 / ⛔ 修正前不得合入)+ rubric 分數 + verdict;有沒有確定貼上的 finding、或 commit status / 標籤沒寫上時附在最後。**總結排在最後**,前兩步沒寫上時才寫得進總結。
+4. `gitlab__resolve_stale_comments`:把**上一輪審查開的**行內討論標成已解決。總結只有一則(重審時改寫它),行內意見卻是每次 N 條重貼一遍 —— 不收掉的話同一行會疊好幾輪的意見,看 MR 的人分不出哪些還有效。
+   - **只收審查自己開的**:作者是 `GITLAB_TOKEN` 的帳號(`own_user_id()`,還沒查過時查一次 `GET /user`)、不是系統留言、記號在第一則留言**開頭**、只有一則留言(**有人回覆過的是對話**,標成已解決會把人的話收起來)、還沒解決。記號誰都打得出來,別人開的含記號討論不動;查不到自己的帳號時一條都不收。記號裡的 commit 跟這一輪相同的是剛貼的,不收;沒有 commit 的舊格式當成上一輪的。
+   - **排在意見、commit status、label 之後**:上一輪越多這一步越久,不讓它拖晚閘門;中途被新的 commit 取代時,MR 上至少還看得到上一輪的意見,不會舊的收了、新的還沒貼。
+   - **從最新的取**:討論清單由舊到新排(含已解決的舊討論、一般留言與系統留言),上一輪的永遠在最後。用 `_api_pages(newest=True)`:先取第一頁看 `X-Total-Pages`,超過 `MAX_DISCUSSION_PAGES`(5 頁,每頁 100 則)時取最後幾頁,截掉的是中間較舊的。
+   - **這一輪有環節沒跑完時不收**(`review_incomplete` 不是空的):收舊意見的前提是這一輪重新審過了;沒跑完時上一輪的(可能是 blocker)沒有人重新看過,收起來就看不到了。
+   - **沒收乾淨要分得出來**:標不掉的條數與種類(被拒絕/不確定;被拒絕時 log 寫狀態碼,403 寫明是 `GITLAB_TOKEN` 的權限)、討論清單列不出來(HTTP 狀態碼或例外型別)或沒取完、這一輪沒跑完沒收、結果看不懂,都記進 `report["_resolve_unfinished"]`,總結的「回寫沒有完成的部分」寫一句;收掉幾條記在 `report["_resolved_stale"]`(看不懂結果時是 `null`,不是 0)。這一步失敗不影響這次審查,不當成回寫失敗。
+   - 專案開了「所有討論都要解決才能合併」時,上一輪有、這一輪沒再報的意見會被收掉,不再擋合併;閘門仍是 commit status(或 CI job 的結束碼)。
+5. `gitlab__post_summary`:總評 + 三態決策文案(✅ 自動放行 / 👤 請人工確認 / ⛔ 修正前不得合入)+ rubric 分數 + verdict;有沒有確定貼上的 finding、commit status / 標籤沒寫上、上一輪的意見沒收乾淨時附在最後。**總結排在最後**,前面幾步沒寫上時才寫得進總結。
 
 **每一步都看結果**(`gitlab.write_failure`):寫回的函式不丟例外,失敗時回 `{"ok": false, "failure": 種類}`——`rejected`(GitLab 拒絕,4xx)、`uncertain`(連線中斷、逾時、5xx,不確定有沒有寫上)、`no_sha`、`failed`(寫入工具本身出錯)。沒寫上的步驟記進 `report["_writeback"]`(`commit_status`、`label`、`summary`),印一行 log(只寫步驟與種類,不寫例外訊息)。
 

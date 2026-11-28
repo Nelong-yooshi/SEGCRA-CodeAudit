@@ -36,7 +36,7 @@
 
 **Graceful 失敗(`_run_review`)**:整段包在 try/except——模型連不上、fixture 不存在、管線任何 exception 都只印 `[webhook] MR !N 審查失敗:...` 到 stdout,server 不死;`finally` 保證把 iid 從 `_inflight` 移除,失敗的 MR 之後還能再觸發。**關掉事件迴圈前先收尾**(`_close_loop`,跟 `asyncio.run` 收尾一樣):取消還沒結束的工作並等它們收完,再收掉 async generator 與預設的執行緒池,最後才關迴圈。外層逾時或新 commit 取消舊審查時,審查裡另外開的工作(背景的模型呼叫等)會一起被取消,不會留下沒人收尾、還在打模型的請求。等待有上限(`_LOOP_CLEANUP_SECONDS`,30 秒):吞掉取消、繼續跑的工作不會讓這條執行緒卡住,照樣關掉並記一筆 log。收尾出錯不往外丟,log 只寫例外類型。payload 不是合法 JSON 回 400。`log_message` 覆寫為靜音,stdout 只留自己的結構化 print。
 
-**資料流**:GitLab 事件 → `POST /gitlab-webhook`(驗 token)→ 路由抽出 `mr_iid`(Draft 不審;update 事件另外看 `oldrev` 與 `changes`)→ 等 `WEBHOOK_DEBOUNCE_SECONDS` 沒有新事件 → 取消同 MR 進行中的審查 → 背景 thread 跑 `review_mr` → 管線經 `toolbox/gitlab.py` 回寫 GitLab:逐條 finding 行內留言、總評留言(決策文字)、`ai-review::<decision>` label、commit status `segcra/review`(`auto_approved` → success,`needs_human`/`blocked` → failed,description 帶原因;見 `orchestrator/pipeline.py` 決策回寫段)。
+**資料流**:GitLab 事件 → `POST /gitlab-webhook`(驗 token)→ 路由抽出 `mr_iid`(Draft 不審;update 事件另外看 `oldrev` 與 `changes`)→ 等 `WEBHOOK_DEBOUNCE_SECONDS` 沒有新事件 → 取消同 MR 進行中的審查 → 背景 thread 跑 `review_mr` → 管線經 `toolbox/gitlab.py` 回寫 GitLab:逐條 finding 行內留言、commit status `segcra/review`(`auto_approved` → success,`needs_human`/`blocked` → failed,description 帶原因)、`ai-review::<decision>` label、把上一輪審查開的行內意見標成已解決、總評留言(決策文字);見 `orchestrator/pipeline.py` 決策回寫段與 06 篇第 3 節。
 
 **GitLab 端對應設定**(README 第 6 節有實測步驟):
 
@@ -156,19 +156,31 @@ finding 貼回 MR、設 label 與 commit status;收尾保留 `FINISH_RESERVE_SEC
 
 ### 收尾保留怎麼訂
 
-收尾 = 執行驗證結束之後到回傳:校準、評分、決策、取一次 MR(`get_mr_refs`:只取 head 與 `diff_refs`,
-用來比對 head,也拿來開行內討論)、逐條貼回(每條 1 個請求;沒有行號的貼一般留言)、commit status、label、
-總結。跟模型無關,時間幾乎都花在 GitLab 的請求上。
+收尾 = 執行驗證結束之後到回傳:校準、評分、決策,然後依序回寫:逐條貼回這一輪的意見(每條 1 個請求;
+沒有行號的開沒有位置的討論)、commit status(不接 CI 時)、label、收掉上一輪的行內意見、總結。每一步寫入前
+取一次 MR(`get_mr_refs`:只取 head 與 `diff_refs`,用來比對 head,也拿來開行內討論)。跟模型無關,時間
+幾乎都花在 GitLab 的請求上。
 
-- **請求數 ≈ finding 數 + 4**(取一次 MR、commit status、label、總結),跟檔案數無關。commit status 或
-  label 寫入失敗時會重送(各最多再送 2、1 次,每次之間等 1 秒)
-- **收尾 ≈ 請求數 × 單次延遲**
+- **第一次審:請求數 ≈ 2 × finding 數 + 9**(每條意見 1 個比對 head + 1 個貼回;另外 commit status、label、
+  收舊意見、總結各 1 個比對 head,commit status、label、總結各 1 個寫入,查帳號 1 個、列討論 1 頁),跟檔案數
+  無關。commit status 或 label 寫入失敗時會重送(各最多再送 2、1 次,每次之間等 1 秒)
+- **重審:再加上一輪留下的條數 + 討論清單多出的頁數**(上一輪的每條 1 個 `PUT` 標成已解決;討論清單每頁
+  100 則,最多取 5 頁)。這一輪有環節沒跑完時不收上一輪的,這部分是 0
+- **收尾 ≈ 請求數 × 單次延遲**。`eval/measure_finish.py` 在本機量到(100 個檔案、119 條 finding、每個請求
+  延遲 0.2 秒):
+
+  | | 收尾請求數 | 收尾秒數 |
+  |---|---|---|
+  | 第一次審 | 247 | 74.0 |
+  | 重審,上一輪 119 條(`--previous 119`) | 367 | 109.9 |
+
+  預設的收尾保留 300 秒,重審、上一輪條數跟這一輪差不多時,每個請求 0.5 秒約撐到 197 條 finding、1.2 秒約 80 條
 - **部署端怎麼量**:先量一次 GitLab API 的延遲(例如 `GET /projects/:id/merge_requests/:iid` 的回應時間),
   帶進 `eval/measure_finish.py` 跑(真的 `review_mr` 與真的 `toolbox/gitlab.py`,GitLab 換成本機的假伺服器、
-  每個請求固定延遲;finding 數用檔案數控制):
+  每個請求固定延遲;finding 數用檔案數控制,`--previous` 是重審時上一輪留下的條數):
 
   ```bash
-  python eval/measure_finish.py --files 10 50 100 200 --latency <部署端量到的延遲>
+  python eval/measure_finish.py --files 10 50 100 200 --latency <部署端量到的延遲> --previous 0 200
   ```
 
   量到的收尾超過 `FINISH_RESERVE_SECONDS`(預設 300 秒)時調大它。

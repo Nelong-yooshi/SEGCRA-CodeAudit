@@ -172,19 +172,25 @@ def _api(method: str, path: str, **kwargs):
 MAX_DIFF_PAGES = 50
 
 
-def _api_pages(path: str, params: dict | None = None) -> tuple[list, bool]:
-    """取回分頁 API 的全部資料。回傳 (資料, 是否因超過頁數上限而截斷)。
+def _api_pages(path: str, params: dict | None = None, *, max_pages: int | None = None,
+               newest: bool = False) -> tuple[list, bool]:
+    """取回分頁 API 的全部資料。回傳 (資料, 是否因超過頁數上限而沒取完)。
 
     PR #10 review 指出:`get_mr_diff()` 用的 `/merge_requests/:iid/diffs`
     沒有處理分頁,GitLab 這個 API 預設一頁 20 筆(上限 100)——第 21 個檔案
     之後不會被注入掃描、不會進規則預掃、不會被模型審查,diff 行數也不會算
     進去,MR 可能因此被誤判成小改而自動放行。
+
+    `newest=True`:清單由舊到新排(例如 MR 的討論)、而要的是最新的那些時用。超過上限時
+    取第一頁與最後 `max_pages - 1` 頁(看 `X-Total-Pages`),截掉的是中間較舊的;GitLab
+    沒回 `X-Total-Pages` 時(資料量很大時可能不給)照順序取,一樣回報沒取完。
     """
     import httpx
     check_gitlab_url()
     check_ssl_cert_file()
-    items, page = [], 1
-    while page and page <= MAX_DIFF_PAGES:
+    max_pages = MAX_DIFF_PAGES if max_pages is None else max_pages
+
+    def get(page: int):
         r = httpx.get(f"{GITLAB_URL}/api/v4/projects/{GITLAB_PROJECT}{path}",
                       headers={"PRIVATE-TOKEN": GITLAB_TOKEN}, timeout=30,
                       params={**(params or {}), "per_page": 100, "page": page})
@@ -193,10 +199,21 @@ def _api_pages(path: str, params: dict | None = None) -> tuple[list, bool]:
         if not isinstance(data, list):
             # 每一頁都要是清單:null、數字、dict 都不是(dict 會被 extend 成它的 key 字串)
             raise NotAnMR("分頁的回應不是清單")
-        items.extend(data)
         nxt = r.headers.get("X-Next-Page", "").strip()
-        page = int(nxt) if nxt else 0
-    return items, bool(page)
+        total = r.headers.get("X-Total-Pages", "").strip()
+        return data, (int(nxt) if nxt.isdigit() else 0), (int(total) if total.isdigit() else None)
+
+    items, nxt, total = get(1)
+    if newest and nxt and total is not None and total > max_pages:
+        for page in range(total - max_pages + 2, total + 1):
+            items.extend(get(page)[0])
+        return items, True
+    fetched = 1
+    while nxt and fetched < max_pages:
+        data, nxt, _ = get(nxt)
+        items.extend(data)
+        fetched += 1
+    return items, bool(nxt)
 
 
 # GitLab MR 的 diff_refs 三個欄位,名稱照 GitLab API 原樣(post_inline_comment 也用這組)
@@ -785,6 +802,153 @@ def _send_with_retry(send, attempts: int) -> str | None:
         time.sleep(RETRY_DELAY_SECONDS)
 
 
+# 行內意見裡的記號:重審時用它認出「上一輪是我們開的那些討論」,把它們標成已解決
+# (`resolve_stale_comments`)。總結只有一則(見 _SUMMARY_MARKERS),但行內意見是每次
+# N 條重貼一遍 —— 不收掉的話,同一行會疊五輪的意見,看 MR 的人分不出哪些還有效。
+# HTML 註解在 GitLab 的 markdown 上看不見。
+#
+# 記號帶這一輪審的 commit(head sha 前 12 碼):收舊意見排在這一輪的意見貼完之後(見 pipeline 的
+# 回寫順序),要分得出哪些是這一輪剛貼的、不能收。沒有 sha 的舊格式一律當成上一輪的。
+_INLINE_MARKER = "<!-- segcra:review-inline -->"
+_INLINE_MARK_RE = re.compile(r"<!-- segcra:review-inline(?: ([0-9a-f]{7,40}))? -->(?:\n|$)")
+
+
+def _inline_marker(head_sha: str) -> str:
+    sha = head_sha[:12] if isinstance(head_sha, str) and _SHA.fullmatch(head_sha or "") else ""
+    return f"<!-- segcra:review-inline {sha} -->" if sha else _INLINE_MARKER
+
+# 列討論最多翻幾頁(每頁 100 則)。超過這個量的 MR,重審洗版已經不是主要問題,
+# 而且收尾有時間上限,不該無上限追下去。
+MAX_DISCUSSION_PAGES = 5
+
+
+def _our_unresolved(d: dict, own: int, current_sha: str = "") -> str | None:
+    """這個討論是不是「上一輪我們開的、而且沒有人回過」?是就回 discussion id。
+
+    條件都要:
+      * 只有一則留言 —— **有人回覆過的是對話**,標成已解決會把人的話收起來;
+      * 那一則是審查自己開的:作者是 GITLAB_TOKEN 的帳號(`own`)、不是系統留言、記號在
+        內文**開頭**。記號是一段看不見、原始碼裡查得到的字串,誰都打得出來;標成已解決的
+        權限審查用的 token 一般都有,只看記號的話別人開的討論也收得掉。模型寫的文字只出現
+        在審查自己貼的留言裡,而且不在開頭,所以它在內文寫記號也收不到別人的討論;
+      * 還沒被標成已解決(resolvable 且未 resolved)—— 已經解決的再送一次只是多一個請求;
+      * 不是這一輪剛貼的:記號裡的 commit 跟 `current_sha` 相同的是這一輪的,不收。
+    """
+    notes = d.get("notes")
+    if not isinstance(notes, list) or len(notes) != 1:
+        return None
+    n = notes[0]
+    if not isinstance(n, dict) or n.get("system") is True:
+        return None
+    body = n.get("body")
+    mark = _INLINE_MARK_RE.match(body) if isinstance(body, str) else None
+    if mark is None:
+        return None
+    if mark.group(1) and current_sha and current_sha.startswith(mark.group(1)):
+        return None                          # 這一輪剛貼的
+    author = n.get("author")
+    uid = author.get("id") if isinstance(author, dict) else None
+    if not isinstance(uid, int) or isinstance(uid, bool) or uid != own:
+        return None
+    if not n.get("resolvable") or n.get("resolved"):
+        return None
+    return str(d.get("id") or "") or None
+
+
+def _list_failure(e: Exception) -> str:
+    """列不出討論清單的原因:HTTP 狀態碼或例外型別(例外原文可能帶主機位址,不寫)。"""
+    import httpx
+    if isinstance(e, httpx.HTTPStatusError):
+        code = e.response.status_code
+        return f"GitLab 回 {code}" + (":GITLAB_TOKEN 的權限不夠" if code == 403 else "")
+    return f"{type(e).__name__}"
+
+
+def resolve_stale_comments(mr_id: str, head_sha: str = "") -> str:
+    """把上一輪審查開的行內討論標成已解決。回
+    `{"ok": true, "resolved": N, "failed": M, "failed_kinds": {種類: 條數}, "incomplete": 原因或 null}`。
+
+    **這一步失敗不影響這次審查**:標不掉只是舊意見留在上面(看 MR 的人仍然看得到新的
+    那些),所以逐個討論各自 try,失敗不中斷回寫。但沒處理完的要分得出來,不能跟「沒有舊的」
+    一樣是 0:標不掉的條數與種類(被拒絕/不確定)、清單列不出來或沒取完的原因都回報,
+    呼叫端記進報告與總結。
+
+    討論清單由舊到新排(含已解決的舊討論、一般留言與系統留言),上一輪的永遠在最後,所以
+    從最新的取(`_api_pages(newest=True)`):超過頁數上限時截掉的是較舊的,不是要收的那些。
+    """
+    def reply(resolved=0, failed=0, kinds=None, incomplete=None):
+        return json.dumps({"ok": True, "resolved": resolved, "failed": failed,
+                           "failed_kinds": kinds or {}, "incomplete": incomplete},
+                          ensure_ascii=False)
+    if not REAL_MODE:
+        # mock 模式沒有討論可以標(結果是落檔,不是 GitLab 上的討論)
+        return reply()
+    mr_id = _check_mr_id(mr_id)
+    own = own_user_id()
+    if own is None:
+        reason = learn_own_user()            # CI 與 demo.py 那條路沒有經過 webhook 啟動時的查詢
+        own = own_user_id()
+        if own is None:
+            # 認不出哪些是自己開的,就一條都不收(收錯別人的討論比舊意見留著糟)
+            print(f"[gitlab] 查不到 GITLAB_TOKEN 的帳號({reason}),認不出上一輪自己開的討論,"
+                  "這次不收", flush=True)
+            return reply(incomplete=f"查不到 GITLAB_TOKEN 的帳號,認不出上一輪自己開的討論")
+    try:
+        got, truncated = _api_pages(f"/merge_requests/{mr_id}/discussions",
+                                    max_pages=MAX_DISCUSSION_PAGES, newest=True)
+    except Exception as e:                   # noqa: BLE001 — 列不出來就不標,原因回報
+        why = _list_failure(e)
+        print(f"[gitlab] MR !{mr_id} 列不出討論清單({why}),上一輪的意見這次沒收", flush=True)
+        return reply(incomplete=f"列不出討論清單({why})")
+    incomplete = (f"討論超過 {MAX_DISCUSSION_PAGES} 頁(每頁 100 則),只看了最新的,較舊的沒看"
+                  if truncated else None)
+    ids = [i for d in got if isinstance(d, dict) and (i := _our_unresolved(d, own, head_sha))]
+    resolved = 0
+    kinds: dict[str, int] = {}
+    codes: set[int] = set()
+    for did in ids:
+        try:
+            _api("PUT", f"/merge_requests/{mr_id}/discussions/{did}",
+                 json={"resolved": True})
+            resolved += 1
+        except Exception as e:               # noqa: BLE001 — 標不掉只是舊意見留著,種類記下來
+            kind = _failure_kind(e)
+            kinds[kind] = kinds.get(kind, 0) + 1
+            if kind == WRITE_REJECTED:
+                codes.add(e.response.status_code)
+    failed = sum(kinds.values())
+    if failed:
+        parts = []
+        if kinds.get(WRITE_REJECTED):
+            why = "、".join(str(c) for c in sorted(codes))
+            parts.append(f"被拒絕 {kinds[WRITE_REJECTED]} 條(GitLab 回 {why}"
+                         + (",GITLAB_TOKEN 的權限不夠" if 403 in codes else "") + ")")
+        if kinds.get(WRITE_UNCERTAIN):
+            parts.append(f"不確定 {kinds[WRITE_UNCERTAIN]} 條(連線中斷、逾時或 5xx)")
+        print(f"[gitlab] MR !{mr_id} 上一輪的意見有 {failed} 條沒收掉:{';'.join(parts)}",
+              flush=True)
+    if incomplete:
+        print(f"[gitlab] MR !{mr_id} {incomplete}", flush=True)
+    return reply(resolved, failed, kinds, incomplete)
+
+
+def _post_unpositioned(mr_id: str, body: str) -> str:
+    """開一個沒有位置的討論(`POST /discussions` 只給 body);GitLab 明確拒絕(4xx)才退成
+    一般留言。回傳 `{"ok": true}`,退成一般留言時多 `"plain_note": true`。
+
+    一般留言不能標成已解決,下一輪 `resolve_stale_comments` 收不掉,每輪多疊一份;沒有位置的
+    討論可以(測試 GitLab 19.1.1 上確認:`resolvable: true`,`PUT resolved` 回 200)。
+    連線中斷、逾時、5xx 時不退(GitLab 可能已經建立了討論),回 `{"ok": false, "failure": "uncertain"}`。"""
+    try:
+        _api("POST", f"/merge_requests/{mr_id}/discussions", json={"body": body})
+        return json.dumps({"ok": True}, ensure_ascii=False)
+    except Exception as e:                   # noqa: BLE001 — 種類記下來,例外訊息不往外帶
+        if not _rejected_by_gitlab(e):
+            return _write_failed(WRITE_UNCERTAIN)
+    _api("POST", f"/merge_requests/{mr_id}/notes", json={"body": body})
+    return json.dumps({"ok": True, "plain_note": True}, ensure_ascii=False)
+
+
 def post_inline_comment(mr_id: str, file: str, line: int, body: str,
                         severity: str = "info", base_sha: str = "", head_sha: str = "",
                         start_sha: str = "") -> str:
@@ -793,18 +957,18 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
     `base_sha`、`head_sha`、`start_sha`(MR 的 `diff_refs`)由呼叫端帶進來,一份審查只取一次
     (見 `get_mr_refs`);沒帶齊時才自己取。
 
-    行內討論被 GitLab 拒絕(4xx)時退成一般留言。連線中斷、逾時、5xx 時**不退**:GitLab 可能
-    已經建立了討論、只是回應沒送到,再貼一般留言同一條就出現兩次。這時回傳
-    `{"ok": false, "failure": "uncertain"}`,由呼叫端記下來。"""
+    沒有行號、拿不到 diff 的位置,或行內討論被 GitLab 拒絕(4xx,行號對不上 diff)時,開一個
+    沒有位置的討論(見 `_post_unpositioned`),再被拒絕才退成一般留言(回傳帶 `plain_note`,
+    下一輪收不掉,呼叫端記下來)。連線中斷、逾時、5xx 時**不退**:GitLab 可能已經建立了討論、
+    只是回應沒送到,再貼一次同一條就出現兩次。這時回傳 `{"ok": false, "failure": "uncertain"}`。"""
     if REAL_MODE:
-        text = f"**[{severity}]** {body}"
+        # 記號一律放在最前面(下一輪 resolve_stale_comments 只認開頭的記號),帶這一輪的 commit
+        tagged = f"**[{severity}]** {body}"
         if isinstance(line, bool) or not isinstance(line, int) or line <= 0:
-            # 沒有對應的行號(檔案層的 finding):直接貼一般留言,不拿第 0 行去開行內討論、
-            # 再靠 API 失敗分流;開頭不寫 `檔名:0`(看起來像第 0 行)
-            _api("POST", f"/merge_requests/{mr_id}/notes",
-                 json={"body": f"`{file}`(無對應行號)\n\n{text}"})
-            return json.dumps({"ok": True}, ensure_ascii=False)
-        note = {"body": f"`{file}:{line}`\n\n{text}"}
+            # 沒有對應的行號(檔案層的 finding):直接開沒有位置的討論,不拿第 0 行去開行內
+            # 討論、再靠 API 失敗分流;開頭不寫 `檔名:0`(看起來像第 0 行)
+            return _post_unpositioned(
+                mr_id, f"{_inline_marker(head_sha)}\n`{file}`(無對應行號)\n\n{tagged}")
         refs = _diff_refs({"diff_refs": {"base_sha": base_sha, "head_sha": head_sha,
                                          "start_sha": start_sha}})
         if not all(refs.values()):
@@ -812,10 +976,12 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
                 refs = _diff_refs(_api("GET", f"/merge_requests/{mr_id}"))
             except Exception:
                 refs = {}
+        marker = _inline_marker(head_sha or (refs or {}).get("head_sha") or "")
+        text = f"{marker}\n{tagged}"
+        located = f"{marker}\n`{file}:{line}`\n\n{tagged}"
         if not refs or not all(refs.values()):
-            # 拿不到行內討論的位置:還沒送出任何東西,貼一般留言不會重複
-            _api("POST", f"/merge_requests/{mr_id}/notes", json=note)
-            return json.dumps({"ok": True}, ensure_ascii=False)
+            # 拿不到行內討論的位置:還沒送出任何東西,開沒有位置的討論不會重複
+            return _post_unpositioned(mr_id, located)
         try:
             _api("POST", f"/merge_requests/{mr_id}/discussions",
                  json={"body": text, "position": {"position_type": "text", "new_path": file,
@@ -823,8 +989,8 @@ def post_inline_comment(mr_id: str, file: str, line: int, body: str,
         except Exception as e:
             if not _rejected_by_gitlab(e):
                 return _write_failed(WRITE_UNCERTAIN)
-            # 行號對不上 diff 時退成一般留言,不讓單一 finding 卡住整份審查
-            _api("POST", f"/merge_requests/{mr_id}/notes", json=note)
+            # 行號對不上 diff 時改開沒有位置的討論,不讓單一 finding 卡住整份審查
+            return _post_unpositioned(mr_id, located)
     else:
         _mock_output(mr_id, "inline", {"file": file, "line": line,
                                        "severity": severity, "body": body})

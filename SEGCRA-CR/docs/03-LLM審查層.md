@@ -47,11 +47,11 @@
 
 行程內工具註冊表:把 `toolbox/` 的**純 Python 函式**轉成 OpenAI tool-calling schema 並分派呼叫,註冊表本身不 spawn 子行程、無協定層(`sqltools__lint` 自己在子行程跑,為了有時間上限,見 01 篇)。工具名格式 `<group>__<tool>`(OpenAI tool name 不允許點號),與舊 MCP 版命名完全相同(`gitlab__get_mr_diff`、`sqltools__run_rules`…),pipeline/prompt 不需改動。
 
-- **`TOOL_GROUPS`**:group 名 → 函式清單。三組共 17 個工具(註冊的全部;交給模型的只有白名單,見下一項):
-  - `gitlab`(8):`get_mr_diff`、`get_mr_refs`、`get_file`、`post_inline_comment`、`post_summary`、`set_commit_status`、`create_rule_mr`、`set_label`。`get_mr_refs` 只取 MR 的 head 與 `diff_refs`(不取檔案內容),是回寫前給管線用的,唯讀但不在白名單:模型用 `get_mr_diff` 就拿得到同樣的資料
+- **`TOOL_GROUPS`**:group 名 → 函式清單。三組共 18 個工具(註冊的全部;交給模型的只有白名單,見下一項):
+  - `gitlab`(9):`get_mr_diff`、`get_mr_refs`、`get_file`、`post_inline_comment`、`post_summary`、`set_commit_status`、`create_rule_mr`、`set_label`、`resolve_stale_comments`。`get_mr_refs` 只取 MR 的 head 與 `diff_refs`(不取檔案內容),是回寫前給管線用的,唯讀但不在白名單:模型用 `get_mr_diff` 就拿得到同樣的資料
   - `sqltools`(3):`parse_ast`、`lint`、`run_rules`
   - `memory`(6):`retrieve_knowledge`、`get_conventions`、`check_style`、`learn_style_from_examples`、`lookup_similar_reviews`、`record_feedback`
-- **`MODEL_TOOLS`(#17)**:審查模型拿得到的工具,全部唯讀,共 10 個:`gitlab__get_mr_diff`、`gitlab__get_file`、`sqltools__parse_ast`、`sqltools__lint`、`sqltools__run_rules`、`memory__retrieve_knowledge`、`memory__get_conventions`、`memory__check_style`、`memory__lookup_similar_reviews`、`load_skill`。MR 的標題、描述、SQL 註解都是作者寫的,可以夾帶給模型的指令;寫判例、學風格、開 MR、留言、設 label、設 commit status 只由管線自己用 `call()` 執行。以名稱逐一列出(不是「排除寫入類」):新增的工具預設**不**開放給模型。
+- **`MODEL_TOOLS`(#17)**:審查模型拿得到的工具,全部唯讀,共 10 個:`gitlab__get_mr_diff`、`gitlab__get_file`、`sqltools__parse_ast`、`sqltools__lint`、`sqltools__run_rules`、`memory__retrieve_knowledge`、`memory__get_conventions`、`memory__check_style`、`memory__lookup_similar_reviews`、`load_skill`。MR 的標題、描述、SQL 註解都是作者寫的,可以夾帶給模型的指令;寫判例、學風格、開 MR、留言、設 label、設 commit status、把上一輪的行內意見標成已解決只由管線自己用 `call()` 執行。以名稱逐一列出(不是「排除寫入類」):新增的工具預設**不**開放給模型。
   - `openai_tools`:只回傳白名單內、且已註冊的工具
   - `call_from_model(name, args)`:模型要求的工具一律走這裡;不在白名單就不執行、回 `MODEL_REFUSAL`。被拒絕的**已註冊**工具名稱記進 `refused_calls`(不記參數),管線據此補 major(`pipeline.enforce_tool_refusals`,見 04 篇);模型自己編的名稱只回拒絕、不記錄
   - 白名單內的工具也要擋得住模型給的參數:`get_mr_diff` / `get_file` 的 `mr_id` 會被接進 GitLab API 路徑與 fixture 檔名,只接受 1–10 位 ASCII 數字(`toolbox/gitlab.py:_check_mr_id`),`1/../../issues/5`、`x/../../config/x` 這類值直接報錯、不發請求、不讀檔

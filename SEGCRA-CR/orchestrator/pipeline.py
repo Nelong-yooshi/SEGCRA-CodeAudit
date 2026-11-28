@@ -47,7 +47,7 @@ from .dbt_render import (MACRO_KIND_TEXT, MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MAC
 from .security import REVIEWER_TERMS, reviewer_terms_pattern, scan_mr
 from .mr_identifiers import extract as extract_identifiers
 from toolbox.style_learn import STYLE_CODES
-from toolbox.gitlab import (WRITE_FAILED, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UNCERTAIN,
+from toolbox.gitlab import (WRITE_FAILED, WRITE_FAILURES, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UNCERTAIN,
                             write_failure)
 from toolbox import gitlab as _gitlab
 from .skills_loader import always_skills, load_skills, skills_index
@@ -429,6 +429,16 @@ def _posted(result: str) -> bool:
     return write_failure(result) is None
 
 
+def _plain_note(result: str) -> bool:
+    """`post_inline_comment` 是不是退成了一般留言(GitLab 連沒有位置的討論都拒絕):一般留言
+    不能標成已解決,下一輪收不掉。"""
+    try:
+        got = json.loads(result)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(got, dict) and got.get("plain_note") is True
+
+
 def _place(fd: dict) -> str:
     return f"`{fd.get('file', '')}:{fd.get('line') or 0}`"
 
@@ -466,7 +476,8 @@ def _pending_section(report: dict) -> str:
 
 
 # 回寫的步驟(寫進 report["_writeback"] 的鍵 → 報告與 log 上的名稱)與失敗的種類
-_WRITEBACK_STEPS = {"inline": "行內意見", "commit_status": "merge 閘門(commit status)",
+_WRITEBACK_STEPS = {"resolve": "收掉上一輪的行內意見", "inline": "行內意見",
+                    "commit_status": "merge 閘門(commit status)",
                     "label": "標籤", "summary": "總結留言"}
 _WRITE_FAILURE_TEXT = {
     WRITE_REJECTED: "GitLab 拒絕了這個請求",
@@ -474,6 +485,53 @@ _WRITE_FAILURE_TEXT = {
     WRITE_NO_SHA: "沒有 commit 的 sha",
     WRITE_FAILED: "寫入工具出錯",
 }
+
+
+def _resolve_result(result) -> tuple[int | None, dict]:
+    """`resolve_stale_comments` 的結果:(標掉了幾個, 沒處理完的部分)。
+
+    看不懂回傳時標掉幾個記成 None(不知道),不記 0:0 跟「沒有舊的」分不出來,這個數字
+    寫進報告給人看,寫成 0 是說了一件不知道的事。沒處理完的部分(標不掉的條數與種類、清單
+    沒取完或列不出來的原因)回成 dict,沒有就是空的。"""
+    try:
+        got = json.loads(result)
+    except Exception:                        # noqa: BLE001 — ToolHub 把例外轉成錯誤字串
+        got = None
+    if not isinstance(got, dict) or not isinstance(got.get("resolved"), int) \
+            or isinstance(got.get("resolved"), bool):
+        return None, {"unknown": True}
+    unfinished = {}
+    failed = got.get("failed")
+    if isinstance(failed, int) and not isinstance(failed, bool) and failed > 0:
+        kinds = got.get("failed_kinds")
+        unfinished["failed"] = failed
+        unfinished["failed_kinds"] = {k: v for k, v in (kinds or {}).items()
+                                      if k in WRITE_FAILURES and isinstance(v, int)} \
+            if isinstance(kinds, dict) else {}
+    if isinstance(got.get("incomplete"), str) and got["incomplete"]:
+        unfinished["incomplete"] = got["incomplete"][:200]
+    return got["resolved"], unfinished
+
+
+def _resolve_lines(unfinished: dict) -> list[str]:
+    """總結裡寫明上一輪的意見沒收乾淨(看 MR 的人才知道上面還有舊的)。"""
+    lines = []
+    if unfinished.get("skipped"):
+        lines.append(f"- {unfinished['skipped']},上一輪的意見這次沒有收(沒有重新看過的地方不當成"
+                     "已經解決),仍留在 MR 上。")
+    if unfinished.get("unknown"):
+        lines.append("- 不知道上一輪的意見收掉了幾條(收舊意見的結果看不懂),MR 上可能還留著上一輪的意見。")
+    if unfinished.get("failed"):
+        kinds = unfinished.get("failed_kinds") or {}
+        detail = "、".join(f"{_WRITE_FAILURE_TEXT.get(k, k)} {n} 條" for k, n in kinds.items())
+        lines.append(f"- 上一輪的意見有 {unfinished['failed']} 條沒有收掉"
+                     + (f"({detail})" if detail else "") + ",仍留在 MR 上。")
+    if unfinished.get("incomplete"):
+        lines.append(f"- 上一輪的意見可能沒收乾淨:{unfinished['incomplete']}。")
+    if unfinished.get("plain_notes"):
+        lines.append(f"- 這一輪有 {unfinished['plain_notes']} 條意見 GitLab 不讓開討論,只能貼成"
+                     "一般留言,下一輪重審時不會自動收掉。")
+    return lines
 
 
 def _record_writeback(writeback: dict, mr_id: str, step: str, result: str) -> str | None:
@@ -487,9 +545,10 @@ def _record_writeback(writeback: dict, mr_id: str, step: str, result: str) -> st
     return failure
 
 
-def _writeback_section(writeback: dict, label: str) -> str:
-    """總結裡寫明 commit status 或標籤沒有寫上(總結在這兩步之後才貼,見 review_mr)。"""
-    lines = []
+def _writeback_section(writeback: dict, label: str, resolve_unfinished: dict | None = None) -> str:
+    """總結裡寫明 commit status 或標籤沒有寫上(總結在這兩步之後才貼,見 review_mr),
+    以及上一輪的意見沒收乾淨。"""
+    lines = _resolve_lines(resolve_unfinished or {})
     if writeback.get("commit_status"):
         lines.append(f"- ⚠️ **merge 閘門沒有寫上**(commit status `segcra/review`:"
                      f"{_WRITE_FAILURE_TEXT[writeback['commit_status']]})。合併閘門上可能沒有這次"
@@ -2667,6 +2726,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             return refs
 
         unposted = []
+        plain_notes = 0
         for fd in report.get("findings", []):
             refs = await writable(_WRITEBACK_STEPS["inline"])
             if refs is None:
@@ -2678,6 +2738,13 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             })
             if not _posted(result):
                 unposted.append(fd)
+            elif _plain_note(result):
+                plain_notes += 1
+        if plain_notes:
+            # 跟收舊意見記在同一份:下一輪收不掉,不能看起來像收掉了
+            report.setdefault("_resolve_unfinished", {})["plain_notes"] = plain_notes
+            print(f"[pipeline] MR !{mr_id} 有 {plain_notes} 條意見只能貼成一般留言,下一輪不會自動收掉",
+                  flush=True)
         writeback = {"unposted": len(unposted)}
         report["_writeback"] = writeback
         if unposted:
@@ -2699,6 +2766,27 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         if await writable(_WRITEBACK_STEPS["label"]) is not None:
             _record_writeback(writeback, mr_id, "label", await hub.call(
                 "gitlab__set_label", {"mr_id": mr_id, "label": label}))
+        # label 設完、總結之前,把上一輪我們開的行內意見標成已解決:總結只有一則,行內意見卻是
+        # 每次 N 條重貼一遍 —— 不收掉的話同一行會疊好幾輪的意見,看 MR 的人分不出哪些還有效。
+        # 排在這一輪的意見、commit status、label 之後:上一輪越多,這一步越久,不讓它拖晚閘門;
+        # 中途被新的 commit 取代時,MR 上至少還看得到上一輪的意見,不會舊的收了、新的還沒貼。
+        # 這一輪剛貼的靠記號裡的 commit 分開(帶 reviewed_sha,同一個 commit 的不收)。
+        # 標不掉不影響這次審查(舊意見留著),記進報告與總結,不當成回寫失敗。
+        #
+        # 這一輪有環節沒跑完時不收:收舊意見的前提是「這一輪重新審過了,上一輪報的、這一輪
+        # 沒再報,就是不用再看了」。沒跑完不是成功,不能當成這一輪已經取代上一輪 —— 上一輪的
+        # blocker 會在沒有人重新看過的情況下被收起來。
+        if review_incomplete(report):
+            report["_resolve_unfinished"] = {**report.get("_resolve_unfinished", {}),
+                                             "skipped": "這一輪有環節沒跑完"}
+            print(f"[pipeline] MR !{mr_id} 這一輪有環節沒跑完,上一輪的意見這次不收", flush=True)
+        elif await writable(_WRITEBACK_STEPS["resolve"]) is not None:
+            resolved, unfinished = _resolve_result(await hub.call(
+                "gitlab__resolve_stale_comments", {"mr_id": mr_id, "head_sha": reviewed_sha or ""}))
+            report["_resolved_stale"] = resolved          # None = 不知道
+            if unfinished:
+                report["_resolve_unfinished"] = {**report.get("_resolve_unfinished", {}),
+                                                 **unfinished}
         decision_text = {"auto_approved": "✅ 小幅變更且無實質問題,自動放行",
                          "needs_human": "👤 請人工確認後裁決",
                          "blocked": "⛔ 有 blocker 級問題,修正前不得合入"}[decision]
@@ -2707,7 +2795,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                 "mr_id": mr_id,
                 "body": f"**決策:{decision_text}**\n\n{report.get('summary', '')}"
                         + _pending_section(report)
-                        + _unposted_section(unposted) + _writeback_section(writeback, label),
+                        + _unposted_section(unposted)
+                        + _writeback_section(writeback, label, report.get("_resolve_unfinished")),
                 "score": int(report.get("score", 0)),
                 "verdict": report.get("verdict", "needs_changes"),
             }))
