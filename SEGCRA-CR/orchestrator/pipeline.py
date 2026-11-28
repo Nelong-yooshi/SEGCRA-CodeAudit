@@ -30,7 +30,7 @@ from .isolation import run_in_thread, run_isolated
 from .mr_fetch_error import mr_fetch_reason
 from .dbt_impact import DEFAULT_ISOLATED_MEMORY_MB, DEFAULT_ISOLATED_TIMEOUT_S, macros_referenced
 from .dbt_context import DbtContext, prepare_dbt_context
-from .dbt_exec import render_for_exec
+from .dbt_exec import render_for_exec, spec_tables
 from .dbt_impact import path_kind
 from .dbt_hidden_writes import IN_TAGS, UNREACHED, UNVERIFIED, WRITE_KEYWORDS, find_hidden_writes
 from .dbt_render import is_dbt_template, render_model_isolated
@@ -49,6 +49,7 @@ from toolbox.gitlab import (WRITE_FAILED, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UN
                             write_failure)
 from toolbox import gitlab as _gitlab
 from .skills_loader import always_skills, load_skills, skills_index
+from . import spec_index, table_defs
 from .dbt_context import PROJECT_FILE_REMOVED, PROJECT_YAML_INVALID, check_yaml_files_isolated
 from .dbt_project import YAML_MODELS_NOT_LIST, YAML_SYNTAX
 from .spec_exec import SpecLookup, find_spec, run_spec_exec
@@ -1706,8 +1707,21 @@ def _is_spec_file(f) -> bool:
     return isinstance(f, dict) and _is_spec_path(f.get("path"))
 
 
+def _spec_moved_away(f) -> bool:
+    """規格檔被改名搬出規格目錄(`specs/X.md` → `docs/X.md`、`specs/X.md.bak`)。GitLab 改名時
+    `path` 是新路徑、舊路徑在 `old_path`:只看 `path` 的話,這份規格從審查讀的位置消失了,
+    卻不算「修改了規格」——同一個序號有兩份規格時,搬走比較嚴的那份就能決定用哪一份。"""
+    return (isinstance(f, dict) and _is_spec_path(f.get("old_path"))
+            and not _is_spec_path(f.get("path")))
+
+
+def _is_spec_change(f) -> bool:
+    """變更清單的一項有沒有動到規格:改了規格檔,或把規格檔改名搬出規格目錄。"""
+    return _is_spec_file(f) or _spec_moved_away(f)
+
+
 def _touches_specs(mr: dict) -> bool:
-    return any(_is_spec_file(f) for f in mr.get("files", []))
+    return any(_is_spec_change(f) for f in mr.get("files", []))
 
 
 def _root_spec_code(path) -> str | None:
@@ -1730,11 +1744,18 @@ def _spec_versions_in_mr(mr: dict) -> tuple[dict, set]:
     拿不到完整內容(沒有 full_content)時無法換成這個 MR 的版本,審查用的是 find_spec 讀到的那一份:
     真實 GitLab 模式下 find_spec 讀的是正在審的 commit(也就是修改後的版本;讀不到就當成沒有規格),
     mock 模式讀工具內建的 specs/(修改前的版本)。兩種情況都不能說成「以修改後的規格為準」,
-    在那條 finding 裡寫明拿不到。"""
+    在那條 finding 裡寫明拿不到。
+
+    改名時舊位置的那份不在了(真實模式下載的是釘住的 commit,本來就沒有它):舊代號記成刪除,
+    mock 模式的對照表才會跟真實模式一致。"""
     versions, unavailable = {}, set()
+    gone = []
     for f in mr.get("files", []):
         if not isinstance(f, dict):
             continue
+        old = _root_spec_code(f.get("old_path"))
+        if old is not None and old != _root_spec_code(f.get("path")):
+            gone.append(old)
         code = _root_spec_code(f.get("path"))
         if code is None:
             continue
@@ -1745,7 +1766,94 @@ def _spec_versions_in_mr(mr: dict) -> tuple[dict, set]:
             versions[code] = text
         else:
             unavailable.add(code)
+    for old in gone:
+        if old not in versions and old not in unavailable:   # 同一個 MR 又放回同名的檔:以它為準
+            versions[old] = ""
     return versions, unavailable
+
+
+def _load_spec_index(mr: dict, dbt_cfg: dict, dbt_ctx: DbtContext | None) -> "spec_index.SpecIndex":
+    """這份審查的「project 編號 → 規格」對照表。model 目錄用 dbt 專案的設定(取不回專案時用
+    預設的 models/;專案取不回來本身已經交人工)。"""
+    project = dbt_ctx.project if dbt_ctx is not None else None
+    prefix = dbt_ctx.prefix if dbt_ctx is not None else check_project_dir(
+        dbt_cfg.get("project_dir", ""))
+    versions, _ = _spec_versions_in_mr(mr)
+    return spec_index.load_index(
+        versions, prefix=prefix,
+        model_paths=project.model_paths if project is not None else spec_index.DEFAULT_MODEL_PATHS,
+        macro_paths=project.macro_paths if project is not None else spec_index.DEFAULT_MACRO_PATHS,
+        table_versions=_table_versions_in_mr(mr))
+
+
+def _table_versions_in_mr(mr: dict) -> dict:
+    """這個 MR 改到的表定義檔(specs/tables/ 底下的 .md):{路徑: 修改後的內容};刪掉的是空字串。
+    拿不到完整內容的不放(mock 模式照舊讀內建的那一份)。"""
+    out = {}
+    for f in mr.get("files", []):
+        if not isinstance(f, dict):
+            continue
+        path = f.get("path")
+        if not (isinstance(path, str) and path.startswith(spec_index.TABLES_DIR + "/")
+                and path.endswith(".md") and path.count("/") == 2):
+            continue
+        text = f.get("full_content")
+        if _is_deleted(f.get("diff")):
+            out[path] = ""
+        elif isinstance(text, str) and text:
+            out[path] = text
+    return out
+
+
+def _with_repo_tables(exec_text, exec_mr: dict) -> tuple:
+    """執行驗證用的規格補上 specs/tables/ 的表定義(見 table_defs)。回傳 (規格, 紀錄或 None)。
+    只在 dbt 開啟(這份審查有對照表)時才有;規格本身已經定義的表以規格為準。"""
+    index = spec_index.current_index()
+    if index is None or index.error or not index.tables or not exec_text:
+        return exec_text, None
+    defs, notes = table_defs.load(index.tables)
+    sql_texts = [f.get("full_content") or _sql_from_diff(f.get("diff", "")) or ""
+                 for f in exec_mr.get("files", []) if isinstance(f, dict)]
+    text, record = table_defs.augment(exec_text, sql_texts, defs, spec_tables(exec_text))
+    if notes:
+        record = record or {"tables": [], "notes": []}
+        record["notes"] = (notes + record["notes"])[:table_defs.MAX_NOTES]
+    return text, record
+
+
+_REPO_TABLES_TITLE = "執行驗證的表定義(specs/tables/)"
+_SQL_RUN_TITLE = "執行驗證:SQL 無法在測資上執行"
+_MISSING_COLUMN = re.compile(r"(?:Invalid column name|無效的資料行名稱)\s*'([^']+)'", re.I)
+
+
+@_isolated_stage("表定義紀錄")
+def enforce_repo_tables(report: dict, record) -> dict:
+    """記下執行驗證用了哪些 specs/tables/ 的表定義(`_repo_tables`,模型輸出的同名欄位蓋掉),
+    有沒採用的定義時補一條 info。
+
+    欄位很多的表只建了 SQL 裡看得到名稱的欄位;沙盒說某個欄位不存在、而那個欄位在完整定義裡有,
+    就是測資表建得不完整,不是 SQL 的錯:把那條「SQL 無法在測資上執行」改寫成執行驗證沒有完成
+    (嚴重度照舊 major,一樣不放行)。"""
+    report["_repo_tables"] = record
+    if not record:
+        return report
+    dropped = {c.lower() for t in record.get("tables", []) for c in t.get("dropped", [])}
+    for f in report.get("findings", []):
+        if f.get("title") != _SQL_RUN_TITLE or f.get("_source") != "program":
+            continue
+        m = _MISSING_COLUMN.search(str(f.get("detail", "")))
+        if m and m.group(1).lower() in dropped:
+            f["title"] = "執行驗證無法完成(測資表少了欄位)"
+            f["detail"] = (f"沙盒說欄位 {m.group(1)} 不存在,但 specs/tables/ 的定義裡有這個欄位:"
+                           "這張表欄位很多,執行驗證只建了 SQL 裡看得到名稱的欄位,這不是 SQL 的錯。"
+                           "未經執行驗證,本 MR 不得自動放行。")
+            f["suggestion"] = "在規格的「資料表定義」寫出這張表要用到的欄位,或請維運確認。"
+    if record.get("notes"):
+        note = {"file": MR_CONTENT_FILE, "line": 0, "severity": "info", "title": _REPO_TABLES_TITLE,
+                "detail": ";".join(record["notes"]) + "。",
+                "suggestion": "照 docs/09「表定義放在 specs/tables/」修正定義檔。", "citations": []}
+        _put_program_finding(report, note)
+    return report
 
 
 def _is_deleted(diff) -> bool:
@@ -1758,9 +1866,10 @@ def _find_spec_in_mr(mr: dict):
     """find_spec 找到的規格,換成這個 MR 的版本(見 _spec_versions_in_mr)。受影響的 model 對規格時
     也用這一個,同一個 MR 裡兩條路讀到的版本一致。
 
-    回傳跟 find_spec 一樣是 SpecLookup,**`unavailable` 要照樣帶出去**:受影響 model 的檢查靠它
-    分出「取不到」與「確定沒有」,丟掉的話 token 沒設也會被說成沒有規格。用的是 MR 的版本時拿得到,
-    不算取不到。"""
+    回傳跟 find_spec 一樣是 SpecLookup,**`unavailable` 與 `note` 要照樣帶出去**:受影響 model 的檢查
+    靠 `unavailable` 分出「取不到」與「確定沒有」,丟掉的話 token 沒設也會被說成沒有規格;`note` 是
+    MR 的程式對不到規格的原因,review_mr 靠它分出「沒有程式檔」(可以改用受影響 model 的規格)與
+    「有程式檔但對不到」(不可以)。用的是 MR 的版本時拿得到,不算取不到。"""
     versions, _ = _spec_versions_in_mr(mr)
 
     async def find(hub, target: dict, **kw):
@@ -1768,7 +1877,7 @@ def _find_spec_in_mr(mr: dict):
         code, text = found
         if code is not None and code in versions:
             return SpecLookup(code, versions[code])
-        return SpecLookup(code, text, found.unavailable)
+        return SpecLookup(code, text, found.unavailable, getattr(found, "note", None))
     return find
 
 
@@ -2007,12 +2116,17 @@ def enforce_spec_change(report: dict, mr: dict) -> dict:
     路徑(code 格式)、行號、數字、固定清單裡的用語與編號型的條文名稱(見 _spec_change_notes),
     不回顯規格內容。標題只能由程式產生(見 _put_program_finding)。
     """
-    spec_files = [f for f in mr.get("files", []) if _is_spec_file(f)]
+    spec_files = [f for f in mr.get("files", []) if _is_spec_change(f)]
     if not spec_files:
         return report
     versions, unavailable = _spec_versions_in_mr(mr)
     parts, shown = [], 0
     for f in spec_files[:MAX_SPEC_FILES_LISTED]:
+        if _spec_moved_away(f):
+            parts.append(f"{_code_span(f.get('old_path'))} 被改名搬出規格目錄(改成 "
+                         f"{_code_span(f.get('path'))}),審查不再讀到這份規格;"
+                         "同一個序號有多份規格時,剩下的那份會被選中。")
+            continue
         notes, stale = _spec_change_notes(f)
         more = max(0, len(notes) - (MAX_SPEC_NOTES - shown))
         notes = notes[:MAX_SPEC_NOTES - shown]
@@ -2040,7 +2154,13 @@ def enforce_spec_change(report: dict, mr: dict) -> dict:
                    + ",無法確認審查讀到的是不是修改後的版本,也沒有檢查規格前後是否一致;")
     elif versions:
         detail += "審查與執行驗證以這個 MR 修改後的規格為準;"
-    elsewhere = sum(_root_spec_code(f.get("path")) is None for f in spec_files)
+    tables = (sum(f.get("path", "").startswith(spec_index.TABLES_DIR + "/") for f in spec_files)
+              if spec_index.current_index() is not None else 0)
+    if tables:
+        # dbt 開啟時,specs/tables/ 的表定義會被拿去建執行驗證的測資表(見 table_defs)
+        detail += (f"有 {tables} 個表定義檔(specs/tables/)被修改,執行驗證用修改後的表結構建測資表;")
+    elsewhere = sum(_root_spec_code(f.get("path")) is None and not _spec_moved_away(f)
+                    for f in spec_files) - tables
     if elsewhere:
         # 只有 repo 根目錄的 specs/<代號>.md 是審查讀的規格;其他位置的不能說成「以修改後的為準」
         detail += (f"有 {elsewhere} 個規格檔不在審查讀取規格的位置(repo 根目錄的 specs/<代號>.md),"
@@ -2161,11 +2281,20 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                             _mr_with_head_text, dict(mr), mr, dbt_ctx, rendered)
         injection_hits = _step(report_stub, "注入掃描", scan_mr, [], scan_target)
 
-        # 找 spec(確定性;執行驗證與 prompt 的規格段共用)。依檔名對應與展開器
-        # 同一個開關:關閉時行為與接線前完全相同。
+        # 找 spec(確定性;執行驗證與 prompt 的規格段共用)。dbt 開啟時依 project 資料夾對應,
+        # 跟展開器同一個開關。對照表每份審查讀一次,受影響 model 的查找與執行驗證共用。
         # MR 改到規格檔時,規格以這個 MR 的版本為準(見 _spec_versions_in_mr)
+        spec_index.use_index(
+            _step(report_stub, "規格清單讀取", _load_spec_index,
+                  spec_index.SpecIndex(error="fetch_failed"), mr, cfg.dbt, dbt_ctx)
+            if cfg.dbt.get("enabled") is True else None)
         find_spec_mr = _find_spec_in_mr(mr)
-        spec_code, spec_text = await find_spec_mr(hub, mr, by_path=cfg.dbt.get("enabled") is True)
+        own_spec = await find_spec_mr(hub, mr, by_path=cfg.dbt.get("enabled") is True)
+        spec_code, spec_text = own_spec
+        # MR 自己的程式對不到規格的原因(不屬於任何 project、分屬不同 project、project 沒有規格……)。
+        # 有原因 = MR 有程式檔但對不到:不可以改用受影響 model 的規格,不然 P09 的程式會拿 P02 的
+        # 規格驗、報告寫通過
+        own_note = getattr(own_spec, "note", None)
         # MR 改到 macro 等:檢查不在變更清單裡、但受影響的 model(沒有反查結果時是 None)
         affected = await check_affected_models(hub, mr, cfg.dbt, dbt_ctx, find_spec=find_spec_mr)
         # MR 改到的 macro 檔載入得了嗎:Jinja 語法錯誤時 dbt 整個專案都編譯不了
@@ -2173,8 +2302,9 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                              mr, dbt_ctx, cfg.dbt)
         # MR 改到的 dbt 設定檔(dbt_project.yml、屬性檔):dbt 解析專案時一定失敗的寫法
         yaml_issues = _step(report_stub, "dbt 設定檔檢查", _dbt_yaml_issues, [], mr, dbt_ctx)
-        if spec_code is None and spec_text is None and affected is not None and affected.spec:
-            # MR 本身對不到規格(只改了 macro),而受影響的 model 都對到同一份:用它來審
+        if (spec_code is None and spec_text is None and not own_note
+                and affected is not None and affected.spec):
+            # MR 本身沒有程式檔(只改了 macro),而受影響的 model 都對到同一份:用它來審
             spec_code, spec_text = affected.spec
         # 對到多份規格、或只有部分對到:找到的都附上,標明對應哪個 model。排序失敗就當成
         # 沒有對到(執行驗證照「無規格可驗」處理)並記下未完整,不中斷整份審查
@@ -2372,6 +2502,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         spec_limit = _stage_limit(SPEC_EXEC_TIMEOUT_SECONDS, review_deadline)
         deadline = time.monotonic() + (spec_limit or 0)
         dbt_exec = None
+        repo_tables = None                 # 執行驗證用到的 specs/tables/ 表定義(見 table_defs)
         try:
             # 端點無法使用時整段不跑:測資生成要呼叫模型。找不到規格等不用模型的結果這次不會出現,
             # 但它們本來就是交人工,決策不受影響;端點恢復後重新審查就看得到
@@ -2381,8 +2512,11 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
                 raise _SpecExecSkipped(_NO_TIME_REASON)
             # 交給執行驗證的 MR 與規格也在 try 裡:組不出來同樣記成執行驗證未完成
             exec_mr = _mr_for_spec_exec(mr, dbt_ctx)
-            exec_code, exec_text = _spec_for_exec(spec_code, spec_text, affected_specs, exec_mr)
-            exec_mr, dbt_exec = _dbt_exec_mr(exec_mr, exec_text, spec_text, affected_specs,
+            # MR 的程式對不到規格(有原因)時,也不拿受影響 model 的規格去驗:執行驗證照實記「無規格可驗」
+            exec_specs = () if own_note else affected_specs
+            exec_code, exec_text = _spec_for_exec(spec_code, spec_text, exec_specs, exec_mr)
+            exec_text, repo_tables = _with_repo_tables(exec_text, exec_mr)
+            exec_mr, dbt_exec = _dbt_exec_mr(exec_mr, exec_text, spec_text, exec_specs,
                                              dbt_ctx, cfg.dbt)
             # 執行驗證裡有好幾次模型呼叫(測資生成、重試、仲裁),越後面的剩的時間越少:
             # 每一次各自用那一刻剩下的(見 agent.llm_deadline / request_timeout)
@@ -2424,6 +2558,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         executed_dbt = (dbt_exec["file"] if dbt_exec and dbt_exec["ok"] and spec_result is not None
                         and spec_result.get("executed_file") == dbt_exec["file"] else None)
         report = enforce_dbt_exec_note(report, dbt_exec)  # dbt model 沒有送進沙盒的原因
+        report = enforce_repo_tables(report, repo_tables)  # 用了哪些 specs/tables/ 的表定義
         report = enforce_dbt_unexecuted(report, mr, dbt_ctx, cfg.dbt, executed_dbt)  # dbt 的變更沒被執行驗證到
         report = enforce_spec_change(report, mr)  # MR 改到規格檔:改了什麼、前後是否一致
         # SQL_DIALECT 不是 tsql(開發測試用):規則層用別的方言解析,結果會跟正式環境不同。

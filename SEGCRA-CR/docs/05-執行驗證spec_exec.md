@@ -18,6 +18,11 @@
 
 ### 第 0 步:找 spec(確定性;`spec_exec.py:extract_rule_codes` / `find_spec`)
 
+`dbt.enabled` 開啟時(部署端),`find_spec` **只**依程式所在的 project 資料夾對應規格
+(`models/<project 編號>/` ↔ 規格「基本資料」的序號,見 09 篇「規格依 project 資料夾對應」),
+下面的 R 編號兩路都不走;對不到的原因(例如「這個檔案不屬於任何 project」)寫進「無規格可驗」
+那條 finding,執行驗證結果另外記 `no_spec_reason`。dbt 關閉時照下面的方式找:
+
 1. `extract_rule_codes`:把 MR 的標題、描述、每個檔的路徑與內容(`full_content`,沒有就用 diff)串起來,用 regex `\bR-\d{2,4}\b` 抓規則碼,去重排序。
 2. `find_spec` 兩路:
    - **mock/本地路**:逐碼查本包 `specs/<code>.md`,存在即讀入回傳。

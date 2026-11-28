@@ -7,12 +7,12 @@
 (`tests/fixtures/dbt_compiled/sqlserver/mrt_RETAIL_M1.sql`),只把 dbt var 代入的
 固定日期改成 `@start_date`(測資建在固定的執行窗上),表名與邏輯原樣。整個 case 的端到端行為要模型與 MS SQL 沙盒才驗得完,但底下這幾件事
 是確定性的,值得在 CI 上釘住——它們壞掉時,那個 case 會以看起來無關的方式失敗
-(「無規格可驗」而不是「檔名對應壞了」)。
+(「無規格可驗」而不是「規格對應壞了」)。
 
 驗的東西:
-  1. 規格**依 model 檔名**對應:`mrt_RETAIL_M1_EVAL.sql` → `specs/RETAIL_M1_EVAL.md`。
-     真實規則沒有 R 編號,這是它唯一的規格來源。評測規格刻意不用正式名稱:
-     真正的 `mrt_RETAIL_M1.sql` 不能對到這份照程式改寫的規格。
+  1. 規格**依 project 資料夾**對應:`models/SAMPLE01/` → 「基本資料」序號是 SAMPLE01 的
+     `specs/RETAIL_M1_EVAL.md`。真實規則沒有 R 編號,這是它唯一的規格來源。正式的範本規格
+     若也放進 specs/(同一個編號),會變成兩份、不自行擇一,不會默默用到這份評測規格。
   2. 這條路確實由 `dbt.enabled` 控制:關閉時必須對不到(#14 的安全預設)。
   3. `case_config()` 只對標記過的 case 換設定,不影響其他 case。
   4. 已編譯的 SQL 不會被誤判成 dbt 樣板(否則會被擋在沙盒外)。
@@ -67,11 +67,11 @@ def _cfg(**dbt) -> Config:
 
 
 def test_真實規則沒有R編號(case):
-    """這正是需要依檔名對應規格的原因——不是這個 case 特別,是真實規則都這樣。"""
+    """這正是需要依 project 資料夾對應規格的原因——不是這個 case 特別,是真實規則都這樣。"""
     assert extract_rule_codes(case) == []
 
 
-def test_規格依model檔名對應得到(case):
+def test_規格依project資料夾對應得到(case):
     code, text = asyncio.run(find_spec(None, case, by_path=True))
     assert code == "RETAIL_M1_EVAL"
     assert text and text.lstrip().startswith("#")
@@ -140,14 +140,17 @@ def test_埋雷版的規格也對得到(bugged):
     assert code == "RETAIL_M1_EVAL" and text
 
 
-def test_正式名稱的model對不到評測專用規格(case):
+def test_正式範本規格也放進來時不會默默用評測專用規格(case, monkeypatch, tmp_path):
     """`specs/RETAIL_M1_EVAL.md` 是照範例程式改寫、讓正向對照乾淨的版本(拿掉了範本
-    規格的兩項排除資料)。若它以正式名稱放在 `specs/`,之後審真正的 `mrt_RETAIL_M1.sql`
-    都會依檔名對到它,範本規格有要求、程式卻沒做的部分就不會再被檢查。"""
-    real = json.loads(json.dumps(case))
-    real["files"][0]["path"] = "models/mrt_RETAIL_M1.sql"
-    code, text = asyncio.run(find_spec(None, real, by_path=True))
-    assert code != "RETAIL_M1_EVAL" and (text is None or "評測專用" not in text)
+    規格的兩項排除資料)。正式的範本規格用同一個編號放進 `specs/` 時,同一個 project
+    有兩份規格,不自行擇一——範本規格有要求、程式卻沒做的部分不會因此不被檢查。"""
+    import orchestrator.spec_exec as spec_exec
+    for name in ("RETAIL_M1_EVAL", "RETAIL_M1"):
+        (tmp_path / f"{name}.md").write_text(
+            (PKG_ROOT / "specs" / "RETAIL_M1_EVAL.md").read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(spec_exec, "SPECS_DIR", tmp_path)
+    lookup = asyncio.run(find_spec(None, case, by_path=True))
+    assert lookup == (None, None) and "2 份規格" in lookup.note
 
 
 def test_埋雷版是大檔裡只改一行的維護型diff(bugged):
