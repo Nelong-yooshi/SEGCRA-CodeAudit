@@ -20,6 +20,7 @@
 
 **(2)審查時查判例 — `toolbox/memory.py:lookup_similar_reviews`**
 用 bigram 集合相似度:`_bigrams` 把文字去空白、轉小寫、切成所有相鄰兩字元的集合;對 history.jsonl 每筆記錄以 `title+detail+sql` 建集合,分數 = 交集大小 / 查詢集合大小,取 top 5 回傳(含 disposition 與 similarity)。審查 system prompt(`orchestrator/pipeline.py` SYSTEM_TEMPLATE)明定:「每個 finding 先用 memory__lookup_similar_reviews 查判例,曾被 rejected 的同型問題降級或不報」。注意這一步是**模型參考判例後自行降權**,屬勸導性;確定性的抑制在第(5)站的 binding suppress。
+模型查回的判例先逐筆過注入掃描,命中的那筆不交給模型(`tool_hub._screen_history`,見 03 篇);被擋下時管線印一行紀錄,寫出判例的 `ts`,照 `ts` 到 history.jsonl 找那一筆處理。`record_feedback` 記 `sql` 時,從 MR 貼過來的 SQL 會連作者的註解一起記下來,這是要掃的原因。
 
 **(3)離線分群起草提案 — `scripts/consolidate_feedback.py`**
 讀 history.jsonl 全量記錄,`_cluster` 分群:**有 tag 的按 tag 精準分群**(規則/檢核點代碼最可靠);無 tag 的退回標題+note 的 bigram Jaccard 相似度(`len(交集)/len(聯集) ≥ 0.3` 併入既有群,否則自成一群)。每群統計:
