@@ -27,6 +27,7 @@ import typing
 
 from toolbox import gitlab, memory, sqltools
 
+from .error_text import error_label
 from .isolation import run_in_thread
 
 # 工具組:group 名 → 該組要暴露的函式(全名 = f"{group}__{fn.__name__}")
@@ -152,7 +153,9 @@ class ToolHub:
             try:
                 result = await self._invoke(full_name, self._functions[full_name], args)
             except Exception as e:   # 與舊版(MCP server 端吞錯)一致:回錯誤字串不炸管線
-                result = f"Error executing tool {full_name}: {e}"
+                # 這個字串會回給模型(工具結果),模型可能照抄進 finding 貼到 MR:不放例外原文
+                # (httpx 的訊息帶完整網址;見 error_text)
+                result = f"Error executing tool {full_name}: {error_label(e)}"
         elif "__" in full_name:
             group = full_name.split("__", 1)[0]
             if group not in self.group_names:

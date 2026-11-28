@@ -13,7 +13,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.errors import SqlglotError
 
-from orchestrator.config import env_seconds
+from orchestrator.config import env_seconds, env_text
 from orchestrator.isolation import run_isolated
 from toolbox import sql_primitives
 
@@ -21,7 +21,12 @@ logging.disable(logging.INFO)  # sqlfluff 的 INFO 輸出會灌爆 stderr
 
 # 規則程式跑在 MS SQL 上。用別的方言解析,T-SQL 的方括號識別字、TOP、WITH (NOLOCK)
 # 會解析失敗,AST 規則(R001 DML 無 WHERE、R002 SELECT * …)就整組跳過。
-DIALECT = os.environ.get("SQL_DIALECT", "tsql")
+# 正式環境只會是 tsql;其他方言是開發測試用的,設了就一直提醒(啟動時、每一份審查、報告與 MR 總結)。
+# 設了但是空的就停:空字串交給 sqlglot 會變成它的預設方言,不是 tsql
+DIALECT = env_text("SQL_DIALECT", "tsql")
+if DIALECT != "tsql":
+    print(f"[sqltools] 警告:SQL_DIALECT={DIALECT}(開發測試用;正式環境是 tsql),審查結果會跟正式環境不同",
+          flush=True)
 
 
 def parse_statements(sql: str):

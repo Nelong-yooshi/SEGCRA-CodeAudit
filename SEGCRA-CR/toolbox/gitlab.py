@@ -13,16 +13,53 @@ import re
 import time
 from pathlib import Path
 
-PKG_ROOT = Path(__file__).resolve().parent.parent
-FIXTURES_DIR = Path(os.environ.get("FIXTURES_DIR", PKG_ROOT / "fixtures"))
-OUTPUT_DIR = Path(os.environ.get("REVIEW_OUTPUT", PKG_ROOT / "review_output"))
+from orchestrator.config import ConfigError, env_int, env_path
+from orchestrator.config import _env_text as _config_env_text
 
-GITLAB_URL = os.environ.get("GITLAB_URL", "")          # e.g. http://localhost:8929
-GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "")
-GITLAB_PROJECT = os.environ.get("GITLAB_PROJECT", "")  # 專案的數字 id(CI 那條路拿它跟 job 的專案比對)
+PKG_ROOT = Path(__file__).resolve().parent.parent
+# 有設時要絕對路徑、設了但是空的就停(見 config.env_path):報告含 MR 的程式碼,不能寫到啟動目錄
+FIXTURES_DIR = env_path("FIXTURES_DIR", PKG_ROOT / "fixtures")
+OUTPUT_DIR = env_path("REVIEW_OUTPUT", PKG_ROOT / "review_output")
+
+
+class GitLabConfigError(ConfigError):
+    """GitLab 的設定不完整:停下來,不悄悄改走 mock 模式。"""
+
+
+_REAL_MODE_VARS = ("GITLAB_URL", "GITLAB_TOKEN", "GITLAB_PROJECT")
+
+
+def _env_text(name: str, unset: str) -> str:
+    """沒設回 `unset`;**設了但去掉前後空白後是空的,直接報錯並寫出變數名**。規則用 config.py 那一份,
+    這裡只把錯誤換成 GitLabConfigError(它是 ConfigError 的子類別)。"""
+    try:
+        value = _config_env_text(name)
+    except ConfigError as e:
+        raise GitLabConfigError(str(e)) from None
+    return unset if value is None else value
+
+
+def _real_mode_settings() -> tuple[str, str, str]:
+    """real 模式的三個設定。**只給了其中幾個時停下來**:以前任一個沒給就悄悄改走 mock 模式,
+    部署時漏設一個(或部署腳本沒把值帶進來),服務照常起來、審的卻是測試資料。三個都不設才是
+    mock 模式(離線開發與評測)。"""
+    # 一個一個寫出名稱(不用迴圈):設定參數的檢查(env_registry)靠字面的名稱找讀法
+    values = {"GITLAB_URL": _env_text("GITLAB_URL", ""), "GITLAB_TOKEN": _env_text("GITLAB_TOKEN", ""),
+              "GITLAB_PROJECT": _env_text("GITLAB_PROJECT", "")}
+    given = [name for name, v in values.items() if v]
+    if given and len(given) != len(_REAL_MODE_VARS):
+        missing = [name for name in _REAL_MODE_VARS if not values[name]]
+        raise GitLabConfigError(
+            f"GitLab 的設定只給了 {'、'.join(given)},還缺 {'、'.join(missing)}:"
+            f"三個都要設才會連 GitLab(三個都不設是離線的 mock 模式)")
+    return values["GITLAB_URL"], values["GITLAB_TOKEN"], values["GITLAB_PROJECT"]
+
+
+# URL 例如 http://localhost:8929;GITLAB_PROJECT 是專案的數字 id(CI 那條路拿它跟 job 的專案比對)
+GITLAB_URL, GITLAB_TOKEN, GITLAB_PROJECT = _real_mode_settings()
 REAL_MODE = bool(GITLAB_URL and GITLAB_TOKEN and GITLAB_PROJECT)
 # 專案層級的唯讀 token(read_api,角色 Reporter),只給打包下載用(#15 條件 1)
-GITLAB_READ_TOKEN = os.environ.get("GITLAB_READ_TOKEN", "")
+GITLAB_READ_TOKEN = _env_text("GITLAB_READ_TOKEN", "")
 
 
 
@@ -194,7 +231,7 @@ def review_ref() -> str | None:
 
 # 取回單一檔案的大小上限。超過就當成「取不到完整內容」交人工,不要讓一個超大的
 # 檔案拖住預掃、注入掃描與沙盒(與審查流程的時間上限同一個原則)。
-MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(1024 * 1024)))
+MAX_FILE_BYTES = env_int("MAX_FILE_BYTES", 1024 * 1024)
 
 
 def _read_token() -> str | None:

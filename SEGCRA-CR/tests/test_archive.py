@@ -724,8 +724,17 @@ def test_module_imports_are_allowlisted():
             imported |= {a.name.split(".")[0] for a in node.names}
         elif isinstance(node, ast.ImportFrom):
             imported.add(("." * node.level) + (node.module or "").split(".")[0])
+    # .error_text:例外轉成可以貼出去的文字(那個模組只匯入 __future__,見下一條),不帶來任何對外能力
     assert imported == {"gzip", "io", "os", "shutil", "stat", "tarfile", "tempfile",
-                        "unicodedata", "dataclasses"}
+                        "unicodedata", "dataclasses", ".error_text"}
+
+
+def test_error_text_不匯入任何東西():
+    """archive.py、dbt_render.py 放行了 .error_text:它自己不能帶進別的能力。"""
+    tree = ast.parse((PKG_ROOT / "orchestrator" / "error_text.py").read_text(encoding="utf-8"))
+    imported = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+    imported |= {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+    assert imported == {"__future__"}
 
 
 def test_module_never_execs():

@@ -517,6 +517,18 @@ def _step(report: dict, stage: str, fn, default, *args, **kwargs):
         return default
 
 
+def _kb_perm_problem() -> str | None:
+    """知識庫的權限太寬時回說明(寫進 log 用,含路徑與權限);沒問題回 None。檢查本身出錯也當成有問題:
+    確認不了知識庫沒被改過,就不能拿它來壓 finding。"""
+    from toolbox.knowledge_store import check_kb_perms   # 延遲匯入,與 _filter_citations 一致
+    from .config import ConfigError
+    try:
+        check_kb_perms()
+    except Exception as e:                  # noqa: BLE001 — 任何例外都當成沒有檢查過
+        return str(e) if isinstance(e, ConfigError) else type(e).__name__
+    return None
+
+
 def review_incomplete(report: dict) -> list[str]:
     """哪些環節沒完成(供決策與測試判讀)。回傳那幾條 finding 的標題。
 
@@ -2145,9 +2157,19 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         kb_query = " ".join(
             (f.get("full_content") or _sql_from_diff(f.get("diff", "")) or "")[:800]
             for f in mr["files"]) or mr.get("title", "")
-        know = await hub.call_json("memory__retrieve_knowledge",
-                                   {"query": kb_query, "scope": ",".join(scope),
-                                    "top_k": 4}) or {}
+        # 知識庫的權限太寬就不讀(binding 會壓掉 finding):記成未完整、交人工。在這裡先檢查一次,
+        # 因為檢索是經 hub 呼叫的工具,工具丟的例外會被 hub 收成一段文字,看起來只是「沒有知識」
+        kb_problem = _kb_perm_problem()
+        if kb_problem is not None:
+            print(f"[pipeline] MR !{mr_id} 知識庫沒有讀:{kb_problem}", flush=True)
+            report_stub.setdefault("findings", []).append(_incomplete_finding(
+                "知識庫檢索", reason="知識庫的檔案或目錄權限太寬(群組或其他帳號改得到),"
+                                    "原因寫在服務的 log;沒有套用任何團隊規範"))
+            know = {}
+        else:
+            know = await hub.call_json("memory__retrieve_knowledge",
+                                       {"query": kb_query, "scope": ",".join(scope),
+                                        "top_k": 4}) or {}
         conventions = know.get("rendered", "(無相關慣例)")
 
         # 確定性抑制:binding 恆常規範標注要抑制的檢核點(如「已淨額→H001 不適用」),
@@ -2245,7 +2267,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             capture["raw"] = raw
         # 存模型原始輸出(未經 pipeline 後處理),供原汁原味檢視
         import os as _os
-        _raw_dir = Path(_os.environ.get("REVIEW_OUTPUT", PKG_ROOT / "review_output"))
+        from .config import env_path
+        _raw_dir = env_path("REVIEW_OUTPUT", PKG_ROOT / "review_output")
         try:
             if raw is not None:             # 模型呼叫失敗時沒有輸出,不寫
                 _raw_dir.mkdir(parents=True, exist_ok=True)
@@ -2354,6 +2377,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 模型自己輸出的同名欄位在這裡被蓋掉
         report["_stage_seconds"] = clock.seconds
         report["_review_deadline_seconds"] = REVIEW_BUDGET_SECONDS   # 評測看得出這輪用的是哪一種截止時間
+        # 這次用的是哪一份模型設定檔(路徑與內容的雜湊):放行門檻在那份檔案裡,事後對得回是哪一版
+        report["_models_config"] = dict(getattr(cfg, "source", None) or {})
         # 報告裡同名的欄位(模型可能自己輸出)一律蓋掉
         report["_dbt_exec"] = dbt_exec
         executed_dbt = (dbt_exec["file"] if dbt_exec and dbt_exec["ok"] and spec_result is not None
@@ -2361,6 +2386,14 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_dbt_exec_note(report, dbt_exec)  # dbt model 沒有送進沙盒的原因
         report = enforce_dbt_unexecuted(report, mr, dbt_ctx, cfg.dbt, executed_dbt)  # dbt 的變更沒被執行驗證到
         report = enforce_spec_change(report, mr)  # MR 改到規格檔:改了什麼、前後是否一致
+        # SQL_DIALECT 不是 tsql(開發測試用):規則層用別的方言解析,結果會跟正式環境不同。
+        # 每一份審查的 log、報告、MR 的總結都寫一句,不能只在啟動時說一次
+        if DIALECT != "tsql":
+            note = (f"(開發測試設定:SQL 方言是 {DIALECT},不是正式環境的 tsql,"
+                    "這份審查的結果會跟正式環境不同)")
+            print(f"[pipeline] MR !{mr_id} 警告:{note}", flush=True)
+            report["_sql_dialect"] = DIALECT
+            report["summary"] = f"{note}\n\n{report.get('summary', '')}"
 
         # 判斷校準:嚴重度交給能確定性驗證的證據決定,不是模型的語氣,也不是
         # 「有沒有找到規格」。順序上必須在執行驗證之後(要用它的條件與案例結果)、
@@ -4451,6 +4484,7 @@ _MODEL_FAILURE_TEXT = {
     "connection": "連不上審查模型的端點",
     "rate_limited": "審查模型的端點忙碌中(請求過多)",
     "rejected": "審查模型的端點拒絕了這次請求(例如輸入超過模型的上限,或權限、設定不符)",
+    "rejected_key": "審查模型的端點拒絕了金鑰(HTTP 401/403):確認環境變數 LLM_API_KEY",
     "server_error": "審查模型的端點發生錯誤",
     "other": "呼叫審查模型時發生非預期的錯誤",
     "no_time": "整份審查剩下的時間不夠(前面的檢查用掉了大部分時間),沒有呼叫審查模型",
@@ -4474,6 +4508,8 @@ def _model_failure_kind(error: BaseException) -> str:
         status = getattr(error, "status_code", None)
         if isinstance(status, int) and status >= 500:
             return "server_error"
+        if status in (401, 403):
+            return "rejected_key"
         return "rejected"
     return "other"
 
