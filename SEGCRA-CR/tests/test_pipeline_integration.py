@@ -119,7 +119,9 @@ def run(monkeypatch, tmp_path):
                  "rows": [["transactions", 2]], "expect_flagged": False},
             ],
         }
-        mismatches = [] if spec_exec_kind == "pass" else [{
+        # "unverified:<原因>":兩個案例行為都符合預期,但 C1-T 的標籤沒驗到
+        unverified = spec_exec_kind.split(":", 1)[1] if spec_exec_kind.startswith("unverified:") else ""
+        mismatches = [] if spec_exec_kind == "pass" or unverified else [{
             "case_id": "C1-T", "condition_id": "C1", "direction": "true",
             "note": "邊界案例", "rows": [["transactions", 1]],
             "expect_flagged": True, "actual_flagged": False,
@@ -135,7 +137,8 @@ def run(monkeypatch, tmp_path):
                     # 驗過且符合預期」,少一個欄位就會退回「未覆蓋」
                     "case_results": [
                         {"case_id": "C1-T", "condition_id": "C1", "expect_flagged": True,
-                         "actual_flagged": True, "ok": not mismatches},
+                         "actual_flagged": True, "ok": not mismatches,
+                         **({"label_unverified": unverified} if unverified else {})},
                         {"case_id": "C1-F", "condition_id": "C1", "expect_flagged": False,
                          "actual_flagged": False, "ok": True}],
                     "mismatches": mismatches}
@@ -421,6 +424,21 @@ def test_自動放行時_commit_status_要是_success(run):
     assert report["decision"] == "auto_approved"
     review = json.loads((output / f"mr_{mr_id}_review.json").read_text(encoding="utf-8"))
     assert review["commit_status"]["state"] == "success"
+
+
+@pytest.mark.parametrize("why", [
+    "條件 C1 沒有判斷式(check_sql)",
+    "條件 C1 的判斷式(check_sql)形狀不合法(非單一 SELECT、含分號/註解/狀態變更),已拿掉",
+    "條件 C1 的判斷式執行失敗:Incorrect syntax near 'ORDER'",
+    "條件 C1 的判斷式沒有回傳值",
+], ids=["沒有判斷式", "判斷式被拿掉", "判斷式執行失敗", "判斷式沒回值"])
+def test_標籤沒驗到時不自動放行_記成執行驗證沒跑完(run, why):
+    """同一份會自動放行的報告(上一條),只差一個案例的標籤沒驗到:執行驗證不算通過,
+    review_incomplete 認得到那條待驗證,決策不是 auto_approved。"""
+    report, _, _ = run(_mr(CLEAN_SQL), RESPONDED_REPORT, spec_exec_kind=f"unverified:{why}")
+    assert report["_spec_exec"]["passed"] is False
+    assert spec_exec.LABEL_UNVERIFIED_TITLE in pipeline.review_incomplete(report)
+    assert report["decision"] != "auto_approved"
 
 
 def test_檢核點只在_summary_回應不能自動放行(run):
