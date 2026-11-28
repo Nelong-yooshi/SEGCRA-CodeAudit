@@ -769,19 +769,41 @@ _SUMMARY_MARKERS = {"review": "<!-- segcra:review-summary -->",
 
 
 def _summary_note_id(mr_id: str, marker: str) -> int | None:
-    """這個 MR 上帶著 `marker` 的那則留言的 id;沒有、或問不出來時回 None。
+    """這個 MR 上我們自己貼的、帶著 `marker` 的那則留言的 id;沒有、或問不出來時回 None。
 
-    問不出來就當作沒有(改貼新的一則):多一則總結是看得見的雜訊,總結完全沒貼上去是
-    無聲失敗,後者嚴重得多。只看第一頁(最新的 100 則):總結是我們自己貼的,不會被
-    埋在一百則留言之前。
+    只認**審查自己貼的**:作者是 GITLAB_TOKEN 的帳號(`own_user_id()`)、不是系統留言、
+    記號在內文**開頭**。記號是一段看不見的文字,誰都打得出來:開發者留一則含記號的留言,
+    重審時報告就會寫進那則(之後他可以再改成任何內容,MR 上看起來卻是審查報告);模型
+    寫進 finding 的記號會用審查帳號貼成一般留言,所以作者對了還要看記號在不在開頭
+    (我們的總結開頭就是記號,finding 的留言開頭是檔名)。
+
+    查不到自己的帳號時當作沒有上一則。問不出來也當作沒有(改貼新的一則):多一則總結是
+    看得見的雜訊,總結完全沒貼上去是無聲失敗,後者嚴重得多。只看第一頁(最新的 100 則)。
     """
     try:
         notes = _api("GET", f"/merge_requests/{mr_id}/notes",
                      params={"per_page": 100, "order_by": "created_at", "sort": "desc"})
     except Exception:                        # noqa: BLE001 — 問不出來就當作沒有
         return None
-    for n in notes if isinstance(notes, list) else []:
-        if isinstance(n, dict) and marker in (n.get("body") or ""):
+    candidates = [n for n in (notes if isinstance(notes, list) else [])
+                  if isinstance(n, dict) and n.get("system") is not True
+                  and isinstance(n.get("body"), str) and n["body"].startswith(marker)]
+    if not candidates:
+        return None
+    own = own_user_id()
+    if own is None:
+        # CI 與 demo.py 那條路沒有經過 webhook 啟動時的查詢,這裡才查(有候選才查,
+        # 沒有上一則時不多一個請求)
+        reason = learn_own_user()
+        own = own_user_id()
+        if own is None:
+            print(f"[gitlab] 查不到 GITLAB_TOKEN 的帳號({reason}),認不出哪一則是審查自己貼的,"
+                  "總結改貼新的一則", flush=True)
+            return None
+    for n in candidates:
+        author = n.get("author")
+        uid = author.get("id") if isinstance(author, dict) else None
+        if isinstance(uid, int) and not isinstance(uid, bool) and uid == own:
             return n.get("id")
     return None
 

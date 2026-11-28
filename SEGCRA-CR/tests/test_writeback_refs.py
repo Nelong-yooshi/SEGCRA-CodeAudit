@@ -26,6 +26,9 @@ REFS = {"base_sha": BASE, "head_sha": HEAD, "start_sha": START}
 SECRET = "ZZ_HOST_192.0.2.10:443_ZZ"
 
 
+OWN_ID = 42          # 測試裡 GITLAB_TOKEN 的帳號 id
+
+
 class FakeGitLab:
     """記下每個請求;`discussions` 決定開行內討論時怎麼回:狀態碼,或要丟的例外。
     `notes`、`label`、`status` 同樣;給清單時依序取用(最後一個重複用),模擬「失敗後重送成功」。"""
@@ -88,6 +91,8 @@ def real(monkeypatch):
     monkeypatch.setattr(gitlab, "GITLAB_TOKEN", "test-write-token")
 
     monkeypatch.setattr(gitlab, "RETRY_DELAY_SECONDS", 0)
+    # GITLAB_TOKEN 的帳號:總結只改寫這個帳號貼的那則
+    monkeypatch.setattr(gitlab, "_own_user", {"id": OWN_ID, "username": "segcra-bot"})
 
     def install(fake):
         monkeypatch.setattr(httpx, "request", fake)
@@ -338,7 +343,7 @@ def test_總結留言帶著記號_下次才找得回來(real):
 
 
 def test_重審改寫上一則_不再貼一則(real):
-    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": f"{REVIEW_MARKER}\n舊的結論"}]))
+    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": f"{REVIEW_MARKER}\n舊的結論", "author": {"id": OWN_ID}}]))
     assert json.loads(gitlab.post_summary("7", "新的結論", 70, "needs_changes")) == {"ok": True}
     assert len(_edited(fake)) == 1 and _edited(fake)[0][0] == "55"
     assert "新的結論" in _edited(fake)[0][1] and REVIEW_MARKER in _edited(fake)[0][1]
@@ -352,9 +357,66 @@ def test_只改寫我們自己貼的那則(real):
     assert _edited(fake) == [] and len(_posted_notes(fake)) == 1
 
 
+def test_別人留的含記號留言不會被改寫(real):
+    """記號誰都打得出來:開發者留一則含記號的留言,重審時報告不能寫進那則。"""
+    fake = real(FakeGitLab(existing_notes=[
+        {"id": 9, "body": f"{REVIEW_MARKER}\n我自己寫的", "author": {"id": 7}}]))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert _edited(fake) == [] and len(_posted_notes(fake)) == 1
+
+
+def test_系統留言不算上一則(real):
+    fake = real(FakeGitLab(existing_notes=[
+        {"id": 9, "body": REVIEW_MARKER, "author": {"id": OWN_ID}, "system": True}]))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert _edited(fake) == [] and len(_posted_notes(fake)) == 1
+
+
+def test_記號不在開頭的不算上一則_模型寫進_finding_的記號改不到(real):
+    """模型寫的 finding 會用審查帳號貼成一般留言(開頭是檔名);它內文帶記號時,下一次
+    改寫的仍然是上一則總結,不是那條 finding。"""
+    fake = real(FakeGitLab(existing_notes=[
+        {"id": 70, "body": f"`sql/a.sql`(無對應行號)\n\n**[major]** 說明 {REVIEW_MARKER}",
+         "author": {"id": OWN_ID}},
+        {"id": 55, "body": f"{REVIEW_MARKER}\n上一則總結", "author": {"id": OWN_ID}}]))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert [i for i, _ in _edited(fake)] == ["55"]
+
+
+def test_查不到自己的帳號時當作沒有上一則(real, monkeypatch, capsys):
+    monkeypatch.setattr(gitlab, "_own_user", None)
+    monkeypatch.setattr(gitlab, "learn_own_user", lambda: "GET /user 回 401:GITLAB_TOKEN 被拒絕")
+    fake = real(FakeGitLab(existing_notes=[
+        {"id": 55, "body": REVIEW_MARKER, "author": {"id": OWN_ID}}]))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert _edited(fake) == [] and len(_posted_notes(fake)) == 1
+    assert "查不到 GITLAB_TOKEN 的帳號" in capsys.readouterr().out
+
+
+def test_帳號還沒查過時_有候選才查一次(real, monkeypatch):
+    """CI 與 demo.py 那條路沒有經過 webhook 啟動時的查詢。"""
+    monkeypatch.setattr(gitlab, "_own_user", None)
+    asked = []
+
+    def learn():
+        asked.append(1)
+        gitlab._own_user = {"id": OWN_ID, "username": "segcra-bot"}
+        return None
+    monkeypatch.setattr(gitlab, "learn_own_user", learn)
+    fake = real(FakeGitLab(existing_notes=[
+        {"id": 55, "body": REVIEW_MARKER, "author": {"id": OWN_ID}}]))
+    assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
+    assert asked == [1] and [i for i, _ in _edited(fake)] == ["55"]
+    asked.clear()
+    real(FakeGitLab(existing_notes=[]))
+    gitlab._own_user = None
+    gitlab.post_summary("7", "內容", 80, "ok")
+    assert asked == [], "沒有上一則時不多查一次帳號"
+
+
 def test_上一則被刪掉時改貼新的一則(real):
     """改寫被明確拒絕(4xx):一定沒有改到,補貼才不會整份總結消失。"""
-    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": REVIEW_MARKER}], edit=404))
+    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": REVIEW_MARKER, "author": {"id": OWN_ID}}], edit=404))
     assert json.loads(gitlab.post_summary("7", "內容", 80, "ok")) == {"ok": True}
     assert len(_edited(fake)) == 1 and len(_posted_notes(fake)) == 1
 
@@ -362,7 +424,7 @@ def test_上一則被刪掉時改貼新的一則(real):
 @pytest.mark.parametrize("failure", _UNCERTAIN)
 def test_不知道有沒有改到就不補貼(real, failure):
     """逾時、5xx:GitLab 可能已經改好了,只是回應沒送到。補貼會變成兩則。"""
-    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": REVIEW_MARKER}], edit=failure))
+    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": REVIEW_MARKER, "author": {"id": OWN_ID}}], edit=failure))
     out = gitlab.post_summary("7", "內容", 80, "ok")
     assert json.loads(out) == {"ok": False, "failure": "uncertain"}
     assert _posted_notes(fake) == [] and SECRET not in out
@@ -377,7 +439,7 @@ def test_問不出留言清單就貼新的一則(real):
 
 def test_審查未完成的通知不蓋掉審查報告(real):
     """那份報告是看 MR 的人唯一看得到的結論,不可以被「審查未完成」取代。"""
-    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": f"{REVIEW_MARKER}\n完整的報告"}]))
+    fake = real(FakeGitLab(existing_notes=[{"id": 55, "body": f"{REVIEW_MARKER}\n完整的報告", "author": {"id": OWN_ID}}]))
     assert json.loads(gitlab.post_summary("7", "逾時", 0, "審查未完成",
                                           kind="incomplete")) == {"ok": True}
     assert _edited(fake) == []
@@ -386,7 +448,7 @@ def test_審查未完成的通知不蓋掉審查報告(real):
 
 def test_未完成的通知改寫自己那一則(real):
     """連續失敗也不洗版。"""
-    fake = real(FakeGitLab(existing_notes=[{"id": 60, "body": f"{INCOMPLETE_MARKER}\n上次失敗"}]))
+    fake = real(FakeGitLab(existing_notes=[{"id": 60, "body": f"{INCOMPLETE_MARKER}\n上次失敗", "author": {"id": OWN_ID}}]))
     assert json.loads(gitlab.post_summary("7", "逾時", 0, "審查未完成",
                                           kind="incomplete")) == {"ok": True}
     assert len(_edited(fake)) == 1 and _edited(fake)[0][0] == "60"

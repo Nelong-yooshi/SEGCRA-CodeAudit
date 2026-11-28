@@ -6798,8 +6798,8 @@ MUTANTS.update({
         '_SUMMARY_MARKERS = {"review": "<!-- segcra:review-summary -->",' + NL
         + '                    "incomplete": "<!-- segcra:review-summary -->"}'),
     "總結:找上一則時不看記號": (G,
-        '        if isinstance(n, dict) and marker in (n.get("body") or ""):',
-        "        if isinstance(n, dict):"),
+        '                  and isinstance(n.get("body"), str) and n["body"].startswith(marker)]',
+        '                  and isinstance(n.get("body"), str)]'),
     "總結:問不出留言清單時當成改寫失敗": (G,
         "    except Exception:                        # noqa: BLE001 — 問不出來就當作沒有" + NL
         + "        return None",
@@ -7135,6 +7135,23 @@ MUTANTS.update({
      + "        # 測試與評測會換上自己的假用戶端,不一定有 close();收尾失敗也不該讓一份"),
 })
 
+
+
+# ---- 總結只改寫審查自己貼的那則(#155 review):作者是 GITLAB_TOKEN 的帳號、不是系統留言、記號在開頭
+MUTANTS.update({
+ '總結:不看作者(別人含記號的留言也改寫)': ("../toolbox/gitlab.py",
+     '        if isinstance(uid, int) and not isinstance(uid, bool) and uid == own:',
+     '        if True:'),
+ '總結:系統留言也算': ("../toolbox/gitlab.py",
+     '                  if isinstance(n, dict) and n.get("system") is not True',
+     '                  if isinstance(n, dict)'),
+ '總結:記號出現在任何位置都算': ("../toolbox/gitlab.py",
+     '                  and isinstance(n.get("body"), str) and n["body"].startswith(marker)]',
+     '                  and isinstance(n.get("body"), str) and marker in n["body"]]'),
+ '總結:查不到自己的帳號時照樣改寫第一則': ("../toolbox/gitlab.py",
+     '                  "總結改貼新的一則", flush=True)' + NL + '            return None',
+     '                  "總結改貼新的一則", flush=True)' + NL + '            return candidates[0].get("id")'),
+})
 
 if __name__ == "__main__":
     sys.exit(main())

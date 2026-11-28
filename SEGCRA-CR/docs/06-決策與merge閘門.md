@@ -78,7 +78,7 @@ LLM 審完、執行驗證跑完之後,管線用兩個**確定性函式**把「�
 2. `gitlab__set_commit_status`:**只在不接 CI 時**(`review_mr(commit_status=True)`,webhook 那條路;部署端的 CI 那條路不寫,job 的結果就是閘門,見第 4 節)。對 `mr["sha"]`(MR head commit)回寫 status,`name="segcra/review"`,**state 的映射:`auto_approved → success`,其餘(`needs_human`、`blocked`)→ `failed`**,description 帶 `decision:summary 前 180 字`。
 3. `gitlab__set_label`:`ai-review::<decision>`,同一個請求用 `remove_labels` 拿掉另外兩種決策標籤(scoped label 互斥是 GitLab 付費版功能,沒有授權時重審後舊結論會留著)。只拿掉 `auto_approved`、`needs_human`、`blocked` 三種,不先查 MR 現有的標籤;舊版程式用過的其他名稱不會被清掉。
 4. `gitlab__post_summary`:總評 + 三態決策文案(✅ 自動放行 / 👤 請人工確認 / ⛔ 修正前不得合入)+ rubric 分數 + verdict;有沒有確定貼上的 finding、或 commit status / 標籤沒寫上時附在最後。**總結排在最後**,前兩步沒寫上時才寫得進總結。
-   **同一個 MR 只有一則總結**:留言裡放一個 HTML 註解當記號(`_SUMMARY_MARKERS`,在 GitLab 的 markdown 上看不見),重審時找回上一則、原地改寫。沒有記號的留言不動(那是人留的)。改寫被明確拒絕(4xx,上一則被刪了)就改貼新的一則;逾時或 5xx 不補貼(可能已經改好了,只是回應沒送到)。問不出留言清單時就貼新的一則:多一則是看得見的雜訊,總結完全沒貼上去是無聲失敗。
+   **同一個 MR 只有一則總結**:留言裡放一個 HTML 註解當記號(`_SUMMARY_MARKERS`,在 GitLab 的 markdown 上看不見),重審時找回上一則、原地改寫。只認審查自己貼的:作者是 `GITLAB_TOKEN` 的帳號(`own_user_id()`,還沒查過時查一次 `GET /user`)、不是系統留言、記號在內文開頭;記號誰都打得出來,別人留的含記號留言、模型寫進 finding 的記號(finding 的留言開頭是檔名)都不會被改寫。查不到自己的帳號時當作沒有上一則,改貼新的一則,log 寫出原因。改寫被明確拒絕(4xx,上一則被刪了)就改貼新的一則;逾時或 5xx 不補貼(可能已經改好了,只是回應沒送到)。問不出留言清單時就貼新的一則:多一則是看得見的雜訊,總結完全沒貼上去是無聲失敗。
    webhook 的「審查未完成」通知用**另一個**記號:它會覆蓋自己那一則(連續失敗不洗版),但不會蓋掉一份完整的審查報告。
 
 **每一步都看結果**(`gitlab.write_failure`):寫回的函式不丟例外,失敗時回 `{"ok": false, "failure": 種類}`——`rejected`(GitLab 拒絕,4xx)、`uncertain`(連線中斷、逾時、5xx,不確定有沒有寫上)、`no_sha`、`failed`(寫入工具本身出錯)。沒寫上的步驟記進 `report["_writeback"]`(`commit_status`、`label`、`summary`),印一行 log(只寫步驟與種類,不寫例外訊息)。
