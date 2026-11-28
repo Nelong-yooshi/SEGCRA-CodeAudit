@@ -46,11 +46,12 @@ from pathlib import Path
 PKG_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PKG_ROOT))
 from orchestrator import ci_gate                  # noqa: E402
-from orchestrator.config import env_seconds, load_config      # noqa: E402
+from orchestrator.config import env_seconds, env_text, load_config      # noqa: E402
 from orchestrator.pipeline import review_mr       # noqa: E402
+from orchestrator.error_text import error_label  # noqa: E402  log 只留型別與狀態碼,不放原文
 
 SECRET = os.environ.get("GITLAB_WEBHOOK_SECRET", "")
-PROFILE = os.environ.get("REVIEW_PROFILE", "review")
+PROFILE = env_text("REVIEW_PROFILE", "review")     # 設了但是空的就停(跟其他文字型的設定一樣)
 TRIGGER_ACTIONS = {"open", "reopen", "update"}     # MR 這些動作觸發審查
 _cfg = load_config()
 # 一份審查的總時間上限(#45)。超過就中止,並在 MR 上留言——**不能無聲無息**:
@@ -177,6 +178,8 @@ def _run_review(mr_iid: int, head_sha: str | None = None, ci_ticket: str | None 
     ci_ticket 給定時是 CI 的 job 呼叫的那一份(見 _ci_start):不寫 commit status,結束時把
     結束碼記在 _ci_reviews[ci_ticket](沒跑完、被取消、出錯都是 EXIT_INCOMPLETE)。
     """
+    if _mock:
+        print(f"[webhook] MR !{mr_iid} 警告:{MOCK_NOTICE}", flush=True)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     task = None
@@ -205,7 +208,7 @@ def _run_review(mr_iid: int, head_sha: str | None = None, ci_ticket: str | None 
         # 所以這裡不留言(免得同一個 MR 洗版)。CI 那條路:舊的 job 拿到 EXIT_INCOMPLETE
         print(f"[webhook] MR !{mr_iid} 舊審查被新的 commit 取代", flush=True)
     except Exception as e:
-        print(f"[webhook] MR !{mr_iid} 審查失敗:{type(e).__name__}: {e}", flush=True)
+        print(f"[webhook] MR !{mr_iid} 審查失敗:{error_label(e)}", flush=True)
         _notify_incomplete(mr_iid, f"審查程式發生 {type(e).__name__}", head_sha,
                            **({"commit_status": False} if in_ci else {}))
     finally:
@@ -233,7 +236,7 @@ def _cancel(mr_iid: int) -> bool:
         loop.call_soon_threadsafe(task.cancel)
         return True
     except Exception as e:
-        print(f"[webhook] MR !{mr_iid} 取消舊審查失敗:{type(e).__name__}: {e}", flush=True)
+        print(f"[webhook] MR !{mr_iid} 取消舊審查失敗:{error_label(e)}", flush=True)
         return False
 
 
@@ -586,6 +589,32 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+MOCK_NOTICE = "mock 模式:結果只寫進本機檔案,沒有寫回 GitLab"
+_mock = False      # --mock 打開時為 True:每一份審查的 log 再提醒一次
+
+
+def _require_real_mode(mock: bool) -> None:
+    """服務收的是 GitLab 送來的真事件,在 mock 模式下跑沒有意義:GitLab 的三個設定都沒設時不啟動。
+
+    三個都忘了設(env 檔路徑寫錯、容器沒帶 --env-file)跟只漏一個是同一種錯;以前照常啟動,留言與
+    commit status 只寫進本機檔案,log 卻寫已經留言、已經設成失敗。要在本機用測試資料跑(docs/07
+    「怎麼驗證它在動」)時用 --mock 明確打開。用命令列參數,不用環境變數:環境變數又會有空值的問題。"""
+    global _mock
+    from toolbox import gitlab
+    if gitlab.REAL_MODE:
+        if mock:
+            raise SystemExit("同時設了 GitLab(GITLAB_URL、GITLAB_TOKEN、GITLAB_PROJECT)與 --mock,"
+                             "不知道要用哪一種;正式服務拿掉 --mock,本機測試拿掉那三個環境變數")
+        _mock = False
+        return
+    if not mock:
+        raise SystemExit("審查服務沒有接上 GitLab:環境變數 GITLAB_URL、GITLAB_TOKEN、GITLAB_PROJECT "
+                         "都沒設,不啟動(結果會只寫進本機檔案)。正式服務請設定這三個;"
+                         "要在本機用測試資料跑時加 --mock")
+    _mock = True
+    print(f"[webhook] 警告:{MOCK_NOTICE}", flush=True)
+
+
 def _startup_lines(host, port) -> list:
     """啟動時印的說明。只走 CI 那條路(/ci/review)的部署不設 GITLAB_WEBHOOK_SECRET,
     不能叫他去設;兩個入口都列出來。"""
@@ -593,7 +622,7 @@ def _startup_lines(host, port) -> list:
     hook = "/gitlab-webhook" if SECRET else "/gitlab-webhook(停用)"
     ci = "/ci/review(CI 的審查 job)" if gitlab.REAL_MODE else "/ci/review(mock 模式,停用)"
     lines = [f"[webhook] 監聽 http://{host}:{port}  入口:{ci}、{hook}  "
-             f"profile={PROFILE}  real_mode={'on' if os.environ.get('GITLAB_URL') else 'off(mock)'}"]
+             f"profile={PROFILE}  real_mode={'on' if gitlab.REAL_MODE else 'off(mock)'}"]
     if not SECRET:
         lines.append("[webhook] 沒設 GITLAB_WEBHOOK_SECRET:webhook 那條路停用,webhook 請求一律回 401;"
                      "CI 那條路(/ci/review)不受影響。要用 webhook 時才需要設")
@@ -609,7 +638,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--host", default="0.0.0.0")
+    ap.add_argument("--mock", action="store_true",
+                    help="不接 GitLab,讀測試資料、結果只寫進本機(只給本機測試用)")
     args = ap.parse_args()
+    _require_real_mode(args.mock)
     global REVIEW_REPEAT
     try:
         REVIEW_REPEAT = ci_gate.review_repeat()

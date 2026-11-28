@@ -212,7 +212,37 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
    curl http://127.0.0.1:11434/api/tags     # 有回模型清單即通
    ```
 
-   endpoint 在別處時:`export OLLAMA_URL=http://<host>:11434/v1`。
+   endpoint 在別處時:`export OLLAMA_URL=http://<host>:11434/v1`。OpenAI 相容的端點(例如 vLLM)也一樣用
+   `OLLAMA_URL` 指定;要 API key 的端點,key **只能**用環境變數 `LLM_API_KEY` 給:`config/models.yaml` 的
+   `api_key` 寫了 `ollama` 以外的值,載入設定就報錯(那個檔案會進版控與離線包)。變數設了但是空的也會報錯。
+   設定檔與所在目錄的權限要求見 docs/10「設定檔的權限」,太寬時服務起不來:
+
+   ```bash
+   read -rs -p "LLM_API_KEY: " LLM_API_KEY && export LLM_API_KEY && echo
+   ```
+
+   **部署端要改這份設定檔的任何一項**(模型名稱、上下文長度、`reasoning_effort`、dbt 接線、`policy`
+   的放行門檻)時,**不要直接改 repo 的 `config/models.yaml`**(換新版程式碼時會被蓋掉),也**不要在伺服器上
+   手改**:這份檔案控制閘門(門檻一改,自動放行就跟著變),改了什麼、誰改的要有紀錄、要有人審,跟 CI 設定
+   放在 MR 改不到的專案(§7)是同一件事。做法:
+
+   1. 部署端那份放在**部署端自己的設定 repo**(跟 CI 設定放在一起或另開一個都可以;`main` 是 protected
+      branch,改動走 MR、由有權限的人合併)。起點是 repo 的 `config/models.yaml`。
+   2. 部署時把那份檔案放到審查服務那台機器、程式目錄以外、唯讀,權限照「設定檔的權限」(docs/10;
+      目錄 755、檔案 644,一路往上的每一層群組與其他人都不能寫)。用 `install` 指定權限,不受 umask 影響:
+
+      ```bash
+      install -d -m 755 /opt/segcra-config
+      install -m 644 <設定 repo>/models.yaml /opt/segcra-config/models.yaml
+      ```
+
+   3. 服務的環境變數 `SEGCRA_MODELS_CONFIG=/opt/segcra-config/models.yaml`(**絕對路徑**;相對路徑會報錯)。
+      每份報告記下這次讀的是哪一份與內容的雜湊(`_models_config`),事後對得回是哪一版。
+
+   **密碼類分開**:`LLM_API_KEY`、`config/gitlab.env`、`config/sandbox.env` 照舊不進任何 repo,只在部署時
+   人工建立(權限 600);模型設定檔的 `api_key` 只能不寫或寫 `ollama`。
+
+   有些模型不接受 `reasoning_effort: none`(端點回 400),冷讀的 profile 改成 `low`。
 
 ### 開啟 dbt 接線(選用;預設關閉)
 
@@ -223,11 +253,11 @@ CREATE TABLE transactions(account_id INT, tx_time DATETIME2, tx_type NVARCHAR(20
 
 | 設定 | 值 | 說明 |
 |---|---|---|
-| `config/models.yaml` 的 `dbt.enabled` | `true` | 只接受布林值 |
+| 使用中的模型設定檔(`SEGCRA_MODELS_CONFIG` 指的那份,沒設時是 `config/models.yaml`;見 docs/10)的 `dbt.enabled` | `true` | 只接受布林值 |
 | 環境變數 `SEGCRA_DBT_DATABASE` | `DBT_PLACEHOLDER` | 固定的假名,只用來把 `ref()` / `source()` 展開成完整表名,不會連線。不符就在載入設定時報錯 |
 | 環境變數 `GITLAB_READ_TOKEN` | 唯讀的 project access token | 見上方第 2 點;用來依 MR 的 commit 取回 dbt 專案(macro 與專案資訊)。不可與 `GITLAB_TOKEN` 相同 |
 
-dbt 專案不在 repo 根目錄時,另外在 `models.yaml` 的 `dbt` 底下設 `project_dir`(`dbt_project.yml` 所在的目錄)。
+dbt 專案不在 repo 根目錄時,另外在使用中的模型設定檔的 `dbt` 底下設 `project_dir`(`dbt_project.yml` 所在的目錄)。
 
 **開啟後的行為:**
 
@@ -246,7 +276,7 @@ dbt 專案不在 repo 根目錄時,另外在 `models.yaml` 的 `dbt` 底下設 `
 (只在本機改,不要提交),然後:
 
 ```bash
-export SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER FIXTURES_DIR=examples/dbt_wiring/fixtures
+export SEGCRA_DBT_DATABASE=DBT_PLACEHOLDER FIXTURES_DIR=$PWD/examples/dbt_wiring/fixtures   # 要絕對路徑
 .venv/bin/python demo.py --mr 801 --dry-run    # 只改 model:findings 是空的(展開成功、規則沒有命中)
 .venv/bin/python demo.py --mr 802 --dry-run    # 只改 macro:多一條 major「dbt 變更對其他 model 的影響」
 ```
@@ -520,8 +550,9 @@ ssh -L 8929:localhost:8929 <your-user>@<your-server>
 
 | 症狀 | 檢查 / 處置 |
 |---|---|
+| 啟動時報「權限太寬」、「有設定但是空的」、「api_key 只能不寫或寫 ollama」、「GitLab 的設定只給了…」 | 設定不安全或不完整,刻意停下來、不退回別的做法。照訊息裡的 `chmod`、補上或拿掉那個變數、把金鑰改用 `LLM_API_KEY` 給(見 docs/10) |
 | 模型連不上(connection refused / timeout) | `curl $OLLAMA_URL` 的主機端(如 `curl http://127.0.0.1:11434/api/tags`)。經反向 tunnel 掛進來的 endpoint，確認 tunnel 活著;模型名不存在時先 `ollama pull` |
-| 審查極慢或 OOM | 換小模型:`--profile fast`，或把 `config/models.yaml` 的 fast 換成更小的模型 |
+| 審查極慢或 OOM | 換小模型:`--profile fast`，或把使用中的模型設定檔(見 docs/10)的 fast 換成更小的模型 |
 | LLM 請求逾時(`APITimeoutError`) | 單次 LLM 請求上限預設 3600 秒、不自動重試;硬體更慢時以環境變數 `LLM_TIMEOUT`(秒)調高。測資生成/仲裁的 LLM 失敗不會中斷管線——降級為 major「執行驗證無法完成」轉 needs_human |
 | 較長的生成固定在約 30 秒失敗,端點回 400 且訊息含 `Timeout passed=30.0` | 模型前面的閘道(例如 LiteLLM)有自己的請求上限,跟 `LLM_TIMEOUT` 無關。設環境變數 `LLM_SEND_TIMEOUT=1`,把上限放進請求內容(見 docs/10) |
 | webhook 回 401 | webhook 的 Secret token 與 `GITLAB_WEBHOOK_SECRET` 不一致，或啟動時忘了 export |
@@ -531,7 +562,7 @@ ssh -L 8929:localhost:8929 <your-user>@<your-server>
 | SQL 無法在測資上執行 | 報告會帶 major「SQL 無法在測資上執行」與 SQL Server 的錯誤訊息。常見:不是 T-SQL 寫法(`= TRUE`、`EXTRACT(...)`、`:start_date` 這類其他資料庫的語法)、用了 spec 資料表定義沒有的欄位、含 dbt 樣板。時間參數用 `@start_date` / `@end_date` |
 | 執行驗證報「沙盒不可用」 | 沙盒沒啟動或連不上:`scripts/sandbox.sh status`;沒啟動就 `scripts/sandbox.sh start`。沙盒不可用時一律不自動放行 |
 | 預掃報「無法解析此檔的 SQL」 | rule-base 的語法樹規則沒有執行(文字層規則如明碼憑證仍有效)。常見:非 T-SQL 語法、dbt 樣板未展開。這條是 major,會擋下自動放行 |
-| 測資生成一直失敗(測資生成失敗 finding) | 小模型產不出合法 JSON;把 `config/models.yaml` 的 `roles.testgen` 指到較大的 profile(預設 review) |
+| 測資生成一直失敗(測資生成失敗 finding) | 小模型產不出合法 JSON;把使用中的模型設定檔(見 docs/10)的 `roles.testgen` 指到較大的 profile(預設 review) |
 | GitLab 網頁打不開 | 先在該主機上 `docker ps -a --filter name=segcra-gitlab` 看容器起了沒;剛啟動要等 1~4 分鐘(ready 判準見 §8);GitLab 在遠端時,自己電腦要掛著 `ssh -L 8929:localhost:8929 <your-user>@<your-server>` |
 | commit status 沒鎖住 Merge 按鈕 | 專案 Settings → Merge requests 沒勾 **Pipelines must succeed**;或審的是舊 commit(push 新 commit 後要重審) |
 | CI 的審查 job 以 5 結束,印「審查服務沒有開始審查(HTTP 403)」 | 呼叫者不符,後面接著原因:「job token 無效或 job 已經結束」(GitLab 拒絕了這把 token)、「job 所在的 pipeline 不是 MR pipeline」(`rules` 或 `workflow` 沒限定 `merge_request_event`)、「要審的 commit 不是 MR 目前的 head」(推了新 commit,看新的 pipeline)、「MR 不是開啟中」(已合併或關閉) |

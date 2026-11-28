@@ -45,6 +45,7 @@ from .dbt_hidden_writes import MODELS_CHECKED, UNREACHED_OUTPUT, find_hidden_wri
 from .dbt_render import (MACRO_KIND_TEXT, MACRO_LOAD_FAILED, MACRO_TOO_DEEP, MACRO_UNSUPPORTED, MACRO_SYNTAX,
                          check_macro_files_isolated)
 from .security import REVIEWER_TERMS, reviewer_terms_pattern, scan_mr
+from .mr_identifiers import extract as extract_identifiers
 from toolbox.style_learn import STYLE_CODES
 from toolbox.gitlab import (WRITE_FAILED, WRITE_NO_SHA, WRITE_REJECTED, WRITE_UNCERTAIN,
                             write_failure)
@@ -53,7 +54,7 @@ from .skills_loader import always_skills, load_skills, skills_index
 from .dbt_context import PROJECT_FILE_REMOVED, PROJECT_YAML_INVALID, check_yaml_files_isolated
 from .dbt_project import YAML_MODELS_NOT_LIST, YAML_SYNTAX
 from .spec_exec import SpecLookup, find_spec, run_spec_exec
-from .tool_hub import ToolHub
+from .tool_hub import REFUSED_OTHER_MR, REFUSED_OTHER_REF, ToolHub
 from toolbox.sqltools import LINT_INCOMPLETE_CODE, LINT_MAX_CHARS, LINT_TIMEOUT_SECONDS
 from toolbox.sqltools import run_rules, run_rules_on_template
 from toolbox.sqltools import DIALECT, parse_statements, parsed_chunks
@@ -552,6 +553,18 @@ def _step(report: dict, stage: str, fn, default, *args, **kwargs):
     except Exception as e:                  # noqa: BLE001 — 任何例外都不得往外丟
         report.setdefault("findings", []).append(_incomplete_finding(stage, e))
         return default
+
+
+def _kb_perm_problem() -> str | None:
+    """知識庫的權限太寬時回說明(寫進 log 用,含路徑與權限);沒問題回 None。檢查本身出錯也當成有問題:
+    確認不了知識庫沒被改過,就不能拿它來壓 finding。"""
+    from toolbox.knowledge_store import check_kb_perms   # 延遲匯入,與 _filter_citations 一致
+    from .config import ConfigError
+    try:
+        check_kb_perms()
+    except Exception as e:                  # noqa: BLE001 — 任何例外都當成沒有檢查過
+        return str(e) if isinstance(e, ConfigError) else type(e).__name__
+    return None
 
 
 def review_incomplete(report: dict) -> list[str]:
@@ -1339,6 +1352,7 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
             sql, dbt_error, in_project = _dbt_head_source(f, sql, dbt_ctx)
         rule_sql = sql
         incremental_sql = None
+        _attach_identifiers(entry, f, sql, dbt_ctx)
         if is_macro:
             entry["dbt_macro"] = True
             hidden = _macro_hidden_writes(f.get("path", ""), dbt_cfg, dbt_ctx)
@@ -1410,6 +1424,33 @@ async def prescan(hub: ToolHub, files: list[dict], dbt_cfg: dict | None = None,
         progress["phase"] = _PHASE_CALLED_MACROS
     await _macro_scan(hub, used_macros, dbt_ctx, {e["path"] for e in results}, results)
     return results
+
+
+def _attach_identifiers(entry: dict, f: dict, sql: str, dbt_ctx: DbtContext | None) -> None:
+    """MR 裡取名的識別字(欄位別名、CTE、macro 名稱…,見 mr_identifiers),給注入掃描用。
+
+    `identifiers` 每筆 `{kind, name, file, line}`;`line` 只在拿到的是檔案變更後的完整內容時給
+    (只有 diff 片段時,行號是片段裡的行號,不是檔案的)。沒收到的筆數(超過上限、Jinja 沒收尾
+    塗到檔尾)記在 `identifiers_skipped`。沒有抽到時兩個鍵都不放。**不進 prompt**(見
+    _prescan_for_prompt)。
+
+    只有 dbt 專案裡的檔案當成 Jinja 樣板:專案外的 T-SQL 裡,字串或註解寫的 `{#` 不是 Jinja。"""
+    in_dbt = dbt_ctx is not None and dbt_ctx.relative(f.get("path")) is not None
+    items, skipped = extract_identifiers(sql, with_lines=_is_full_text(f, sql, dbt_ctx), jinja=in_dbt)
+    if items:
+        entry["identifiers"] = [dict(item, file=f.get("path")) for item in items]
+    if skipped:
+        entry["identifiers_skipped"] = skipped
+
+
+# 預掃結果裡不放進 prompt 的鍵:MR 取的名稱是 MR 決定的文字,放在「程式的檢查結果」那一段,
+# 模型會把夾帶的指示當成程式說的話。模型在 diff 裡本來就看得到原文,這份只給注入掃描用
+_PROMPT_HIDDEN_KEYS = ("identifiers", "identifiers_skipped")
+
+
+def _prescan_for_prompt(pre: list) -> list:
+    return [{k: v for k, v in entry.items() if k not in _PROMPT_HIDDEN_KEYS}
+            if isinstance(entry, dict) else entry for entry in pre]
 
 
 def _merge_env_hits(hits: list, raw) -> list:
@@ -2118,6 +2159,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # MR 描述引導去呼叫別的 MR,釘住的版本就會被換掉,之後讀到的是別人的檔案。
         # 拿不到 head sha 時釘 None——get_file 會明講取不到,不會退回舊版。
         _gitlab.pin_review_ref(mr.get("head_sha"))
+        # 模型能讀的範圍也在這裡定:這次的 MR、這次 MR 的版本與目標分支(tool_hub 的 READ_TOOLS)
+        hub.set_review_scope(mr_id, mr)
 
         if baseline:
             # 裸模型 A/B 對照組 — 無 skills/memory/工具/預掃/執行驗證,不回寫 GitLab
@@ -2195,9 +2238,19 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         kb_query = " ".join(
             (f.get("full_content") or _sql_from_diff(f.get("diff", "")) or "")[:800]
             for f in mr["files"]) or mr.get("title", "")
-        know = await hub.call_json("memory__retrieve_knowledge",
-                                   {"query": kb_query, "scope": ",".join(scope),
-                                    "top_k": 4}) or {}
+        # 知識庫的權限太寬就不讀(binding 會壓掉 finding):記成未完整、交人工。在這裡先檢查一次,
+        # 因為檢索是經 hub 呼叫的工具,工具丟的例外會被 hub 收成一段文字,看起來只是「沒有知識」
+        kb_problem = _kb_perm_problem()
+        if kb_problem is not None:
+            print(f"[pipeline] MR !{mr_id} 知識庫沒有讀:{kb_problem}", flush=True)
+            report_stub.setdefault("findings", []).append(_incomplete_finding(
+                "知識庫檢索", reason="知識庫的檔案或目錄權限太寬(群組或其他帳號改得到),"
+                                    "原因寫在服務的 log;沒有套用任何團隊規範"))
+            know = {}
+        else:
+            know = await hub.call_json("memory__retrieve_knowledge",
+                                       {"query": kb_query, "scope": ",".join(scope),
+                                        "top_k": 4}) or {}
         conventions = know.get("rendered", "(無相關慣例)")
 
         # 確定性抑制:binding 恆常規範標注要抑制的檢核點(如「已淨額→H001 不適用」),
@@ -2263,7 +2316,7 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         user = USER_TEMPLATE.format(
             title=mr["title"], description=mr.get("description", ""),
             diff_section=build_diff_section(code_files, cfg.budget["diff"]) + full_text,
-            prescan=json.dumps(pre, ensure_ascii=False),
+            prescan=json.dumps(_prescan_for_prompt(pre), ensure_ascii=False),
             spec_section=spec_section + spec_changes,
         )
         # 給程式補的 finding 寫行號;prompt 已組好,不受影響。出錯時記一條未完整、行號維持 0
@@ -2291,7 +2344,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
             capture["raw"] = raw
         # 存模型原始輸出(未經 pipeline 後處理),供原汁原味檢視
         import os as _os
-        _raw_dir = Path(_os.environ.get("REVIEW_OUTPUT", PKG_ROOT / "review_output"))
+        from .config import env_path
+        _raw_dir = env_path("REVIEW_OUTPUT", PKG_ROOT / "review_output")
         try:
             if raw is not None:             # 模型呼叫失敗時沒有輸出,不寫
                 _raw_dir.mkdir(parents=True, exist_ok=True)
@@ -2342,6 +2396,15 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_truncation(report, output_meta, profile.max_output_tokens)  # 輸出被截斷
         report = enforce_unreviewable(report, mr)  # 有內容沒被審查到時,不得自動放行
         report = enforce_tool_refusals(report, hub.refused_calls)  # 模型要求了寫入工具
+        # 模型用工具讀回的內容命中注入掃描:跟 MR 本身命中走同一個函式。MR 本身已經命中時,
+        # 模型再讀這次的 MR(get_mr_diff)命中的是同一份文字,不多一條(內容照樣沒有交給模型)
+        tool_hits = [h for h in hub.tool_injection_hits if not (injection_hits and h.get("this_mr"))]
+        if tool_hits:
+            report["_injection_scan"] = list(report.get("_injection_scan") or []) + [
+                {"category": h.get("category"), "source": "tool"} for h in tool_hits]
+        report = enforce_injection(report, tool_hits, source="tool")
+        report = enforce_tool_reads(report, hub.refused_reads, hub.scan_failures)  # 範圍外、沒掃完的讀取
+        _log_withheld_history(mr_id, hub.withheld_history)  # 判例不是這次 MR 的,不進報告
 
         # 執行驗證(必跑;測資生成 → 沙盒執行 → 仲裁)——在 rubric 之前。
         # **整段有時間上限**:沙盒的單一查詢自己有上限,但整段沒有,而測資生成可以跑
@@ -2401,6 +2464,8 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         # 模型自己輸出的同名欄位在這裡被蓋掉
         report["_stage_seconds"] = clock.seconds
         report["_review_deadline_seconds"] = REVIEW_BUDGET_SECONDS   # 評測看得出這輪用的是哪一種截止時間
+        # 這次用的是哪一份模型設定檔(路徑與內容的雜湊):放行門檻在那份檔案裡,事後對得回是哪一版
+        report["_models_config"] = dict(getattr(cfg, "source", None) or {})
         # 報告裡同名的欄位(模型可能自己輸出)一律蓋掉
         report["_dbt_exec"] = dbt_exec
         executed_dbt = (dbt_exec["file"] if dbt_exec and dbt_exec["ok"] and spec_result is not None
@@ -2408,6 +2473,14 @@ async def review_mr(cfg: Config, mr_id: str, profile_name: str | None = None,
         report = enforce_dbt_exec_note(report, dbt_exec)  # dbt model 沒有送進沙盒的原因
         report = enforce_dbt_unexecuted(report, mr, dbt_ctx, cfg.dbt, executed_dbt)  # dbt 的變更沒被執行驗證到
         report = enforce_spec_change(report, mr)  # MR 改到規格檔:改了什麼、前後是否一致
+        # SQL_DIALECT 不是 tsql(開發測試用):規則層用別的方言解析,結果會跟正式環境不同。
+        # 每一份審查的 log、報告、MR 的總結都寫一句,不能只在啟動時說一次
+        if DIALECT != "tsql":
+            note = (f"(開發測試設定:SQL 方言是 {DIALECT},不是正式環境的 tsql,"
+                    "這份審查的結果會跟正式環境不同)")
+            print(f"[pipeline] MR !{mr_id} 警告:{note}", flush=True)
+            report["_sql_dialect"] = DIALECT
+            report["summary"] = f"{note}\n\n{report.get('summary', '')}"
 
         # 判斷校準:嚴重度交給能確定性驗證的證據決定,不是模型的語氣,也不是
         # 「有沒有找到規格」。順序上必須在執行驗證之後(要用它的條件與案例結果)、
@@ -4400,7 +4473,7 @@ def enforce_scan_skipped(report: dict, skipped: int) -> dict:
 
 
 @_isolated_stage("注入防線")
-def enforce_injection(report: dict, hits: list[dict]) -> dict:
+def enforce_injection(report: dict, hits: list[dict], source: str = "mr") -> dict:
     """確定性注入防線:掃描器命中 → 一律加 blocker,不參考模型輸出。
 
     **更正(PR #10 review 找到的嚴重漏洞)**:上一版在補 blocker 前會先看
@@ -4418,6 +4491,22 @@ def enforce_injection(report: dict, hits: list[dict]) -> dict:
     會被回寫到 MR 留言,等於把攻擊者寫的東西原封不動貼回公開留言,沒有必要
     且可能被利用成另一個注入面。只留類別名稱(我們自己定義的固定字串)。"""
     if not hits:
+        return report
+    if source == "tool":
+        # 審查模型用工具讀回的內容命中(tool_hub._screen):內容已經沒有交給模型,處理跟 MR 本身
+        # 命中走同一個函式,之後注入掃描多一種類別、或某一類改成交人工,兩條路一起變。
+        # _injection_scan 由呼叫端在這一步之前寫好(理由同 MR 那條,見 review_mr)
+        cats = ", ".join(sorted({str(h.get("category")) for h in hits}))
+        tools = ", ".join(sorted({str(h.get("tool")) for h in hits}))
+        _put_program_finding(report, {
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "blocker",
+            "title": _TOOL_READ_INJECTION_TITLE,
+            "detail": (f"審查模型用工具({tools})讀回的內容含疑似操縱審查器的指令,類別:{cats}。"
+                       "這段內容沒有交給模型;模型會去讀它,很可能是 MR 的文字引導的,"
+                       "這次審查結果需要人工資安確認。"),
+            "suggestion": "檢查 MR 標題、描述與註解中是否有引導審查器去讀特定檔案的文字,"
+                          "以及被讀的那個檔案裡的內容。",
+            "citations": []})
         return report
     cats = ", ".join(h["category"] for h in hits)
     report.setdefault("findings", []).insert(0, {
@@ -4538,6 +4627,67 @@ def enforce_tool_refusals(report: dict, refused: list[str]) -> dict:
     return report
 
 
+_TOOL_READ_REFUSAL_TITLE = "審查模型要求讀這次審查範圍以外的內容"
+_TOOL_READ_INJECTION_TITLE = "工具讀回的內容疑似含提示注入(確定性掃描命中)"
+# 被拒絕的讀取:代碼 → 寫進 finding 的說法(固定文字;模型給的參數不寫)
+_REFUSED_READ_TEXT = {
+    REFUSED_OTHER_MR: "要求讀別的 MR",
+    REFUSED_OTHER_REF: "要求讀這次 MR 的版本與目標分支以外的版本",
+}
+
+
+@_isolated_stage("工具讀取揭露")
+def enforce_tool_reads(report: dict, refused: list[str], scan_failures: list[dict]) -> dict:
+    """審查模型用工具讀 MR 與檔案時,範圍外的讀取與讀回內容沒掃完的。讀回內容的注入掃描命中
+    跟 MR 本身命中走同一個函式(enforce_injection 的 `source="tool"`),不在這裡。
+
+    - **讀回內容的注入掃描出錯**:這是程式自己的檢查沒跑完,不是模型讀了範圍外的內容,也不是
+      被 MR 引導。記成這一環節沒跑完(帶 `stage`,review_incomplete 認得到,交人工),寫出是哪個
+      工具與例外的類型(不寫例外訊息:可能帶著讀回的文字);內容已經沒有交給模型。
+    - **範圍外的讀取**(別的 MR、別的版本)已被拒絕、沒有讀到:補一條 **info**,不影響決策。
+      沒讀到就沒有內容進來;MR 的文字引導模型去讀,靠注入掃描與冷讀接住。這次 MR 的寫法
+      (`mr_id` 不填、`!951`、`HEAD`、`origin/<分支>`)已經對應到範圍內,不會走到這裡。
+
+    finding 只寫固定的說法,不寫模型給的參數或讀回的原文(會貼回 MR)。"""
+    for tool in dict.fromkeys(str(s.get("tool")) for s in scan_failures):
+        types = ", ".join(dict.fromkeys(str(s.get("error")) for s in scan_failures
+                                        if str(s.get("tool")) == tool))
+        report.setdefault("findings", []).append(_incomplete_finding(
+            f"工具讀回內容的注入掃描({tool})", reason=f"掃描執行時發生 {types},讀回的內容沒有交給模型"))
+    reasons = [_REFUSED_READ_TEXT[r] for r in dict.fromkeys(refused) if r in _REFUSED_READ_TEXT]
+    if reasons:
+        _put_program_finding(report, {
+            "file": MR_CONTENT_FILE, "line": 0, "severity": "info",
+            "title": _TOOL_READ_REFUSAL_TITLE,
+            "detail": ("審查模型" + "、".join(reasons) + ",已被拒絕、沒有讀到,不影響這次的結果。"
+                       "讀取範圍是這次審查的 MR、這次 MR 的版本與目標分支。"),
+            "suggestion": "MR 的說明若引用了別的 MR 或別的版本,審查只依這次 MR 的內容判斷。",
+            "citations": []})
+    return report
+
+
+def _log_withheld_history(mr_id, withheld: list[dict]) -> None:
+    """沒有交給模型的判例印一行,讓維運的人去檢查判例檔(memory 的 HISTORY_FILE)。
+
+    判例是以前記下來的,不是這次 MR 帶進來的,所以不進這次的報告、不影響判定;
+    只寫筆數、判例的時間(ts)與命中類別,不寫判例的內容。"""
+    if not withheld:
+        return
+    errors = [str(w.get("error") or "例外") for w in withheld if w.get("categories") is None]
+    stamps = sorted({w["ts"] for w in withheld if w.get("ts") is not None})
+    cats = sorted({c for w in withheld for c in (w.get("categories") or [])})
+    hit = len(withheld) - len(errors)
+    if hit:
+        print(f"[pipeline] MR !{mr_id} 查回的審查判例有 {hit} 筆疑似含對審查工具的指令,沒有交給模型"
+              + (f";類別:{', '.join(cats)}" if cats else "")
+              + (f";判例時間(ts):{', '.join(map(str, stamps))}" if stamps else "")
+              + ";請檢查判例檔", flush=True)
+    if errors:
+        # 壞的是掃描,不是判例檔:不叫人去檢查判例檔
+        print(f"[pipeline] MR !{mr_id} 判例的注入掃描執行失敗({', '.join(dict.fromkeys(errors))}),"
+              f"查回的判例沒有交給模型", flush=True)
+
+
 _UNREVIEWABLE_TITLE = "部分變更內容無法取得,未經審查"
 
 
@@ -4574,7 +4724,7 @@ def enforce_unreviewable(report: dict, mr: dict) -> dict:
     if no_full:
         parts.append(f"以下檔案取不到完整的新版內容,只能依 diff 判斷:"
                      f"{', '.join(no_full[:10])}" + ("等" if len(no_full) > 10 else "")
-                     + "(可能是拿不到被審的 commit、未設定唯讀 token、或超過單檔上限)。")
+                     + "(可能是拿不到被審的 commit、未設定唯讀 token、超過單檔上限,或內容是二進位)。")
     if truncated:
         parts.append("MR 變更的檔案數超過可取得的分頁上限,部分檔案未能取得。")
     report.setdefault("findings", []).insert(0, {
@@ -4606,6 +4756,7 @@ _MODEL_FAILURE_TEXT = {
     "connection": "連不上審查模型的端點",
     "rate_limited": "審查模型的端點忙碌中(請求過多)",
     "rejected": "審查模型的端點拒絕了這次請求(例如輸入超過模型的上限,或權限、設定不符)",
+    "rejected_key": "審查模型的端點拒絕了金鑰(HTTP 401/403):確認環境變數 LLM_API_KEY",
     "server_error": "審查模型的端點發生錯誤",
     "other": "呼叫審查模型時發生非預期的錯誤",
     "no_time": "整份審查剩下的時間不夠(前面的檢查用掉了大部分時間),沒有呼叫審查模型",
@@ -4629,6 +4780,8 @@ def _model_failure_kind(error: BaseException) -> str:
         status = getattr(error, "status_code", None)
         if isinstance(status, int) and status >= 500:
             return "server_error"
+        if status in (401, 403):
+            return "rejected_key"
         return "rejected"
     return "other"
 

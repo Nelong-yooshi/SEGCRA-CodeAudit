@@ -4,6 +4,9 @@ from pathlib import Path
 
 import yaml
 
+from .file_perms import PermissionProblem, check_file as _check_file, check_path as _check_path
+from .file_perms import permission_problem as _permission_problem  # noqa: F401  測試直接呼叫
+
 PKG_ROOT = Path(__file__).resolve().parent.parent
 
 # dbt 展開用的資料庫名稱:約定的固定假名(#14 review)。只用來把 ref()/source() 拼成
@@ -146,10 +149,97 @@ def _env_seed(name: str) -> int | None:
     return v
 
 
+class ConfigError(ValueError):
+    """設定不安全或不完整:停下來交給人處理,不退回別的做法(見 _env_text、check_config_file)。"""
+
+
+def _env_text(name: str) -> str | None:
+    """文字型的環境變數:沒設回 None;**設了但去掉前後空白後是空的,直接報錯**。
+
+    設了變數就表示要用它;變數是空的,多半是部署腳本沒把值帶進來(例如 `read` 時直接按了
+    Enter)。這時改用設定檔或預設值,等於用一份沒有人指定的設定繼續跑,而症狀(端點回 401、
+    連線錯誤)看不出是哪個變數。前後的空白去掉。"""
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = raw.strip()
+    if not value:
+        raise ConfigError(f"環境變數 {name} 有設定但是空的;要用就給值,不用就把這個變數拿掉")
+    return value
+
+
+# ─── 讀環境變數的規則(這些 helper 都在這裡) ───
+# - 文字、整數、路徑(_env_text、env_int、env_path):**設了但是空的就停**(ConfigError,寫出變數名)。
+#   空的時退回預設值,等於用沒人指定的端點、資料庫、目錄繼續跑。
+# - 秒數、開關(env_seconds 等):讀不懂退回程式的預設值並印一行警告;等太短或沒送 timeout 時
+#   模型呼叫失敗也是交人工,不會因此放行。
+
+
+def env_text(name: str, default: str) -> str:
+    """文字型的環境變數,沒設時用 `default`;設了但是空的就停(見 _env_text)。預設值寫在呼叫端,
+    設定參數的檢查(env_registry)才對得到文件。"""
+    value = _env_text(name)
+    return default if value is None else value
+
+
+def env_int(name: str, default: int, *, lo: int = 1, hi: int | None = None) -> int:
+    """整數型的環境變數:沒設用預設;設了但是空的、不是整數、超出範圍就停,訊息寫出變數名。"""
+    raw = _env_text(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ConfigError(f"環境變數 {name} 的值不是整數({raw[:40]!r})") from None
+    if value < lo or (hi is not None and value > hi):
+        limit = f"{lo} 到 {hi}" if hi is not None else f"至少 {lo}"
+        raise ConfigError(f"環境變數 {name}={value} 超出範圍({limit})")
+    return value
+
+
+def env_path(name: str, default) -> Path:
+    """路徑型的環境變數:沒設用預設(repo 裡的目錄)。有設時先展開 `~`;設了但是空的、不是絕對路徑
+    就停(`Path("")` 是啟動目錄,相對路徑跟著啟動目錄走,讀寫到哪裡都是意外)。指到的檔案或目錄
+    與一路往上的每一層,群組或其他人可寫就停(file_perms.check_path):知識庫裡的 binding 會壓掉
+    finding,報告含 MR 的程式碼,誰改得到這些目錄不能是意外。`/` 開頭、`..` 不擋:能設環境變數的人
+    本來就能寫任何路徑。"""
+    raw = _env_text(name)
+    if raw is None:
+        return Path(default)
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ConfigError(f"環境變數 {name} 要是絕對路徑(目前是相對路徑,會跟著啟動目錄走)")
+    try:
+        _check_path(path)
+    except PermissionProblem as e:
+        raise ConfigError(f"環境變數 {name} 指到的位置:{e}") from None
+    return path
+
+
+# 模型設定檔裡 api_key 唯一接受的值(或不寫):Ollama 不驗證,這只是佔位
+_API_KEY_PLACEHOLDER = "ollama"
+
+
+def check_config_file(path: Path, *, secret: bool) -> None:
+    """讀設定檔前檢查權限,太寬就停(ConfigError)。規則在 file_perms.py,只有那一份:檔案本身、
+    實際的檔案所在的目錄一路往上到 `/`、路徑上的連結所在的目錄;只看權限位元,不看擁有者。
+
+    - `secret=True`(gitlab.env、sandbox.env:裡面是密碼):群組或其他人**可讀或可寫**就停
+    - `secret=False`(模型設定檔:不放金鑰,但別人改得到的話,端點換掉 → 金鑰與每個 MR 的
+      程式碼都送到他指定的地方;或把 policy 改寬):群組或其他人**可寫**就停"""
+    try:
+        _check_file(path, secret=secret)
+    except PermissionProblem as e:
+        raise ConfigError(str(e)) from None
+
+
 @dataclass
 class Config:
-    endpoint: str
-    api_key: str
+    # 都不放進 repr(str 也是用 repr):Config 被印出來、寫進例外訊息、pytest 斷言失敗印出來時,
+    # 金鑰與端點都不跟著出去 —— 端點網址也可能帶通行碼(`gpu run` 設的 OLLAMA_URL、
+    # 閘道常用的 http://user:pass@host/v1)
+    endpoint: str = field(repr=False)
+    api_key: str = field(repr=False)
     default_profile: str
     profiles: dict
     roles: dict
@@ -159,6 +249,9 @@ class Config:
     # 而沒指定 dbt 的呼叫端(測試、其他腳本)一律落在「未接線」的安全狀態,
     # 不會因為漏寫這個欄位就意外開啟。
     dbt: dict = field(default_factory=lambda: {"enabled": False, "database": ""})
+    # 這次讀的是哪一份模型設定檔:{"path": ..., "sha256": 內容的雜湊}。寫進每份報告(_models_config),
+    # 事後對得回是哪一版設定(放行門檻在這份檔案裡,改了閘門就跟著變)
+    source: dict = field(default_factory=dict)
 
     def profile(self, name: str | None = None) -> ModelProfile:
         p = self.profiles[name or self.default_profile]
@@ -204,7 +297,9 @@ def _load_dbt_section(raw: dict, where: str = "設定檔") -> dict:
             f"設定檔 dbt.enabled 必須是布林值 true/false,目前是 {enabled!r}"
             f"({type(enabled).__name__})。字串 \"false\" 在 Python 裡會被當成"
             f"真值,為避免誤開,一律不接受字串。")
-    database = os.environ.get("SEGCRA_DBT_DATABASE", section.get("database", ""))
+    # 設了但是空的一樣停下來(見 _env_text):空的時改用設定檔的值,等於用沒人指定的設定跑
+    env_database = _env_text("SEGCRA_DBT_DATABASE")
+    database = env_database if env_database is not None else section.get("database", "")
     if not isinstance(database, str):
         raise ValueError(f"設定檔 dbt.database 必須是字串,目前是 {database!r}")
     if database:
@@ -316,16 +411,132 @@ def _var_value(value, where: str, depth: int = 0):
     raise ValueError(f"{where} 的型別是 {type(value).__name__},只收字串、數字、布林,以及它們組成的清單與物件")
 
 
+def _yaml_api_key(raw: dict) -> str:
+    """設定檔的 api_key 只接受不寫或佔位的 `ollama`,其他值一律停下來。
+
+    那個檔案會進版控與離線包。以前照收:部署端忘了把金鑰拿掉時,服務照常運作、沒有任何提示,
+    金鑰就一直留在檔案裡。訊息不寫出金鑰本身。"""
+    value = raw.get("api_key", _API_KEY_PLACEHOLDER)
+    if value != _API_KEY_PLACEHOLDER:
+        raise ConfigError(
+            "模型設定檔的 api_key 只能不寫或寫 ollama(佔位):金鑰改用環境變數 LLM_API_KEY 給,"
+            "設定檔會進版控與離線包。改完把寫過金鑰的備份檔一起刪掉;"
+            "金鑰曾經寫在檔案裡的話,換一把新的")
+    return value
+
+
+_DEFAULT_ENDPOINT = "http://localhost:11434/v1"
+
+
+def _check_endpoint(value, source: str) -> str:
+    """最後要用的模型端點:字串、去掉前後空白後不是空的、http 或 https、有主機。不符就停。
+
+    設定檔的 `endpoint:` 空著時 YAML 讀到的是 None,openai 套件收到 `base_url=None` 會改用
+    `OPENAI_BASE_URL`,沒有的話送到 api.openai.com —— MR 的程式碼和 LLM_API_KEY 一起送到外部。
+    沒有 `http://` 的位址也不自動補:補錯了一樣是送到沒人指定的地方。訊息寫出來源,不寫出值
+    (網址可能帶通行碼)。"""
+    from urllib.parse import urlsplit
+    text = value.strip() if isinstance(value, str) else ""
+    try:
+        parts = urlsplit(text)
+        ok = parts.scheme in ("http", "https") and bool(parts.hostname)
+    except ValueError:
+        ok = False
+    if not ok:
+        raise ConfigError(
+            f"模型端點({source})不是有效的網址:要是 http:// 或 https:// 開頭、有主機名稱的位址"
+            "(例如 http://localhost:11434/v1)。值不寫出來(可能帶通行碼)")
+    return text
+
+
+# 其他會讀的設定檔(有的話):密碼類,群組與其他人不能讀寫。load_config 是服務啟動時就會
+# 呼叫的,在這裡一起檢查,權限不對時服務起不來,而不是等到第一份審查用到才失敗
+_SECRET_FILES = ("gitlab.env", "sandbox.env")
+
+
+def models_config_path() -> Path:
+    """要讀的模型設定檔:環境變數 SEGCRA_MODELS_CONFIG 指定的檔案;沒設時是 repo 的 config/models.yaml。
+    **設了但是空的就停**(見 _env_text):不改讀 repo 那份 —— 那等於用一份沒有人指定的設定跑。
+    有設時先展開 `~`,**不是絕對路徑就停**:相對路徑跟著啟動目錄走,在 SEGCRA-CR 底下啟動、寫成
+    `config/models.yaml` 時,讀到的正是 repo 那份(開發用的值),而且不報錯。
+
+    部署端那份放在部署端自己的設定 repo(改動走 MR),部署時放到審查服務那台機器、唯讀,用這個變數
+    指過去(README §5)。指到的檔案一樣在 load_config 檢查權限。"""
+    custom = _env_text("SEGCRA_MODELS_CONFIG")
+    if custom is None:
+        return PKG_ROOT / "config" / "models.yaml"
+    path = Path(custom).expanduser()
+    if not path.is_absolute():
+        raise ConfigError("環境變數 SEGCRA_MODELS_CONFIG 要是絕對路徑(目前是相對路徑,會跟著啟動目錄走)")
+    return path
+
+
+_REQUIRED_KEYS = ("default_profile", "profiles", "budget")
+
+
+def _read_models_yaml(path: Path, where: str) -> tuple[dict, str]:
+    """讀模型設定檔並檢查最外層的形狀。出錯時訊息寫出是哪個檔案(where),不寫出內容。"""
+    try:
+        data = path.read_bytes()
+        text = data.decode("utf-8")
+    except OSError as e:
+        raise ConfigError(f"{where} 讀不到({type(e).__name__}:不存在、是目錄或沒有讀取權限)") from None
+    except UnicodeDecodeError:
+        raise ConfigError(f"{where} 不是 UTF-8 文字檔") from None
+    try:
+        raw = yaml.safe_load(text)
+    except yaml.YAMLError as e:
+        mark = getattr(e, "problem_mark", None)
+        at = f"(第 {mark.line + 1} 行附近)" if mark is not None else ""
+        raise ConfigError(f"{where} 不是合法的 YAML{at}") from None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where} 是空的,或最外層不是 key: value 的格式")
+    missing = [k for k in _REQUIRED_KEYS if k not in raw]
+    if missing:
+        raise ConfigError(f"{where} 缺少 {'、'.join(missing)}")
+    import hashlib
+    return raw, hashlib.sha256(data).hexdigest()
+
+
 def load_config(path: Path | None = None) -> Config:
-    raw = yaml.safe_load((path or PKG_ROOT / "config" / "models.yaml").read_text(encoding="utf-8"))
-    # endpoint 可用環境變數覆蓋(如 Ollama 掛在遠端或 tunnel 上)
-    endpoint = os.environ.get("OLLAMA_URL", raw.get("endpoint", "http://localhost:11434/v1"))
+    """path 有給時讀那個檔案(測試用),沒給時讀 models_config_path()。
+
+    設定檔本身的問題(讀不到、格式錯、內容不合規、權限太寬)訊息一律寫出是哪個檔案;路徑來自
+    環境變數時也寫出 SEGCRA_MODELS_CONFIG —— 部署的人要先知道讀的是哪一份,才知道去改哪裡。"""
+    from_env = path is None and _env_text("SEGCRA_MODELS_CONFIG") is not None
+    path = path or models_config_path()
+    where = f"模型設定檔 {path}" + ("(環境變數 SEGCRA_MODELS_CONFIG 指定)" if from_env else "")
+
+    def in_file(fn):
+        try:
+            return fn()
+        except ConfigError as e:
+            msg = str(e)
+            raise ConfigError(msg if str(path) in msg else f"{where}:{msg}") from None
+        except ValueError as e:      # dbt 區塊的格式錯誤
+            raise ConfigError(f"{where}:{e}") from None
+
+    in_file(lambda: check_config_file(path, secret=False))
+    for name in _SECRET_FILES:
+        check_config_file(PKG_ROOT / "config" / name, secret=True)
+    raw, digest = _read_models_yaml(path, where)
+    # endpoint 可用環境變數覆蓋(如 Ollama 掛在遠端或 tunnel 上;OpenAI 相容的端點都可以)
+    env_endpoint = _env_text("OLLAMA_URL")
+    if env_endpoint is not None:
+        endpoint, source = env_endpoint, "環境變數 OLLAMA_URL"
+    else:
+        endpoint = raw["endpoint"] if "endpoint" in raw else _DEFAULT_ENDPOINT
+        source = f"{where} 的 endpoint"
+    endpoint = _check_endpoint(endpoint, source)
+    # 端點要驗證時,金鑰用環境變數給,不寫進設定檔(會進版控與離線包;見 _yaml_api_key)
+    yaml_key = in_file(lambda: _yaml_api_key(raw))
+    api_key = _env_text("LLM_API_KEY") or yaml_key
     return Config(
-        endpoint=endpoint, api_key=raw.get("api_key", "ollama"),
+        endpoint=endpoint, api_key=api_key,
         default_profile=raw["default_profile"], profiles=raw["profiles"],
         roles=raw.get("roles", {}), budget=raw["budget"],
-        policy=raw.get("policy", {}),
-        dbt=_load_dbt_section(raw, f"設定檔 {path or PKG_ROOT / 'config' / 'models.yaml'}"),
+        policy=raw.get("policy", {}), dbt=in_file(lambda: _load_dbt_section(raw, where)),
+        source={"path": str(path), "sha256": digest},
     )
 
 
