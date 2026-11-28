@@ -573,16 +573,16 @@ RULES = [
 # 鍵名(像憑證的那些)。三處共用:鍵=值、位置參數的前後文、欄位比較的降級判斷。
 _CRED_KEY = (r"password|passwd|pwd|secret|api[_-]?key|access[_-]?key|auth[_-]?token"
              r"|token|credential|conn(?:ection)?[_-]?string")
-# 寫死的值。涵蓋三種寫法:
-#   1. 引號包起來的值,前面可以有 T-SQL 的 N 前綴:`PASSWORD = N'6789'`
+# 寫死的值。涵蓋三種寫法(以下 <數字>/<字串> 代表任意常值,不是真實範例):
+#   1. 引號包起來的值,前面可以有 T-SQL 的 N 前綴:`PASSWORD = N'<字串>'`
 #   2. 沒加引號的值。**冒號與等號要分開**:
-#      YAML 的 `password: 6789`、`password: S3cr3tPass` —— 冒號後面什麼都算;
-#      SQL 的 `SET @pwd = 6789` —— 等號後面只認數字開頭的,不然 `password = other_column`
+#      YAML 的 `password: <數字>`、`password: <字串>` —— 冒號後面什麼都算;
+#      SQL 的 `SET @pwd = <數字>` —— 等號後面只認數字開頭的,不然 `password = other_column`
 #      這種拿欄位比較的寫法會被當成寫死的值
 #   3. 連線字串裡的 `帳號:密碼@主機`
 #
 # **值本身抓成群組**:要判斷的是那個值是不是佔位符,不是「附近有沒有佔位符」。
-# 往後看一行之內的話,`SET @password = 'hunter2'; PRINT '${x}'` 會因為後面那個 `${}`
+# 往後看一行之內的話,`SET @password = '<字串>'; PRINT '${x}'` 會因為後面那個 `${}`
 # 整條不報 —— 比改之前還鬆。
 _QUOTED = r"""N?'[^'\n]{1,}'|N?\"[^\"\n]{1,}\""""
 _SECRET_RE = re.compile(
@@ -660,12 +660,12 @@ def _secret_kind(m: "re.Match") -> str:
 # 「欄位 = 字串」的比較**有時**不是寫死憑證:`WHERE token = 'ACTIVE'` 是拿狀態值在比對,
 # 而 R004 是 blocker,這種誤報會直接把 MR 擋下來。降級成 H004 交模型判斷。
 #
-# **但降級要收得很窄**,不然會把真的憑證放掉:`WHERE password = 'hunter2'`、
-# `AND password = 'P@ssw0rd-2026'` 都是寫死的密碼,只是寫在比較裡。三個條件同時成立
-# 才降級:
+# **但降級要收得很窄**,不然會把真的憑證放掉:`WHERE password = '<字串>'`
+# 這種寫在比較裡的也是寫死的密碼(<字串> 代表任意常值,不是真實範例)。三個條件同時
+# 成立才降級:
 #   1. 前面是 WHERE / AND / OR / ON(是比較,不是賦值或設定)
 #   2. 值看起來是狀態碼:只有字母或底線、不長 —— 'ACTIVE'、'LEGACY'、'N'。
-#      有數字或符號的('hunter2'、'sk-live-0000'、'P@ssw0rd-2026')一律當成憑證
+#      有數字或符號的(例如 '<字串2>')一律當成憑證
 #   3. 鍵名不是密碼家族:password / passwd / pwd 的比較照樣 blocker
 _COMPARE_HEAD_RE = re.compile(r"(?i)(?:WHERE|AND|OR|ON)\s+(?:\w+\s*\.\s*)?$")
 # `.match(sql, pos)` 本身就從 pos 開始比,不要加 `^`:沒有 MULTILINE 時 `^` 只在整份的
