@@ -245,6 +245,9 @@ TESTGEN_SYSTEM = """你是測試資料工程師。給你一份異常交易規則
                               HAVING SUM(amount) >= 100000) THEN 1 ELSE 0 END
    限制:**單一 SELECT、不得有分號或註解、不得出現 INSERT/UPDATE/DELETE/DROP/
    CREATE/ALTER/EXEC 等會改變狀態的字**(不符會被忽略,那個條件就失去這道檢查)。
+   **日期一律寫成字面值**(例如 `tx_time >= '{win_start}'`),不要用自訂參數:
+   判斷式是單獨執行的,用了沒有宣告的變數會整條算不出來。
+   (`@start_date` / `@end_date` 這兩個會自動宣告,用它們沒問題。)
    這些查詢會在沙盒上逐條執行,用來驗:基準讓該分支每一條都成立、
    變體**只有**被指定的那一條不成立。所以變體要精準。
 8. 資料庫是 MS SQL(SQL Server),schema_ddl 一律用 T-SQL 型別
@@ -273,6 +276,27 @@ _CHECK_SQL_FORBIDDEN = re.compile(
     r"exec|execute|backup|restore|shutdown|openrowset|opendatasource|bulk|"
     r"commit|rollback|waitfor|begin|while|goto|declare|set)\b"
     r"|\b(xp_|sp_)")
+
+
+# 受審 SQL 與判斷式共用的參數宣告。規格裡的條件常常寫成「在執行窗內」,模型產生的
+# 判斷式就會直接用 @start_date / @end_date —— 而判斷式是**單獨**送進沙盒跑的,沒有
+# 宣告就回錯誤 137(Must declare the scalar variable),整個案例變成「標籤未驗證」。
+# 兩邊用同一組值,條件的語意才跟受審 SQL 執行時一致。
+_WINDOW_PARAMS = (("@start_date", f"DATE = '{WIN_START}'"),
+                  ("@end_date", f"DATE = '{WIN_END}'"))
+
+
+def _window_decls(text: str) -> str:
+    """這段 SQL 用到的執行窗參數的 DECLARE(沒用到就回空字串)。"""
+    used = [f"{name} {spec}" for name, spec in _WINDOW_PARAMS
+            if re.search(rf"{name}\b", text, re.I)]
+    return "DECLARE " + ", ".join(used) + ";\n" if used else ""
+
+
+# 判斷式用到我們不知道的參數時,SQL Server 回的是同一個錯誤 137。要分得出來:
+# 「我們沒宣告」跟「條件本身寫錯」對看報告的人是兩件事 —— 前者是我們沒驗到,
+# 後者是測資或規格有問題。
+_UNDECLARED_RE = re.compile(r'(?i)must declare the scalar variable\s+"?(@\w+)"?')
 
 
 def _wrap_check_sql(q: str) -> str:
@@ -488,6 +512,10 @@ def _rows_fit_ddl(rows, cols_by_table: dict[str, list[dict]]) -> str:
     return ""
 
 
+# 條件的判斷式因為形狀不合法被拿掉時,原因記在條件的這個欄位(_eval_conditions 據此寫出原因)
+CHECK_SQL_DROPPED = "_check_sql_dropped"
+
+
 def _shape_check(plan: dict) -> tuple[dict, list[str], list[dict]]:
     """確定性檢查測資計畫:JSON 形狀 + 逐條件 true/false 覆蓋。
     回傳 (清洗後 plan, coverage_gaps, dropped_malformed)。"""
@@ -499,11 +527,13 @@ def _shape_check(plan: dict) -> tuple[dict, list[str], list[dict]]:
     for c in plan.get("conditions", []):
         if not (isinstance(c, dict) and c.get("id") and c.get("desc")):
             continue
-        # check_sql 是**可選**的(#23 第 3 點):沒給就不做標籤一致性檢查,行為同以往。
-        # 給了但形狀不合法 → 丟掉那個欄位而不是丟掉整個條件:條件本身是好的,
-        # 只是附帶的判斷式不能用,不該因此讓這個條件的案例全部消失。
+        # check_sql 沒給或被拿掉時,這個條件的案例標籤驗不到 → 記成待驗證,執行驗證不算通過
+        # (見 gaps_and_passed)。給了但形狀不合法 → 丟掉那個欄位而不是丟掉整個條件:條件本身
+        # 是好的,只是附帶的判斷式不能用,不該因此讓這個條件的案例全部消失。拿掉的原因
+        # 留在條件上(CHECK_SQL_DROPPED),報告才說得出是「被拿掉」而不是「沒寫」。
         if "check_sql" in c and not _check_sql_ok(c.get("check_sql")):
             c = {k: v for k, v in c.items() if k != "check_sql"}
+            c[CHECK_SQL_DROPPED] = "判斷式(check_sql)形狀不合法(非單一 SELECT、含分號/註解/狀態變更),已拿掉"
             dropped.append({"case": {"condition_id": c["id"]},
                             "reason": "條件的 check_sql 形狀不合法(非單一 SELECT、含分號/註解/狀態變更),已忽略"})
         conds.append(c)
@@ -1309,15 +1339,7 @@ def prepare_sql(sql: str) -> str:
         except Exception:
             pass
     body = _SYSDATE.sub(f"CAST('{WIN_END}' AS DATETIME2)", body)
-    decl = []
-    if re.search(r"@start_date\b", body, re.I):
-        decl.append(f"@start_date DATE = '{WIN_START}'")
-    if re.search(r"@end_date\b", body, re.I):
-        decl.append(f"@end_date DATE = '{WIN_END}'")
-    head = "SET NOCOUNT ON; SET DATEFORMAT ymd;\n"
-    if decl:
-        head += "DECLARE " + ", ".join(decl) + ";\n"
-    return head + body
+    return "SET NOCOUNT ON; SET DATEFORMAT ymd;\n" + _window_decls(body) + body
 
 
 def _drop_stale_sandbox_dbs(admin) -> None:
@@ -1378,11 +1400,18 @@ def _eval_conditions(cursor, conds: list[dict]) -> tuple[dict[str, bool] | None,
     for c in conds:
         q = c.get("check_sql")
         if not q:
+            if c.get(CHECK_SQL_DROPPED):
+                return None, f"條件 {c.get('id')} 的{c[CHECK_SQL_DROPPED]}"
             return None, f"條件 {c.get('id')} 沒有判斷式(check_sql)"
         try:
-            cursor.execute(_wrap_check_sql(q))
+            cursor.execute(_window_decls(q) + _wrap_check_sql(q))
             row = cursor.fetchone()
         except Exception as e:
+            undeclared = _UNDECLARED_RE.search(str(e))
+            if undeclared:
+                return None, (f"條件 {c.get('id')} 的判斷式用了沒有宣告的參數 "
+                              f"{undeclared.group(1)}(執行窗的 @start_date / @end_date "
+                              f"已經自動宣告):這是判斷式本身的問題,不是條件不成立")
             return None, f"條件 {c.get('id')} 的判斷式執行失敗:{str(e)[:120]}"
         if not row:
             return None, f"條件 {c.get('id')} 的判斷式沒有回傳值"
@@ -1994,24 +2023,38 @@ def _apply_label_checks(plan: dict, results: list[dict], truth: dict) -> None:
 
 
 def _unverified(case_results: list[dict]) -> list[dict]:
-    """標籤完全沒驗到的案例(判斷式缺漏或算不出來)。"""
-    return [{"case_id": r.get("case_id"), "reason": r["label_unverified"]}
-            for r in case_results if r.get("label_unverified")]
+    """標籤沒驗到的案例(沒有判斷式、判斷式被拿掉、判斷式執行失敗或沒回值)。
+
+    被仲裁剔除的不算在這裡:剔除本身已經列進覆蓋缺口,再算一次就重複了。"""
+    return [{"case_id": r.get("case_id"), "condition_id": r.get("condition_id"),
+             "reason": r["label_unverified"]}
+            for r in case_results if r.get("label_unverified") and not r.get("dropped")]
 
 
-def _unverified_note(case_results: list[dict]) -> str:
-    """寫進「執行驗證通過」那條 finding 的一句話:標籤有沒有真的驗到。
+LABEL_UNVERIFIED_TITLE = "[執行驗證] 案例的標籤沒有驗到"
 
-    刻意**不**列入覆蓋缺口:舊格式的凍結測資根本沒有 check_sql,列入的話它們會
-    全部變成「不通過」——那是另一回事,不是這次驗證的品質問題。但也不能不講:
-    「案例皆符合預期」在標籤完全沒驗到的時候,證明力比看起來小得多。
-    """
+
+def _unverified_finding(path: str, spec_code: str, case_results: list[dict]) -> dict | None:
+    """標籤沒驗到的案例記成**待驗證**(帶 stage):行為符合預期,但沒辦法確認資料真的測到
+    它宣稱的那一條,所以不是確定的缺陷,也不能當成驗過了。
+
+    「沒驗到」是模型可以決定的(判斷式是模型寫的,不寫或寫錯格式就沒驗到),所以這裡不能
+    比「驗過但不對」寬:後者讓執行驗證不通過,前者也一樣不通過(gaps_and_passed)。"""
     bad = _unverified(case_results)
     if not bad:
-        return ""
-    return (f"另外有 {len(bad)}/{len(case_results)} 個案例的標籤未經驗證"
-            f"(無法確認資料真的測到它宣稱的那一條):{bad[0]['reason']}"
-            + ("等" if len(bad) > 1 else "") + "。")
+        return None
+    total = sum(1 for r in case_results if not r.get("dropped"))
+    by_reason: dict[str, list[str]] = {}
+    for b in bad:
+        by_reason.setdefault(b["reason"], []).append(str(b["case_id"]))
+    parts = [f"{reason}(案例 {'、'.join(ids[:10])}{'等' if len(ids) > 10 else ''})"
+             for reason, ids in by_reason.items()]
+    return {**_finding(
+        path, "major", LABEL_UNVERIFIED_TITLE,
+        f"規則 {spec_code}:{len(bad)}/{total} 個案例的標籤沒有驗到,無法確認測資真的測到它宣稱的"
+        f"那一條條件;這部分沒有經過執行驗證,記成待驗證,本 MR 不得自動放行。原因:" + ";".join(parts),
+        "請人工依核定規格核對這些條件;判斷式寫錯或缺漏時,重新觸發審查讓測資重新生成。"),
+        "stage": EXEC_STAGE}
 
 
 def _label_gaps(case_results: list[dict]) -> list[str]:
@@ -2077,6 +2120,9 @@ def gaps_and_passed(plan: dict, ex: dict, base_gaps=(),
 
     `base_gaps` 是前面已經累積的缺口(生成階段的覆蓋檢查、仲裁剔除的案例);
     `faults` 是仲裁判成「SQL 錯」的案例(腳本那邊是 `mismatches`)。
+
+    標籤沒驗到的案例(`_unverified`)不列進缺口(它們另外記成待驗證,跟「資料與標籤不符」
+    分開講),但 `passed` 一樣不成立:確定不對的會擋,沒辦法確定的不能反而通過。
     """
     gaps = list(base_gaps) + _label_gaps(ex["case_results"])
     if ex.get("timed_out"):
@@ -2085,7 +2131,8 @@ def gaps_and_passed(plan: dict, ex: dict, base_gaps=(),
         unrun = len(plan.get("cases") or []) - len(ex["case_results"])
         gaps.append(f"沙盒執行超過時間上限,{unrun} 個案例未執行(逾時)")
     effective = [r for r in ex["case_results"] if not r.get("dropped")]
-    return gaps, bool(effective) and not faults and not gaps
+    unverified = _unverified(ex["case_results"])
+    return gaps, bool(effective) and not faults and not gaps and not unverified
 
 
 # 執行驗證的三個階段。失敗或逾時要看得出是哪一個(#53 review 第 7 點):整段只算一個
@@ -2376,6 +2423,9 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
             findings.append(_finding(path, "major", "執行驗證失敗:實作與規格行為不符",
                                      f"規則 {spec_code} 在依規格生成的測資上行為不符:{detail}",
                                      "對照規格與上列案例修正邏輯(含/不含、時段、過濾、粒度)。"))
+    unverified_finding = _unverified_finding(path, spec_code, ex["case_results"])
+    if unverified_finding:
+        findings.append(unverified_finding)
     if coverage_gaps:
         findings.append(_finding(path, "info", "執行驗證覆蓋缺口",
                                  "以下條件未達 true/false 兩向覆蓋,該部分未經執行驗證:" +
@@ -2387,8 +2437,7 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                                  f"執行驗證:{len(effective)} 個生成測試案例皆符合預期",
                                  f"測資由模型依規格 {spec_code} 產生,涵蓋每個條件成立與不成立"
                                  f"兩種情況,以及門檻邊界值;再於沙盒實際編譯執行。"
-                                 f"執行本身是確定性的,但測資與驗證出自模型,AI 可能有幻覺。"
-                                 + _unverified_note(ex["case_results"])))
+                                 f"執行本身是確定性的,但測資與驗證出自模型,AI 可能有幻覺。"))
     prog["stage"] = None        # 跑完了,沒有「卡在哪裡」這件事
     return {"passed": passed, "spec_code": spec_code, "engine": ex["engine"],
             "executed_file": executed_file,

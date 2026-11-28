@@ -1872,30 +1872,63 @@ def test_標籤沒驗到要留下痕跡(monkeypatch):
     assert "label_ok" not in r, "算不出來就不該下標籤結論"
     assert "ORDER" in r["label_unverified"], r.get("label_unverified")
     assert spec_exec._unverified(out["case_results"]) == [
-        {"case_id": "C1-T", "reason": r["label_unverified"]}]
+        {"case_id": "C1-T", "condition_id": "C1", "reason": r["label_unverified"]}]
 
 
-def test_標籤沒驗到不列入覆蓋缺口():
-    """舊格式的凍結測資根本沒有 check_sql,列入覆蓋缺口的話它們會全部變成
-    「不通過」—— 那是另一回事,不是這次驗證的品質問題。"""
-    results = [{"case_id": "A", "condition_id": "C1", "direction": "true",
-                "label_unverified": "條件 C1 沒有判斷式(check_sql)"}]
-    assert spec_exec._label_gaps(results) == []
+# 標籤沒驗到 = 待驗證:執行驗證不算通過(#153 review 要修的 1)。同一個案例(行為符合預期)只換標籤。
+_VERIFIED_OK = {"label_ok": True}
+_VERIFIED_BAD = {"label_ok": False, "label_mismatch": ["C1 不成立"]}
+_EXEC_FAILED = {"label_unverified": "條件 C1 的判斷式執行失敗:Incorrect syntax near 'ORDER'"}
+_NO_CHECK = {"label_unverified": "條件 C1 沒有判斷式(check_sql)"}
 
 
-def test_通過的_finding_要說標籤有幾個沒驗到():
-    """「案例皆符合預期」在標籤完全沒驗到的時候,證明力比看起來小得多,
-    所以要寫在同一條 finding 裡,不是只留在稽核欄位。"""
-    results = [{"case_id": "A", "label_unverified": "條件 C1 沒有判斷式(check_sql)"},
-               {"case_id": "B", "label_ok": True}]
-    note = spec_exec._unverified_note(results)
-    assert "1/2" in note and "沒有判斷式" in note, note
-    assert spec_exec._unverified_note([{"case_id": "B", "label_ok": True}]) == ""
+def _one_case(label: dict) -> dict:
+    return {"case_results": [{"case_id": "C1-T", "condition_id": "C1", "direction": "true",
+                              "expect_flagged": True, "actual_flagged": True, "ok": True,
+                              **label}]}
 
 
-def test_run_spec_exec_把標籤沒驗到寫進通過的_finding(monkeypatch):
-    """走 run_spec_exec 的完整路徑:上面那條只測 _unverified_note 自己,
-    所以把 finding 裡那段接起來的程式拿掉也不會紅。"""
+@pytest.mark.parametrize("label, passed, n_gaps", [
+    (_VERIFIED_OK, True, 0),
+    (_VERIFIED_BAD, False, 1),
+    (_EXEC_FAILED, False, 0),
+    (_NO_CHECK, False, 0),
+], ids=["驗過對", "驗過不對", "判斷式執行失敗", "沒有判斷式"])
+def test_標籤沒驗到的案例_執行驗證不算通過(label, passed, n_gaps):
+    """確定不對的會擋,沒辦法確定的也不能通過。沒驗到的不列進覆蓋缺口(另外記成待驗證,
+    跟「資料與標籤不符」分開講),但 passed 一樣不成立。"""
+    gaps, ok = spec_exec.gaps_and_passed({"cases": [{"case_id": "C1-T"}]}, _one_case(label))
+    assert ok is passed and len(gaps) == n_gaps, gaps
+
+
+def test_被仲裁剔除的案例不算標籤沒驗到():
+    """剔除本身已經列進覆蓋缺口,再記一次待驗證就重複了。"""
+    results = [{"case_id": "A", "condition_id": "C1", "dropped": True, **_NO_CHECK}]
+    assert spec_exec._unverified(results) == []
+
+
+def test_判斷式形狀不合格被拿掉時_標籤記成沒驗到並說出原因(monkeypatch):
+    """模型寫的判斷式多一個結尾註解就整個被拿掉;拿掉之後要算沒驗到,原因要說是被拿掉,
+    不是「沒寫」—— 不然看報告的人會去查為什麼模型沒寫判斷式。"""
+    _fake_sandbox(monkeypatch)
+    raw = {"schema_ddl": ["CREATE TABLE t (id INT)"],
+           "conditions": [{"id": "C1", "desc": "金額達門檻",
+                           "check_sql": "SELECT CASE WHEN 1 = 1 THEN 1 ELSE 0 END -- 門檻"}],
+           "cases": [{"case_id": "C1-T", "condition_id": "C1", "direction": "true",
+                      "expect_flagged": True, "note": "", "rows": [["t", 1]]},
+                     {"case_id": "C1-F", "condition_id": "C1", "direction": "false",
+                      "expect_flagged": False, "note": "", "rows": [["t", 2]]}]}
+    plan, gaps, dropped = _shape_check(raw)
+    assert "check_sql" not in plan["conditions"][0]
+    out = spec_exec.execute_cases("SELECT id FROM t WHERE id = 1", plan)
+    assert not out["sandbox_error"], out["sandbox_error"]
+    reasons = [u["reason"] for u in spec_exec._unverified(out["case_results"])]
+    assert reasons and all("已拿掉" in r for r in reasons), reasons
+    _, passed = spec_exec.gaps_and_passed(plan, out, gaps)
+    assert passed is not True
+
+
+def _run_with_labels(monkeypatch, labels):
     plan = _plan([_case("C1-T", "C1", "true"), _case("C1-F", "C1", "false", False)])
 
     async def fake_generate(cfg, code, text, profile_name=None):
@@ -1905,19 +1938,36 @@ def test_run_spec_exec_把標籤沒驗到寫進通過的_finding(monkeypatch):
         return {"engine": "stub", "sandbox_error": None, "testdata_error": None,
                 "sql_error": None, "mismatches": [],
                 "case_results": [
-                    {"case_id": "C1-T", "label_unverified": "條件 C1 沒有判斷式(check_sql)"},
-                    {"case_id": "C1-F", "label_ok": True}]}
+                    {"case_id": cid, "condition_id": "C1", "ok": True, **label}
+                    for cid, label in zip(("C1-T", "C1-F"), labels)]}
 
     monkeypatch.setattr(spec_exec, "generate_cases", fake_generate)
     monkeypatch.setattr(spec_exec, "execute_cases", fake_execute)
     mr = {"files": [{"path": "sql/rules/r201.sql", "full_content": "SELECT 1",
                      "diff": "@@ -1 +1 @@\n+SELECT 1"}]}
-    r = asyncio.run(run_spec_exec(None, None, mr, "R-201", "規格內容"))
+    return asyncio.run(run_spec_exec(None, None, mr, "R-201", "規格內容"))
+
+
+def test_run_spec_exec_標籤沒驗到記成帶_stage_的待驗證(monkeypatch):
+    """走 run_spec_exec 的完整路徑:不通過、記一條帶 stage 的 finding(review_incomplete 認得到),
+    寫出幾個案例、哪一條條件、什麼原因;不寫成「皆符合預期」。"""
+    r = _run_with_labels(monkeypatch, [_NO_CHECK, _VERIFIED_OK])
+    assert r["passed"] is False
+    assert r["label_unverified"] == [{"case_id": "C1-T", "condition_id": "C1",
+                                      "reason": _NO_CHECK["label_unverified"]}]
+    f = next(f for f in r["findings"] if f["title"] == spec_exec.LABEL_UNVERIFIED_TITLE)
+    assert f["stage"] == spec_exec.EXEC_STAGE and f["severity"] == "major"
+    assert "1/2" in f["detail"] and "條件 C1 沒有判斷式" in f["detail"] and "C1-T" in f["detail"]
+    assert not any("皆符合預期" in x["title"] for x in r["findings"])
+    assert not any("沒有驗到" in g for g in r["coverage_gaps"]), "待驗證跟覆蓋缺口分開記"
+
+
+def test_run_spec_exec_標籤全部驗過而且對的照樣通過(monkeypatch):
+    r = _run_with_labels(monkeypatch, [_VERIFIED_OK, _VERIFIED_OK])
     assert r["passed"] is True, r["coverage_gaps"]
-    assert r["label_unverified"] == [{"case_id": "C1-T",
-                                      "reason": "條件 C1 沒有判斷式(check_sql)"}]
-    passed_finding = next(f for f in r["findings"] if "皆符合預期" in f["title"])
-    assert "1/2 個案例的標籤未經驗證" in passed_finding["detail"], passed_finding["detail"]
+    assert r["label_unverified"] == []
+    assert not any(f.get("stage") for f in r["findings"])
+    assert any("皆符合預期" in f["title"] for f in r["findings"])
 
 
 # ───────── 混著改的變體、SQL Server 收得下的日期寫法 ─────────
