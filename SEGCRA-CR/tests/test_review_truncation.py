@@ -14,10 +14,11 @@ import json
 import pytest
 
 from orchestrator import agent, pipeline, spec_exec
-from orchestrator.config import load_config
+from orchestrator.config import PKG_ROOT, load_config
 from toolbox import gitlab
 
-LIMIT = load_config().profile(None).max_output_tokens
+# 模組載入時讀(在 conftest 拿掉 SEGCRA_MODELS_CONFIG 之前):明確讀 repo 那份,不讀部署端的
+LIMIT = load_config(PKG_ROOT / "config" / "models.yaml").profile(None).max_output_tokens
 TITLE = pipeline._TRUNCATED_TITLE
 
 CLEAN_SQL = """-- R-201: 單日 ATM 現金提領累計達 100000(含)通報
@@ -36,7 +37,7 @@ PATH = "sql/maintenance/x.sql"
 
 # 模型在檔案上回應了檢核點:沒有截斷時這份報告會自動放行,是「截斷會擋下放行」的對照組
 RESPONDED = {"file": PATH, "line": 1, "severity": "info",
-             "title": "已與核定規格 R-201 逐項核對",
+             "title": "[H003] 已核對:門檻與時間窗都跟規格 R-201 一致",
              "detail": "門檻 >= 100000 與規格「達」一致;時間窗與通報粒度相符。",
              "suggestion": "", "citations": []}
 CLEAN_REPORT = {"score": 100, "verdict": "approve", "summary": "實作與核定規格相符。",
@@ -371,19 +372,14 @@ def test_沒有截斷時只多一個稽核欄位():
 # ─────────────────── 程式補的文字不能被當成模型的回應 ───────────────────
 
 def test_空報告不會讓檢核點被當成已回應(review):
-    """enforce_hints 以報告全文含關鍵字判斷模型有沒有回應;空報告的摘要是程式寫的,
-    而且在 enforce_hints 之前就在報告裡——它若含關鍵字,檢核點會被悄悄吞掉。"""
+    """空報告的摘要與 finding 是程式寫的,而且在 enforce_hints 之前就在報告裡 —— 它們
+    不能被當成模型的回應而把檢核點悄悄吞掉(enforce_hints 只認模型寫的、標題帶代碼的)。"""
     normal, _, _ = review({"summary": "x", "findings": []}, STOP)
     hints = [f["title"] for f in normal["findings"] if "模型未回應" in f["title"]]
     assert hints, "對照組沒有任何檢核點,這個測試驗不到東西"
     raw = THREE_TEXT[:THREE_TEXT.index("}")]
     report, _, _ = review(raw, LENGTH)
     assert [f["title"] for f in report["findings"] if "模型未回應" in f["title"]] == hints
-
-
-def test_程式寫的摘要不含任何檢核點的關鍵字():
-    for code, words in pipeline._HINT_KEYWORDS.items():
-        assert not [w for w in [code, *words] if w in pipeline._TRUNCATED_SUMMARY], code
 
 
 # ─────────────────── 報告裡的稽核紀錄 ───────────────────
@@ -467,8 +463,3 @@ def test_模型自己輸出同標題的info_會被程式的取代(review):
                        "title": pipeline._EXHAUSTED_TITLE, "detail": "x", "citations": []}]},
         EXHAUSTED, LIMIT)
     assert [f["severity"] for f in _exhausted_findings(report)] == ["major"]
-
-
-def test_用完回合的摘要不含任何檢核點的關鍵字():
-    for code, words in pipeline._HINT_KEYWORDS.items():
-        assert not [w for w in [code, *words] if w in pipeline._EXHAUSTED_SUMMARY], code

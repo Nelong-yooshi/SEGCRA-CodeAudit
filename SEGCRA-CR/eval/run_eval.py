@@ -57,6 +57,7 @@ sys.path.insert(0, str(PKG_ROOT))
 
 from orchestrator.config import DBT_DATABASE_PLACEHOLDER, load_config  # noqa: E402
 from orchestrator.pipeline import review_mr  # noqa: E402
+from orchestrator.error_text import error_label  # noqa: E402  只留型別與狀態碼,不放原文
 
 # Windows 主控台預設 cp950,中文輸出會炸;能改就改成 UTF-8。
 if hasattr(sys.stdout, "reconfigure"):
@@ -180,8 +181,8 @@ def case_config(cfg, golden: dict):
     預設,改它等於把正式審查的行為一起改掉,而 golden set 只是想讓某幾個 case
     走到那條路。所以這裡只換一份 Config 複本,影響範圍僅限這個 case。
 
-    目前唯一需要它的是**規格依 model 檔名對應**(`mrt_RETAIL_M1_EVAL.sql` →
-    `specs/RETAIL_M1_EVAL.md`):真實規則沒有 R 編號,不開這個開關就一律「無規格可驗」。
+    目前唯一需要它的是**規格依 project 資料夾對應**(`models/SAMPLE01/` →
+    序號 SAMPLE01 的 `specs/RETAIL_M1_EVAL.md`):真實規則沒有 R 編號,不開這個開關就一律「無規格可驗」。
     """
     if not golden.get("dbt_enabled"):
         return cfg
@@ -448,10 +449,10 @@ async def run(args) -> int:
                                          dry_run=args.dry_run,
                                          baseline=getattr(args, "baseline", False))
         except Exception as e:  # noqa: BLE001 - 蒐集所有失敗原因,不預設種類
-            errors.append((mr_id, layer, f"{type(e).__name__}: {e}"))
+            errors.append((mr_id, layer, error_label(e)))
             st = layer_stat.setdefault(layer, {"pass": 0, "fail": 0, "gap": 0, "error": 0})
             st["error"] += 1
-            rows.append({"case": mr_id, "layer": layer, "error": f"{type(e).__name__}: {e}"})
+            rows.append({"case": mr_id, "layer": layer, "error": error_label(e)})
             print(f"‼ mr_{mr_id} [{layer}] 執行失敗:{type(e).__name__}(已跳過,續跑下一個)")
             continue
         # 完整報告要在**算分之前**就落地:模型那一段是 15-20 分鐘、要 GPU、會飄;

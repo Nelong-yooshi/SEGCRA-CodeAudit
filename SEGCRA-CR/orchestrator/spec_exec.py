@@ -2,9 +2,9 @@
 
 MR 的 SQL 不只要「看起來對」,還要「跑起來對」。流程:
 
-  0. 找 spec(確定性):從 MR 抓規則碼 R-xxx → 對應 specs/<code>.md;完全沒有
-     R 編號、且 config 的 dbt.enabled 開啟時(dbt model 常見情境),改依 model
-     檔名對應(見 dbt_impact.resolve_spec,#7 第 2 點)。
+  0. 找 spec(確定性):config 的 dbt.enabled 開啟時(部署端),依程式所在的 project
+     資料夾對到規格「基本資料」的序號(見 spec_index),MR 裡的 R 編號不參與;
+     dbt 關閉時從 MR 抓規則碼 R-xxx → 對應 specs/<code>.md。
      **找不到 spec = major finding「無規格可驗」→ 一律 needs_human**
      (「必跑」的意思:不是沒 spec 就跳過,而是沒 spec 就不能自動放行)。
      SQL 是 dbt 樣板時不送進沙盒(原樣執行只會得到語法錯誤,不代表程式有錯),
@@ -35,7 +35,8 @@ from decimal import Decimal
 from toolbox.gitlab import UNAVAILABLE_TEXT, fetch_file
 from .agent import (LlmNoTimeLeft, extract_json, is_timeout, output_completeness, run_agent,
                     strict_json_object)
-from .config import Config, PKG_ROOT
+from .config import Config, PKG_ROOT, check_config_file, env_int, env_text
+from .error_text import error_label
 from .isolation import run_in_thread
 from .text_fields import as_text
 
@@ -89,32 +90,43 @@ class SpecLookup(tuple):
     一份其實已經存在的規格,維運也看不出是 token 設錯了(#90 第 2 點)。
 
     代碼只放固定的英文短字串:它會被轉成給人看的訊息、貼回 MR,不可以帶原始錯誤。
+
+    `note` 是對不到規格時給人看的原因(例如「這個檔案不屬於任何 project」),寫進
+    「無規格可驗」那條 finding;只有 project 對應會給。
     """
 
-    def __new__(cls, code, text, unavailable=None):
+    def __new__(cls, code, text, unavailable=None, note=None):
         obj = super().__new__(cls, (code, text))
         obj.unavailable = unavailable
+        obj.note = note
         return obj
 
     def __getnewargs__(self):
         """複製與 pickle 都靠它。沒有的話 tuple 子類別會把 (code, text) 整個當成
         第一個參數傳回 __new__,三種都丟 TypeError —— 管線有 deepcopy(capture),
         踩到只是時間問題。"""
-        return (self[0], self[1], self.unavailable)
+        return (self[0], self[1], self.unavailable, self.note)
 
 
 async def find_spec(hub, mr: dict, *, by_path: bool = False) -> SpecLookup:
-    """回傳 SpecLookup(rule_code, spec_text, unavailable)。mock 模式讀本地 specs/;
-    real 模式**只**用 gitlab get_file 抓 repo 內 specs/<code>.md(讀正在審的那一版)。
-    都找不到 → (code|None, None);**拿不到**(環境問題)另外記在 `unavailable`。
+    """回傳 SpecLookup(rule_code, spec_text, unavailable, note)。
 
-    R 編號的比對邏輯不變(即使多個編號都對到既有規格,一律取第一個找到的)。
-    by_path 為 True **且完全沒有** R 編號時,才改依 model 檔名對應規格:
-      * by_path 由呼叫端依 config 的 dbt.enabled 傳入,**預設 False**——跟展開器
-        同一個開關,合併後正式審查的行為完全不變,確認後才一起開
-      * 只在沒有 R 編號時才試,避免蓋掉「MR 提到了編號、但規格真的不存在」
-        這種需要如實回報成「無規格」的情況
+    by_path 為 True(呼叫端依 config 的 dbt.enabled 傳入,部署端):**只**依程式所在的
+    project 資料夾對規格(見 spec_index),MR 裡的 R 編號與檔名都不參與——R 編號等於讓
+    送審者自己挑規格。對照表用這次審查設定的那一份(spec_index.use_index);沒有設定時
+    (直接呼叫、測試)當場讀一份。對不到的原因放在 note。
+
+    by_path 為 False(dbt 關閉):mock 模式讀本地 specs/;real 模式**只**用 gitlab get_file
+    抓 repo 內 specs/<code>.md(讀正在審的那一版)。多個編號都對到既有規格時取第一個找到的。
+    都找不到 → (code|None, None);**拿不到**(環境問題)另外記在 `unavailable`。
     """
+    if by_path:
+        from . import spec_index      # 延遲匯入,與 dbt 相關的模組一致
+        index = spec_index.current_index()
+        if index is None:
+            index = spec_index.load_index({})
+        choice = spec_index.choose(index, mr.get("files", []))
+        return SpecLookup(choice.code, choice.text, choice.unavailable, choice.note)
     codes = extract_rule_codes(mr)
     # **real 模式不讀工具內建的 specs/**:那份是評測與離線開發用的樣本,不是
     # 正式環境的規格。先讀本地的話,MR 改了 specs/R-093.md 時執行驗證拿到的
@@ -146,59 +158,7 @@ async def find_spec(hub, mr: dict, *, by_path: bool = False) -> SpecLookup:
             # 拿到了,但不是規格的格式。**不可以當成不存在**:那會叫開發者去補一份
             # 已經在 repo 裡的檔案,而真正的問題是這個檔被改壞了或放錯了。
             unavailable = unavailable or "not_a_spec"
-    if by_path and not codes:
-        found, by_path_unavailable = await _find_spec_by_path(hub, mr)
-        if found is not None:
-            return SpecLookup(found[0], found[1])
-        unavailable = unavailable or by_path_unavailable
     return SpecLookup(codes[0] if codes else None, None, unavailable)
-
-
-async def _find_spec_by_path(hub, mr: dict) -> tuple[tuple[str, str] | None, str | None]:
-    """依 model 檔名對應規格(dbt_impact.resolve_spec)。只由 find_spec() 在完全
-    沒有 R 編號時呼叫。回傳 ((code, text) 或 None, 「拿不到」的代碼或 None)。
-
-    **拿不到也要分出來**:dbt 的 model 沒有 R 編號,走的就是這條路;只回 None 的話,
-    token 沒設一樣會變成「沒有規格」—— 跟 R 編號那條是同一個病(#90 第 2 點)。
-
-    查找順序與上面 R 編號那段相同:**先查本機 specs/,再問 GitLab**。管線呼叫時
-    hub 一定存在,所以本機這段不能只在 hub 為 None 時才走,否則 mock 模式(demo、
-    golden set)永遠找不到本機規格。
-      * 本機:列得出 specs/ 底下實際有哪些檔,拿到 resolve_spec 的完整語意
-        (大小寫落差不採用、多個候選不自行擇一)
-      * GitLab:目前沒有列目錄的工具(見 docs/09-dbt展開與反查.md 的已知限制),
-        改成逐一探測候選路徑——跟 R 編號的做法一致,不新增任何 API 面
-    """
-    from .dbt_impact import resolve_spec   # 延遲匯入,避免無關呼叫端多背一份相依
-
-    paths = [f["path"] for f in mr.get("files", []) if f.get("path")]
-    if not paths:
-        return None, None
-
-    available = ([f"specs/{p.name}" for p in SPECS_DIR.glob("*.md") if p.is_file()]
-                 if SPECS_DIR.is_dir() else [])
-    for path in paths:
-        match = resolve_spec(path, available)
-        if match.spec_path:
-            local = SPECS_DIR / match.spec_path.rsplit("/", 1)[-1]
-            if local.is_file():   # available 就是列這個目錄得來的,理論上必成立
-                return (local.stem, local.read_text(encoding="utf-8")), None
-
-    if hub is None:
-        return None, None
-    unavailable = None
-    for path in paths:
-        for candidate in resolve_spec(path, ()).candidates:   # 只要候選路徑,不比對存在與否
-            txt, reason = fetch_file(candidate)               # 同上:不指定 ref
-            if reason:
-                unavailable = unavailable or reason
-                continue
-            if txt is None:
-                continue
-            if _is_spec_text(txt):
-                return (candidate.rsplit("/", 1)[-1][:-len(".md")], txt), None
-            unavailable = unavailable or "not_a_spec"
-    return None, unavailable
 
 
 # ------------------------------------------------------------------ 1. 測資生成
@@ -1076,7 +1036,8 @@ async def generate_cases(cfg: Config, spec_code: str, spec_text: str,
             raw = await run_agent(cfg, profile, system, user, hub=None,
                                   use_tools=False, verbose=False, meta=meta)
         except Exception as e:   # LLM 傳輸層失敗(連線/逾時)→ 降級為「測資生成失敗」,不炸管線
-            llm_error = f"{type(e).__name__}: {e}"
+            # 只放例外型別與狀態碼,不放原文(會進報告與 MR 留言;原文可能帶金鑰或主機,見 error_text)
+            llm_error = error_label(e)
             timed_out = timed_out or is_timeout(e)
             if isinstance(e, LlmNoTimeLeft):
                 break        # 剩的時間不夠:不再重試(再送也一樣不送)
@@ -1230,14 +1191,17 @@ _WRAPPED = re.compile(r"\s*(?:WITH\b[\s\S]*?\bINSERT\b|INSERT\b|CREATE\s+(?:OR\s
 def _sandbox_params() -> dict:
     """沙盒連線設定:環境變數優先,沒設就讀 config/sandbox.env(不進版控)。"""
     env_file = PKG_ROOT / "config" / "sandbox.env"
+    check_config_file(env_file, secret=True)   # 含沙盒密碼:群組或其他人讀得到就停
     if env_file.exists():
         for line in env_file.read_text(encoding="utf-8").splitlines():
             if "=" in line and not line.lstrip().startswith("#"):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
-    return {"server": os.environ.get("SANDBOX_MSSQL_HOST", "127.0.0.1"),
-            "port": int(os.environ.get("SANDBOX_MSSQL_PORT", "1433")),
-            "user": os.environ.get("SANDBOX_MSSQL_USER", "sa"),
+    # 設了但是空的就停(_env_text):空的主機名連到哪裡看連線函式庫的預設,可能不是沙盒那台,
+    # MR 的 SQL 不能拿 sa 去那裡跑。環境變數(含空的)優先於 sandbox.env(上面用 setdefault 讀)
+    return {"server": env_text("SANDBOX_MSSQL_HOST", "127.0.0.1"),
+            "port": env_int("SANDBOX_MSSQL_PORT", 1433, hi=65535),
+            "user": env_text("SANDBOX_MSSQL_USER", "sa"),
             "password": os.environ.get("SANDBOX_MSSQL_PASSWORD", ""),
             "login_timeout": 10, "timeout": 120}
 
@@ -2231,13 +2195,14 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
         if got:
             sql, executed_file = got, f.get("path", "")
 
-    unavailable = None
+    unavailable = note = None
     if spec_text is None:
         # getattr:呼叫端可能傳測試用的替身 cfg(沒有 dbt 欄位),視為未開啟
         lookup = await find_spec(
             hub, mr, by_path=(getattr(cfg, "dbt", None) or {}).get("enabled") is True)
         spec_code, spec_text = lookup
         unavailable = getattr(lookup, "unavailable", None)
+        note = getattr(lookup, "note", None)
 
     if not spec_text and unavailable:
         # **拿不到 ≠ 沒有**:環境出了問題,卻叫開發者去補一份其實可能已經存在的規格,
@@ -2254,15 +2219,22 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
                                       "處理後重新觸發審查。")]}
 
     if not spec_text:
-        detail = (f"MR 涉及規則 {spec_code},但找不到對應的規格檔 specs/{spec_code}.md。"
-                  if spec_code else "MR 中未找到規則碼(R-xxx),也無對應規格檔。")
+        if note:
+            # project 對應:原因寫清楚(不屬於任何 project、編號沒有規格、不只一份……),
+            # 處理方式是放對資料夾或補規格,不是補 R 編號
+            detail = f"{note}。"
+            fix = ("把 model 放在 models/<project 編號>/ 底下,並在規格「基本資料」的"
+                   "「序號 / 程式名稱」填同一個編號(見 docs/09)。")
+        else:
+            detail = (f"MR 涉及規則 {spec_code},但找不到對應的規格檔 specs/{spec_code}.md。"
+                      if spec_code else "MR 中未找到規則碼(R-xxx),也無對應規格檔。")
+            fix = "依 README「spec 怎麼寫」補上規格檔。"
         return {"passed": False, "spec_code": spec_code, "conditions": [],
                 "coverage_gaps": [], "case_results": [], "dropped_cases": [],
-                "no_spec": True,
+                "no_spec": True, **({"no_spec_reason": note} if note else {}),
                 "findings": [_finding(path, "major", "無規格可驗,無法執行驗證",
                                       detail + "執行驗證是合入的必要條件:請先補上核定規格"
-                                      "(specs/<規則碼>.md)再送審;本 MR 不得自動放行。",
-                                      "依 README「spec 怎麼寫」補上規格檔。")]}
+                                      "再送審;本 MR 不得自動放行。", fix)]}
     if not sql:
         return {"passed": False, "spec_code": spec_code, "conditions": [],
                 "coverage_gaps": [], "case_results": [], "dropped_cases": [],

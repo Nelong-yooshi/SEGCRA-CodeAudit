@@ -334,47 +334,114 @@ def test_檢核點標題要能被決策閘門認出來():
 
 
 def test_模型回應過的檢核點不補():
-    """H001 的判定關鍵詞是 沖正/退匯/淨額,報告裡提到任一個就算回應過。"""
+    """同一個檔、標題帶 [H001] 的模型 finding 就算回應過。"""
     pre = _pre([{"rule": "H001", "severity": "hint", "message": "沖正是否處理"}])
     report = enforce_hints(
         {"findings": [{"severity": "info", "file": FILE,
-                       "title": "已確認沖正資料於前置系統淨額"}]}, pre)
+                       "title": "[H001] 已核對:沖正資料於前置系統淨額"}]}, pre)
     assert len(report["findings"]) == 1
 
 
 _H001 = {"rule": "H001", "severity": "hint", "message": "沖正是否處理"}
 
 
-@pytest.mark.parametrize("field", ["title", "detail", "suggestion"])
-def test_同檔_finding_的標題內文建議都算回應(field):
-    """#16 review:只認同一個檔案的 findings 裡,標題、內文、建議提到的回應。"""
-    finding = {"severity": "info", "file": FILE, "title": "核對結果"}
-    finding[field] = "已確認沖正資料於前置系統處理"
-    report = enforce_hints({"findings": [finding]}, _pre([_H001]))
-    assert len(report["findings"]) == 1
+def _h001_pending(findings):
+    out = enforce_hints({"findings": list(findings)}, _pre([_H001]))
+    return [f for f in out["findings"] if "檢核點待人工確認" in f.get("title", "")]
+
+
+@pytest.mark.parametrize("field", ["detail", "suggestion"])
+def test_代碼只寫在內文或建議不算回應(field):
+    """回應的格式是「標題帶代碼」:寫在內文或建議裡的 [H001] 可能是在引用預掃結果。"""
+    finding = {"severity": "info", "file": FILE, "title": "核對結果",
+               field: "[H001] 已核對:沖正資料於前置系統處理"}
+    assert len(_h001_pending([finding])) == 1
+
+
+@pytest.mark.parametrize("title", [
+    "已核對:沖正資料於前置系統淨額",          # 以前的關鍵詞(沖正、淨額)都有,但沒有代碼
+    "H001 已核對:沖正資料於前置系統淨額",     # 沒有方括號
+    "[H0011] 已核對:沖正資料於前置系統淨額",  # 別的代碼
+])
+def test_標題沒有那個代碼就不算回應(title):
+    """不再用字詞猜。以前同檔的 finding 只要提到「沖正」「淨額」就算回應過,
+    講別的事也一樣,檢核點因此不擋自動放行。"""
+    assert len(_h001_pending([{"severity": "info", "file": FILE, "title": title}])) == 1
+
+
+def test_關鍵詞在講別的事時不會吞掉檢核點():
+    """issue 的例子:同一個檔的其他 finding 提到「規格」,H003 以前就算回應過。"""
+    h003 = {"rule": "H003", "severity": "hint", "message": "檔案涉及規則 R-201:必須與核定規格逐項核對"}
+    other = {"severity": "minor", "file": FILE, "title": "欄位命名與規格書的慣例不同",
+             "detail": "total_amount 建議依規格改名。"}
+    report = enforce_hints({"findings": [other]}, _pre([h003]))
+    assert any(f["title"] == "[H003] 檢核點待人工確認(模型未回應)" for f in report["findings"])
+
+
+def test_程式補的_finding_標題帶代碼也不算回應():
+    """程式補的那條標題就是「[H001] 檢核點待人工確認…」;它不是模型的回應。"""
+    from orchestrator.pipeline import PROGRAM_SOURCE
+    prog = {"severity": "info", "file": FILE, "title": "[H001] 已核對:沖正已另外處理",
+            "_source": PROGRAM_SOURCE}
+    assert len(_h001_pending([prog])) == 1
+
+
+@pytest.mark.parametrize("finding", [
+    {"title": "[H001] 沖正是否處理"},
+    {"title": "[H001]", "detail": "沖正是否處理"},
+    {"title": "[H001] 沖正是否處理", "detail": " 沖正是否處理 ", "suggestion": "`[H001]`"},
+], ids=["title", "detail", "all-fields"])
+def test_照抄檢核點訊息的不算回應(finding):
+    """模型把預掃結果原樣抄進 findings(gemma 會這樣):拿掉代碼與預掃訊息之後什麼都不剩。"""
+    assert len(_h001_pending([{"severity": "info", "file": FILE, **finding}])) == 1
+
+
+def test_prompt_規定的回應格式跟程式認的一致():
+    """格式寫在 system prompt,程式只認那個格式;兩邊對不上的話模型照 prompt 寫,
+    程式卻一條都不認,每個檢核點都會變成「模型未回應」。"""
+    import re
+
+    from orchestrator import pipeline
+    prompt = pipeline.SYSTEM_TEMPLATE
+    example = re.search(r"「(\[H\d{3}\][^」]*)」", prompt)
+    assert example, "system prompt 要舉一個標題帶代碼的例子"
+    code = re.match(r"\[(H\d{3})\]", example.group(1)).group(1)
+    assert pipeline._is_hint_reply({"title": example.group(1)}, code,
+                                   [{"message": "x"}])
+    assert pipeline._pending_tag({"title": "規格未載明:幣別"}) == "幣別"
+    assert "「規格未載明:<項目名>」" in prompt
+    # 常駐的 objective-reviewer skill 也講待補事項怎麼報(每次都放進 system prompt):兩份要一致
+    skill = (pipeline.PKG_ROOT / "skills" / "objective-reviewer" / "SKILL.md").read_text(encoding="utf-8")
+    assert "「規格未載明:<項目名>」" in skill
+
+
+def test_照抄訊息之外有寫東西的算回應():
+    finding = {"severity": "info", "file": FILE, "title": "[H001] 已核對:沖正是否處理",
+               "detail": "已確認:前置系統已排除沖正交易。"}
+    assert _h001_pending([finding]) == []
 
 
 @pytest.mark.parametrize("severity", ["info", "minor", "major", "blocker"])
 def test_檢核點的回應不限嚴重度(severity):
     """檢核點的回應本來就可以是 info(與 enforce_rules 要求同等嚴重度不同)。"""
     report = enforce_hints(
-        {"findings": [{"severity": severity, "file": FILE, "title": "已確認沖正處理"}]},
+        {"findings": [{"severity": severity, "file": FILE, "title": "[H001] 已核對:沖正已另外處理"}]},
         _pre([_H001]))
     assert len(report["findings"]) == 1
 
 
 @pytest.mark.parametrize("report", [
-    {"summary": "沖正已確認無誤", "findings": []},
+    {"summary": "[H001] 已核對:沖正已另外處理", "findings": []},
     {"findings": [{"severity": "info", "file": "sql/rules/other.sql",
-                   "title": "已確認沖正處理"}]},
+                   "title": "[H001] 已核對:沖正已另外處理"}]},
     {"findings": [{"severity": "info", "file": FILE, "title": "核對結果",
-                   "citations": [{"source": "沖正"}]}]},
+                   "citations": [{"source": "[H001] 沖正"}]}]},
 ], ids=["summary", "other-file", "other-field"])
 def test_summary_別的檔案或其他欄位提到不算回應(report):
-    """#16 review:以前比對報告全文,summary 寫一句、別的檔案或其他欄位提到關鍵詞,
+    """#16 review:以前比對報告全文,summary 寫一句、別的檔案或其他欄位提到,
     這個檔案的檢核點就算處理過、不再擋自動放行。"""
     out = enforce_hints(report, _pre([_H001]))
-    assert any(f["title"].startswith("[H001]") for f in out["findings"])
+    assert any(f["title"] == "[H001] 檢核點待人工確認(模型未回應)" for f in out["findings"])
 
 
 def test_自己補的檢核點不能吞掉同檔的其他檢核點():
@@ -397,8 +464,8 @@ def _hint(statement, rule="H001", message="此規則聚合交易金額,但未見
     return {"rule": rule, "severity": "hint", "message": message, "statement": statement}
 
 
-def _reply(text, severity="info", file=FILE):
-    return {"severity": severity, "file": file, "title": "檢核點回應", "detail": text,
+def _reply(text, severity="info", file=FILE, code="H001"):
+    return {"severity": severity, "file": file, "title": f"[{code}] 已核對:見內文", "detail": text,
             "suggestion": ""}
 
 
@@ -441,10 +508,10 @@ def test_檔案提到兩個規格代碼_只回應一次時另一個仍待確認(
     """H003 是每個規格代碼一處(沒有語句),照數量算。"""
     hints = [_hint("", rule="H003", message="檔案涉及規則 R-201:必須與核定規格逐項核對"),
              _hint("", rule="H003", message="檔案涉及規則 R-202:必須與核定規格逐項核對")]
-    one = [_reply("已與核定規格 R-201 逐項核對")]
+    one = [_reply("已與核定規格 R-201 逐項核對", code="H003")]
     report = enforce_hints({"findings": list(one)}, _pre(hints))
     assert len(_pending(report)) == 1
-    two = one + [_reply("已與核定規格 R-202 逐項核對")]
+    two = one + [_reply("已與核定規格 R-202 逐項核對", code="H003")]
     assert _pending(enforce_hints({"findings": list(two)}, _pre(hints))) == []
 
 
@@ -475,9 +542,9 @@ def test_不認得的嚴重度不算回應():
     所以嚴重度幾乎不影響 —— 唯一還有作用的是**不認得的嚴重度**:那種 finding 不算回應,
     檢核點照樣待確認,寧可多擋一次。"""
     pre = _pre([_H001])
-    weird = {"severity": "critical", "file": FILE, "title": "沖正已處理"}
+    weird = {"severity": "critical", "file": FILE, "title": "[H001] 已核對:沖正已另外處理"}
     report = enforce_hints({"findings": [weird]}, pre)
-    assert any("[H001]" in f["title"] for f in report["findings"])
+    assert len(_pending(report)) == 1
 
 
 def test_引用了語句的回應先對應():
@@ -487,12 +554,12 @@ def test_引用了語句的回應先對應():
     hits = [_hint("SELECT a FROM t1"), _hint("SELECT b FROM t2")]
     # 引用的是**第一句**:沒引用的那條若先對應,就會占走第一句,有引用的那條反而
     # 對不到 —— 結果多補一條「未回應」,而那一處其實有人回應過。
-    model = [{"severity": "info", "file": FILE, "title": "沖正處理已確認", "detail": "",
+    model = [{"severity": "info", "file": FILE, "title": "[H001] 已核對:沖正處理沒有問題", "detail": "",
               "suggestion": ""},
-             {"severity": "info", "file": FILE, "title": "沖正:`SELECT a FROM t1` 已確認",
+             {"severity": "info", "file": FILE, "title": "[H001] 已核對:`SELECT a FROM t1` 的沖正沒有問題",
               "detail": "", "suggestion": ""}]
     report = enforce_hints({"findings": list(model)}, _pre(hits))
-    assert [f for f in report["findings"] if "[H001]" in f["title"]] == []
+    assert _pending(report) == []
 
 
 def test_補的檢核點不回顯命中的語句():

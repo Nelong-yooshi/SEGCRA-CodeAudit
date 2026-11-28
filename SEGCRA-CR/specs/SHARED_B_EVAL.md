@@ -10,7 +10,7 @@
 
 | 欄位 | 值 |
 |---|---|
-| 序號 / 程式名稱 | EVAL862 / SHARED_B_EVAL |
+| 序號 / 程式名稱 | EVAL862B / SHARED_B_EVAL |
 | 資料取用 | txn_log |
 | 程式負責人 | 資料工程團隊 |
 

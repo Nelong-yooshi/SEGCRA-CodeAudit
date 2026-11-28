@@ -56,8 +56,8 @@ LLM 審完、執行驗證跑完之後,管線用兩個**確定性函式**把「�
        H009 現在時間與寫死的日期比較)也沒有。`report["_rule_hits"]` 由程式從預掃結果算
        (`_rule_hit_codes`,呼叫到的 macro 的命中也算),模型輸出的同名欄位會被蓋掉;不看 finding 的標題或
        嚴重度(模型可以自己寫一條同標題的 finding,或把命中寫成 info)。彙整這一步出錯時記成環節未完整
-       - 這幾個檢核點不看模型有沒有回應:「有沒有回應」是同一個檔的 finding 有沒有含關鍵詞
-         (見 04 篇的已知限制),一條 info 寫「密碼欄位存的是雜湊值,沒有問題」就算回應過 H004。
+       - 這幾個檢核點不看模型有沒有回應:「有沒有回應」是同一個檔有沒有標題帶代碼的 finding
+         (見 04 篇的已知限制),一條 info 寫「[H004] 密碼欄位存的是雜湊值,沒有問題」就算回應過 H004。
          H006–H009 會讓沙盒與正式環境走不同分支,執行驗證驗不到。其他檢核點(H001–H003、H005)照
          `pending_hints` 與 `forbid_pending_hints`
      - `not cold_read`:冷讀沒有命中、也看完了(`report["_cold_read"]` 的 `flagged`、`truncated`)
@@ -68,7 +68,7 @@ LLM 審完、執行驗證跑完之後,管線用兩個**確定性函式**把「�
 4. 訊號寫進 `report["_policy_signals"]`(change_lines / new_rule / severities / pending_hints / spec_exec_passed /
    needs_human / spec_changed / incomplete / rule_hits / cold_read)供稽核,決策寫 `report["decision"]`。`policy` 段整個缺席時直接 `needs_human`(fail-safe)。
 
-與 `config/models.yaml` 的對應:`policy.auto_approve.{max_diff_lines, min_score, allowed_severities, forbid_pending_hints}` 與 `policy.block.min_blockers` 一一對應上述條件;寫死在程式的那幾項(`spec_exec_ok`、`_needs_human`、`spec_changed`、`incomplete`、`rule_hits`、`cold_read`)不在 yaml,因為它們不是可調參數而是不變量。規則層命中與冷讀命中在預設設定下也擋得住(`allowed_severities` 只許 info),寫死是為了設定放寬之後一樣擋得住;`rule_hits` 裡的檢核點在預設設定下也要靠它擋(模型一條提到關鍵詞的 info 就讓 `pending_hints` 不成立)。
+與 `config/models.yaml` 的對應:`policy.auto_approve.{max_diff_lines, min_score, allowed_severities, forbid_pending_hints}` 與 `policy.block.min_blockers` 一一對應上述條件;寫死在程式的那幾項(`spec_exec_ok`、`_needs_human`、`spec_changed`、`incomplete`、`rule_hits`、`cold_read`)不在 yaml,因為它們不是可調參數而是不變量。規則層命中與冷讀命中在預設設定下也擋得住(`allowed_severities` 只許 info),寫死是為了設定放寬之後一樣擋得住;`rule_hits` 裡的檢核點在預設設定下也要靠它擋(模型一條標題帶代碼的 info 就讓 `pending_hints` 不成立)。
 
 ### 3. 回寫(`orchestrator/pipeline.py:review_mr` 尾段)
 
@@ -208,7 +208,7 @@ EOF
 
 ## 擴充與注意
 
-- **調閾值**:`config/models.yaml` 的 `policy:` 段——`max_diff_lines`、`min_score`、`allowed_severities`、`forbid_pending_hints`、`min_blockers`。改完即生效,不用動程式。
+- **調閾值**:使用中的模型設定檔(`SEGCRA_MODELS_CONFIG` 指的那份,沒設時是 `config/models.yaml`;見 docs/10)的 `policy:` 段——`max_diff_lines`、`min_score`、`allowed_severities`、`forbid_pending_hints`、`min_blockers`。改完即生效,不用動程式。
 - **改評分權重**:`orchestrator/pipeline.py:apply_rubric` 的公式(40/15/5 與 59 封頂)。動之前想清楚連動:`min_score: 95` 的意思是「至多一個 minor(100−5)」,權重一改,yaml 的 min_score 語意跟著變。
 - **加新的放行條件**:加在 `apply_policy` 的 `ok = (...)` 鏈上,並把新訊號寫進 `_policy_signals`,決策才可稽核。與 `spec_exec_ok` 同級的「不變量」請寫死在程式,不要進 yaml。
 - **選 `CI_REVIEW_REPEAT=first` 的代價**:第一次之後的改動整份不經過審查(規則檢查、注入掃描、執行驗證、
