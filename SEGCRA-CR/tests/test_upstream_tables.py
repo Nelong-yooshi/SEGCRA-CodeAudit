@@ -640,3 +640,54 @@ def test_紀錄_模型輸出的同名欄位蓋掉():
     report = {"findings": [], "_upstream_tables": {"tables": [{"name": "假的"}]}}
     out = enforce_upstream_tables(report, None)
     assert out["_upstream_tables"] is None and out["findings"] == []
+
+
+# ─────────────────── 給測資生成的上游說明 ───────────────────
+
+def _context(spec_text):
+    head = spec_text.index(upstream_tables.CONTEXT_HEADING)
+    return spec_text[head:]
+
+
+def test_補上的規格最後附上上游說明_讀哪幾張_怎麼來_要一致(in_process):
+    r = _build(FILES)
+    ctx = _context(r.spec_text)
+    assert "要驗的 model 直接讀這幾張表:snap_acct、stg_a。" in ctx
+    assert "要一致" in ctx and "不是需求,不要拆成條件" in ctx
+    assert "**stg_a**(dbt model)" in ctx and "**snap_acct**(dbt snapshot)" in ctx
+    assert ctx.count("[dbo].[transactions]") == 2                  # 附的是展開後的 SQL
+    # 說明段在資料表定義之後,不影響表的解析
+    assert set(spec_tables(r.spec_text)) == {"transactions", "stg_a", "snap_acct"}
+    assert r.spec_text.index("## 資料表定義") < r.spec_text.index("## 需求項目") \
+        < r.spec_text.index(upstream_tables.CONTEXT_HEADING)
+
+
+def test_說明只附直接讀的上游(in_process):
+    files = {"models/stg_a.sql": STG,
+             "models/int_b.sql": "SELECT account_no FROM {{ ref('stg_a') }}\n",
+             "models/mrt_BIG.sql": "SELECT account_no FROM {{ ref('int_b') }}\n"}
+    ctx = _context(_build(files).spec_text)
+    assert "直接讀這幾張表:int_b。" in ctx
+    assert "**int_b**" in ctx and "**stg_a**" not in ctx
+
+
+def test_定義太長時截斷_整段超過上限時不再附(in_process, monkeypatch):
+    monkeypatch.setattr(upstream_tables, "MAX_DEFINITION_CHARS", 10)
+    ctx = _context(_build(FILES).spec_text)
+    assert ctx.count("-- (以下省略)") == 2
+    monkeypatch.setattr(upstream_tables, "MAX_DEFINITION_CHARS", 1500)
+    base = len(_context_head())
+    monkeypatch.setattr(upstream_tables, "MAX_CONTEXT_CHARS", base + 1)
+    ctx = _context(_build(FILES).spec_text)
+    assert "**stg_a**" not in ctx and "沒有附上" in ctx
+
+
+def _context_head():
+    return upstream_tables._context_section(["snap_acct", "stg_a"], [])
+
+
+def test_沒有推出上游時不附說明(in_process):
+    spec = SPEC.replace("tx_time DATETIME2);", "tx_time DATETIME2);\nCREATE TABLE stg_a(account_no INT, "
+                        "amount DECIMAL(14,2));\nCREATE TABLE snap_acct(account_no INT, dbt_valid_to DATETIME2);")
+    r = _build(FILES, spec=spec)
+    assert upstream_tables.CONTEXT_HEADING not in r.spec_text

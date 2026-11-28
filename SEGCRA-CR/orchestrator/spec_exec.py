@@ -518,6 +518,7 @@ def _shape_check(plan: dict) -> tuple[dict, list[str], list[dict]]:
     cases = []
     cols_by_table = _ddl_columns(ddl)
     for c in plan.get("cases", []):
+        c = _bare_row_tables(c)
         ok, why = _case_ok(c, cond_ids, branches, new_shape)
         if ok:
             # 形狀對了還要灌得進去:超長字串、超出精度的金額、認不出來的日期,
@@ -595,6 +596,26 @@ def _branches(conds: list[dict]) -> set[str]:
     out = {str(c.get("branch", "") or "") for c in conds}
     out.discard(GLOBAL_BRANCH)
     return out or {""}
+
+
+# 資料列的表名寫成 dbo.x、[dbo].[x]、[x]:沙盒的測資表都在 dbo,去掉這層就是表名
+_DBO_TABLE = re.compile(r"^(?:\[?dbo\]?\.)?\[?([A-Za-z_][A-Za-z0-9_]*)\]?$", re.I)
+
+
+def _bare_row_tables(c):
+    """資料列的表名去掉 `dbo.` 與方括號。規格的表結構寫成 `[dbo].[x]` 時,模型常照抄成 `dbo.x`;
+    以前整個案例當成表名非法丟掉、重新生成(真模型實測一輪多花 20 多分鐘)。只認 dbo,其他 schema
+    照舊不合法。"""
+    if not isinstance(c, dict) or not isinstance(c.get("rows"), list):
+        return c
+    rows = []
+    for r in c["rows"]:
+        if isinstance(r, list) and r and isinstance(r[0], str):
+            m = _DBO_TABLE.match(r[0].strip())
+            if m:
+                r = [m.group(1)] + r[1:]
+        rows.append(r)
+    return {**c, "rows": rows}
 
 
 def _rows_ok(rows) -> bool:
@@ -2113,6 +2134,94 @@ DBT_NOT_RENDERED_TITLE = "[執行驗證] dbt model 沒有展開"
 STAND_IN_MISMATCH_TITLE = "[執行驗證] 上游由測資代替,結果不符無法判定"
 
 
+def _with_spec_ddl(plan: dict, spec_text: str) -> dict:
+    """上游由測資代替時:規格「資料表定義」有、模型沒列進 schema_ddl 的表,照規格補上。
+
+    補進規格的表(specs/tables/ 的原始表、沿 ref() 推出的上游)都是規則要讀的;模型漏列一張,
+    SQL 讀到沙盒裡沒有的表,整份執行驗證就做不了。表結構本來就以規格為準,不靠模型抄。
+    規格解析不了時照原樣(那種情況前面推結構時已經記下了)。"""
+    from .upstream_tables import UpstreamError, _spec_ddl     # 延後匯入:upstream_tables 匯入了 dbt_exec
+    try:
+        spec = _spec_ddl(spec_text)
+    except UpstreamError:
+        return plan
+    have = _ddl_tables(plan.get("schema_ddl"))
+    extra = [d for d in spec if not (set(_ddl_columns([d])) & have)]
+    if not extra:
+        return plan
+    return {**plan, "schema_ddl": list(plan.get("schema_ddl") or []) + extra}
+
+
+def _required_tables(sql: str, plan: dict) -> set[str]:
+    """規則要輸出一列時**一定要有資料**的測資表(小寫):最外層查詢的 FROM 與 INNER / CROSS JOIN 讀的表,
+    讀的是 CTE 或子查詢時照同樣的規則往裡找。
+
+    不算的:LEFT JOIN 右邊、RIGHT JOIN 左邊(含它前面的)、FULL JOIN 兩邊、WHERE 裡的子查詢(`NOT EXISTS`、`NOT IN` 讀的
+    排除名單本來就該是空的)、UNION 的各段(哪一段出列都可以)。解析不了時回空集合:寧可不剔除,
+    交給仲裁。"""
+    import sqlglot
+    from sqlglot import exp
+    try:
+        tree = sqlglot.parse_one(sql, dialect="tsql")
+    except Exception:                                  # noqa: BLE001
+        return set()
+    known = _ddl_tables(plan.get("schema_ddl"))
+    out: set[str] = set()
+
+    def walk(node, ctes: dict, depth: int) -> None:
+        if depth > 20 or not isinstance(node, exp.Select):
+            return                                      # UNION 等:哪一段出列都可以,不算
+        with_ = node.args.get("with_") or node.args.get("with")     # sqlglot 新版的鍵名有底線
+        if with_ is not None:
+            ctes = {**ctes, **{c.alias_or_name.lower(): c.this for c in with_.expressions}}
+        joins = node.args.get("joins") or []
+        sides = {str(j.side or "").upper() for j in joins}
+        sources = []
+        from_ = node.args.get("from_") or node.args.get("from")
+        if from_ is not None and not (sides & {"RIGHT", "FULL"}):
+            sources.append(from_.this)
+        for j in joins:
+            if str(j.side or "").upper() in ("LEFT", "FULL"):
+                continue                                # RIGHT JOIN 的右邊照樣要有資料
+            sources.append(j.this)
+        for src in sources:
+            if isinstance(src, exp.Table):
+                name = src.name.lower()
+                if not src.args.get("db") and name in ctes:
+                    walk(ctes[name], ctes, depth + 1)
+                elif name in known:
+                    out.add(name)
+            elif isinstance(src, exp.Subquery):
+                walk(src.this, ctes, depth + 1)
+
+    walk(tree, {}, 0)
+    return out
+
+
+def _empty_read_misses(sql: str, plan: dict, mismatches: list[dict]) -> tuple[list, list]:
+    """應該命中卻沒命中、而 SQL 讀的表有一張在這個案例裡沒有資料:那是測資沒放齊,不是 SQL 錯。
+
+    上游由測資代替時,模型只看得到規格與表結構,常把資料放進看起來像明細的表,規則直接讀的
+    加總表卻是空的;規則用 JOIN 接起來時什麼都查不出來,正確的 SQL 也會「沒命中」。這種案例
+    不交給仲裁(仲裁看不到上游,判斷不能採用),直接剔除、列成覆蓋缺口。
+
+    只看「應命中卻沒命中」,而且只看規則一定要有資料的表(_required_tables):`NOT EXISTS` 讀的排除
+    名單、LEFT JOIN 的右邊本來就可以是空的,那種案例沒命中是真的不符,要交給仲裁。
+    回 (留下來的 mismatches, [(mismatch, 空的表名)])。"""
+    read = _required_tables(sql, plan)
+    kept, empty = [], []
+    for mm in mismatches:
+        if mm.get("expect_flagged") and not mm.get("actual_flagged"):
+            present = {str(r[0]).strip("[]").split(".")[-1].strip("[]").lower()
+                       for r in mm.get("rows") or [] if isinstance(r, list) and r}
+            missing = sorted(read - present)
+            if missing:
+                empty.append((mm, missing))
+                continue
+        kept.append(mm)
+    return kept, empty
+
+
 async def run_spec_exec(cfg: Config, hub, mr: dict,
                         spec_code: str | None = None,
                         spec_text: str | None = None,
@@ -2227,6 +2336,8 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
         plan, coverage_gaps, malformed = await generate_cases(cfg, spec_code, spec_text)
     finally:
         _leave(STAGE_GENERATE, _t)
+    if stand_ins:
+        plan = _with_spec_ddl(plan, spec_text)
     dropped_cases += [{"case_id": (d.get("case") or {}).get("case_id", "?"),
                        "by": "shape-check", "reason": d["reason"]} for d in malformed]
     if not plan["cases"] and (plan.get("timed_out") or plan.get("call_failed")):
@@ -2304,6 +2415,18 @@ async def run_spec_exec(cfg: Config, hub, mr: dict,
     #   沒有結論        → inconclusive:不剔除、不當 SQL 錯,落成帶 stage 的 finding(交人工)
     sql_faults = []
     inconclusive = []
+    if stand_ins:
+        ex["mismatches"], empty_reads = _empty_read_misses(sql, plan, ex["mismatches"])
+        for mm, missing in empty_reads:
+            names = "、".join(missing[:10])
+            reason = f"規則讀的表 {names} 在這個案例裡沒有資料(測資可能沒放齊)"
+            dropped_cases.append({"case_id": mm["case_id"], "by": "empty-read", "reason": reason})
+            coverage_gaps.append(
+                f"案例 {mm['case_id']}(條件 {mm['condition_id']} {mm['direction']} 向)剔除:"
+                f"{reason},該向未驗證")
+            for r in ex["case_results"]:
+                if r["case_id"] == mm["case_id"]:
+                    r["dropped"] = True
     _t = _enter(STAGE_ARBITRATE)
     for mm in ex["mismatches"]:
         verdict = await arbitrate(cfg, spec_text, sql, mm)

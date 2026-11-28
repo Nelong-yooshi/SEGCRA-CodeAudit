@@ -7371,5 +7371,97 @@ MUTANTS.update({
 })
 
 
+# 上游由測資代替時,模型產生的測資沒放齊表
+SE = "spec_exec.py"
+MUTANTS.update({
+ "上游測資:不補規格的表": (SE,
+     '    if stand_ins:' + NL + '        plan = _with_spec_ddl(plan, spec_text)',
+     '    if False:' + NL + '        plan = _with_spec_ddl(plan, spec_text)'),
+ "上游測資:補表時不看已列的": (SE,
+     '    extra = [d for d in spec if not (set(_ddl_columns([d])) & have)]',
+     '    extra = []'),
+ "上游測資:已列的也重複補": (SE,
+     '    have = _ddl_tables(plan.get("schema_ddl"))' + NL + '    extra',
+     '    have = set()' + NL + '    extra'),
+ "上游測資:不剔除沒放齊的": (SE,
+     '    if stand_ins:' + NL + '        ex["mismatches"], empty_reads',
+     '    if False:' + NL + '        ex["mismatches"], empty_reads'),
+ "上游測資:每種不符都剔除": (SE,
+     '        if mm.get("expect_flagged") and not mm.get("actual_flagged"):',
+     '        if True:'),
+ "上游測資:不看缺哪幾張": (SE,
+     '            missing = sorted(read - present)',
+     '            missing = []'),
+ "上游測資:表名不去掉 schema": (SE,
+     '.split(".")[-1].strip("[]").lower()',
+     '.lower()'),
+ "上游測資:不列覆蓋缺口": (SE,
+     '            coverage_gaps.append(' + NL + '                f"案例 {mm[\'case_id\']}(條件 {mm[\'condition_id\']} {mm[\'direction\']} 向)剔除:"',
+     '            [].append(' + NL + '                f"案例 {mm[\'case_id\']}(條件 {mm[\'condition_id\']} {mm[\'direction\']} 向)剔除:"'),
+ "上游測資:剔除記成仲裁": (SE,
+     '"by": "empty-read", "reason": reason})',
+     '"by": "arbiter", "reason": reason})'),
+})
+
+# 給測資生成的上游說明
+UP = "upstream_tables.py"
+MUTANTS.update({
+ "上游說明:不附": (UP,
+     r'    result.spec_text = result.spec_text.rstrip("\n") + "\n\n" + _context_section(reads, defs)',
+     '    result.spec_text = result.spec_text'),
+ "上游說明:附了更上層的": (UP,
+     '    defs = [(name, kind, sql) for name, _table, kind, _file, sql in order if name in direct]',
+     '    defs = [(name, kind, sql) for name, _table, kind, _file, sql in order]'),
+ "上游說明:讀的表不限要驗的 model": (UP,
+     '    reads = [built[k].split(".")[-1].strip("[]") for k in sorted(built) if k in target_words]',
+     '    reads = [built[k].split(".")[-1].strip("[]") for k in sorted(built)]'),
+ "上游說明:定義不截斷": (UP,
+     '        if len(body) > MAX_DEFINITION_CHARS:',
+     '        if False:'),
+ "上游說明:整段不設上限": (UP,
+     '        if used + size > MAX_CONTEXT_CHARS:',
+     '        if False:'),
+})
+
+# 一定要有資料的表;資料列表名的 dbo.
+MUTANTS.update({
+ "必要表:LEFT JOIN 也算": (SE,
+     '            if str(j.side or "").upper() in ("LEFT", "FULL"):',
+     '            if str(j.side or "").upper() in ("FULL",):'),
+ "必要表:RIGHT JOIN 的左邊也算": (SE,
+     '        if from_ is not None and not (sides & {"RIGHT", "FULL"}):',
+     '        if from_ is not None:'),
+ "必要表:不往 CTE 裡找": (SE,
+     '                if not src.args.get("db") and name in ctes:',
+     '                if False:'),
+ "必要表:帶 schema 的也當 CTE": (SE,
+     '                if not src.args.get("db") and name in ctes:',
+     '                if name in ctes:'),
+ "必要表:不往子查詢裡找": (SE,
+     '            elif isinstance(src, exp.Subquery):' + NL + '                walk(src.this, ctes, depth + 1)',
+     '            elif isinstance(src, exp.Subquery):' + NL + '                pass'),
+ "必要表:不認新版鍵名": (SE,
+     '        with_ = node.args.get("with_") or node.args.get("with")',
+     '        with_ = node.args.get("with")'),
+ "必要表:不是測資表也算": (SE,
+     '                elif name in known:' + NL + '                    out.add(name)',
+     '                else:' + NL + '                    out.add(name)'),
+ "必要表:UNION 也往裡找": (SE,
+     '        if depth > 20 or not isinstance(node, exp.Select):',
+     '        if isinstance(node, exp.Union):' + NL + '            walk(node.this, ctes, depth + 1)' + NL + '        if depth > 20 or not isinstance(node, exp.Select):'),
+ "必要表:解析不了時全部算": (SE,
+     '        tree = sqlglot.parse_one(sql, dialect="tsql")' + NL + '    except Exception:                                  # noqa: BLE001' + NL + '        return set()',
+     '        tree = sqlglot.parse_one(sql, dialect="tsql")' + NL + '    except Exception:                                  # noqa: BLE001' + NL + '        return _ddl_tables(plan.get("schema_ddl"))'),
+ "dbo 表名:不去掉": (SE,
+     '        c = _bare_row_tables(c)' + NL,
+     ''),
+ "dbo 表名:其他 schema 也去掉": (SE,
+     r'_DBO_TABLE = re.compile(r"^(?:\[?dbo\]?\.)?\[?([A-Za-z_][A-Za-z0-9_]*)\]?$", re.I)',
+     r'_DBO_TABLE = re.compile(r"^(?:\[?\w+\]?\.)?\[?([A-Za-z_][A-Za-z0-9_]*)\]?$", re.I)'),
+ "dbo 表名:不去前後空白": (SE,
+     '            m = _DBO_TABLE.match(r[0].strip())',
+     '            m = _DBO_TABLE.match(r[0])'),
+})
+
 if __name__ == "__main__":
     sys.exit(main())

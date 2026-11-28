@@ -305,6 +305,22 @@ CREATE To」的輸出(可以包在 ```sql 圍欄裡,也可以不包)。新增或
 6. 推出的表記在報告的 `_upstream_tables`(`direct` 標出是不是直接讀的、`dropped` 是裁掉的欄位),補一條 info「執行驗證的上游表結構(沿 ref() 推出)」寫明
    哪些、只推了結構、上游的邏輯沒有執行。snapshot 推出來後,展開時表名也算確定(`sandbox_upstream`
    的 `snapshots`),由那張測資表代替。
+7. **給測資生成的上游說明**(`upstream_tables._context_section`):補過的規格最後加一段「執行驗證的上游表說明
+   (程式補上,不是需求)」,寫要驗的 model 直接讀哪幾張表、每張直接讀的上游展開後的 SQL(每張最多
+   `MAX_DEFINITION_CHARS` 字元、整段最多 `MAX_CONTEXT_CHARS`),並要求同一筆業務資料在各表一致、定義不要拆成
+   條件。放在規格最後、`資料表定義` 之外,不影響表的解析;測資生成的 system prompt 不變。給的是上游的 SQL,不是要驗的
+   model 的 SQL,測資生成仍然看不到被審的程式。
+8. **測資沒放齊時不算不符**(`spec_exec.run_spec_exec`,只在上游由測資代替時):測資生成只看得到規格與表結構,
+   不知道規則讀哪幾張、各表怎麼來;真模型實測時資料只放進看起來像明細的表,規則直接讀的加總表是空的,
+   正確的 SQL 也「應命中卻沒命中」。所以:
+   - `schema_ddl` 照規格補齊(`_with_spec_ddl`):規格有、模型沒列的表補上,不然 SQL 讀到沙盒沒有的表。
+   - 應命中卻沒命中、而規則**一定要有資料**的表(`_required_tables`:最外層的 FROM 與 INNER / CROSS JOIN,
+     讀的是 CTE 或子查詢時往裡找;LEFT JOIN 右邊、RIGHT JOIN 左邊、FULL JOIN、WHERE 裡的子查詢、UNION 都
+     不算,解析不了時一張都不算)有一張在案例裡沒有資料(`_empty_read_misses`):剔除(`dropped_cases` 的
+     `by` 是 `empty-read`)、列覆蓋缺口,不交給仲裁、不報不符。`NOT EXISTS` 讀的排除名單本來就該是空的,
+     不算;真模型實測時,資料放齊、排除名單空著的案例,埋錯(`>=` 改 `>`)的 SQL 沒命中,照樣交給仲裁。
+   - 資料列的表名寫成 `dbo.x`、`[dbo].[x]` 時去掉 `dbo.`(`_bare_row_tables`,所有執行驗證都適用):規格的表
+     結構是 `[dbo].[x]`,模型常照抄;以前整個案例當成表名非法丟掉、重新生成,真模型實測一輪多花 20 多分鐘。
 
 **snapshot 的設定照 dbt 的優先順序合併**:`dbt_project.yml` 的 `snapshots:` 區段(專案名底下一層層
 資料夾,越深的蓋掉越淺的;`+鍵` 或值不是物件的鍵是設定)< 屬性檔(yml)的 `config:` < 區塊裡的

@@ -438,6 +438,39 @@ def _trim(columns: list, words: set, star: bool) -> tuple[list, list]:
     return kept, [c for c, _ in columns if c.lower() not in words]
 
 
+# 給測資生成的上游說明(補在規格最後一段):每張上游的定義、整段的字元上限
+MAX_DEFINITION_CHARS = 1500
+MAX_CONTEXT_CHARS = 6000
+CONTEXT_HEADING = "## 執行驗證的上游表說明(程式補上,不是需求)"
+
+
+def _context_section(reads: list, defs: list) -> str:
+    """給測資生成看的一段:要驗的 model 讀哪幾張表、直接讀的上游各自怎麼來、各表的資料要一致。
+
+    測資生成只看得到規格與表結構。真模型實測時,它把資料放進看起來像明細的表,規則直接讀的加總表
+    是空的(它不知道規則讀哪幾張、加總表就是明細的合計)。這段補上這兩件事;上游的定義只是說明,
+    寫明不要拆成條件。reads 是表名,defs 是 [(名稱, 種類, 展開後的 SQL)](只有直接讀的上游)。"""
+    lines = [CONTEXT_HEADING, "",
+             "要驗的 model 直接讀這幾張表:" + "、".join(reads) + "。上游 model 不會執行,測資直接放進這些表。",
+             "- 讓規則命中的案例,規則需要的每張表都要放到那筆資料。",
+             "- 同一筆業務資料在各表要一致:下面是每張上游表怎麼從其他表算出來的,照它推算各表的值"
+             "(例如加總表的金額要等於明細表的合計;snapshot 的 dbt_valid_to 是 NULL 的那列是目前有效的資料)。",
+             "- 下面的定義只說明表怎麼來,不是需求,不要拆成條件。", ""]
+    used = sum(len(x) for x in lines)
+    for name, kind, sql in defs:
+        body = sql.strip()
+        if len(body) > MAX_DEFINITION_CHARS:
+            body = body[:MAX_DEFINITION_CHARS] + "\n-- (以下省略)"
+        block = [f"**{name}**({'dbt snapshot' if kind == 'snapshot' else 'dbt model'})", "```sql", body, "```", ""]
+        size = sum(len(x) for x in block)
+        if used + size > MAX_CONTEXT_CHARS:
+            lines.append("(其餘上游的定義超過長度上限,沒有附上)")
+            break
+        lines += block
+        used += size
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
 def build(path: str, source: str, spec_text: str, database: str, project_kwargs: dict, project,
           session_factory=None, repo_defs=None) -> UpstreamResult:
     """沿 ref() 推出上游表結構、補進規格。回傳 UpstreamResult:補過的規格(沒補就是原本的)、
@@ -509,5 +542,9 @@ def build(path: str, source: str, spec_text: str, database: str, project_kwargs:
         if session is not None:
             session.close()
     result.spec_text = table_defs._insert(spec_text, out_ddl, bool(tables))
+    built = spec_tables(result.spec_text)
+    reads = [built[k].split(".")[-1].strip("[]") for k in sorted(built) if k in target_words]
+    defs = [(name, kind, sql) for name, _table, kind, _file, sql in order if name in direct]
+    result.spec_text = result.spec_text.rstrip("\n") + "\n\n" + _context_section(reads, defs)
     result.snapshots = tuple((t["name"], t["table"]) for t in result.tables if t["kind"] == "snapshot")
     return result
